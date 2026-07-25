@@ -107,6 +107,12 @@
   .msg.you { color:#a88f92; }
   .msg.you::before { content:"Ido · "; color:#8f6f72; font-size:11px;
     letter-spacing:.08em; text-transform:uppercase; }
+  #liveVid { position:fixed; top:max(18px, env(safe-area-inset-top)); right:16px; width:110px;
+    border-radius:14px; border:1.5px solid rgba(255,120,135,.55); z-index:5; display:none;
+    box-shadow:0 6px 24px rgba(0,0,0,.5), 0 0 18px rgba(230,50,80,.35); }
+  body.liveview #liveVid { display:block; animation:fadein .3s ease; }
+  .msg img { display:block; max-width:78%; border-radius:14px; margin-top:6px;
+    border:1px solid rgba(255,150,160,.2); box-shadow:0 4px 18px rgba(0,0,0,.4); }
   @keyframes fadein { from { opacity:0; transform:translateY(4px); } to { opacity:1; } }
 </style>
 </head>
@@ -128,7 +134,13 @@
   </main>
 
   <footer>
+    <button class="mute" id="liveBtn" title="Live view - she sees what you see">👁</button>
+    <button class="mute" id="fileBtn" title="Share a file">📎</button>
+    <button class="mute" id="camBtn" title="Show her a photo">📷</button>
     <button class="mute" id="chatBtn" title="Show/hide text">💬</button>
+    <input type="file" id="imgInput" accept="image/*" hidden>
+    <input type="file" id="fileInput" hidden>
+    <video id="liveVid" playsinline muted></video>
     <button class="mute" id="muteBtn" title="Mute my microphone">🎙</button>
     <button class="primary" id="mainBtn">Start talking</button>
   </footer>
@@ -142,6 +154,13 @@
   const mainBtn = document.getElementById("mainBtn");
   const muteBtn = document.getElementById("muteBtn");
   const chatBtn = document.getElementById("chatBtn");
+  const camBtn = document.getElementById("camBtn");
+  const imgInput = document.getElementById("imgInput");
+  const fileBtn = document.getElementById("fileBtn");
+  const fileInput = document.getElementById("fileInput");
+  const liveBtn = document.getElementById("liveBtn");
+  const liveVid = document.getElementById("liveVid");
+  let liveStream = null, liveTimer = null, liveStartedAt = 0;
   const chat = document.getElementById("chat");
   let herLine = null;
   const audioEl = new Audio();
@@ -247,6 +266,9 @@
       mainBtn.classList.add("live");
       muteBtn.style.display = "block";
       chatBtn.style.display = "block";
+      camBtn.style.display = "block";
+      fileBtn.style.display = "block";
+      liveBtn.style.display = "block";
       document.body.classList.add("showchat");
       chatBtn.classList.add("on");
       setStatus("Listening\u2026");
@@ -280,12 +302,154 @@
     mainBtn.classList.remove("live");
     muteBtn.style.display = "none";
     chatBtn.style.display = "none";
+    camBtn.style.display = "none";
+    fileBtn.style.display = "none";
+    liveBtn.style.display = "none";
+    stopLive();
     document.body.classList.remove("showchat");
     setStatus("Tap to wake her");
   }
 
+  function sendImage(file) {
+    const img = new Image();
+    img.onload = () => {
+      const MAX = 896;
+      const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.7);
+      URL.revokeObjectURL(img.src);
+      const bubble = addMsg("you", "");
+      const shown = document.createElement("img");
+      shown.src = dataUrl;
+      bubble.appendChild(shown);
+      document.body.classList.add("showchat");
+      chatBtn.classList.add("on");
+      chat.scrollTop = chat.scrollHeight;
+      if (dc && dc.readyState === "open") {
+        dc.send(JSON.stringify({ type: "conversation.item.create",
+          item: { type: "message", role: "user",
+                  content: [{ type: "input_image", image_url: dataUrl }] } }));
+        dc.send(JSON.stringify({ type: "response.create" }));
+      }
+    };
+    img.src = URL.createObjectURL(file);
+  }
+  function sendTextToHer(label, text) {
+    const clipped = text.length > 24000 ? text.slice(0, 24000) + "\n[...truncated]" : text;
+    if (dc && dc.readyState === "open") {
+      dc.send(JSON.stringify({ type: "conversation.item.create",
+        item: { type: "message", role: "user",
+                content: [{ type: "input_text",
+                            text: "Ido shared a file: " + label + "\n---\n" + clipped }] } }));
+      dc.send(JSON.stringify({ type: "response.create" }));
+    }
+  }
+
+  async function pdfToText(file) {
+    const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/legacy/build/pdf.min.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/legacy/build/pdf.worker.min.mjs";
+    const doc = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+    let out = "";
+    const pages = Math.min(doc.numPages, 25);
+    for (let p = 1; p <= pages; p++) {
+      const content = await (await doc.getPage(p)).getTextContent();
+      out += content.items.map((i) => i.str).join(" ") + "\n";
+    }
+    if (doc.numPages > pages) out += "[... " + (doc.numPages - pages) + " more pages]";
+    return out;
+  }
+
+  async function sendFile(file) {
+    if (file.type.startsWith("image/")) { sendImage(file); return; }
+    const bubble = addMsg("you", "\uD83D\uDCCE " + file.name);
+    document.body.classList.add("showchat");
+    chatBtn.classList.add("on");
+    try {
+      let text;
+      if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+        bubble.textContent += " (reading\u2026)";
+        text = await pdfToText(file);
+        bubble.textContent = "\uD83D\uDCCE " + file.name;
+      } else if (file.size < 300000) {
+        text = await file.text();
+        if (text.includes("\u0000")) throw new Error("binary");
+      } else {
+        throw new Error("too large");
+      }
+      if (!text || !text.trim()) throw new Error("empty");
+      sendTextToHer(file.name, text);
+    } catch (e) {
+      console.error(e);
+      bubble.textContent = "\uD83D\uDCCE " + file.name + " \u2014 couldn't read this file type";
+    }
+  }
+
+  function sendLiveFrame() {
+    if (!liveStream || !dc || dc.readyState !== "open") return;
+    if (Date.now() - liveStartedAt > 10 * 60 * 1000) { stopLive(); return; }
+    const MAX = 512;
+    const vw = liveVid.videoWidth, vh = liveVid.videoHeight;
+    if (!vw) return;
+    const scale = Math.min(1, MAX / Math.max(vw, vh));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(vw * scale); canvas.height = Math.round(vh * scale);
+    canvas.getContext("2d").drawImage(liveVid, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.55);
+    dc.send(JSON.stringify({ type: "conversation.item.create",
+      item: { type: "message", role: "user",
+              content: [{ type: "input_text", text: "[live camera frame - what Ido sees right now; do not comment unless asked]" },
+                        { type: "input_image", image_url: dataUrl }] } }));
+  }
+
+  async function startLive() {
+    try {
+      liveStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1024 } } });
+      liveVid.srcObject = liveStream;
+      await liveVid.play();
+      document.body.classList.add("liveview");
+      liveBtn.classList.add("on");
+      liveStartedAt = Date.now();
+      sendLiveFrame();
+      liveTimer = setInterval(sendLiveFrame, 7000);
+    } catch (e) { console.error(e); setStatus("Camera permission is needed for live view."); }
+  }
+
+  function stopLive() {
+    if (liveTimer) clearInterval(liveTimer);
+    liveTimer = null;
+    if (liveStream) liveStream.getTracks().forEach((t) => t.stop());
+    liveStream = null;
+    liveVid.srcObject = null;
+    document.body.classList.remove("liveview");
+    liveBtn.classList.remove("on");
+  }
+
+  liveBtn.addEventListener("click", () => { if (liveStream) stopLive(); else startLive(); });
+
+  camBtn.addEventListener("click", () => imgInput.click());
+  fileBtn.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files[0]) sendFile(fileInput.files[0]);
+    fileInput.value = "";
+  });
+  imgInput.addEventListener("change", () => {
+    if (imgInput.files && imgInput.files[0]) sendImage(imgInput.files[0]);
+    imgInput.value = "";
+  });
+
   mainBtn.addEventListener("click", async () => {
     if (pc) { reset(); } else await start();
+  });
+
+  // Open = listening. Works silently once mic permission was granted before
+  // (best as a home-screen app); on first visit the browser still asks once.
+  window.addEventListener("load", () => {
+    setTimeout(() => { if (!pc) start(); }, 300);
   });
   muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
   chatBtn.addEventListener("click", () => {
