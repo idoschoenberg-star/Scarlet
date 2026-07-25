@@ -198,6 +198,23 @@
   #pdfPages canvas { width:100%; max-width:820px; border-radius:10px; margin:6px auto;
     display:block; box-shadow:0 8px 30px rgba(0,0,0,.6); background:#fff; }
   .ovnote { text-align:center; color:#c9a2a4; font-size:13px; padding:20px; }
+
+  /* ---------- lock screen ---------- */
+  #lock { z-index:90; align-items:center; justify-content:center; text-align:center;
+    background:rgba(7,3,4,.96); }
+  #lock .wordmark { font-size:26px; }
+  .lockbox { display:flex; flex-direction:column; gap:14px; align-items:center;
+    width:min(86vw, 320px); margin-top:26px; }
+  .locknote { font-size:13px; color:#c9a2a4; font-weight:300; letter-spacing:.05em; line-height:1.6; }
+  #lockCode { width:100%; padding:14px 18px; border-radius:16px; border:1px solid rgba(255,150,160,.25);
+    background:rgba(255,255,255,.07); color:#f8e9ea; font-size:17px; text-align:center;
+    outline:none; font-family:inherit; letter-spacing:.08em; }
+  .lockbtn { width:100%; padding:15px; font-size:16px; color:#fff; border-radius:16px;
+    background:linear-gradient(135deg, #d92446, #8c1130);
+    box-shadow:0 8px 30px rgba(210,35,70,.4); }
+  .lockbtn.alt { background:rgba(255,255,255,.08); border:1px solid rgba(255,150,160,.25);
+    box-shadow:none; color:#ffc7ce; }
+  .lockerr { min-height:18px; font-size:12.5px; color:#e8b04b; }
 </style>
 </head>
 <body>
@@ -249,6 +266,19 @@
     </div>
   </section>
 
+  <!-- lock screen -->
+  <div class="overlay" id="lock">
+    <div class="lockbox">
+      <div class="wordmark">Scarlet</div>
+      <div class="locknote" id="lockNote">Private. Yours alone.</div>
+      <button class="lockbtn" id="faceBtn" style="display:none">Unlock with Face&nbsp;ID</button>
+      <input id="lockCode" type="password" placeholder="Unlock code" autocomplete="off" style="display:none">
+      <button class="lockbtn" id="unlockBtn" style="display:none">Unlock</button>
+      <button class="lockbtn alt" id="codeModeBtn" style="display:none">Use unlock code instead</button>
+      <div class="lockerr" id="lockErr"></div>
+    </div>
+  </div>
+
   <!-- tab bar -->
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
@@ -270,8 +300,16 @@
   </div>
 
 <script>
-  const SESSION_URL = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1/realtime-session?s=c540cd811e505ed97a262d96f62129dc017274639c49c620";
-  const APP_URL = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1/app-api?s=c540cd811e505ed97a262d96f62129dc017274639c49c620";
+  // No secrets live in this page. The token is fetched once per device with
+  // Ido's unlock code, kept in localStorage, and (when enrolled) released
+  // only after Face ID.
+  const API_BASE = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1";
+  let TOKEN = localStorage.getItem("scarletToken") || "";
+  let SESSION_URL = "", APP_URL = "";
+  function applyToken() {
+    SESSION_URL = API_BASE + "/realtime-session?s=" + TOKEN;
+    APP_URL = API_BASE + "/app-api?s=" + TOKEN;
+  }
 
   /* ============================================================
      TABS
@@ -432,7 +470,7 @@
 
   let pollTimer = null, polling = false;
   async function poll() {
-    if (polling) return;
+    if (polling || !APP_URL) return;
     polling = true;
     try {
       const u = APP_URL + "&op=feed" + (lastTs ? "&after=" + encodeURIComponent(lastTs) : "");
@@ -580,7 +618,7 @@
     }
   }
 
-  startPolling();
+  // polling starts in boot(), after unlock
 
   /* ============================================================
      LIVE — voice call (WebRTC to gpt-realtime)
@@ -670,6 +708,7 @@
   }
 
   async function start() {
+    if (!SESSION_URL) return;
     mainBtn.disabled = true;
     setStatus("Waking her up…");
     try {
@@ -882,10 +921,111 @@
     if (pc) { reset(); } else await start();
   });
 
-  // Open = listening. Works silently once mic permission was granted before
-  // (best as a home-screen app); on first visit the browser still asks once.
+  /* ============================================================
+     LOCK — unlock code once per device, Face ID afterwards
+  ============================================================ */
+  const lockEl = document.getElementById("lock");
+  const lockNote = document.getElementById("lockNote");
+  const lockErr = document.getElementById("lockErr");
+  const lockCode = document.getElementById("lockCode");
+  const unlockBtn = document.getElementById("unlockBtn");
+  const faceBtn = document.getElementById("faceBtn");
+  const codeModeBtn = document.getElementById("codeModeBtn");
+
+  function boot() {
+    lockEl.classList.remove("on");
+    applyToken();
+    startPolling();
+    setTimeout(() => { if (!pc) start(); }, 300); // opens muted by design
+  }
+  function showLock(withFace) {
+    lockEl.classList.add("on");
+    const hasFace = withFace && localStorage.getItem("scarletCredId");
+    faceBtn.style.display = hasFace ? "block" : "none";
+    codeModeBtn.style.display = hasFace ? "block" : "none";
+    lockCode.style.display = hasFace ? "none" : "block";
+    unlockBtn.style.display = hasFace ? "none" : "block";
+    lockNote.textContent = hasFace ? "Locked. A glance opens it." : "Private. Yours alone.";
+  }
+  async function faceGate() {
+    try {
+      const idB64 = localStorage.getItem("scarletCredId");
+      const id = Uint8Array.from(atob(idB64), (c) => c.charCodeAt(0));
+      await navigator.credentials.get({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(16)),
+        allowCredentials: [{ type: "public-key", id }],
+        userVerification: "required", timeout: 60000,
+      } });
+      return true;
+    } catch (e) { return false; }
+  }
+  async function enrollFace() {
+    try {
+      const cred = await navigator.credentials.create({ publicKey: {
+        challenge: crypto.getRandomValues(new Uint8Array(16)),
+        rp: { name: "Scarlet" },
+        user: { id: crypto.getRandomValues(new Uint8Array(16)), name: "ido", displayName: "Ido" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: "platform", userVerification: "required" },
+        timeout: 60000,
+      } });
+      localStorage.setItem("scarletCredId",
+        btoa(String.fromCharCode(...new Uint8Array(cred.rawId))));
+      return true;
+    } catch (e) { return false; }
+  }
+  async function tryUnlock() {
+    const code = lockCode.value.trim();
+    if (!code) return;
+    unlockBtn.disabled = true;
+    lockErr.textContent = "";
+    lockNote.textContent = "Checking…";
+    try {
+      const r = await fetch(API_BASE + "/app-api?op=unlock", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+      const d = await r.json();
+      if (!d.token) throw new Error("wrong");
+      TOKEN = d.token;
+      localStorage.setItem("scarletToken", TOKEN);
+      lockCode.value = "";
+      // Offer Face ID for every future open (real device biometrics).
+      if (window.PublicKeyCredential && !localStorage.getItem("scarletCredId")) {
+        lockNote.textContent = "Protect with Face ID for next time?";
+        lockCode.style.display = "none"; unlockBtn.style.display = "none";
+        faceBtn.textContent = "Enable Face ID";
+        faceBtn.style.display = "block";
+        codeModeBtn.textContent = "Not now";
+        codeModeBtn.style.display = "block";
+        faceBtn.onclick = async () => { await enrollFace(); boot(); };
+        codeModeBtn.onclick = () => boot();
+        return;
+      }
+      boot();
+    } catch (e) {
+      lockNote.textContent = "Private. Yours alone.";
+      lockErr.textContent = "That's not it — try again.";
+      unlockBtn.disabled = false;
+    }
+    unlockBtn.disabled = false;
+  }
+  unlockBtn.addEventListener("click", tryUnlock);
+  lockCode.addEventListener("keydown", (e) => { if (e.key === "Enter") tryUnlock(); });
+  faceBtn.addEventListener("click", async () => {
+    if (await faceGate()) boot();
+    else lockErr.textContent = "Face ID didn't confirm — try again or use the code.";
+  });
+  codeModeBtn.addEventListener("click", () => {
+    faceBtn.style.display = "none"; codeModeBtn.style.display = "none";
+    lockCode.style.display = "block"; unlockBtn.style.display = "block";
+    lockNote.textContent = "Private. Yours alone.";
+  });
+
   window.addEventListener("load", () => {
-    setTimeout(() => { if (!pc) start(); }, 300);
+    if (!TOKEN) { showLock(false); return; }
+    if (localStorage.getItem("scarletCredId")) { showLock(true); return; }
+    boot();
   });
   muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
   chatBtn.addEventListener("click", () => {
