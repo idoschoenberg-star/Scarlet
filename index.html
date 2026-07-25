@@ -230,7 +230,7 @@
       <video id="liveVid" playsinline muted></video>
       <button class="primary" id="mainBtn">Start talking</button>
     </footer>
-    <div class="hint" id="hint">She waits quietly while you think — and while muted, she can't hear you.</div>
+    <div class="hint" id="hint">She opens muted — tap the mic button when you're ready to talk.</div>
   </section>
 
   <!-- ================= CHAT ================= -->
@@ -598,7 +598,7 @@
   const audioEl = new Audio();
   audioEl.autoplay = true;
 
-  let pc = null, dc = null, micTrack = null, muted = false;
+  let pc = null, dc = null, micTrack = null, muted = true; // opens muted by design
 
   function setStatus(text, cls) {
     status.textContent = text;
@@ -674,6 +674,7 @@
 
       const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
       micTrack = ms.getAudioTracks()[0];
+      micTrack.enabled = !muted;
 
       pc = new RTCPeerConnection();
       pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
@@ -703,7 +704,7 @@
       liveBtn.style.display = "flex";
       document.body.classList.add("showchat");
       chatBtn.classList.add("on");
-      setStatus("Listening…");
+      applyMute();
     } catch (e) {
       console.error(e);
       setStatus(String(e).includes("Permission") || String(e).includes("NotAllowed")
@@ -718,13 +719,13 @@
     if (micTrack) micTrack.enabled = !muted;
     muteBtn.classList.toggle("on", muted);
     muteBtn.textContent = muted ? "🔇" : "🎙";
-    if (muted) setStatus("Mic muted — she can't hear you", "muted-note");
+    if (muted) setStatus("Muted — tap 🎙 when you're ready", "muted-note");
     else setStatus("Listening…");
   }
 
   function cleanup() {
     if (pc) { try { pc.close(); } catch (e) {} }
-    pc = null; dc = null; micTrack = null; muted = false;
+    pc = null; dc = null; micTrack = null; muted = true;
   }
 
   function reset() {
