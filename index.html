@@ -183,6 +183,23 @@
     box-shadow:0 5px 18px rgba(210,35,70,.45); }
   .sendbtn:disabled { opacity:.35; box-shadow:none; }
 
+  /* ---------- GALLERY view ---------- */
+  #viewGallery { padding-top:0; }
+  .gfeed { flex:1; width:100%; max-width:680px; overflow-y:auto; overscroll-behavior:contain;
+    padding:6px 14px 20px; scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent;
+    -webkit-overflow-scrolling:touch; }
+  .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
+    box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
+    cursor:zoom-in; animation:fadein .3s ease; }
+  .gcard img { display:block; width:100%; max-height:72vh; object-fit:cover; background:#1a0a0e; }
+  .gcap { position:absolute; left:0; right:0; bottom:0; padding:34px 16px 12px;
+    background:linear-gradient(transparent, rgba(8,3,4,.85)); display:flex;
+    justify-content:space-between; align-items:flex-end; gap:10px; }
+  .gcap .t { font-size:14px; color:#f6dfe1; font-weight:300; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .gcap .d { font-size:10.5px; color:#c9a2a4; letter-spacing:.08em; white-space:nowrap; }
+  .gempty { text-align:center; color:#8f6f72; font-size:13.5px; padding:60px 30px; line-height:1.8; }
+
   /* ---------- overlays ---------- */
   .overlay { position:fixed; inset:0; z-index:50; display:none; flex-direction:column;
     background:rgba(5,2,3,.93); backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px); }
@@ -266,6 +283,15 @@
     </div>
   </section>
 
+  <!-- ================= GALLERY ================= -->
+  <section class="view" id="viewGallery">
+    <div class="chathead">
+      <div class="name">Gallery</div>
+      <div class="sub" id="gallerySub">Your photos & creations</div>
+    </div>
+    <div class="gfeed" id="gfeed"></div>
+  </section>
+
   <!-- lock screen -->
   <div class="overlay" id="lock">
     <div class="lockbox">
@@ -283,6 +309,7 @@
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
+    <button class="tab" id="tabGallery"><span class="ic">🖼</span>Gallery<span class="dot"></span></button>
   </nav>
 
   <!-- image lightbox -->
@@ -314,12 +341,14 @@
   /* ============================================================
      TABS
   ============================================================ */
-  const views = { live: document.getElementById("viewLive"), chat: document.getElementById("viewChat") };
-  const tabs = { live: document.getElementById("tabLive"), chat: document.getElementById("tabChat") };
+  const views = { live: document.getElementById("viewLive"), chat: document.getElementById("viewChat"),
+    gallery: document.getElementById("viewGallery") };
+  const tabs = { live: document.getElementById("tabLive"), chat: document.getElementById("tabChat"),
+    gallery: document.getElementById("tabGallery") };
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
-    for (const k of ["live", "chat"]) {
+    for (const k of ["live", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
@@ -328,9 +357,74 @@
       scrollFeed(true);
       pollNow();
     }
+    if (name === "gallery") loadGallery(true);
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
+  tabs.gallery.addEventListener("click", () => switchTab("gallery"));
+
+  /* ============================================================
+     GALLERY — large cards, endless scroll
+  ============================================================ */
+  const gfeed = document.getElementById("gfeed");
+  const gallerySub = document.getElementById("gallerySub");
+  const gSeen = new Set();
+  let gOldest = null, gLoading = false, gDone = false, gFreshest = 0;
+
+  function gCard(ph) {
+    const card = document.createElement("div");
+    card.className = "gcard";
+    const img = document.createElement("img");
+    img.loading = "lazy"; img.src = ph.media_url; img.alt = "";
+    const cap = document.createElement("div");
+    cap.className = "gcap";
+    const t = document.createElement("div");
+    t.className = "t"; t.dir = "auto";
+    t.textContent = (ph.text || "").replace(/^📷\s*/, "") || "";
+    const d = document.createElement("div");
+    d.className = "d";
+    d.textContent = new Date(ph.created_at).toLocaleDateString([], { month: "short", day: "numeric" });
+    cap.appendChild(t); cap.appendChild(d);
+    card.appendChild(img); card.appendChild(cap);
+    card.addEventListener("click", () => openLightbox(ph.media_url, ph.text || ""));
+    return card;
+  }
+
+  async function loadGallery(fresh) {
+    if (!APP_URL || gLoading) return;
+    if (fresh && Date.now() - gFreshest < 15000 && gfeed.children.length) return;
+    gLoading = true;
+    try {
+      const u = APP_URL + "&op=gallery" + (!fresh && gOldest ? "&before=" + encodeURIComponent(gOldest) : "");
+      const r = await fetch(u);
+      const d = await r.json();
+      const photos = d.photos || [];
+      if (fresh) gFreshest = Date.now();
+      if (!fresh && !photos.length) gDone = true;
+      for (const ph of photos) {
+        if (gSeen.has(ph.id)) continue;
+        gSeen.add(ph.id);
+        if (fresh && gfeed.firstChild && new Date(ph.created_at) > new Date(gOldest || 0)) {
+          gfeed.insertBefore(gCard(ph), gfeed.firstChild);
+        } else {
+          gfeed.appendChild(gCard(ph));
+        }
+        if (!gOldest || ph.created_at < gOldest) gOldest = ph.created_at;
+      }
+      if (!gfeed.children.length) {
+        gfeed.innerHTML = '<div class="gempty">No photos yet.<br>Ask Scarlet — "show me my last photos" —<br>and they\'ll gather here.</div>';
+      } else {
+        const empty = gfeed.querySelector(".gempty");
+        if (empty) empty.remove();
+      }
+      gallerySub.textContent = "Your photos & creations";
+    } catch (e) { gallerySub.textContent = "reconnecting…"; }
+    gLoading = false;
+  }
+  gfeed.addEventListener("scroll", () => {
+    if (gDone || gLoading) return;
+    if (gfeed.scrollHeight - gfeed.scrollTop - gfeed.clientHeight < 600) loadGallery(false);
+  });
 
   /* ============================================================
      CHAT — feed, composer, voice notes
