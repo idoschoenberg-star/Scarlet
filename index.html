@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0507">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Scarlet</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; overflow:hidden; }
+  body {
+    font-family: -apple-system, "SF Pro Display", Segoe UI, sans-serif;
+    background:#0b0507; color:#f5e9e7;
+    display:flex; flex-direction:column; align-items:center; justify-content:space-between;
+    padding: max(24px, env(safe-area-inset-top)) 24px max(34px, env(safe-area-inset-bottom));
+    position:relative;
+  }
+  /* --- living scarlet silk background --- */
+  .bg { position:fixed; inset:0; z-index:0; pointer-events:none; }
+  .blob { position:absolute; border-radius:50%; filter:blur(70px); opacity:.55;
+          animation: drift 26s ease-in-out infinite alternate; }
+  .b1 { width:62vmax; height:62vmax; left:-18vmax; top:-24vmax;
+        background:radial-gradient(circle at 35% 35%, #8e1230, #3d0716 60%, transparent 75%); }
+  .b2 { width:55vmax; height:55vmax; right:-20vmax; bottom:-18vmax; animation-delay:-9s;
+        background:radial-gradient(circle at 60% 60%, #c2233f, #52091c 55%, transparent 75%); opacity:.4; }
+  .b3 { width:40vmax; height:40vmax; left:30vw; top:45vh; animation-delay:-17s;
+        background:radial-gradient(circle, #ff5d73, #7a0f26 50%, transparent 72%); opacity:.22; }
+  @keyframes drift {
+    0% { transform: translate(0,0) scale(1) rotate(0deg); }
+    100% { transform: translate(6vmax,-4vmax) scale(1.15) rotate(28deg); }
+  }
+  .grain { position:fixed; inset:0; z-index:1; pointer-events:none; opacity:.05; mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E"); }
+  .vignette { position:fixed; inset:0; z-index:1; pointer-events:none;
+    background:radial-gradient(ellipse at 50% 42%, transparent 40%, rgba(5,2,3,.75) 100%); }
+
+  header, main, footer { position:relative; z-index:2; width:100%; max-width:430px; text-align:center; }
+
+  header { padding-top:6px; }
+  .wordmark { font-size:30px; letter-spacing:.42em; text-indent:.42em; font-weight:200;
+    text-transform:uppercase; color:#fbeaea;
+    text-shadow:0 0 24px rgba(255,80,110,.35); }
+  .tag { margin-top:8px; font-size:12.5px; letter-spacing:.12em; color:#c9a2a4; font-weight:300; }
+
+  /* --- the presence --- */
+  main { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px; }
+  .orbwrap { position:relative; width:min(56vw,240px); aspect-ratio:1; }
+  .halo { position:absolute; inset:-22%; border-radius:50%;
+    background:radial-gradient(circle, rgba(255,90,115,.28), transparent 60%);
+    animation:breathe 5.2s ease-in-out infinite; }
+  .ring { position:absolute; inset:-7%; border-radius:50%;
+    border:1px solid rgba(255,150,160,.22);
+    animation:spin 30s linear infinite; }
+  .ring::before { content:""; position:absolute; top:-3px; left:50%; width:5px; height:5px;
+    border-radius:50%; background:#ff96a2; box-shadow:0 0 12px 2px rgba(255,120,135,.8); }
+  .orb { position:absolute; inset:0; border-radius:50%;
+    background:
+      radial-gradient(circle at 32% 28%, rgba(255,205,205,.9), transparent 28%),
+      radial-gradient(circle at 62% 70%, #ff4d68, #a1162f 46%, #45081a 78%, #200510 100%);
+    box-shadow: 0 0 90px 8px rgba(230,50,80,.35), inset 0 0 60px rgba(0,0,0,.5);
+    animation:breathe 5.2s ease-in-out infinite; transition: box-shadow .4s;
+  }
+  .speaking .orb { animation:pulse 1.15s ease-in-out infinite;
+    box-shadow:0 0 130px 18px rgba(255,70,100,.55), inset 0 0 60px rgba(0,0,0,.5); }
+  .speaking .halo { animation:pulse 1.15s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { transform:scale(1); } 50% { transform:scale(1.045); } }
+  @keyframes pulse   { 0%,100% { transform:scale(1); } 50% { transform:scale(1.09); } }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  .status { font-size:15px; font-weight:300; letter-spacing:.06em; color:#e8c9cc; min-height:22px;
+    transition:opacity .3s; }
+  .muted-note { color:#d4a24f; }
+
+  /* --- controls --- */
+  footer { display:flex; gap:14px; justify-content:center; align-items:center; }
+  button { border:none; cursor:pointer; font-family:inherit; border-radius:999px;
+    transition:all .22s ease; font-weight:500; letter-spacing:.03em;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  .primary { flex:1; max-width:220px; padding:17px 20px; font-size:16.5px; color:#fff;
+    background:linear-gradient(135deg, #d92446, #8c1130);
+    box-shadow:0 8px 30px rgba(210,35,70,.4), inset 0 1px 0 rgba(255,255,255,.22); }
+  .primary:active { transform:scale(.97); }
+  .primary.live { background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.18);
+    box-shadow:none; color:#f3d9dc; }
+  .mute { width:58px; height:58px; font-size:23px; display:none;
+    background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.16); color:#fff; }
+  .mute.on { background:linear-gradient(135deg,#e8b04b,#b97b1e);
+    box-shadow:0 6px 24px rgba(220,160,60,.4); }
+  .hint { position:relative; z-index:2; margin-top:12px; font-size:11.5px; color:#8f6f72;
+    font-weight:300; letter-spacing:.04em; }
+</style>
+</head>
+<body>
+  <div class="bg"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+  <div class="grain"></div><div class="vignette"></div>
+
+  <header>
+    <div class="wordmark">Scarlet</div>
+    <div class="tag">שלך. תמיד מקשיבה — רק כשתרצה.</div>
+  </header>
+
+  <main>
+    <div class="orbwrap" id="orbwrap">
+      <div class="halo"></div><div class="ring"></div><div class="orb"></div>
+    </div>
+    <div class="status" id="status">Tap to wake her</div>
+  </main>
+
+  <footer>
+    <button class="mute" id="muteBtn" title="Mute my microphone">🎙</button>
+    <button class="primary" id="mainBtn">Start talking</button>
+  </footer>
+  <div class="hint" id="hint">She waits quietly while you think — and while muted, she can't hear you.</div>
+
+<script type="module">
+  import { Conversation } from "https://esm.sh/@elevenlabs/client";
+
+  const AGENT_ID = "agent_7301kyb0f7p3ejk99mp1st5x6njy";
+  const orbwrap = document.getElementById("orbwrap");
+  const status = document.getElementById("status");
+  const mainBtn = document.getElementById("mainBtn");
+  const muteBtn = document.getElementById("muteBtn");
+
+  let convo = null;
+  let muted = false;
+
+  function setStatus(text, cls) {
+    status.textContent = text;
+    status.className = "status" + (cls ? " " + cls : "");
+  }
+
+  async function start() {
+    mainBtn.disabled = true;
+    setStatus("Waking her up…");
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+      convo = await Conversation.startSession({
+        agentId: AGENT_ID,
+        onModeChange: (m) => {
+          orbwrap.classList.toggle("speaking", m.mode === "speaking");
+          if (!muted) setStatus(m.mode === "speaking" ? "Scarlet is speaking…" : "Listening…");
+        },
+        onStatusChange: (s) => {
+          if (s.status === "disconnected") reset();
+        },
+        onError: (e) => { console.error(e); setStatus("Connection hiccup — tap Start again."); reset(); },
+      });
+      mainBtn.textContent = "End";
+      mainBtn.classList.add("live");
+      muteBtn.style.display = "block";
+      setStatus("Listening…");
+    } catch (e) {
+      console.error(e);
+      setStatus("Microphone permission is needed — allow it and try again.");
+    }
+    mainBtn.disabled = false;
+  }
+
+  function applyMute() {
+    if (!convo) return;
+    try {
+      if (typeof convo.setMicMuted === "function") convo.setMicMuted(muted);
+      else if (convo.input?.inputStream) {
+        convo.input.inputStream.getAudioTracks().forEach((t) => t.enabled = !muted);
+      }
+    } catch (e) { console.error("mute failed:", e); }
+    muteBtn.classList.toggle("on", muted);
+    muteBtn.textContent = muted ? "🔇" : "🎙";
+    if (muted) setStatus("Mic muted — she can't hear you", "muted-note");
+    else setStatus("Listening…");
+  }
+
+  function reset() {
+    convo = null; muted = false;
+    orbwrap.classList.remove("speaking");
+    mainBtn.textContent = "Start talking";
+    mainBtn.classList.remove("live");
+    muteBtn.style.display = "none";
+    muteBtn.classList.remove("on"); muteBtn.textContent = "🎙";
+    setStatus("Tap to wake her");
+  }
+
+  mainBtn.addEventListener("click", async () => {
+    if (convo) { const c = convo; convo = null; await c.endSession().catch(() => {}); reset(); }
+    else await start();
+  });
+  muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
+</script>
+</body>
+</html>
