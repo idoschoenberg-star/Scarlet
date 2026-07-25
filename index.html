@@ -114,77 +114,127 @@
   </footer>
   <div class="hint" id="hint">She waits quietly while you think — and while muted, she can't hear you.</div>
 
-<script type="module">
-  import { Conversation } from "https://esm.sh/@elevenlabs/client";
+<script>
+  const SESSION_URL = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1/realtime-session?s=c540cd811e505ed97a262d96f62129dc017274639c49c620";
 
-  const AGENT_ID = "agent_7301kyb0f7p3ejk99mp1st5x6njy";
   const orbwrap = document.getElementById("orbwrap");
   const status = document.getElementById("status");
   const mainBtn = document.getElementById("mainBtn");
   const muteBtn = document.getElementById("muteBtn");
+  const audioEl = new Audio();
+  audioEl.autoplay = true;
 
-  let convo = null;
-  let muted = false;
+  let pc = null, dc = null, micTrack = null, muted = false;
 
   function setStatus(text, cls) {
     status.textContent = text;
     status.className = "status" + (cls ? " " + cls : "");
   }
 
+  async function callTool(name, args) {
+    try {
+      const r = await fetch(SESSION_URL + "&tool=" + encodeURIComponent(name), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(args || {}),
+      });
+      return await r.text();
+    } catch (e) {
+      return JSON.stringify({ error: String(e) });
+    }
+  }
+
+  function handleEvent(ev) {
+    if (ev.type === "output_audio_buffer.started") {
+      orbwrap.classList.add("speaking");
+      if (!muted) setStatus("Scarlet is speaking\u2026");
+    } else if (ev.type === "output_audio_buffer.stopped" || ev.type === "output_audio_buffer.cleared") {
+      orbwrap.classList.remove("speaking");
+      if (!muted) setStatus("Listening\u2026");
+    } else if (ev.type === "response.done" && ev.response && ev.response.output) {
+      for (const item of ev.response.output) {
+        if (item.type === "function_call") {
+          callTool(item.name, JSON.parse(item.arguments || "{}")).then((out) => {
+            if (!dc || dc.readyState !== "open") return;
+            dc.send(JSON.stringify({ type: "conversation.item.create",
+              item: { type: "function_call_output", call_id: item.call_id, output: out } }));
+            dc.send(JSON.stringify({ type: "response.create" }));
+          });
+        }
+      }
+    } else if (ev.type === "error") {
+      console.error("realtime error:", ev);
+    }
+  }
+
   async function start() {
     mainBtn.disabled = true;
-    setStatus("Waking her up…");
+    setStatus("Waking her up\u2026");
     try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      convo = await Conversation.startSession({
-        agentId: AGENT_ID,
-        onModeChange: (m) => {
-          orbwrap.classList.toggle("speaking", m.mode === "speaking");
-          if (!muted) setStatus(m.mode === "speaking" ? "Scarlet is speaking…" : "Listening…");
-        },
-        onStatusChange: (s) => {
-          if (s.status === "disconnected") reset();
-        },
-        onError: (e) => { console.error(e); setStatus("Connection hiccup — tap Start again."); reset(); },
+      const tok = await (await fetch(SESSION_URL, { method: "POST" })).json();
+      if (!tok.client_secret) throw new Error(tok.error || "no session");
+
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micTrack = ms.getAudioTracks()[0];
+
+      pc = new RTCPeerConnection();
+      pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
+      pc.addTrack(micTrack, ms);
+      dc = pc.createDataChannel("oai-events");
+      dc.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+      pc.onconnectionstatechange = () => {
+        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) reset();
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const resp = await fetch("https://api.openai.com/v1/realtime/calls?model=gpt-realtime", {
+        method: "POST",
+        headers: { Authorization: "Bearer " + tok.client_secret, "Content-Type": "application/sdp" },
+        body: offer.sdp,
       });
+      if (!resp.ok) throw new Error("call setup failed: " + resp.status);
+      await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
+
       mainBtn.textContent = "End";
       mainBtn.classList.add("live");
       muteBtn.style.display = "block";
-      setStatus("Listening…");
+      setStatus("Listening\u2026");
     } catch (e) {
       console.error(e);
-      setStatus("Microphone permission is needed — allow it and try again.");
+      setStatus(String(e).includes("Permission") || String(e).includes("NotAllowed")
+        ? "Microphone permission is needed \u2014 allow it and try again."
+        : "Couldn't connect \u2014 tap Start again.");
+      cleanup();
     }
     mainBtn.disabled = false;
   }
 
   function applyMute() {
-    if (!convo) return;
-    try {
-      if (typeof convo.setMicMuted === "function") convo.setMicMuted(muted);
-      else if (convo.input?.inputStream) {
-        convo.input.inputStream.getAudioTracks().forEach((t) => t.enabled = !muted);
-      }
-    } catch (e) { console.error("mute failed:", e); }
+    if (micTrack) micTrack.enabled = !muted;
     muteBtn.classList.toggle("on", muted);
-    muteBtn.textContent = muted ? "🔇" : "🎙";
-    if (muted) setStatus("Mic muted — she can't hear you", "muted-note");
-    else setStatus("Listening…");
+    muteBtn.textContent = muted ? "\uD83D\uDD07" : "\uD83C\uDF99";
+    if (muted) setStatus("Mic muted \u2014 she can't hear you", "muted-note");
+    else setStatus("Listening\u2026");
+  }
+
+  function cleanup() {
+    if (pc) { try { pc.close(); } catch (e) {} }
+    pc = null; dc = null; micTrack = null; muted = false;
   }
 
   function reset() {
-    convo = null; muted = false;
+    cleanup();
     orbwrap.classList.remove("speaking");
     mainBtn.textContent = "Start talking";
     mainBtn.classList.remove("live");
     muteBtn.style.display = "none";
-    muteBtn.classList.remove("on"); muteBtn.textContent = "🎙";
+    muteBtn.classList.remove("on"); muteBtn.textContent = "\uD83C\uDF99";
     setStatus("Tap to wake her");
   }
 
   mainBtn.addEventListener("click", async () => {
-    if (convo) { const c = convo; convo = null; await c.endSession().catch(() => {}); reset(); }
-    else await start();
+    if (pc) { reset(); } else await start();
   });
   muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
 </script>
