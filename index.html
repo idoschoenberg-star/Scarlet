@@ -85,17 +85,19 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .status { font-size:15px; font-weight:300; letter-spacing:.06em; color:#e8c9cc; min-height:22px; transition:opacity .3s; }
   .muted-note { color:#d4a24f; }
-  #viewLive footer { display:flex; gap:14px; justify-content:center; align-items:center; padding-bottom:10px; }
+  #viewLive footer { display:flex; flex-direction:column; gap:13px; align-items:center; padding-bottom:10px; }
+  .toolrow { display:flex; gap:12px; justify-content:center; align-items:center; width:100%; }
   button { border:none; cursor:pointer; font-family:inherit; border-radius:999px;
     transition:all .22s ease; font-weight:500; letter-spacing:.03em;
     backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
-  .primary { flex:1; max-width:220px; padding:17px 20px; font-size:16.5px; color:#fff;
+  .primary { width:100%; max-width:250px; padding:16px 20px; font-size:16.5px; color:#fff;
     background:linear-gradient(135deg, #d92446, #8c1130);
     box-shadow:0 8px 30px rgba(210,35,70,.4), inset 0 1px 0 rgba(255,255,255,.22); }
   .primary:active { transform:scale(.97); }
   .primary.live { background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.18);
     box-shadow:none; color:#f3d9dc; }
-  .rndbtn { width:58px; height:58px; font-size:23px; display:none;
+  .rndbtn { width:50px; height:50px; min-width:50px; font-size:21px; display:none;
+    align-items:center; justify-content:center; padding:0; line-height:1;
     background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.16); color:#fff; }
   .rndbtn.on { background:linear-gradient(135deg,#e8b04b,#b97b1e); box-shadow:0 6px 24px rgba(220,160,60,.4); }
   .hint { position:relative; z-index:2; margin-top:10px; margin-bottom:6px; font-size:11.5px; color:#8f6f72;
@@ -216,14 +218,16 @@
       <div class="status" id="status">Tap to wake her</div>
     </main>
     <footer>
-      <button class="rndbtn" id="liveBtn" title="Live view - she sees what you see">👁</button>
-      <button class="rndbtn" id="fileBtn" title="Share a file">📎</button>
-      <button class="rndbtn" id="camBtn" title="Show her a photo">📷</button>
-      <button class="rndbtn" id="chatBtn" title="Show/hide text">💬</button>
+      <div class="toolrow">
+        <button class="rndbtn" id="liveBtn" title="Live view - she sees what you see">👁</button>
+        <button class="rndbtn" id="fileBtn" title="Share a file">📎</button>
+        <button class="rndbtn" id="camBtn" title="Show her a photo">📷</button>
+        <button class="rndbtn" id="chatBtn" title="Show/hide text">💬</button>
+        <button class="rndbtn" id="muteBtn" title="Mute my microphone">🎙</button>
+      </div>
       <input type="file" id="imgInput" accept="image/*" hidden>
       <input type="file" id="fileInput" hidden>
       <video id="liveVid" playsinline muted></video>
-      <button class="rndbtn" id="muteBtn" title="Mute my microphone">🎙</button>
       <button class="primary" id="mainBtn">Start talking</button>
     </footer>
     <div class="hint" id="hint">She waits quietly while you think — and while muted, she can't hear you.</div>
