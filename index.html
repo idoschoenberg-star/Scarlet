@@ -90,6 +90,24 @@
     box-shadow:0 6px 24px rgba(220,160,60,.4); }
   .hint { position:relative; z-index:2; margin-top:12px; font-size:11.5px; color:#8f6f72;
     font-weight:300; letter-spacing:.04em; }
+
+  /* --- live transcript --- */
+  .chat { display:none; width:100%; max-width:430px; max-height:32vh; overflow-y:auto;
+    padding:14px 16px; border-radius:20px; text-align:start;
+    background:rgba(10,4,6,.55); border:1px solid rgba(255,150,160,.14);
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent; }
+  body.showchat .chat { display:block; }
+  body.showchat .orbwrap { width:min(34vw,140px); }
+  .msg { margin:7px 0; font-size:14.5px; line-height:1.55; font-weight:300;
+    unicode-bidi:plaintext; animation:fadein .3s ease; }
+  .msg.her { color:#f6dfe1; }
+  .msg.her::before { content:"Scarlet · "; color:#e0788c; font-size:11px;
+    letter-spacing:.08em; text-transform:uppercase; }
+  .msg.you { color:#a88f92; }
+  .msg.you::before { content:"Ido · "; color:#8f6f72; font-size:11px;
+    letter-spacing:.08em; text-transform:uppercase; }
+  @keyframes fadein { from { opacity:0; transform:translateY(4px); } to { opacity:1; } }
 </style>
 </head>
 <body>
@@ -105,10 +123,12 @@
     <div class="orbwrap" id="orbwrap">
       <div class="halo"></div><div class="ring"></div><div class="orb"></div>
     </div>
+    <div class="chat" id="chat"></div>
     <div class="status" id="status">Tap to wake her</div>
   </main>
 
   <footer>
+    <button class="mute" id="chatBtn" title="Show/hide text">💬</button>
     <button class="mute" id="muteBtn" title="Mute my microphone">🎙</button>
     <button class="primary" id="mainBtn">Start talking</button>
   </footer>
@@ -121,6 +141,9 @@
   const status = document.getElementById("status");
   const mainBtn = document.getElementById("mainBtn");
   const muteBtn = document.getElementById("muteBtn");
+  const chatBtn = document.getElementById("chatBtn");
+  const chat = document.getElementById("chat");
+  let herLine = null;
   const audioEl = new Audio();
   audioEl.autoplay = true;
 
@@ -144,7 +167,31 @@
     }
   }
 
+  function addMsg(cls, text) {
+    const d = document.createElement("div");
+    d.className = "msg " + cls;
+    d.textContent = text;
+    d.dir = "auto";
+    chat.appendChild(d);
+    chat.scrollTop = chat.scrollHeight;
+    return d;
+  }
+
   function handleEvent(ev) {
+    if (ev.type === "response.output_audio_transcript.delta" || ev.type === "response.audio_transcript.delta") {
+      if (!herLine) herLine = addMsg("her", "");
+      herLine.textContent += ev.delta || "";
+      chat.scrollTop = chat.scrollHeight;
+      return;
+    }
+    if (ev.type === "response.output_audio_transcript.done" || ev.type === "response.audio_transcript.done") {
+      herLine = null;
+      return;
+    }
+    if (ev.type === "conversation.item.input_audio_transcription.completed") {
+      if (ev.transcript && ev.transcript.trim()) addMsg("you", ev.transcript.trim());
+      return;
+    }
     if (ev.type === "output_audio_buffer.started") {
       orbwrap.classList.add("speaking");
       if (!muted) setStatus("Scarlet is speaking\u2026");
@@ -199,6 +246,9 @@
       mainBtn.textContent = "End";
       mainBtn.classList.add("live");
       muteBtn.style.display = "block";
+      chatBtn.style.display = "block";
+      document.body.classList.add("showchat");
+      chatBtn.classList.add("on");
       setStatus("Listening\u2026");
     } catch (e) {
       console.error(e);
@@ -229,7 +279,8 @@
     mainBtn.textContent = "Start talking";
     mainBtn.classList.remove("live");
     muteBtn.style.display = "none";
-    muteBtn.classList.remove("on"); muteBtn.textContent = "\uD83C\uDF99";
+    chatBtn.style.display = "none";
+    document.body.classList.remove("showchat");
     setStatus("Tap to wake her");
   }
 
@@ -237,6 +288,11 @@
     if (pc) { reset(); } else await start();
   });
   muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
+  chatBtn.addEventListener("click", () => {
+    document.body.classList.toggle("showchat");
+    chatBtn.classList.toggle("on", document.body.classList.contains("showchat"));
+    chat.scrollTop = chat.scrollHeight;
+  });
 </script>
 </body>
 </html>
