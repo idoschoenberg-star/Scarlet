@@ -804,7 +804,7 @@
         bubble.textContent = "📎 " + file.name;
       } else if (file.size < 300000) {
         text = await file.text();
-        if (text.includes(" ")) throw new Error("binary");
+        if (text.includes("\u0000")) throw new Error("binary");
       } else {
         throw new Error("too large");
       }
