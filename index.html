@@ -334,6 +334,10 @@
     let s = String(t ?? "")
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+    s = s.replace(/\b(tel:\+?[\d][\d]{5,})/g, (u) =>
+      '<a class="doclink" href="' + u + '">📞 ' + u.slice(4) + "</a>");
+    s = s.replace(/\b(mailto:[^\s<>"]+)/g, (u) =>
+      '<a class="doclink" href="' + u + '">✉️ ' + u.slice(7) + "</a>");
     s = s.replace(/(https?:\/\/[^\s<>")]+)/g, (u) => {
       const isPdf = /\.pdf(\?|$)/i.test(u);
       const label = isPdf ? "📄 Open document" : (u.length > 46 ? u.slice(0, 43) + "…" : u);
