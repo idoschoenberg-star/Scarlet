@@ -211,8 +211,15 @@
     text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
   .sig .swhen { font-size:10px; color:#a68184; white-space:nowrap; }
   .sig .sprev { font-size:13px; color:#cdb4b6; line-height:1.45; unicode-bidi:plaintext;
-    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-  .sig.open .sprev { -webkit-line-clamp:unset; }
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;
+    transition:font-size .15s ease, color .15s ease; }
+  /* When a signal is focused/open, pull the whole card to full brightness (even
+     if previously read) and enlarge + brighten the message text so it's easy to read. */
+  .sig.open { opacity:1 !important; background:rgba(255,255,255,.075);
+    border-color:rgba(255,150,160,.28); }
+  .sig.open .sprev { -webkit-line-clamp:unset; font-size:15.5px; color:#fdeff0;
+    line-height:1.55; }
+  .sig.open .swho { color:#ffffff; }
   .sigact { margin-top:11px; display:none; gap:8px; flex-direction:column; }
   .sig.open .sigact { display:flex; }
   .sigact .row { display:flex; gap:8px; align-items:flex-end; }
@@ -222,6 +229,7 @@
   .sigbtn { flex:0 0 auto; border:none; border-radius:12px; padding:9px 13px; font-size:14px; cursor:pointer;
     background:rgba(255,199,206,.2); color:#ffd9dd; }
   .sigbtn.talk { background:rgba(120,131,235,.22); color:#cdd2ff; }
+  .sigbtn.arch { background:rgba(255,255,255,.08); color:#c9b0b3; }
   .sighint { font-size:10.5px; color:#9c797c; letter-spacing:.03em; }
   .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
     box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
@@ -899,7 +907,8 @@
         '<div class="sigact"><div class="row">' +
         '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
         '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
-        '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button></div>' +
+        '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button>' +
+        '<button class="sigbtn arch" title="Archive — clear it from Signals">🗄️</button></div>' +
         '<div class="sighint">She drafts it, reads it back, and you approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact")) return;
@@ -913,6 +922,11 @@
         const t = ta.value.trim(); if (!t) return; ta.value = ""; ta.style.height = "auto"; instructSignal(it, t);
       });
       card.querySelector(".talk").addEventListener("click", () => talkSignal(it));
+      card.querySelector(".arch").addEventListener("click", () => {
+        markSig([it.id], "inbox_archive");
+        sigItems = sigItems.filter((x) => x.id !== it.id);
+        renderSignals();
+      });
       feed.appendChild(card);
     }
   }
