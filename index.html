@@ -898,6 +898,10 @@
   }
 
   async function callTool(name, args) {
+    // Device-local tools: saving/removing clips ON THIS PHONE can only happen
+    // here, so these two are handled in the app instead of the server proxy.
+    if (name === "save_clip_offline") return await voiceSaveClips(String((args || {}).which || ""));
+    if (name === "delete_clip") return await voiceDeleteClips(String((args || {}).which || ""));
     try {
       const r = await fetch(SESSION_URL + "&tool=" + encodeURIComponent(name), {
         method: "POST",
@@ -1330,7 +1334,9 @@
     comp.innerHTML =
       '<input id="clipQuery" placeholder="e.g. most popular Claude Code clip" dir="auto">' +
       '<div class="crow" style="margin-bottom:8px"><button class="cbtn mic" id="clipMic" title="Dictate">🎙</button>' +
-      '<button class="cbtn" id="clipNow" style="flex:1">Fetch one now</button></div>' +
+      '<select id="clipCount" class="cbtn" style="appearance:none;text-align:center">' +
+      '<option value="1">1</option><option value="3">3</option><option value="5">5</option></select>' +
+      '<button class="cbtn" id="clipNow" style="flex:1">Fetch now</button></div>' +
       '<div class="crow"><button class="cbtn" id="clipRule" style="flex:1;background:rgba(120,131,235,.22);color:#cdd2ff">➕ Make it a daily rule</button></div>';
     feed.appendChild(comp);
     comp.querySelector("#clipMic").addEventListener("click", (e) => dictate(e.currentTarget, (t) => {
@@ -1338,10 +1344,11 @@
     }));
     comp.querySelector("#clipNow").addEventListener("click", async () => {
       const q = comp.querySelector("#clipQuery").value.trim(); if (!q) return;
+      const n = Number(comp.querySelector("#clipCount").value) || 1;
       const btn = comp.querySelector("#clipNow"); btn.textContent = "Scarlet is fetching…"; btn.disabled = true;
-      try { await fetch(APP_URL + "&op=clip_fetch_now", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q }) }); } catch (e) {}
+      try { await fetch(APP_URL + "&op=clip_fetch_now", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q, count: n }) }); } catch (e) {}
       comp.querySelector("#clipQuery").value = "";
-      setTimeout(() => { btn.textContent = "Fetch one now"; btn.disabled = false; loadClips(); }, 1500);
+      setTimeout(() => { btn.textContent = "Fetch now"; btn.disabled = false; loadClips(); }, 1500);
     });
     comp.querySelector("#clipRule").addEventListener("click", async () => {
       const q = comp.querySelector("#clipQuery").value.trim(); if (!q) return;
@@ -1413,6 +1420,58 @@
       feed.appendChild(card);
     }
   }
+
+  // ---- Voice/chat control of the clip library ("save it on my phone") ----
+  function matchClips(which) {
+    const w = (which || "").trim().toLowerCase();
+    const ready = clipItems.filter((c) => c.url || offlineIds.has(c.id));
+    if (!ready.length) return [];
+    if (!w || w === "all" || w === "everything") return ready;
+    if (w === "latest" || w === "last" || w === "newest" || w === "it" || w === "this") return [ready[0]];
+    const words = w.split(/\s+/).filter((x) => x.length > 2);
+    const scored = ready.map((c) => {
+      const t = (c.title || "").toLowerCase();
+      return { c, score: words.filter((x) => t.includes(x)).length };
+    }).filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+    return scored.length ? [scored[0].c] : [];
+  }
+  async function voiceSaveClips(which) {
+    if (!clipItems.length) await loadClips();
+    const targets = matchClips(which).filter((c) => !offlineIds.has(c.id));
+    const already = matchClips(which).length - targets.length;
+    if (!targets.length) {
+      return JSON.stringify(already > 0
+        ? { ok: true, note: "already saved on this phone" }
+        : { error: "no clip in the library matches \"" + which + "\" — use list_clips for exact titles" });
+    }
+    const saved = [];
+    for (const c of targets) {
+      try {
+        const resp = await fetch(c.url); const blob = await resp.blob();
+        await idbPut(c.id, blob); offlineIds.add(c.id); saveClipMeta(c); saved.push(c.title);
+      } catch (e) { /* skip this one */ }
+    }
+    if (activeTab === "gallery" && galSub === "clips") renderClips();
+    return JSON.stringify(saved.length
+      ? { saved: saved.length, titles: saved, note: "stored on this phone — plays offline now" }
+      : { error: "download to the phone failed — try again" });
+  }
+  async function voiceDeleteClips(which) {
+    if (!clipItems.length) await loadClips();
+    const targets = matchClips(which);
+    if (!targets.length) return JSON.stringify({ error: "no clip matches \"" + which + "\"" });
+    const gone = [];
+    for (const c of targets) {
+      await idbDel(c.id).catch(() => {}); delClipMeta(c.id); offlineIds.delete(c.id);
+      try { await fetch(APP_URL + "&op=clip_delete", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: c.id }) }); } catch (e) {}
+      clipItems = clipItems.filter((x) => x.id !== c.id); gone.push(c.title);
+    }
+    if (activeTab === "gallery" && galSub === "clips") renderClips();
+    return JSON.stringify({ deleted: gone.length, titles: gone });
+  }
+  // New clips land while the tab is open — refresh quietly.
+  setInterval(() => { if (activeTab === "gallery" && galSub === "clips") loadClips(); }, 30000);
 
   function addMsg(cls, text) {
     const d = document.createElement("div");
