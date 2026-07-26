@@ -280,6 +280,28 @@
   .cbtn.mic.busy { opacity:.6; }
   .nsectlabel { width:100%; max-width:640px; margin:4px auto 8px; padding:0 16px;
     font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#9c797c; }
+  /* ── Clips (offline video library) ── */
+  .clip { margin:0 0 15px; border-radius:18px; overflow:hidden; background:rgba(255,255,255,.05);
+    border:1px solid rgba(255,255,255,.08); animation:fadein .25s ease; }
+  .clip .thumbwrap { position:relative; cursor:pointer; background:#160a0e; }
+  .clip .thumbwrap img { display:block; width:100%; max-height:230px; object-fit:cover; }
+  .clip .playpad { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    background:rgba(0,0,0,.18); font-size:46px; color:#fff; text-shadow:0 2px 14px rgba(0,0,0,.6); }
+  .clip video { display:block; width:100%; max-height:60vh; background:#000; }
+  .clip .clipinfo { padding:11px 14px 13px; }
+  .clip .cliptitle { font-size:14.5px; color:#f6e9ea; line-height:1.35; unicode-bidi:plaintext; }
+  .clip .clipmeta { font-size:11.5px; color:#a68184; margin-top:4px; display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .offbadge { font-size:10px; padding:2px 7px; border-radius:8px; background:rgba(37,211,102,.18); color:#8ff0b5; }
+  .clip .clipbtns { display:flex; gap:8px; margin-top:11px; }
+  .clip .clipbtns button { flex:1; border:none; border-radius:11px; padding:9px; font-size:13px; cursor:pointer;
+    background:rgba(255,199,206,.16); color:#ffd9dd; }
+  .clip .clipbtns .save { background:rgba(37,211,102,.16); color:#a7f0c4; }
+  .clip .clipbtns .del  { background:rgba(255,255,255,.07); color:#c9b0b3; flex:0 0 auto; }
+  .rulecard { width:100%; max-width:640px; margin:0 auto 9px; padding:11px 14px; border-radius:14px;
+    background:rgba(120,131,235,.1); border:1px solid rgba(120,131,235,.2); display:flex; align-items:center; gap:10px; }
+  .rulecard .rq { flex:1; font-size:13.5px; color:#e8def6; unicode-bidi:plaintext; }
+  .rulecard .rc { font-size:11px; color:#a99cc9; }
+  .rulecard .rdel { border:none; background:rgba(255,255,255,.08); color:#c9b0b3; border-radius:9px; padding:6px 9px; cursor:pointer; font-size:12px; }
   .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
     box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
     cursor:zoom-in; animation:fadein .3s ease; }
@@ -379,9 +401,14 @@
   <section class="view" id="viewGallery">
     <div class="chathead">
       <div class="name">Gallery</div>
-      <div class="sub" id="gallerySub">Your photos & creations</div>
+      <div class="sub" id="gallerySub">Your photos, creations &amp; clips</div>
+    </div>
+    <div class="seg" id="galSeg">
+      <button class="segbtn active" data-s="photos">🖼 Photos</button>
+      <button class="segbtn" data-s="clips">▶️ Clips</button>
     </div>
     <div class="gfeed" id="gfeed"></div>
+    <div class="sigfeed" id="clipFeed" style="display:none"><div class="ovnote" style="margin-top:30px">Loading your clips…</div></div>
   </section>
 
   <!-- ================= SIGNALS ================= -->
@@ -483,7 +510,7 @@
     }
     if (name === "signals") { tabs.signals.classList.remove("unread"); loadSignals(); }
     if (name === "notes") loadNotesTab();
-    if (name === "gallery") loadGallery(true);
+    if (name === "gallery") { if (galSub === "clips") loadClips(); else loadGallery(true); }
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
   tabs.signals.addEventListener("click", () => switchTab("signals"));
@@ -1214,6 +1241,163 @@
             body.dataset.loaded = "1";
           } catch (e) { body.textContent = "Couldn't read this note."; }
         }
+      });
+      feed.appendChild(card);
+    }
+  }
+
+  /* ============================================================
+     CLIPS — offline video library (inside the Gallery tab)
+  ============================================================ */
+  let galSub = "photos";
+  let clipItems = [], clipRules = [], offlineIds = new Set();
+  document.getElementById("galSeg").addEventListener("click", (e) => {
+    const b = e.target.closest(".segbtn"); if (!b) return;
+    galSub = b.dataset.s;
+    document.querySelectorAll("#galSeg .segbtn").forEach((c) => c.classList.toggle("active", c === b));
+    const photos = galSub === "photos";
+    document.getElementById("gfeed").style.display = photos ? "" : "none";
+    document.getElementById("clipFeed").style.display = photos ? "none" : "";
+    if (photos) loadGallery(true); else loadClips();
+  });
+
+  // Downloaded clip blobs live in IndexedDB → true offline playback (on a flight).
+  function clipDB() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open("scarletClips", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("blobs");
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  }
+  async function idbPut(id, blob) {
+    const db = await clipDB();
+    return new Promise((res, rej) => { const tx = db.transaction("blobs", "readwrite");
+      tx.objectStore("blobs").put(blob, id); tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error); });
+  }
+  async function idbGet(id) {
+    const db = await clipDB();
+    return new Promise((res) => { const tx = db.transaction("blobs", "readonly");
+      const g = tx.objectStore("blobs").get(id); g.onsuccess = () => res(g.result || null); g.onerror = () => res(null); });
+  }
+  async function idbDel(id) {
+    const db = await clipDB();
+    return new Promise((res) => { const tx = db.transaction("blobs", "readwrite");
+      tx.objectStore("blobs").delete(id); tx.oncomplete = () => res(); tx.onerror = () => res(); });
+  }
+  async function idbKeys() {
+    const db = await clipDB();
+    return new Promise((res) => { const tx = db.transaction("blobs", "readonly");
+      const g = tx.objectStore("blobs").getAllKeys(); g.onsuccess = () => res(g.result || []); g.onerror = () => res([]); });
+  }
+  // Cache clip metadata so the saved library still renders with no internet.
+  const clipMeta = () => { try { return JSON.parse(localStorage.getItem("scarletClipMeta") || "{}"); } catch (e) { return {}; } };
+  const saveClipMeta = (it) => { const m = clipMeta(); m[it.id] = { id: it.id, title: it.title, channel: it.channel, duration_s: it.duration_s, views: it.views, thumb_url: it.thumb_url }; localStorage.setItem("scarletClipMeta", JSON.stringify(m)); };
+  const delClipMeta = (id) => { const m = clipMeta(); delete m[id]; localStorage.setItem("scarletClipMeta", JSON.stringify(m)); };
+
+  async function loadClips() {
+    offlineIds = new Set(await idbKeys());
+    try {
+      const [c, r] = await Promise.all([
+        fetch(APP_URL + "&op=clips").then((x) => x.json()),
+        fetch(APP_URL + "&op=clip_rules").then((x) => x.json()),
+      ]);
+      clipItems = c.clips || []; clipRules = r.rules || [];
+      for (const it of clipItems) if (offlineIds.has(it.id)) saveClipMeta(it); // keep cache fresh
+    } catch (e) {
+      // Offline: show whatever's been downloaded, from the local metadata cache.
+      const m = clipMeta(); clipItems = [...offlineIds].map((id) => m[id]).filter(Boolean); clipRules = [];
+    }
+    renderClips();
+  }
+  const fmtDur = (s) => { s = Number(s) || 0; return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+  const fmtViews = (v) => { v = Number(v) || 0; return v >= 1e6 ? (v / 1e6).toFixed(1) + "M views" : v >= 1e3 ? Math.round(v / 1e3) + "K views" : v ? v + " views" : ""; };
+  function renderClips() {
+    const feed = document.getElementById("clipFeed");
+    feed.innerHTML = "";
+    const comp = document.createElement("div");
+    comp.className = "compose";
+    comp.innerHTML =
+      '<input id="clipQuery" placeholder="e.g. most popular Claude Code clip" dir="auto">' +
+      '<div class="crow" style="margin-bottom:8px"><button class="cbtn mic" id="clipMic" title="Dictate">🎙</button>' +
+      '<button class="cbtn" id="clipNow" style="flex:1">Fetch one now</button></div>' +
+      '<div class="crow"><button class="cbtn" id="clipRule" style="flex:1;background:rgba(120,131,235,.22);color:#cdd2ff">➕ Make it a daily rule</button></div>';
+    feed.appendChild(comp);
+    comp.querySelector("#clipMic").addEventListener("click", (e) => dictate(e.currentTarget, (t) => {
+      const inp = comp.querySelector("#clipQuery"); inp.value = (inp.value ? inp.value + " " : "") + t;
+    }));
+    comp.querySelector("#clipNow").addEventListener("click", async () => {
+      const q = comp.querySelector("#clipQuery").value.trim(); if (!q) return;
+      const btn = comp.querySelector("#clipNow"); btn.textContent = "Scarlet is fetching…"; btn.disabled = true;
+      try { await fetch(APP_URL + "&op=clip_fetch_now", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q }) }); } catch (e) {}
+      comp.querySelector("#clipQuery").value = "";
+      setTimeout(() => { btn.textContent = "Fetch one now"; btn.disabled = false; loadClips(); }, 1500);
+    });
+    comp.querySelector("#clipRule").addEventListener("click", async () => {
+      const q = comp.querySelector("#clipQuery").value.trim(); if (!q) return;
+      try { await fetch(APP_URL + "&op=clip_add_rule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: q, cleanup: "watched" }) }); } catch (e) {}
+      comp.querySelector("#clipQuery").value = "";
+      setTimeout(loadClips, 1000);
+    });
+
+    if (clipRules.length) {
+      const lbl = document.createElement("div"); lbl.className = "nsectlabel"; lbl.textContent = "Daily rules"; feed.appendChild(lbl);
+      for (const r of clipRules) {
+        const rc = document.createElement("div"); rc.className = "rulecard";
+        rc.innerHTML = '<div class="rq">🔁 ' + esc(r.query) + '<div class="rc">' + esc(r.criteria) +
+          " · keep " + r.max_keep + " · " + (r.cleanup === "watched" ? "delete after watched" : r.cleanup === "days7" ? "delete after 7 days" : "keep") +
+          '</div></div><button class="rdel">✕</button>';
+        rc.querySelector(".rdel").addEventListener("click", async () => {
+          try { await fetch(APP_URL + "&op=clip_rule_delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: r.id }) }); } catch (e) {}
+          clipRules = clipRules.filter((x) => x.id !== r.id); renderClips();
+        });
+        feed.appendChild(rc);
+      }
+    }
+
+    const lbl2 = document.createElement("div"); lbl2.className = "nsectlabel";
+    lbl2.textContent = "Library" + (clipItems.length ? " · " + clipItems.length : ""); feed.appendChild(lbl2);
+    if (!clipItems.length) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "10px";
+      e.textContent = "No clips yet — ask above, or Scarlet fills your daily rules overnight."; feed.appendChild(e); return;
+    }
+    for (const it of clipItems) {
+      const card = document.createElement("div"); card.className = "clip";
+      const off = offlineIds.has(it.id);
+      const meta = [fmtDur(it.duration_s), it.channel ? esc(it.channel) : "", fmtViews(it.views)].filter(Boolean).join(" · ");
+      card.innerHTML =
+        '<div class="thumbwrap">' + (it.thumb_url ? '<img src="' + esc(it.thumb_url) + '" alt="">' : '<div style="height:150px"></div>') +
+        '<div class="playpad">▶</div></div>' +
+        '<div class="clipinfo"><div class="cliptitle">' + esc(it.title || "Clip") + "</div>" +
+        '<div class="clipmeta">' + meta + (off ? '<span class="offbadge">⬇ offline</span>' : "") + "</div>" +
+        '<div class="clipbtns"><button class="save">' + (off ? "✓ Saved offline" : "⬇ Save for offline") +
+        '</button><button class="del">🗑</button></div></div>';
+      const thumb = card.querySelector(".thumbwrap");
+      thumb.addEventListener("click", async () => {
+        const blob = off ? await idbGet(it.id) : null;
+        const src = blob ? URL.createObjectURL(blob) : it.url;
+        if (!src) return;
+        const v = document.createElement("video");
+        v.controls = true; v.autoplay = true; v.playsInline = true; v.src = src;
+        v.addEventListener("ended", () => {
+          fetch(APP_URL + "&op=clip_played", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id }) }).catch(() => {});
+        }, { once: true });
+        thumb.replaceWith(v);
+      });
+      card.querySelector(".save").addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        if (offlineIds.has(it.id)) { await idbDel(it.id); delClipMeta(it.id); offlineIds.delete(it.id); renderClips(); return; }
+        if (!it.url) return;
+        btn.textContent = "Downloading…"; btn.disabled = true;
+        try {
+          const resp = await fetch(it.url); const blob = await resp.blob();
+          await idbPut(it.id, blob); offlineIds.add(it.id); saveClipMeta(it);
+        } catch (err) { btn.textContent = "Failed — retry"; btn.disabled = false; return; }
+        renderClips();
+      });
+      card.querySelector(".del").addEventListener("click", async () => {
+        await idbDel(it.id).catch(() => {}); delClipMeta(it.id);
+        try { await fetch(APP_URL + "&op=clip_delete", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id }) }); } catch (e) {}
+        clipItems = clipItems.filter((x) => x.id !== it.id); offlineIds.delete(it.id); renderClips();
       });
       feed.appendChild(card);
     }
