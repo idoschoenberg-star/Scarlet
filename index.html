@@ -622,7 +622,7 @@
   async function toggleRec() {
     if (rec) { rec.stop(); return; }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
         : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
       rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
@@ -809,7 +809,7 @@
       const tok = await (await fetch(SESSION_URL, { method: "POST" })).json();
       if (!tok.client_secret) throw new Error(tok.error || "no session");
 
-      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       micTrack = ms.getAudioTracks()[0];
       micTrack.enabled = !muted;
 
