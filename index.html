@@ -188,6 +188,41 @@
   .gfeed { flex:1; width:100%; max-width:680px; overflow-y:auto; overscroll-behavior:contain;
     padding:6px 14px 20px; scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent;
     -webkit-overflow-scrolling:touch; }
+  /* --- Signals --- */
+  .sigfilter { width:100%; max-width:640px; display:flex; gap:8px; padding:4px 14px 8px;
+    overflow-x:auto; scrollbar-width:none; }
+  .sigfilter::-webkit-scrollbar { display:none; }
+  .fchip { flex:0 0 auto; display:flex; align-items:center; gap:6px; padding:7px 14px; border-radius:999px;
+    border:1px solid rgba(255,150,160,.2); background:rgba(255,255,255,.04); color:#e8cdcf;
+    font-size:12.5px; cursor:pointer; transition:all .15s; }
+  .fchip.active { background:rgba(255,199,206,.16); border-color:rgba(255,199,206,.5); color:#ffd9dd; }
+  .fdot { width:8px; height:8px; border-radius:50%; }
+  .sigfeed { flex:1; width:100%; max-width:640px; overflow-y:auto; overscroll-behavior:contain;
+    padding:4px 14px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent;
+    -webkit-overflow-scrolling:touch; }
+  .sig { position:relative; margin:0 0 11px; border-radius:16px; padding:12px 14px 12px 16px;
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.07);
+    border-left:3px solid var(--sc,#888); cursor:pointer; animation:fadein .25s ease; }
+  .sig.read { opacity:.55; }
+  .sig.acted { opacity:.4; }
+  .sig .srow { display:flex; align-items:center; gap:8px; margin-bottom:3px; }
+  .sig .stag { font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--sc,#aaa); font-weight:600; }
+  .sig .swho { font-size:13.5px; color:#f4e2e4; font-weight:500; flex:1; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
+  .sig .swhen { font-size:10px; color:#a68184; white-space:nowrap; }
+  .sig .sprev { font-size:13px; color:#cdb4b6; line-height:1.45; unicode-bidi:plaintext;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .sig.open .sprev { -webkit-line-clamp:unset; }
+  .sigact { margin-top:11px; display:none; gap:8px; flex-direction:column; }
+  .sig.open .sigact { display:flex; }
+  .sigact .row { display:flex; gap:8px; align-items:flex-end; }
+  .sigact textarea { flex:1; resize:none; border-radius:12px; border:1px solid rgba(255,150,160,.22);
+    background:rgba(0,0,0,.25); color:#f4e2e4; padding:9px 12px; font:inherit; font-size:13.5px;
+    max-height:120px; }
+  .sigbtn { flex:0 0 auto; border:none; border-radius:12px; padding:9px 13px; font-size:14px; cursor:pointer;
+    background:rgba(255,199,206,.2); color:#ffd9dd; }
+  .sigbtn.talk { background:rgba(120,131,235,.22); color:#cdd2ff; }
+  .sighint { font-size:10.5px; color:#9c797c; letter-spacing:.03em; }
   .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
     box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
     cursor:zoom-in; animation:fadein .3s ease; }
@@ -292,6 +327,22 @@
     <div class="gfeed" id="gfeed"></div>
   </section>
 
+  <!-- ================= SIGNALS ================= -->
+  <section class="view" id="viewSignals">
+    <div class="chathead">
+      <div class="name">Signals</div>
+      <div class="sub">Everything that reached you — act in one place</div>
+    </div>
+    <div class="sigfilter" id="sigFilter">
+      <button class="fchip active" data-f="all">All</button>
+      <button class="fchip" data-f="outlook_mail"><span class="fdot" style="background:#4a9fff"></span>Email</button>
+      <button class="fchip" data-f="whatsapp"><span class="fdot" style="background:#25d366"></span>WhatsApp</button>
+      <button class="fchip" data-f="teams"><span class="fdot" style="background:#7b83eb"></span>Teams</button>
+      <button class="fchip" data-f="outlook_calendar"><span class="fdot" style="background:#e6a23c"></span>Calendar</button>
+    </div>
+    <div class="sigfeed" id="sigFeed"><div class="ovnote" style="margin-top:30px">Loading your signals…</div></div>
+  </section>
+
   <!-- lock screen -->
   <div class="overlay" id="lock">
     <div class="lockbox">
@@ -308,6 +359,7 @@
   <!-- tab bar -->
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
+    <button class="tab" id="tabSignals"><span class="ic">📥</span>Signals<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
     <button class="tab" id="tabGallery"><span class="ic">🖼</span>Gallery<span class="dot"></span></button>
   </nav>
@@ -341,14 +393,14 @@
   /* ============================================================
      TABS
   ============================================================ */
-  const views = { live: document.getElementById("viewLive"), chat: document.getElementById("viewChat"),
-    gallery: document.getElementById("viewGallery") };
-  const tabs = { live: document.getElementById("tabLive"), chat: document.getElementById("tabChat"),
-    gallery: document.getElementById("tabGallery") };
+  const views = { live: document.getElementById("viewLive"), signals: document.getElementById("viewSignals"),
+    chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery") };
+  const tabs = { live: document.getElementById("tabLive"), signals: document.getElementById("tabSignals"),
+    chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery") };
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
-    for (const k of ["live", "chat", "gallery"]) {
+    for (const k of ["live", "signals", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
@@ -357,9 +409,11 @@
       scrollFeed(true);
       pollNow();
     }
+    if (name === "signals") { tabs.signals.classList.remove("unread"); loadSignals(); }
     if (name === "gallery") loadGallery(true);
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
+  tabs.signals.addEventListener("click", () => switchTab("signals"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
   tabs.gallery.addEventListener("click", () => switchTab("gallery"));
 
@@ -754,6 +808,121 @@
     }
   }
 
+  /* ============================================================
+     SIGNALS — unified real-time notifications you act on
+  ============================================================ */
+  const SIG = {
+    outlook_mail:     { tag: "Email",    color: "#4a9fff" },
+    whatsapp:         { tag: "WhatsApp", color: "#25d366" },
+    teams:            { tag: "Teams",    color: "#7b83eb" },
+    outlook_calendar: { tag: "Calendar", color: "#e6a23c" },
+    graph:            { tag: "Update",   color: "#9c9c9c" },
+  };
+  let sigItems = [], sigFilter = "all";
+  const sigMeta = (s) => SIG[s] || { tag: s, color: "#9c9c9c" };
+  const esc = (s) => (s || "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  function relTime(iso) {
+    const d = (Date.now() - new Date(iso).getTime()) / 1000;
+    if (d < 60) return "now";
+    if (d < 3600) return Math.floor(d / 60) + "m";
+    if (d < 86400) return Math.floor(d / 3600) + "h";
+    return Math.floor(d / 86400) + "d";
+  }
+  async function loadSignals() {
+    if (!APP_URL) return;
+    try {
+      const r = await fetch(APP_URL + "&op=inbox", { signal: AbortSignal.timeout(9000) });
+      const j = await r.json();
+      sigItems = j.events || [];
+      renderSignals();
+      if (sigItems.some((i) => !i.read_at) && activeTab !== "signals") tabs.signals.classList.add("unread");
+    } catch (e) { /* keep what we have */ }
+  }
+  async function markSig(ids, op) {
+    try {
+      await fetch(APP_URL + "&op=" + op, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+    } catch (e) {}
+  }
+  const sigContext = (it) => {
+    const m = sigMeta(it.source);
+    return "Ido is looking at this " + m.tag + " notification" +
+      (it.sender ? " from " + it.sender : "") + ':\n"' + (it.preview || "") + '"';
+  };
+  async function ensureLive() {
+    if (dc && dc.readyState === "open") return true;
+    await start();
+    for (let i = 0; i < 40 && !(dc && dc.readyState === "open"); i++) await new Promise((r) => setTimeout(r, 150));
+    return !!(dc && dc.readyState === "open");
+  }
+  async function instructSignal(it, instruction) {
+    it.acted_at = new Date().toISOString();
+    markSig([it.id], "inbox_acted");
+    renderSignals();
+    switchTab("chat");
+    const ok = await ensureLive();
+    if (!ok) return;
+    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+      content: [{ type: "input_text", text: sigContext(it) + "\n\nHis instruction: " + instruction +
+        "\n\nAct on it with the right tool (WhatsApp send, Teams draft, Outlook draft, or Gmail draft/send). Read the exact wording back and only send after he approves." }] } }));
+    dc.send(JSON.stringify({ type: "response.create" }));
+  }
+  async function talkSignal(it) {
+    if (!it.read_at) { it.read_at = new Date().toISOString(); markSig([it.id], "inbox_read"); }
+    switchTab("live");
+    const ok = await ensureLive();
+    if (!ok) return;
+    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+      content: [{ type: "input_text", text: sigContext(it) +
+        "\n\nHe's about to tell you by voice what to do with it. Briefly acknowledge you see it, then wait for his instruction." }] } }));
+    dc.send(JSON.stringify({ type: "response.create" }));
+  }
+  function renderSignals() {
+    const feed = document.getElementById("sigFeed");
+    const items = sigItems.filter((i) => sigFilter === "all" || i.source === sigFilter);
+    if (!items.length) {
+      feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Nothing here yet — new messages appear the moment they arrive.</div>';
+      return;
+    }
+    feed.innerHTML = "";
+    for (const it of items) {
+      const m = sigMeta(it.source);
+      const card = document.createElement("div");
+      card.className = "sig" + (it.read_at ? " read" : "") + (it.acted_at ? " acted" : "");
+      card.style.setProperty("--sc", m.color);
+      card.innerHTML =
+        '<div class="srow"><span class="stag">' + m.tag + "</span>" +
+        '<span class="swho">' + esc(it.sender || m.tag) + "</span>" +
+        '<span class="swhen">' + relTime(it.received_at) + "</span></div>" +
+        '<div class="sprev">' + esc(it.preview || "(no preview)") + "</div>" +
+        '<div class="sigact"><div class="row">' +
+        '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
+        '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
+        '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button></div>' +
+        '<div class="sighint">She drafts it, reads it back, and you approve before anything sends.</div></div>';
+      card.addEventListener("click", (e) => {
+        if (e.target.closest(".sigact")) return;
+        const wasOpen = card.classList.contains("open");
+        card.classList.toggle("open");
+        if (!wasOpen && !it.read_at) { it.read_at = new Date().toISOString(); card.classList.add("read"); markSig([it.id], "inbox_read"); }
+      });
+      const ta = card.querySelector("textarea");
+      ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 120) + "px"; });
+      card.querySelector(".send").addEventListener("click", () => {
+        const t = ta.value.trim(); if (!t) return; ta.value = ""; ta.style.height = "auto"; instructSignal(it, t);
+      });
+      card.querySelector(".talk").addEventListener("click", () => talkSignal(it));
+      feed.appendChild(card);
+    }
+  }
+  document.getElementById("sigFilter").addEventListener("click", (e) => {
+    const b = e.target.closest(".fchip"); if (!b) return;
+    sigFilter = b.dataset.f;
+    document.querySelectorAll("#sigFilter .fchip").forEach((c) => c.classList.toggle("active", c === b));
+    renderSignals();
+  });
+
   function addMsg(cls, text) {
     const d = document.createElement("div");
     d.className = "lmsg " + cls;
@@ -1030,6 +1199,8 @@
     lockEl.classList.remove("on");
     applyToken();
     startPolling();
+    loadSignals();
+    setInterval(loadSignals, 25000); // keeps the Signals list + unread dot fresh
     setTimeout(() => { if (!pc) start(); }, 300); // opens muted by design
   }
   function showLock(withFace) {
