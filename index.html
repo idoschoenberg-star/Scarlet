@@ -231,6 +231,55 @@
   .sigbtn.talk { background:rgba(120,131,235,.22); color:#cdd2ff; }
   .sigbtn.arch { background:rgba(255,255,255,.08); color:#c9b0b3; }
   .sighint { font-size:10.5px; color:#9c797c; letter-spacing:.03em; }
+  /* ── Notes & Reminders tab ── */
+  .seg { display:flex; gap:6px; width:100%; max-width:640px; margin:2px auto 0;
+    padding:8px 14px 4px; }
+  .segbtn { flex:1; border:1px solid rgba(255,150,160,.16); background:rgba(255,255,255,.04);
+    color:#c9b0b3; border-radius:13px; padding:10px; font:inherit; font-size:14px; font-weight:500;
+    cursor:pointer; transition:all .15s ease; }
+  .segbtn.active { background:rgba(255,199,206,.2); color:#ffd9dd; border-color:rgba(255,150,160,.34); }
+  .rem { position:relative; margin:0 0 10px; border-radius:16px; padding:12px 14px;
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.07);
+    border-left:3px solid var(--rc,#e6a23c); animation:fadein .25s ease; }
+  .rem.hi { --rc:#ff6b6b; } .rem.med { --rc:#e6a23c; } .rem.lo { --rc:#7b9acc; }
+  .rem .rtop { display:flex; align-items:flex-start; gap:11px; }
+  .rem .rcheck { flex:0 0 auto; width:24px; height:24px; border-radius:50%; margin-top:1px;
+    border:2px solid rgba(255,199,206,.5); background:transparent; cursor:pointer; transition:all .15s; }
+  .rem .rcheck:active { transform:scale(.9); }
+  .rem.done .rcheck { background:#ffc7ce; border-color:#ffc7ce; }
+  .rem .rbody { flex:1; min-width:0; }
+  .rem .rtitle { font-size:15px; color:#f6e9ea; line-height:1.35; unicode-bidi:plaintext; }
+  .rem.done .rtitle { text-decoration:line-through; opacity:.5; }
+  .rem .rmeta { font-size:11.5px; color:#a68184; margin-top:3px; unicode-bidi:plaintext; }
+  .rem .rmeta .due { color:#e6a23c; }
+  .rem .ract { margin-top:10px; display:none; gap:7px; flex-wrap:wrap; align-items:center; }
+  .rem.open .ract { display:flex; }
+  .pchip { border:1px solid rgba(255,150,160,.2); background:rgba(0,0,0,.2); color:#c9b0b3;
+    border-radius:11px; padding:6px 11px; font-size:12.5px; cursor:pointer; }
+  .pchip.on { background:rgba(255,199,206,.22); color:#ffd9dd; border-color:rgba(255,150,160,.4); }
+  .rem .rtalk { border:none; border-radius:11px; padding:6px 12px; font-size:12.5px; cursor:pointer;
+    background:rgba(120,131,235,.22); color:#cdd2ff; margin-left:auto; }
+  .note { margin:0 0 10px; border-radius:16px; padding:13px 15px; cursor:pointer;
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.07);
+    border-left:3px solid #ffd166; animation:fadein .25s ease; }
+  .note .ntitle { font-size:15px; color:#f6e9ea; unicode-bidi:plaintext; display:flex; gap:8px; }
+  .note .nbody { font-size:14px; color:#dcc7c9; line-height:1.55; margin-top:9px; white-space:pre-wrap;
+    unicode-bidi:plaintext; display:none; }
+  .note.open .nbody { display:block; }
+  .note.open { background:rgba(255,255,255,.075); border-color:rgba(255,209,102,.3); }
+  .compose { width:100%; max-width:640px; margin:0 auto 14px; padding:12px 14px;
+    border-radius:16px; background:rgba(255,255,255,.05); border:1px solid rgba(255,209,102,.2); }
+  .compose input, .compose textarea { width:100%; box-sizing:border-box; border-radius:11px;
+    border:1px solid rgba(255,150,160,.2); background:rgba(0,0,0,.25); color:#f4e2e4;
+    padding:10px 12px; font:inherit; font-size:14px; margin-bottom:8px; resize:none; }
+  .compose .crow { display:flex; gap:8px; align-items:center; }
+  .cbtn { border:none; border-radius:12px; padding:10px 15px; font-size:14px; cursor:pointer;
+    background:rgba(255,199,206,.2); color:#ffd9dd; }
+  .cbtn.mic { background:rgba(120,131,235,.22); color:#cdd2ff; }
+  .cbtn.mic.rec { background:#ff5a6a; color:#fff; animation:pulse 1.2s infinite; }
+  .cbtn.mic.busy { opacity:.6; }
+  .nsectlabel { width:100%; max-width:640px; margin:4px auto 8px; padding:0 16px;
+    font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#9c797c; }
   .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
     box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
     cursor:zoom-in; animation:fadein .3s ease; }
@@ -351,6 +400,18 @@
     <div class="sigfeed" id="sigFeed"><div class="ovnote" style="margin-top:30px">Loading your signals…</div></div>
   </section>
 
+  <section class="view" id="viewNotes">
+    <div class="chathead">
+      <div class="name">Notes &amp; Reminders</div>
+      <div class="sub">Your Apple Reminders &amp; Notes — check, re-prioritize, dictate</div>
+    </div>
+    <div class="seg" id="notesSeg">
+      <button class="segbtn active" data-s="reminders">✅ Reminders</button>
+      <button class="segbtn" data-s="notes">📝 Notes</button>
+    </div>
+    <div class="sigfeed" id="notesFeed"><div class="ovnote" style="margin-top:30px">Loading…</div></div>
+  </section>
+
   <!-- lock screen -->
   <div class="overlay" id="lock">
     <div class="lockbox">
@@ -368,6 +429,7 @@
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
     <button class="tab" id="tabSignals"><span class="ic">📥</span>Signals<span class="dot"></span></button>
+    <button class="tab" id="tabNotes"><span class="ic">📝</span>Notes<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
     <button class="tab" id="tabGallery"><span class="ic">🖼</span>Gallery<span class="dot"></span></button>
   </nav>
@@ -402,13 +464,15 @@
      TABS
   ============================================================ */
   const views = { live: document.getElementById("viewLive"), signals: document.getElementById("viewSignals"),
+    notes: document.getElementById("viewNotes"),
     chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery") };
   const tabs = { live: document.getElementById("tabLive"), signals: document.getElementById("tabSignals"),
+    notes: document.getElementById("tabNotes"),
     chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery") };
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
-    for (const k of ["live", "signals", "chat", "gallery"]) {
+    for (const k of ["live", "signals", "notes", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
@@ -418,10 +482,12 @@
       pollNow();
     }
     if (name === "signals") { tabs.signals.classList.remove("unread"); loadSignals(); }
+    if (name === "notes") loadNotesTab();
     if (name === "gallery") loadGallery(true);
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
   tabs.signals.addEventListener("click", () => switchTab("signals"));
+  tabs.notes.addEventListener("click", () => switchTab("notes"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
   tabs.gallery.addEventListener("click", () => switchTab("gallery"));
 
@@ -936,6 +1002,222 @@
     document.querySelectorAll("#sigFilter .fchip").forEach((c) => c.classList.toggle("active", c === b));
     renderSignals();
   });
+
+  /* ============================================================
+     NOTES & REMINDERS
+     - Reminders read/write the `tasks` table (mirrored to Apple Reminders
+       by the Mac agent, both ways, within a few seconds).
+     - Apple Notes are fetched live from the Mac each time (no local copy).
+  ============================================================ */
+  let notesSub = "reminders";
+  let reminders = [];
+  function loadNotesTab() {
+    if (notesSub === "reminders") loadReminders(); else loadNotesList();
+  }
+  document.getElementById("notesSeg").addEventListener("click", (e) => {
+    const b = e.target.closest(".segbtn"); if (!b) return;
+    notesSub = b.dataset.s;
+    document.querySelectorAll("#notesSeg .segbtn").forEach((c) => c.classList.toggle("active", c === b));
+    document.getElementById("notesFeed").innerHTML = '<div class="ovnote" style="margin-top:30px">Loading…</div>';
+    loadNotesTab();
+  });
+
+  // Reusable push-to-talk dictation: record → transcribe (no capture) → onText.
+  let dictRec = null;
+  async function dictate(btn, onText) {
+    if (dictRec) { dictRec.stop(); return; }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
+        : MediaRecorder.isTypeSupported("audio/mp4") ? "audio/mp4" : "";
+      dictRec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      const chunks = [];
+      dictRec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+      dictRec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(chunks, { type: dictRec.mimeType || "audio/webm" });
+        dictRec = null; btn.classList.remove("rec");
+        if (blob.size < 1200) return;
+        btn.classList.add("busy");
+        try {
+          const b64 = await new Promise((res) => {
+            const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(",")[1]); fr.readAsDataURL(blob);
+          });
+          const r = await fetch(APP_URL + "&op=transcribe", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audio: b64, mime: blob.type }) });
+          const d = await r.json();
+          if (d.transcript) onText(d.transcript);
+        } catch (e) {}
+        btn.classList.remove("busy");
+      };
+      dictRec.start(); btn.classList.add("rec");
+    } catch (e) {}
+  }
+
+  /* ---- Reminders ---- */
+  async function loadReminders() {
+    try {
+      const r = await fetch(APP_URL + "&op=reminders");
+      const d = await r.json();
+      reminders = d.reminders || [];
+    } catch (e) { reminders = []; }
+    renderReminders();
+  }
+  const prioClass = (p) => (p >= 1 && p <= 3) ? "hi" : (p >= 7) ? "lo" : "med";
+  function remWhen(it) {
+    const t = it.remind_at || it.due_at;
+    if (!t) return it.location_name ? "📍 " + it.location_name : "";
+    const d = new Date(t);
+    const day = d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    return (d < new Date() ? "⚠️ " : "") + day + " · " + time;
+  }
+  async function talkReminder(it) {
+    switchTab("live");
+    const ok = await ensureLive(); if (!ok) return;
+    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+      content: [{ type: "input_text", text: 'Ido is looking at this reminder: "' + (it.title || "") + '"' +
+        (it.notes ? " (notes: " + it.notes + ")" : "") +
+        ".\n\nHe's about to tell you by voice what to do with it — reschedule it, change it, add detail, or act on it. Briefly acknowledge, then listen." }] } }));
+    dc.send(JSON.stringify({ type: "response.create" }));
+  }
+  function renderReminders() {
+    const feed = document.getElementById("notesFeed");
+    feed.innerHTML = "";
+    const add = document.createElement("div");
+    add.className = "compose";
+    add.innerHTML = '<input id="remNew" placeholder="Add a reminder…" dir="auto">' +
+      '<div class="crow"><button class="cbtn mic" id="remMic" title="Dictate">🎙</button>' +
+      '<button class="cbtn" id="remAdd" style="flex:1">Add reminder</button></div>';
+    feed.appendChild(add);
+    add.querySelector("#remMic").addEventListener("click", (e) => dictate(e.currentTarget, (t) => {
+      const inp = add.querySelector("#remNew"); inp.value = (inp.value ? inp.value + " " : "") + t;
+    }));
+    add.querySelector("#remAdd").addEventListener("click", async () => {
+      const inp = add.querySelector("#remNew"); const t = inp.value.trim(); if (!t) return;
+      inp.value = "";
+      try { await fetch(APP_URL + "&op=reminder_add", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: t }) }); } catch (e) {}
+      setTimeout(loadReminders, 500);
+    });
+
+    if (!reminders.length) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "24px";
+      e.textContent = "Nothing on your list — you're all caught up. 🌿"; feed.appendChild(e); return;
+    }
+    for (const it of reminders) {
+      const card = document.createElement("div");
+      const pc = it.priority ? prioClass(it.priority) : "med";
+      card.className = "rem " + pc;
+      const when = remWhen(it);
+      card.innerHTML =
+        '<div class="rtop"><button class="rcheck" title="Complete"></button>' +
+        '<div class="rbody"><div class="rtitle">' + esc(it.title || "(untitled)") + "</div>" +
+        (when ? '<div class="rmeta"><span class="due">' + esc(when) + "</span></div>" : "") +
+        (it.notes ? '<div class="rmeta">' + esc(it.notes) + "</div>" : "") +
+        '<div class="ract"><span style="font-size:11.5px;color:#9c797c">Priority</span>' +
+        '<button class="pchip" data-p="1">High</button>' +
+        '<button class="pchip" data-p="5">Med</button>' +
+        '<button class="pchip" data-p="9">Low</button>' +
+        '<button class="rtalk">🎤 Tell Scarlet</button></div></div></div>';
+      card.querySelectorAll(".pchip").forEach((ch) => { if (Number(ch.dataset.p) === it.priority) ch.classList.add("on"); });
+      card.querySelector(".rbody").addEventListener("click", (e) => {
+        if (e.target.closest(".ract")) return;
+        card.classList.toggle("open");
+      });
+      card.querySelector(".rcheck").addEventListener("click", async () => {
+        card.classList.add("done");
+        try { await fetch(APP_URL + "&op=reminder_update", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id, done: true }) }); } catch (e) {}
+        setTimeout(() => { reminders = reminders.filter((x) => x.id !== it.id); renderReminders(); }, 450);
+      });
+      card.querySelectorAll(".pchip").forEach((ch) => ch.addEventListener("click", async () => {
+        card.querySelectorAll(".pchip").forEach((c) => c.classList.remove("on"));
+        ch.classList.add("on");
+        const p = Number(ch.dataset.p); it.priority = p;
+        card.className = "rem " + prioClass(p) + " open";
+        try { await fetch(APP_URL + "&op=reminder_update", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id, priority: p }) }); } catch (e) {}
+      }));
+      card.querySelector(".rtalk").addEventListener("click", () => talkReminder(it));
+      feed.appendChild(card);
+    }
+  }
+
+  /* ---- Apple Notes (live from the Mac) ---- */
+  async function loadNotesList() {
+    const feed = document.getElementById("notesFeed");
+    feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Reading your notes from your Mac…</div>';
+    let res = {};
+    try {
+      const r = await fetch(APP_URL + "&op=notes_list");
+      res = await r.json();
+    } catch (e) { res = { error: "couldn't reach the server" }; }
+    renderNotes(res);
+  }
+  function renderNotes(res) {
+    const feed = document.getElementById("notesFeed");
+    feed.innerHTML = "";
+    const comp = document.createElement("div");
+    comp.className = "compose";
+    comp.innerHTML =
+      '<input id="noteTitle" placeholder="Note title…" dir="auto">' +
+      '<textarea id="noteBody" rows="3" placeholder="Write or dictate a new note…" dir="auto"></textarea>' +
+      '<div class="crow"><button class="cbtn mic" id="noteMic" title="Dictate into the note">🎙 Dictate</button>' +
+      '<button class="cbtn" id="noteSave" style="flex:1">Save to Apple Notes</button></div>';
+    feed.appendChild(comp);
+    comp.querySelector("#noteMic").addEventListener("click", (e) => dictate(e.currentTarget, (t) => {
+      const ta = comp.querySelector("#noteBody"); ta.value = (ta.value ? ta.value + " " : "") + t;
+    }));
+    comp.querySelector("#noteSave").addEventListener("click", async () => {
+      const title = comp.querySelector("#noteTitle").value.trim();
+      const bodyv = comp.querySelector("#noteBody").value.trim();
+      if (!title && !bodyv) return;
+      const btn = comp.querySelector("#noteSave"); btn.textContent = "Saving…"; btn.disabled = true;
+      try { await fetch(APP_URL + "&op=note_create", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: title || bodyv.slice(0, 40), body: bodyv }) }); } catch (e) {}
+      comp.querySelector("#noteTitle").value = ""; comp.querySelector("#noteBody").value = "";
+      btn.textContent = "Save to Apple Notes"; btn.disabled = false;
+      setTimeout(loadNotesList, 800);
+    });
+
+    if (res.error) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "18px";
+      e.textContent = "⚠️ " + res.error; feed.appendChild(e); return;
+    }
+    if (res.queued) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "18px";
+      e.textContent = "🗒 " + (res.note || "Your Mac is waking up — try again in a moment."); feed.appendChild(e); return;
+    }
+    const label = document.createElement("div"); label.className = "nsectlabel";
+    label.textContent = "Recent notes" + (res.count ? " · " + res.count + " total" : "");
+    feed.appendChild(label);
+    const list = res.notes || [];
+    if (!list.length) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.textContent = "No notes yet."; feed.appendChild(e); return;
+    }
+    for (const n of list) {
+      const card = document.createElement("div");
+      card.className = "note";
+      card.innerHTML = '<div class="ntitle">📝 <span>' + esc(n.title || "(untitled)") + '</span></div><div class="nbody"></div>';
+      card.addEventListener("click", async () => {
+        const open = card.classList.toggle("open");
+        const body = card.querySelector(".nbody");
+        if (open && !body.dataset.loaded) {
+          body.textContent = "Reading…";
+          try {
+            const r = await fetch(APP_URL + "&op=note_read", { method: "POST",
+              headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: n.title }) });
+            const d = await r.json();
+            body.textContent = d.found ? (d.text || "(empty note)")
+              : (d.queued ? (d.note || "Mac didn't respond — try again.") : "Couldn't read this note.");
+            body.dataset.loaded = "1";
+          } catch (e) { body.textContent = "Couldn't read this note."; }
+        }
+      });
+      feed.appendChild(card);
+    }
+  }
 
   function addMsg(cls, text) {
     const d = document.createElement("div");
