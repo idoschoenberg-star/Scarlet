@@ -1001,7 +1001,7 @@
         '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
         '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
         '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button>' +
-        '<button class="sigbtn arch" title="Archive — clear it from Signals">🗄️</button></div>' +
+        '<button class="sigbtn arch" title="Archive — email is really moved to your Outlook Archive">🗄️</button></div>' +
         '<div class="sighint">She drafts it, reads it back, and you approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact")) return;
@@ -1015,10 +1015,17 @@
         const t = ta.value.trim(); if (!t) return; ta.value = ""; ta.style.height = "auto"; instructSignal(it, t);
       });
       card.querySelector(".talk").addEventListener("click", () => talkSignal(it));
-      card.querySelector(".arch").addEventListener("click", () => {
-        markSig([it.id], "inbox_archive");
-        sigItems = sigItems.filter((x) => x.id !== it.id);
-        renderSignals();
+      card.querySelector(".arch").addEventListener("click", async (e) => {
+        const btn = e.currentTarget; btn.disabled = true;
+        btn.textContent = it.source === "outlook_mail" ? "…" : "🗄️";
+        let ok = true;
+        try {
+          const r = await fetch(APP_URL + "&op=inbox_archive", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [it.id] }) });
+          const d = await r.json(); ok = d.ok !== false;
+        } catch (err) { ok = false; }
+        if (ok) { sigItems = sigItems.filter((x) => x.id !== it.id); renderSignals(); }
+        else { btn.disabled = false; btn.textContent = "⚠️"; btn.title = "Archive failed — tap to retry"; }
       });
       feed.appendChild(card);
     }
