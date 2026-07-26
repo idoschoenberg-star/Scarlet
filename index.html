@@ -419,7 +419,8 @@
     </div>
     <div class="sigfilter" id="sigFilter">
       <button class="fchip active" data-f="all">All</button>
-      <button class="fchip" data-f="outlook_mail"><span class="fdot" style="background:#4a9fff"></span>Email</button>
+      <button class="fchip" data-f="outlook_mail"><span class="fdot" style="background:#4a9fff"></span>Amwell</button>
+      <button class="fchip" data-f="gmail"><span class="fdot" style="background:#ea4335"></span>Gmail</button>
       <button class="fchip" data-f="whatsapp"><span class="fdot" style="background:#25d366"></span>WhatsApp</button>
       <button class="fchip" data-f="teams"><span class="fdot" style="background:#7b83eb"></span>Teams</button>
       <button class="fchip" data-f="outlook_calendar"><span class="fdot" style="background:#e6a23c"></span>Calendar</button>
@@ -913,7 +914,8 @@
      SIGNALS — unified real-time notifications you act on
   ============================================================ */
   const SIG = {
-    outlook_mail:     { tag: "Email",    color: "#4a9fff" },
+    outlook_mail:     { tag: "Amwell",   color: "#4a9fff" },
+    gmail:            { tag: "Gmail",    color: "#ea4335" },
     whatsapp:         { tag: "WhatsApp", color: "#25d366" },
     teams:            { tag: "Teams",    color: "#7b83eb" },
     outlook_calendar: { tag: "Calendar", color: "#e6a23c" },
@@ -1001,7 +1003,9 @@
         '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
         '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
         '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button>' +
-        '<button class="sigbtn arch" title="Archive — email is really moved to your Outlook Archive">🗄️</button></div>' +
+        ((it.source === "outlook_mail" || it.source === "gmail")
+          ? '<button class="sigbtn arch" title="Archive — really moves the email to Archive in Outlook/Gmail">🗄️</button>'
+          : "") + "</div>" +
         '<div class="sighint">She drafts it, reads it back, and you approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact")) return;
@@ -1015,9 +1019,9 @@
         const t = ta.value.trim(); if (!t) return; ta.value = ""; ta.style.height = "auto"; instructSignal(it, t);
       });
       card.querySelector(".talk").addEventListener("click", () => talkSignal(it));
-      card.querySelector(".arch").addEventListener("click", async (e) => {
-        const btn = e.currentTarget; btn.disabled = true;
-        btn.textContent = it.source === "outlook_mail" ? "…" : "🗄️";
+      const archBtn = card.querySelector(".arch");
+      if (archBtn) archBtn.addEventListener("click", async (e) => {
+        const btn = e.currentTarget; btn.disabled = true; btn.textContent = "…";
         let ok = true;
         try {
           const r = await fetch(APP_URL + "&op=inbox_archive", { method: "POST",
