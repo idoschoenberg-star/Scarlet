@@ -462,6 +462,7 @@
       <button class="fchip" data-f="outlook_mail"><span class="fdot" style="background:#4a9fff"></span>Amwell</button>
       <button class="fchip" data-f="gmail"><span class="fdot" style="background:#ea4335"></span>Gmail</button>
       <button class="fchip" data-f="whatsapp"><span class="fdot" style="background:#25d366"></span>WhatsApp</button>
+      <button class="fchip" data-f="imessage"><span class="fdot" style="background:#0b93f6"></span>iMessage</button>
       <button class="fchip" data-f="teams"><span class="fdot" style="background:#7b83eb"></span>Teams</button>
       <button class="fchip" data-f="outlook_calendar"><span class="fdot" style="background:#e6a23c"></span>Calendar</button>
     </div>
@@ -1009,6 +1010,7 @@
     outlook_mail:     { tag: "Amwell",   color: "#4a9fff" },
     gmail:            { tag: "Gmail",    color: "#ea4335" },
     whatsapp:         { tag: "WhatsApp", color: "#25d366" },
+    imessage:         { tag: "iMessage", color: "#0b93f6" },
     teams:            { tag: "Teams",    color: "#7b83eb" },
     outlook_calendar: { tag: "Calendar", color: "#e6a23c" },
     graph:            { tag: "Update",   color: "#9c9c9c" },
@@ -1060,7 +1062,7 @@
     if (!ok) return;
     dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
       content: [{ type: "input_text", text: sigContext(it) + "\n\nHis instruction: " + instruction +
-        "\n\nAct on it with the right tool (WhatsApp send, Teams draft, Outlook draft, or Gmail draft/send). Read the exact wording back and only send after he approves." }] } }));
+        "\n\nAct on it with the right tool (WhatsApp send, iMessage send, Teams draft, Outlook draft, or Gmail draft/send). Read the exact wording back and only send after he approves." }] } }));
     dc.send(JSON.stringify({ type: "response.create" }));
   }
   async function talkSignal(it) {
