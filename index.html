@@ -939,8 +939,25 @@
   let herLine = null;
   const audioEl = new Audio();
   audioEl.autoplay = true;
+  audioEl.playsInline = true; // iOS: keep playback inline and steady
 
   let pc = null, dc = null, micTrack = null, muted = true; // opens muted by design
+  // Half-duplex gate: while Scarlet speaks, the mic is hard-silenced so her own
+  // voice from the speaker can never reach the turn detector and cut her off —
+  // she always finishes a thought start to end. Reopens ~0.4s after she stops.
+  let micGated = false, gateTimer = null;
+  function setMicGate(on) {
+    clearTimeout(gateTimer);
+    if (on) {
+      micGated = true;
+      if (micTrack) micTrack.enabled = false;
+    } else {
+      gateTimer = setTimeout(() => {
+        micGated = false;
+        if (micTrack) micTrack.enabled = !muted;
+      }, 400);
+    }
+  }
 
   function setStatus(text, cls) {
     status.textContent = text;
@@ -1762,9 +1779,11 @@
       return;
     }
     if (ev.type === "output_audio_buffer.started") {
+      setMicGate(true);
       orbwrap.classList.add("speaking");
       if (!muted) setStatus("Scarlet is speaking…");
     } else if (ev.type === "output_audio_buffer.stopped" || ev.type === "output_audio_buffer.cleared") {
+      setMicGate(false);
       orbwrap.classList.remove("speaking");
       if (!muted) setStatus("Listening…");
     } else if (ev.type === "response.done" && ev.response && ev.response.output) {
@@ -1796,7 +1815,7 @@
       micTrack.enabled = !muted;
 
       pc = new RTCPeerConnection();
-      pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; };
+      pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; audioEl.play().catch(() => {}); };
       pc.addTrack(micTrack, ms);
       dc = pc.createDataChannel("oai-events");
       dc.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
@@ -1835,7 +1854,7 @@
   }
 
   function applyMute() {
-    if (micTrack) micTrack.enabled = !muted;
+    if (micTrack) micTrack.enabled = !muted && !micGated;
     muteBtn.classList.toggle("on", muted);
     muteBtn.textContent = muted ? "🔇" : "🎙";
     if (muted) setStatus("Muted — tap 🎙 when you're ready", "muted-note");
