@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#0b0507">
 <!-- Defense in depth: no plugins, no <base> hijacking, no foreign scripts. -->
 <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; script-src 'unsafe-inline'">
+<meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Scarlet</title>
@@ -1829,7 +1830,12 @@
       micTrack = ms.getAudioTracks()[0];
       micTrack.enabled = !muted;
 
-      pc = new RTCPeerConnection();
+      pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:global.stun.twilio.com:3478" },
+        ],
+      });
       pc.ontrack = (e) => { audioEl.srcObject = e.streams[0]; audioEl.play().catch(() => {}); };
       pc.addTrack(micTrack, ms);
       dc = pc.createDataChannel("oai-events");
