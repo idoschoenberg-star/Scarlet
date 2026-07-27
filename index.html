@@ -1115,7 +1115,15 @@
       return;
     }
     feed.innerHTML = "";
+    let junkDivider = false;
     for (const it of items) {
+      if (it.bucket === "junk" && !junkDivider) {
+        junkDivider = true;
+        const dv = document.createElement("div");
+        dv.style.cssText = "margin:18px 4px 8px;font-size:11px;letter-spacing:1px;color:#8a6a70;text-transform:uppercase;display:flex;align-items:center;gap:8px";
+        dv.innerHTML = '<span style="flex:1;height:1px;background:#3a2a2e"></span>Lower priority<span style="flex:1;height:1px;background:#3a2a2e"></span>';
+        feed.appendChild(dv);
+      }
       const m = sigMeta(it.source);
       const card = document.createElement("div");
       card.className = "sig" + (it.read_at ? " read" : "") + (it.acted_at ? " acted" : "");
