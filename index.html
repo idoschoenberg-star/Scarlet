@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#0b0507">
+<!-- Defense in depth: no plugins, no <base> hijacking, no foreign scripts. -->
+<meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; script-src 'unsafe-inline'">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Scarlet</title>
@@ -532,9 +534,21 @@
   let TOKEN = localStorage.getItem("scarletToken") || "";
   let SESSION_URL = "", APP_URL = "";
   function applyToken() {
-    SESSION_URL = API_BASE + "/realtime-session?s=" + TOKEN;
-    APP_URL = API_BASE + "/app-api?s=" + TOKEN;
+    // The token travels ONLY as a request header (injected below), never in the
+    // URL — so it can't land in server request logs. The "?v=2" keeps existing
+    // "&op=..." concatenations valid.
+    SESSION_URL = API_BASE + "/realtime-session?v=2";
+    APP_URL = API_BASE + "/app-api?v=2";
   }
+  // Inject the auth header on every call to our own API.
+  const _fetch = window.fetch.bind(window);
+  window.fetch = (url, opts) => {
+    if (typeof url === "string" && url.startsWith(API_BASE)) {
+      opts = opts || {};
+      opts.headers = Object.assign({}, opts.headers, { "x-scarlet-token": TOKEN });
+    }
+    return _fetch(url, opts);
+  };
 
   /* ============================================================
      TABS
