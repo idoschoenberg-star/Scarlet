@@ -520,6 +520,26 @@
     <button id="alarmStopBtn" style="font-size:19px;font-weight:600;padding:17px 58px;border:none;border-radius:999px;background:#ff5a6a;color:#fff;cursor:pointer">Stop</button>
   </div>
 
+  <!-- Drafting studio: the active draft floats above everything; Scarlet
+       updates it as Ido revises by voice; approval routes per channel. -->
+  <div id="draftWin" style="position:fixed;left:12px;right:12px;bottom:86px;z-index:60;display:none;
+       background:#1d1216;border:1px solid #5a3a42;border-radius:18px;box-shadow:0 12px 40px rgba(0,0,0,.55);
+       max-height:62vh;overflow:hidden;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:8px;padding:12px 14px 8px">
+      <span id="draftChip" style="font-size:11px;font-weight:700;letter-spacing:.4px;padding:3px 9px;border-radius:999px;background:#477EF0;color:#fff"></span>
+      <span id="draftTo" style="font-size:14px;color:#fdf3f4;font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+      <span id="draftRev" style="font-size:11px;color:#c9989c"></span>
+    </div>
+    <div id="draftSubj" style="padding:0 14px 6px;font-size:13px;color:#e8c9cd;font-weight:600"></div>
+    <div id="draftBody" dir="auto" style="padding:2px 14px 10px;font-size:15px;line-height:1.5;color:#fdf3f4;white-space:pre-wrap;overflow-y:auto;flex:1"></div>
+    <div id="draftOutcome" style="display:none;padding:8px 14px;font-size:13px;color:#7ee2a8;background:#12281a"></div>
+    <div id="draftBtns" style="display:flex;gap:8px;padding:10px 12px 12px">
+      <button id="draftApprove" style="flex:1;font-size:15px;font-weight:700;padding:12px;border:none;border-radius:12px;background:#2ea86b;color:#fff;cursor:pointer">Approve</button>
+      <button id="draftDismiss" style="font-size:15px;padding:12px 18px;border:none;border-radius:12px;background:#3a2a2e;color:#e8c9cd;cursor:pointer">Discard</button>
+    </div>
+    <div style="padding:0 14px 10px;font-size:11px;color:#9c7a80">Or just tell Scarlet what to change — the draft updates here.</div>
+  </div>
+
   <!-- image lightbox -->
   <div class="overlay" id="lightbox">
     <div class="ovhead"><div class="ovtitle" id="lbTitle"></div>
@@ -1062,7 +1082,7 @@
     if (!ok) return;
     dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
       content: [{ type: "input_text", text: sigContext(it) + "\n\nHis instruction: " + instruction +
-        "\n\nAct on it with the right tool (WhatsApp send, iMessage send, Teams draft, Outlook draft, or Gmail draft/send). Read the exact wording back and only send after he approves." }] } }));
+        "\n\nIf a reply/message is wanted, use compose_draft with the matching channel — the draft shows in his Draft window; do NOT read it aloud, just say it's on screen. Revise via revise_draft as he reacts; approve_draft only on his explicit approval." }] } }));
     dc.send(JSON.stringify({ type: "response.create" }));
   }
   async function talkSignal(it) {
@@ -1775,6 +1795,69 @@
     if (due) startRing(due);
   }, 5000);
   setInterval(fetchAlarms, 30000);
+
+  /* ============================================================
+     DRAFTING STUDIO — the floating draft window
+  ============================================================ */
+  const DRAFT_CH = {
+    email_outlook: { tag: "Amwell email", color: "#4a9fff", ok: "Save to Outlook Drafts" },
+    email_gmail:   { tag: "Gmail",        color: "#ea4335", ok: "Approve & Send" },
+    teams:         { tag: "Teams",        color: "#7b83eb", ok: "Approve & Stage" },
+    whatsapp:      { tag: "WhatsApp",     color: "#25d366", ok: "Approve & Send" },
+    imessage:      { tag: "iMessage",     color: "#0b93f6", ok: "Approve & Send" },
+  };
+  let draftCur = null, draftBusy = false;
+  function renderDraft(d) {
+    const win = document.getElementById("draftWin");
+    if (!d) { win.style.display = "none"; draftCur = null; return; }
+    const known = draftCur && draftCur.id === d.id && draftCur.revision === d.revision && draftCur.status === d.status;
+    draftCur = d;
+    if (known) return;
+    const ch = DRAFT_CH[d.channel] || { tag: d.channel, color: "#9c9c9c", ok: "Approve" };
+    document.getElementById("draftChip").textContent = ch.tag;
+    document.getElementById("draftChip").style.background = ch.color;
+    document.getElementById("draftTo").textContent = "To: " + (d.recipient || "");
+    document.getElementById("draftRev").textContent = "v" + d.revision;
+    const sj = document.getElementById("draftSubj");
+    sj.textContent = d.subject || ""; sj.style.display = d.subject ? "block" : "none";
+    document.getElementById("draftBody").textContent = d.body || "";
+    const done = d.status === "approved";
+    const oc = document.getElementById("draftOutcome");
+    oc.style.display = done ? "block" : "none";
+    oc.textContent = done ? ("✓ " + (d.outcome || "approved")) : "";
+    document.getElementById("draftBtns").style.display = done ? "none" : "flex";
+    document.getElementById("draftApprove").textContent = ch.ok;
+    win.style.display = "flex";
+  }
+  async function pollDraft() {
+    try {
+      const r = await fetch(APP_URL + "&op=draft_active");
+      const j = await r.json();
+      renderDraft(j.draft);
+    } catch (e) {}
+  }
+  document.getElementById("draftApprove").addEventListener("click", async () => {
+    if (!draftCur || draftBusy) return; draftBusy = true;
+    const btn = document.getElementById("draftApprove");
+    btn.disabled = true; btn.textContent = "Working…";
+    try {
+      await fetch(APP_URL + "&op=draft_action", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: draftCur.id, action: "approve" }) });
+    } catch (e) {}
+    btn.disabled = false; draftBusy = false; draftCur = null; pollDraft();
+  });
+  document.getElementById("draftDismiss").addEventListener("click", async () => {
+    if (!draftCur) return;
+    const id = draftCur.id;
+    renderDraft(null);
+    try {
+      await fetch(APP_URL + "&op=draft_action", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, action: "dismiss" }) });
+    } catch (e) {}
+  });
+  setInterval(pollDraft, 4000);
 
   function addMsg(cls, text) {
     const d = document.createElement("div");
