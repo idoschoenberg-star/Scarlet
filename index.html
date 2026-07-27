@@ -1821,8 +1821,9 @@
     mainBtn.disabled = true;
     setStatus("Waking her up…");
     try {
-      const tok = await (await fetch(SESSION_URL, { method: "POST" })).json();
-      if (!tok.client_secret) throw new Error(tok.error || "no session");
+      const tokResp = await fetch(SESSION_URL, { method: "POST" });
+      const tok = await tokResp.json().catch(() => ({}));
+      if (!tok.client_secret) throw new Error((tok.detail || tok.error || ("session " + tokResp.status)));
 
       const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
       micTrack = ms.getAudioTracks()[0];
@@ -1859,9 +1860,10 @@
       applyMute();
     } catch (e) {
       console.error(e);
-      setStatus(String(e).includes("Permission") || String(e).includes("NotAllowed")
+      const msg = String(e && e.message ? e.message : e);
+      setStatus(/Permission|NotAllowed/.test(msg)
         ? "Microphone permission is needed — allow it and try again."
-        : "Couldn't connect — tap Start again.");
+        : ("Couldn't connect — " + msg.slice(0, 80) + " · tap Start again."));
       cleanup();
     }
     mainBtn.disabled = false;
