@@ -302,6 +302,37 @@
   .rulecard .rq { flex:1; font-size:13.5px; color:#e8def6; unicode-bidi:plaintext; }
   .rulecard .rc { font-size:11px; color:#a99cc9; }
   .rulecard .rdel { border:none; background:rgba(255,255,255,.08); color:#c9b0b3; border-radius:9px; padding:6px 9px; cursor:pointer; font-size:12px; }
+  /* ── Today dashboard ── */
+  .tcard { margin:0 0 13px; border-radius:18px; padding:15px 16px; animation:fadein .3s ease;
+    background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08); }
+  .tlabel { font-size:11px; letter-spacing:.09em; text-transform:uppercase; color:#c9989c;
+    font-weight:600; margin-bottom:10px; }
+  .wxnow { display:flex; align-items:center; gap:16px; }
+  .wxtemp { font-size:44px; font-weight:200; color:#fdf3f4; line-height:1; }
+  .wxemoji { font-size:40px; }
+  .wxmeta { font-size:12px; color:#b99598; line-height:1.6; }
+  .wxchart { width:100%; height:auto; margin-top:12px; display:block; }
+  .tbullet { display:flex; gap:9px; margin:0 0 9px; font-size:14px; color:#eddcde; line-height:1.5;
+    unicode-bidi:plaintext; }
+  .tbullet .bsrc { flex:0 0 auto; font-size:9.5px; letter-spacing:.06em; text-transform:uppercase;
+    padding:3px 7px; border-radius:8px; align-self:flex-start; margin-top:2px;
+    background:rgba(255,199,206,.14); color:#e8b6bb; white-space:nowrap; }
+  .tnimg { width:100%; border-radius:13px; margin:10px 0 4px; max-height:220px; object-fit:cover; display:block; }
+  .tncap { font-size:11px; color:#a68184; margin-bottom:6px; }
+  .tstamp { font-size:10.5px; color:#8d6f72; margin-top:6px; text-align:center; }
+  .sigcount { display:inline-block; font-size:11.5px; padding:4px 9px; border-radius:10px; margin:0 5px 8px 0;
+    background:rgba(255,255,255,.06); color:#d8bfc2; border-left:3px solid var(--sc,#888); }
+  /* Reminder drag + edit */
+  .rem .rgrab { flex:0 0 auto; align-self:stretch; display:flex; align-items:center; padding:0 2px 0 8px;
+    color:#8d6f72; font-size:17px; cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
+  .rem.dragging { opacity:.92; transform:scale(1.02); box-shadow:0 12px 30px rgba(0,0,0,.5); z-index:5; position:relative; }
+  .rem .redit { border:none; border-radius:11px; padding:6px 12px; font-size:12.5px; cursor:pointer;
+    background:rgba(255,255,255,.08); color:#c9b0b3; }
+  .rem .editrow { display:flex; gap:7px; margin-top:9px; width:100%; }
+  .rem .editrow input { flex:1; border-radius:11px; border:1px solid rgba(255,150,160,.25);
+    background:rgba(0,0,0,.28); color:#f4e2e4; padding:8px 11px; font:inherit; font-size:14px; }
+  .rem .editrow button { border:none; border-radius:11px; padding:8px 13px; font-size:13px; cursor:pointer;
+    background:rgba(255,199,206,.22); color:#ffd9dd; }
   .gcard { position:relative; margin:0 0 16px; border-radius:22px; overflow:hidden;
     box-shadow:0 10px 34px rgba(0,0,0,.5); border:1px solid rgba(255,150,160,.14);
     cursor:zoom-in; animation:fadein .3s ease; }
@@ -428,6 +459,14 @@
     <div class="sigfeed" id="sigFeed"><div class="ovnote" style="margin-top:30px">Loading your signals…</div></div>
   </section>
 
+  <section class="view" id="viewToday">
+    <div class="chathead">
+      <div class="name">Today</div>
+      <div class="sub" id="todaySub">Your live morning dashboard</div>
+    </div>
+    <div class="sigfeed" id="todayFeed"><div class="ovnote" style="margin-top:30px">Building your day…</div></div>
+  </section>
+
   <section class="view" id="viewNotes">
     <div class="chathead">
       <div class="name">Notes &amp; Reminders</div>
@@ -456,6 +495,7 @@
   <!-- tab bar -->
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
+    <button class="tab" id="tabToday"><span class="ic">☀️</span>Today<span class="dot"></span></button>
     <button class="tab" id="tabSignals"><span class="ic">📥</span>Signals<span class="dot"></span></button>
     <button class="tab" id="tabNotes"><span class="ic">📝</span>Notes<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
@@ -491,16 +531,16 @@
   /* ============================================================
      TABS
   ============================================================ */
-  const views = { live: document.getElementById("viewLive"), signals: document.getElementById("viewSignals"),
-    notes: document.getElementById("viewNotes"),
+  const views = { live: document.getElementById("viewLive"), today: document.getElementById("viewToday"),
+    signals: document.getElementById("viewSignals"), notes: document.getElementById("viewNotes"),
     chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery") };
-  const tabs = { live: document.getElementById("tabLive"), signals: document.getElementById("tabSignals"),
-    notes: document.getElementById("tabNotes"),
+  const tabs = { live: document.getElementById("tabLive"), today: document.getElementById("tabToday"),
+    signals: document.getElementById("tabSignals"), notes: document.getElementById("tabNotes"),
     chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery") };
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
-    for (const k of ["live", "signals", "notes", "chat", "gallery"]) {
+    for (const k of ["live", "today", "signals", "notes", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
@@ -509,11 +549,13 @@
       scrollFeed(true);
       pollNow();
     }
+    if (name === "today") loadToday();
     if (name === "signals") { tabs.signals.classList.remove("unread"); loadSignals(); }
     if (name === "notes") loadNotesTab();
     if (name === "gallery") { if (galSub === "clips") loadClips(); else loadGallery(true); }
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
+  tabs.today.addEventListener("click", () => switchTab("today"));
   tabs.signals.addEventListener("click", () => switchTab("signals"));
   tabs.notes.addEventListener("click", () => switchTab("notes"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
@@ -1151,6 +1193,7 @@
       const card = document.createElement("div");
       const pc = it.priority ? prioClass(it.priority) : "med";
       card.className = "rem " + pc;
+      card.dataset.id = it.id;
       const when = remWhen(it);
       card.innerHTML =
         '<div class="rtop"><button class="rcheck" title="Complete"></button>' +
@@ -1161,7 +1204,9 @@
         '<button class="pchip" data-p="1">High</button>' +
         '<button class="pchip" data-p="5">Med</button>' +
         '<button class="pchip" data-p="9">Low</button>' +
-        '<button class="rtalk">🎤 Tell Scarlet</button></div></div></div>';
+        '<button class="redit">✏️</button>' +
+        '<button class="rtalk">🎤 Tell Scarlet</button></div></div>' +
+        '<div class="rgrab" title="Drag to reorder">≡</div></div>';
       card.querySelectorAll(".pchip").forEach((ch) => { if (Number(ch.dataset.p) === it.priority) ch.classList.add("on"); });
       card.querySelector(".rbody").addEventListener("click", (e) => {
         if (e.target.closest(".ract")) return;
@@ -1182,6 +1227,53 @@
           headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id, priority: p }) }); } catch (e) {}
       }));
       card.querySelector(".rtalk").addEventListener("click", () => talkReminder(it));
+      // Inline edit: swap the title for an input, save syncs to Apple Reminders.
+      card.querySelector(".redit").addEventListener("click", () => {
+        const body = card.querySelector(".rbody");
+        if (body.querySelector(".editrow")) return;
+        const row = document.createElement("div");
+        row.className = "editrow";
+        row.innerHTML = '<input value="' + esc(it.title || "") + '" dir="auto"><button>Save</button>';
+        body.appendChild(row);
+        const inp = row.querySelector("input"); inp.focus();
+        const save = async () => {
+          const t = inp.value.trim(); if (!t || t === it.title) { row.remove(); return; }
+          it.title = t; card.querySelector(".rtitle").textContent = t; row.remove();
+          try { await fetch(APP_URL + "&op=reminder_update", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id, title: t }) }); } catch (e) {}
+        };
+        row.querySelector("button").addEventListener("click", save);
+        inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") save(); });
+      });
+      // Drag the ≡ handle to move a reminder up/down; the new order persists.
+      const grab = card.querySelector(".rgrab");
+      grab.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        grab.setPointerCapture(e.pointerId);
+        card.classList.add("dragging");
+        const move = (ev) => {
+          const prev = card.previousElementSibling, next = card.nextElementSibling;
+          if (prev && prev.classList.contains("rem")) {
+            const r = prev.getBoundingClientRect();
+            if (ev.clientY < r.top + r.height / 2) { card.parentNode.insertBefore(card, prev); return; }
+          }
+          if (next && next.classList.contains("rem")) {
+            const r = next.getBoundingClientRect();
+            if (ev.clientY > r.top + r.height / 2) { card.parentNode.insertBefore(card, next.nextSibling); }
+          }
+        };
+        const up = async () => {
+          grab.removeEventListener("pointermove", move);
+          grab.removeEventListener("pointerup", up);
+          card.classList.remove("dragging");
+          const ids = [...card.parentNode.querySelectorAll(".rem")].map((el) => el.dataset.id);
+          reminders.sort((a, b) => ids.indexOf(a.id) - ids.indexOf(b.id));
+          try { await fetch(APP_URL + "&op=reminders_reorder", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) }); } catch (err) {}
+        };
+        grab.addEventListener("pointermove", move);
+        grab.addEventListener("pointerup", up);
+      });
       feed.appendChild(card);
     }
   }
@@ -1472,6 +1564,93 @@
   }
   // New clips land while the tab is open — refresh quietly.
   setInterval(() => { if (activeTab === "gallery" && galSub === "clips") loadClips(); }, 30000);
+
+  /* ============================================================
+     TODAY — live dashboard: weather (48h, °C), signals digest, news brief
+  ============================================================ */
+  const WMO = (c) => c === 0 ? "☀️" : c <= 2 ? "🌤" : c === 3 ? "☁️" : c <= 48 ? "🌫" : c <= 57 ? "🌦"
+    : c <= 67 ? "🌧" : c <= 77 ? "❄️" : c <= 82 ? "🌧" : c <= 86 ? "🌨" : "⛈";
+  function wxChart(h) {
+    const temps = h.temp || [], rains = h.rain || [], times = h.time || [], codes = h.code || [];
+    if (!temps.length) return "";
+    const min = Math.min(...temps), max = Math.max(...temps), span = Math.max(max - min, 2);
+    const X = (i) => 8 + i * (464 / Math.max(temps.length - 1, 1));
+    const Y = (t) => 88 - ((t - min) / span) * 58;
+    let s = '<svg class="wxchart" viewBox="0 0 480 150" xmlns="http://www.w3.org/2000/svg">';
+    // rain probability bars
+    for (let i = 0; i < rains.length; i++) {
+      const rh = (rains[i] || 0) * 0.28;
+      if (rh > 1) s += '<rect x="' + (X(i) - 3) + '" y="' + (128 - rh) + '" width="6" height="' + rh + '" rx="2" fill="rgba(90,150,255,.45)"/>';
+    }
+    // temperature curve
+    s += '<polyline fill="none" stroke="#ffb3ba" stroke-width="2.5" stroke-linecap="round" points="' +
+      temps.map((t, i) => X(i).toFixed(1) + "," + Y(t).toFixed(1)).join(" ") + '"/>';
+    // condition emojis every 6h + hour labels + midnight separators
+    for (let i = 0; i < temps.length; i += 6) {
+      s += '<text x="' + X(i) + '" y="16" font-size="13" text-anchor="middle">' + WMO(codes[i] || 0) + "</text>";
+      s += '<text x="' + X(i) + '" y="' + (Y(temps[i]) - 8) + '" font-size="10" fill="#f4d9db" text-anchor="middle">' + Math.round(temps[i]) + "°</text>";
+      const hh = (times[i] || "").slice(11, 16);
+      s += '<text x="' + X(i) + '" y="144" font-size="9" fill="#a68184" text-anchor="middle">' + hh + "</text>";
+    }
+    for (let i = 1; i < times.length; i++) {
+      if ((times[i] || "").slice(11, 16) === "00:00") {
+        s += '<line x1="' + X(i) + '" y1="8" x2="' + X(i) + '" y2="132" stroke="rgba(255,255,255,.14)" stroke-dasharray="3 4"/>';
+        const day = new Date(times[i]).toLocaleDateString([], { weekday: "short" });
+        s += '<text x="' + (X(i) + 4) + '" y="132" font-size="9.5" fill="#c9989c">' + day + "</text>";
+      }
+    }
+    return s + "</svg>";
+  }
+  async function loadToday() {
+    const feed = document.getElementById("todayFeed");
+    let d = null;
+    try { d = await (await fetch(APP_URL + "&op=today")).json(); } catch (e) {}
+    if (!d) { feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Couldn’t load — check the connection.</div>'; return; }
+    feed.innerHTML = "";
+    document.getElementById("todaySub").textContent = new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+    // ── Weather ──
+    const w = d.weather;
+    const wc = document.createElement("div"); wc.className = "tcard";
+    if (w && w.current) {
+      wc.innerHTML = '<div class="tlabel">Weather · next 48 hours</div>' +
+        '<div class="wxnow"><div class="wxtemp">' + Math.round(w.current.temperature_2m) + "°C</div>" +
+        '<div class="wxemoji">' + WMO(w.current.weather_code || 0) + "</div>" +
+        '<div class="wxmeta">Feels like ' + Math.round(w.current.apparent_temperature) + "°<br>" +
+        "Wind " + Math.round(w.current.wind_speed_10m) + ' km/h · Humidity ' + (w.current.relative_humidity_2m ?? "–") + "%</div></div>" +
+        wxChart(w.hourly || {});
+    } else { wc.innerHTML = '<div class="tlabel">Weather</div><div class="ovnote">Unavailable right now.</div>'; }
+    feed.appendChild(wc);
+    // ── Signals digest ──
+    const sg = document.createElement("div"); sg.className = "tcard";
+    const sig = (d.brief && d.brief.signals) || {};
+    let sh = '<div class="tlabel">Signals · last 12 hours</div>';
+    const counts = sig.counts || {};
+    const order = ["outlook_mail", "gmail", "whatsapp", "teams", "outlook_calendar"];
+    let any = false;
+    for (const k of order) {
+      if (counts[k]) { any = true; const m = sigMeta(k);
+        sh += '<span class="sigcount" style="--sc:' + m.color + '">' + m.tag + " · " + counts[k] + "</span>"; }
+    }
+    if (!any) sh += '<div class="ovnote">Quiet — nothing new reached you.</div>';
+    for (const b of (sig.bullets || [])) sh += '<div class="tbullet"><span>•</span><span>' + esc(b) + "</span></div>";
+    sg.innerHTML = sh; feed.appendChild(sg);
+    // ── News brief ──
+    const nc = document.createElement("div"); nc.className = "tcard";
+    const news = (d.brief && d.brief.news) || {};
+    let nh = '<div class="tlabel">The news · Ynet, Haaretz &amp; NYT</div>';
+    const imgs = news.images || [];
+    if (imgs[0]) nh += '<img class="tnimg" src="' + esc(imgs[0].url) + '" alt="">' +
+      (imgs[0].caption ? '<div class="tncap">' + esc(imgs[0].caption) + "</div>" : "");
+    for (const b of (news.bullets || [])) {
+      nh += '<div class="tbullet"><span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") + "</span></div>";
+    }
+    if (!(news.bullets || []).length) nh += '<div class="ovnote">' + (d.refreshing ? "Scarlet is writing your brief — check back in a minute." : "No news brief yet.") + "</div>";
+    if (imgs[1]) nh += '<img class="tnimg" src="' + esc(imgs[1].url) + '" alt="">' +
+      (imgs[1].caption ? '<div class="tncap">' + esc(imgs[1].caption) + "</div>" : "");
+    if (d.brief && d.brief.updated_at) nh += '<div class="tstamp">Brief written ' + relTime(d.brief.updated_at) + (d.refreshing ? " · refreshing now…" : "") + "</div>";
+    nc.innerHTML = nh; feed.appendChild(nc);
+  }
+  setInterval(() => { if (activeTab === "today") loadToday(); }, 10 * 60_000);
 
   function addMsg(cls, text) {
     const d = document.createElement("div");
