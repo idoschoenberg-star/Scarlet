@@ -570,12 +570,24 @@
   }
   // Inject the auth header on every call to our own API.
   const _fetch = window.fetch.bind(window);
-  window.fetch = (url, opts) => {
-    if (typeof url === "string" && url.startsWith(API_BASE)) {
+  let relocking = false;
+  window.fetch = async (url, opts) => {
+    const own = typeof url === "string" && url.startsWith(API_BASE);
+    if (own) {
       opts = opts || {};
       opts.headers = Object.assign({}, opts.headers, { "x-scarlet-token": TOKEN });
     }
-    return _fetch(url, opts);
+    const res = await _fetch(url, opts);
+    // Self-heal: a rejected/expired device key means this device must unlock
+    // again — clear it and show the code screen instead of failing silently.
+    if (own && res.status === 401 && !url.includes("op=unlock") && !relocking) {
+      relocking = true;
+      TOKEN = "";
+      localStorage.removeItem("scarletToken");
+      try { showLock(false); } catch (e) {}
+      setTimeout(() => { relocking = false; }, 4000);
+    }
+    return res;
   };
 
   /* ============================================================
