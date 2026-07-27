@@ -502,6 +502,14 @@
     <button class="tab" id="tabGallery"><span class="ic">🖼</span>Gallery<span class="dot"></span></button>
   </nav>
 
+  <!-- alarm ringing -->
+  <div id="alarmRing" style="position:fixed;inset:0;z-index:99;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(22,5,9,.97)">
+    <div style="font-size:66px;animation:pulse 1s infinite">⏰</div>
+    <div id="alarmRingLabel" style="font-size:25px;color:#fdf3f4;margin:16px 0 6px;text-align:center;padding:0 30px"></div>
+    <div id="alarmRingTime" style="font-size:15px;color:#c9989c;margin-bottom:38px"></div>
+    <button id="alarmStopBtn" style="font-size:19px;font-weight:600;padding:17px 58px;border:none;border-radius:999px;background:#ff5a6a;color:#fff;cursor:pointer">Stop</button>
+  </div>
+
   <!-- image lightbox -->
   <div class="overlay" id="lightbox">
     <div class="ovhead"><div class="ovtitle" id="lbTitle"></div>
@@ -1604,10 +1612,31 @@
   async function loadToday() {
     const feed = document.getElementById("todayFeed");
     let d = null;
-    try { d = await (await fetch(APP_URL + "&op=today")).json(); } catch (e) {}
+    const [dr] = await Promise.all([
+      fetch(APP_URL + "&op=today").then((r) => r.json()).catch(() => null),
+      fetchAlarms(),
+    ]);
+    d = dr;
     if (!d) { feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Couldn’t load — check the connection.</div>'; return; }
     feed.innerHTML = "";
     document.getElementById("todaySub").textContent = new Date().toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+    // ── Active alarms ──
+    if (alarmItems.length) {
+      const ac = document.createElement("div"); ac.className = "tcard";
+      let ah = '<div class="tlabel">⏰ Alarms</div>';
+      ac.innerHTML = ah;
+      for (const a of alarmItems) {
+        const row = document.createElement("div");
+        row.className = "tbullet"; row.style.alignItems = "center";
+        row.innerHTML = '<span style="flex:1">' +
+          esc(a.label || "Alarm") + ' · <b>' +
+          new Date(a.ring_at).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }) + "</b></span>" +
+          '<button class="rdel" style="border:none;background:rgba(255,255,255,.08);color:#c9b0b3;border-radius:9px;padding:6px 11px;cursor:pointer;font-size:12px">✕ Delete</button>';
+        row.querySelector("button").addEventListener("click", () => { dismissAlarm(a.id); row.remove(); });
+        ac.appendChild(row);
+      }
+      feed.appendChild(ac);
+    }
     // ── Weather ──
     const w = d.weather;
     const wc = document.createElement("div"); wc.className = "tcard";
@@ -1651,6 +1680,61 @@
     nc.innerHTML = nh; feed.appendChild(nc);
   }
   setInterval(() => { if (activeTab === "today") loadToday(); }, 10 * 60_000);
+
+  /* ============================================================
+     ALARMS — voice-set via Scarlet; ring here with a full-screen Stop
+  ============================================================ */
+  let alarmItems = [], ringingAlarm = null, ringTimer = null, audioCtx = null;
+  async function fetchAlarms() {
+    try {
+      const r = await fetch(APP_URL + "&op=alarms");
+      alarmItems = (await r.json()).alarms || [];
+    } catch (e) {}
+  }
+  function alarmBeep() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === "suspended") audioCtx.resume();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = "sine"; o.frequency.value = 880;
+      g.gain.setValueAtTime(0.55, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.42);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + 0.45);
+    } catch (e) {}
+    if (navigator.vibrate) navigator.vibrate(350);
+  }
+  function startRing(a) {
+    ringingAlarm = a;
+    document.getElementById("alarmRingLabel").textContent = a.label || "Alarm";
+    document.getElementById("alarmRingTime").textContent =
+      new Date(a.ring_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    document.getElementById("alarmRing").style.display = "flex";
+    alarmBeep();
+    ringTimer = setInterval(alarmBeep, 700);
+  }
+  async function dismissAlarm(id) {
+    alarmItems = alarmItems.filter((x) => x.id !== id);
+    try { await fetch(APP_URL + "&op=alarm_dismiss", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) }); } catch (e) {}
+    if (activeTab === "today") loadToday();
+  }
+  document.getElementById("alarmStopBtn").addEventListener("click", () => {
+    clearInterval(ringTimer);
+    document.getElementById("alarmRing").style.display = "none";
+    const a = ringingAlarm; ringingAlarm = null;
+    if (a) dismissAlarm(a.id);
+  });
+  setInterval(() => {
+    if (ringingAlarm) return;
+    const now = Date.now();
+    const due = alarmItems.find((a) => {
+      const t = new Date(a.ring_at).getTime();
+      return t <= now && now - t < 20 * 60_000;
+    });
+    if (due) startRing(due);
+  }, 5000);
+  setInterval(fetchAlarms, 30000);
 
   function addMsg(cls, text) {
     const d = document.createElement("div");
@@ -1929,6 +2013,7 @@
     applyToken();
     startPolling();
     loadSignals();
+    fetchAlarms(); // so a due alarm rings even if Today was never opened
     setInterval(loadSignals, 25000); // keeps the Signals list + unread dot fresh
     setTimeout(() => { if (!pc) start(); }, 300); // opens muted by design
   }
