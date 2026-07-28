@@ -534,6 +534,7 @@
       <button class="lockbtn" id="unlockBtn" style="display:none">Unlock</button>
       <button class="lockbtn alt" id="codeModeBtn" style="display:none">Use unlock code instead</button>
       <div class="lockerr" id="lockErr"></div>
+      <div id="lockVer" style="margin-top:16px;font-size:12px;letter-spacing:.4px;color:rgba(250,244,243,.35)"></div>
     </div>
   </div>
 
@@ -599,6 +600,30 @@
   // Ido's unlock code, kept in localStorage, and (when enrolled) released
   // only after Face ID.
   const API_BASE = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1";
+  // Build stamp + self-update: every copy of this page — however it was cached —
+  // periodically compares its BUILD against the freshly published source and
+  // reloads itself when a newer build exists. A stale copy can never stick.
+  const BUILD = "2026-07-29.1";
+  document.getElementById("lockVer").textContent = "build " + BUILD;
+  const _rawFetch = window.fetch.bind(window);
+  async function checkForUpdate() {
+    try {
+      const clean = location.href.split("#")[0].split("?")[0];
+      const res = await _rawFetch(clean + "?vchk=" + Date.now(), { cache: "reload" });
+      if (!res.ok) return;
+      const m = (await res.text()).match(/const BUILD = "([^"]+)"/);
+      if (!m || m[1] === BUILD) return;
+      // Never reload-loop, and never yank a live voice conversation.
+      const last = Number(sessionStorage.getItem("scarletReloadAt") || 0);
+      if (Date.now() - last < 60000) return;
+      if (typeof dc !== "undefined" && dc && dc.readyState === "open") return;
+      sessionStorage.setItem("scarletReloadAt", String(Date.now()));
+      location.replace(clean + "?v=" + Date.now());
+    } catch (e) {}
+  }
+  checkForUpdate();
+  setInterval(checkForUpdate, 10 * 60 * 1000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
   let TOKEN = localStorage.getItem("scarletToken") || "";
   let SESSION_URL = "", APP_URL = "";
   function applyToken() {
