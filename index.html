@@ -1138,10 +1138,14 @@
       card.className = "sig" + (it.read_at ? " read" : "") + (it.acted_at ? " acted" : "") + (sigOpen.has(it.id) ? " open" : "");
       card.style.setProperty("--sc", m.color);
       const draftable = !!DRAFT_SRC[it.source];
+      const emailish = it.source === "outlook_mail" || it.source === "gmail";
       card.innerHTML =
         '<div class="srow"><span class="stag">' + m.tag + "</span>" +
         '<span class="swho">' + esc(it.sender || m.tag) + "</span>" +
-        '<span class="swhen">' + relTime(it.received_at) + "</span></div>" +
+        '<span class="swhen">' + relTime(it.received_at) + "</span>" +
+        (emailish
+          ? '<button class="qarch" title="Archive in Outlook/Gmail" style="border:none;background:rgba(255,255,255,.07);color:#c9989c;border-radius:9px;padding:4px 9px;font-size:14px;cursor:pointer;margin-left:6px">🗄️</button>'
+          : "") + "</div>" +
         '<div class="sprev">' + esc(it.preview || "(no preview)") + "</div>" +
         '<div class="sigact">' +
         (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
@@ -1196,6 +1200,43 @@
         if (ok) { sigItems = sigItems.filter((x) => x.id !== it.id); renderSignals(); }
         else { btn.disabled = false; btn.textContent = "⚠️"; btn.title = "Archive failed — tap to retry"; }
       });
+      // One-tap archive from the list + Outlook-style swipe-left-to-archive.
+      // Both perform the REAL archive at the source (Outlook/Gmail).
+      async function archiveNow() {
+        let ok = true;
+        try {
+          const r = await fetch(APP_URL + "&op=inbox_archive", { method: "POST",
+            headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [it.id] }) });
+          const d = await r.json(); ok = d.ok !== false;
+        } catch (err) { ok = false; }
+        if (ok) { sigItems = sigItems.filter((x) => x.id !== it.id); sigOpen.delete(it.id); }
+        renderSignals();
+      }
+      const qarch = card.querySelector(".qarch");
+      if (qarch) qarch.addEventListener("click", (e) => {
+        e.stopPropagation(); qarch.textContent = "…"; qarch.disabled = true; archiveNow();
+      });
+      if (emailish) {
+        let sx = 0, sy = 0, dx = 0, swiping = false;
+        card.addEventListener("touchstart", (e) => {
+          if (e.target.closest(".sigact")) return;
+          sx = e.touches[0].clientX; sy = e.touches[0].clientY; dx = 0; swiping = true;
+          card.style.transition = "none";
+        }, { passive: true });
+        card.addEventListener("touchmove", (e) => {
+          if (!swiping) return;
+          dx = e.touches[0].clientX - sx;
+          const dy = e.touches[0].clientY - sy;
+          if (Math.abs(dy) > 30 && Math.abs(dy) > Math.abs(dx)) { swiping = false; card.style.transform = ""; return; }
+          if (dx < 0) { card.style.transform = "translateX(" + dx + "px)"; card.style.opacity = String(Math.max(0.35, 1 + dx / 300)); }
+        }, { passive: true });
+        card.addEventListener("touchend", () => {
+          if (!swiping) return; swiping = false;
+          card.style.transition = "transform .22s ease, opacity .22s ease";
+          if (dx < -90) { card.style.transform = "translateX(-110%)"; card.style.opacity = "0"; archiveNow(); }
+          else { card.style.transform = ""; card.style.opacity = "1"; }
+        });
+      }
       feed.appendChild(card);
     }
   }
