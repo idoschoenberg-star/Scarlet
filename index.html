@@ -537,7 +537,12 @@
       <button id="draftApprove" style="flex:1;font-size:15px;font-weight:700;padding:12px;border:none;border-radius:12px;background:#2ea86b;color:#fff;cursor:pointer">Approve</button>
       <button id="draftDismiss" style="font-size:15px;padding:12px 18px;border:none;border-radius:12px;background:#3a2a2e;color:#e8c9cd;cursor:pointer">Discard</button>
     </div>
-    <div style="padding:0 14px 10px;font-size:11px;color:#9c7a80">Or just tell Scarlet what to change — the draft updates here.</div>
+    <div id="draftRefineRow" style="display:flex;gap:8px;padding:0 12px 10px">
+      <input id="draftRefine" dir="auto" placeholder="Refine: tell her what to change…"
+        style="flex:1;font-size:14px;padding:10px 12px;border-radius:10px;border:1px solid #5a3a42;background:#140c0f;color:#fdf3f4">
+      <button id="draftRefineBtn" style="font-size:15px;padding:10px 16px;border:none;border-radius:10px;background:#3a2a2e;color:#e8c9cd;cursor:pointer">↻</button>
+    </div>
+    <div style="padding:0 14px 10px;font-size:11px;color:#9c7a80">Type above or just tell Scarlet by voice — the draft updates here.</div>
   </div>
 
   <!-- image lightbox -->
@@ -1048,6 +1053,10 @@
     graph:            { tag: "Update",   color: "#9c9c9c" },
   };
   let sigItems = [], sigFilter = "all";
+  // Cards Ido opened stay open across background refreshes — they collapse
+  // only when he taps them again, never on their own.
+  const sigOpen = new Set();
+  const DRAFT_SRC = { outlook_mail: "email_outlook", gmail: "email_gmail", whatsapp: "whatsapp", imessage: "imessage", teams: "teams" };
   const sigMeta = (s) => SIG[s] || { tag: s, color: "#9c9c9c" };
   const esc = (s) => (s || "").replace(/[&<>"]/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -1126,26 +1135,48 @@
       }
       const m = sigMeta(it.source);
       const card = document.createElement("div");
-      card.className = "sig" + (it.read_at ? " read" : "") + (it.acted_at ? " acted" : "");
+      card.className = "sig" + (it.read_at ? " read" : "") + (it.acted_at ? " acted" : "") + (sigOpen.has(it.id) ? " open" : "");
       card.style.setProperty("--sc", m.color);
+      const draftable = !!DRAFT_SRC[it.source];
       card.innerHTML =
         '<div class="srow"><span class="stag">' + m.tag + "</span>" +
         '<span class="swho">' + esc(it.sender || m.tag) + "</span>" +
         '<span class="swhen">' + relTime(it.received_at) + "</span></div>" +
         '<div class="sprev">' + esc(it.preview || "(no preview)") + "</div>" +
-        '<div class="sigact"><div class="row">' +
+        '<div class="sigact">' +
+        (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
+        '<div class="row">' +
         '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
         '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
         '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button>' +
         ((it.source === "outlook_mail" || it.source === "gmail")
           ? '<button class="sigbtn arch" title="Archive — really moves the email to Archive in Outlook/Gmail">🗄️</button>'
           : "") + "</div>" +
-        '<div class="sighint">She drafts it, reads it back, and you approve before anything sends.</div></div>';
+        '<div class="sighint">✍️ opens a first draft in your voice — refine it, then approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact")) return;
-        const wasOpen = card.classList.contains("open");
-        card.classList.toggle("open");
+        const wasOpen = sigOpen.has(it.id);
+        if (wasOpen) { sigOpen.delete(it.id); card.classList.remove("open"); }
+        else { sigOpen.add(it.id); card.classList.add("open"); }
         if (!wasOpen && !it.read_at) { it.read_at = new Date().toISOString(); card.classList.add("read"); markSig([it.id], "inbox_read"); }
+      });
+      const draftBtn = card.querySelector(".draft");
+      if (draftBtn) draftBtn.addEventListener("click", async (e) => {
+        const btn = e.currentTarget; btn.disabled = true; btn.textContent = "✍️ Drafting…";
+        const extra = card.querySelector("textarea").value.trim();
+        try {
+          await fetch(APP_URL + "&op=draft_compose", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              channel: DRAFT_SRC[it.source], recipient: it.sender || "",
+              original: it.preview || "",
+              instruction: extra || "Draft the appropriate reply.",
+            }) });
+          if (!it.acted_at) { it.acted_at = new Date().toISOString(); markSig([it.id], "inbox_acted"); }
+          btn.textContent = "✍️ Draft is up ↓";
+          pollDraft();
+        } catch (err) { btn.textContent = "Failed — try again"; }
+        setTimeout(() => { btn.disabled = false; btn.textContent = "✍️ Draft reply"; }, 4000);
       });
       const ta = card.querySelector("textarea");
       ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 120) + "px"; });
@@ -1574,12 +1605,26 @@
         const blob = off ? await idbGet(it.id) : null;
         const src = blob ? URL.createObjectURL(blob) : it.url;
         if (!src) return;
+        const wrap = document.createElement("div");
+        wrap.style.position = "relative";
         const v = document.createElement("video");
         v.controls = true; v.autoplay = true; v.playsInline = true; v.src = src;
+        v.style.width = "100%"; v.style.display = "block"; v.style.borderRadius = "12px";
         v.addEventListener("ended", () => {
           fetch(APP_URL + "&op=clip_played", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id }) }).catch(() => {});
         }, { once: true });
-        thumb.replaceWith(v);
+        // Real fullscreen — iPhone uses the video element's own method.
+        const fs = document.createElement("button");
+        fs.textContent = "⛶";
+        fs.title = "Full screen";
+        fs.style.cssText = "position:absolute;top:8px;right:8px;z-index:2;font-size:18px;padding:6px 10px;border:none;border-radius:10px;background:rgba(0,0,0,.55);color:#fff;cursor:pointer";
+        fs.addEventListener("click", (e) => {
+          e.stopPropagation();
+          if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();
+          else if (v.requestFullscreen) v.requestFullscreen();
+        });
+        wrap.appendChild(v); wrap.appendChild(fs);
+        thumb.replaceWith(wrap);
       });
       card.querySelector(".save").addEventListener("click", async (e) => {
         const btn = e.currentTarget;
@@ -1650,8 +1695,14 @@
     if (activeTab === "gallery" && galSub === "clips") renderClips();
     return JSON.stringify({ deleted: gone.length, titles: gone });
   }
-  // New clips land while the tab is open — refresh quietly.
-  setInterval(() => { if (activeTab === "gallery" && galSub === "clips") loadClips(); }, 30000);
+  // New clips land while the tab is open — refresh quietly. NEVER while a
+  // video element is on screen: rebuilding the list would kill playback
+  // mid-clip (this was the "clips get cut off" bug).
+  setInterval(() => {
+    if (activeTab !== "gallery" || galSub !== "clips") return;
+    if (document.querySelector("#clipFeed video")) return;
+    loadClips();
+  }, 30000);
 
   /* ============================================================
      TODAY — live dashboard: weather (48h, °C), signals digest, news brief
@@ -1846,6 +1897,7 @@
     oc.style.display = done ? "block" : "none";
     oc.textContent = done ? ("✓ " + (d.outcome || "approved")) : "";
     document.getElementById("draftBtns").style.display = done ? "none" : "flex";
+    document.getElementById("draftRefineRow").style.display = done ? "none" : "flex";
     document.getElementById("draftApprove").textContent = ch.ok;
     win.style.display = "flex";
   }
@@ -1867,6 +1919,24 @@
     } catch (e) {}
     btn.disabled = false; draftBusy = false; draftCur = null; pollDraft();
   });
+  async function draftRefineSend() {
+    const inp = document.getElementById("draftRefine");
+    const t = inp.value.trim();
+    if (!t || !draftCur || draftBusy) return;
+    draftBusy = true;
+    const btn = document.getElementById("draftRefineBtn");
+    btn.textContent = "…"; inp.disabled = true;
+    try {
+      await fetch(APP_URL + "&op=draft_action", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: draftCur.id, action: "revise", instruction: t }) });
+      inp.value = "";
+    } catch (e) {}
+    btn.textContent = "↻"; inp.disabled = false; draftBusy = false;
+    pollDraft();
+  }
+  document.getElementById("draftRefineBtn").addEventListener("click", draftRefineSend);
+  document.getElementById("draftRefine").addEventListener("keydown", (e) => { if (e.key === "Enter") draftRefineSend(); });
   document.getElementById("draftDismiss").addEventListener("click", async () => {
     if (!draftCur) return;
     const id = draftCur.id;
