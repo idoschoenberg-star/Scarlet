@@ -385,6 +385,41 @@
   .lockbtn.alt { background:rgba(255,255,255,.08); border:1px solid rgba(255,150,160,.25);
     box-shadow:none; color:#ffc7ce; }
   .lockerr { min-height:18px; font-size:12.5px; color:#e8b04b; }
+
+  /* ================= ido1 — Apple-inspired design system =================
+     Larger, calmer, layered. One set of tokens; every surface obeys them. */
+  :root {
+    --i1-ink:#faf4f3; --i1-sub:#cdb4b6; --i1-faint:#9b8285;
+    --i1-card:rgba(255,255,255,.05); --i1-line:rgba(255,255,255,.08);
+    --i1-r:18px; --i1-r-sm:12px;
+  }
+  body { font-size:16.5px; letter-spacing:.01em; }
+  h1,h2,h3 { letter-spacing:.02em; }
+  /* Readability: primary text bigger and brighter across cards */
+  .sprev, .nbody, .rbody, .cliptitle { font-size:16px !important; line-height:1.6 !important; color:var(--i1-ink) !important; }
+  .swho { font-size:16px !important; font-weight:650 !important; color:var(--i1-ink) !important; }
+  .swhen, .clipmeta, .sighint, .rc { font-size:12.5px !important; color:var(--i1-faint) !important; }
+  .stag { font-size:11px !important; font-weight:700 !important; letter-spacing:.06em; }
+  /* Cards: one glassy language everywhere */
+  .sig, .note, .rem, .clip, .rulecard, .compose {
+    background:var(--i1-card) !important; border:1px solid var(--i1-line) !important;
+    border-radius:var(--i1-r) !important; backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+    box-shadow:0 6px 24px rgba(0,0,0,.25);
+  }
+  .sig { padding:15px 16px !important; margin-bottom:10px !important; }
+  /* Touch targets & controls: comfortable, uniform */
+  .sigbtn, .cbtn, .fchip, button.rdel {
+    border-radius:var(--i1-r-sm) !important; font-size:15px !important;
+    min-height:44px; padding:11px 14px !important;
+  }
+  .fchip { min-height:38px; padding:8px 14px !important; font-size:13.5px !important; }
+  input, textarea, select { font-size:16px !important; border-radius:var(--i1-r-sm) !important; padding:12px 14px !important; }
+  /* Tab bar: quieter labels, clearer active state */
+  .tab { font-size:10.5px; letter-spacing:.12em; }
+  .tab .ic { font-size:23px; }
+  .tab.active { background:rgba(255,255,255,.08); }
+  .nsectlabel { font-size:11.5px !important; letter-spacing:.16em !important; color:var(--i1-faint) !important; margin:18px 4px 10px; }
+
 </style>
 </head>
 <body>
