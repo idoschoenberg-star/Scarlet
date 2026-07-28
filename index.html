@@ -1142,10 +1142,7 @@
       card.innerHTML =
         '<div class="srow"><span class="stag">' + m.tag + "</span>" +
         '<span class="swho">' + esc(it.sender || m.tag) + "</span>" +
-        '<span class="swhen">' + relTime(it.received_at) + "</span>" +
-        (emailish
-          ? '<button class="qarch" title="Archive in Outlook/Gmail" style="border:none;background:rgba(255,255,255,.07);color:#c9989c;border-radius:9px;padding:4px 9px;font-size:14px;cursor:pointer;margin-left:6px">🗄️</button>'
-          : "") + "</div>" +
+        '<span class="swhen">' + relTime(it.received_at) + "</span></div>" +
         '<div class="sprev">' + esc(it.preview || "(no preview)") + "</div>" +
         '<div class="sigact">' +
         (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
