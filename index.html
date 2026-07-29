@@ -755,7 +755,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.15";
+  const BUILD = "2026-07-29.16";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1407,7 +1407,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           channel: DRAFT_SRC[it.source], recipient: it.sender || "",
-          original: it.preview || "",
+          original: it.preview || "", event_id: it.id,
           instruction: extra || "Draft the appropriate reply.",
         }) });
       if (!it.acted_at) { it.acted_at = new Date().toISOString(); markSig([it.id], "inbox_acted"); }
@@ -1450,7 +1450,8 @@
   const sigContext = (it) => {
     const m = sigMeta(it.source);
     return "Ido is looking at this " + m.tag + " notification" +
-      (it.sender ? " from " + it.sender : "") + ':\n"' + (it.preview || "") + '"';
+      (it.sender ? " from " + it.sender : "") + ':\n"' + (it.preview || "") + '"' +
+      "\n(signal_id: " + it.id + " — when drafting an email reply to THIS message, pass original_event_id: " + it.id + " to compose_draft so the reply carries all recipients)";
   };
   async function ensureLive() {
     // Ido chose to talk — an active mute must never swallow his voice.
@@ -1814,7 +1815,7 @@
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               channel: DRAFT_SRC[it.source], recipient: it.sender || "",
-              original: it.preview || "",
+              original: it.preview || "", event_id: it.id,
               instruction: extra || "Draft the appropriate reply.",
             }) });
           if (!it.acted_at) { it.acted_at = new Date().toISOString(); markSig([it.id], "inbox_acted"); }
@@ -3094,7 +3095,12 @@
     if (localStorage.getItem("scarletCredId")) { showLock(true); return; }
     boot();
   });
-  muteBtn.addEventListener("click", () => { muted = !muted; applyMute(); });
+  // Unmuting IS the intent to talk: if the voice line isn't up yet (the app
+  // opens muted and idle), tapping 🎙 also starts it.
+  muteBtn.addEventListener("click", () => {
+    muted = !muted; applyMute();
+    if (!muted && !pc) start();
+  });
   // Stop button: cut off a long/misguided reply without touching the mic.
   // Cancels the model's response and clears whatever audio is still buffered,
   // then hands the turn straight back to Ido.
