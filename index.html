@@ -644,9 +644,12 @@
 
   <!-- ================= LIVE ================= -->
   <section class="view active" id="viewLive">
-    <header>
+    <header style="position:relative">
       <div class="wordmark">Scarlet</div>
       <div class="tag">שלך. תמיד מקשיבה — רק כשתרצה.</div>
+      <button id="settingsBtn" title="Settings" style="position:absolute;top:0;right:14px;width:40px;height:40px;
+        border-radius:50%;background:rgba(255,255,255,.07);border:1px solid rgba(255,150,160,.18);
+        color:#e8c9cc;font-size:18px">⚙️</button>
     </header>
     <main>
       <div class="orbwrap" id="orbwrap">
@@ -824,6 +827,24 @@
   <div id="deskHint"><div class="dhmark">📬</div><div>Select a signal to read it here.<br>Use ↑ ↓ to move, Enter to open.</div></div>
   <div id="deskKeys">↑ ↓ move · Enter open · E archive · Esc close</div>
 
+  <!-- ================= SETTINGS =================
+       Extensible preferences page. Each setting persists in localStorage via
+       scSet/scGet and applies on the next voice session. -->
+  <div class="overlay" id="settingsWin">
+    <div class="ovhead"><div class="ovtitle" style="font-size:16px;font-weight:700">Settings</div>
+      <button class="ovbtn" id="settingsClose">✕</button></div>
+    <div style="flex:1;overflow-y:auto;padding:6px 18px 40px;max-width:560px;width:100%;margin:0 auto">
+      <div class="nsectlabel" style="margin-top:14px">Voice engine</div>
+      <div id="setEngine"></div>
+      <div class="nsectlabel" style="margin-top:22px">Her voice <span id="setVoiceNote" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+      <div id="setVoices"><div class="ovnote">Pick the ElevenLabs engine to choose a voice.</div></div>
+      <div style="margin-top:26px;font-size:12.5px;color:#9b8285;line-height:1.6">
+        Changes apply the next time you start a voice conversation.<br>
+        More settings will appear here over time.
+      </div>
+    </div>
+  </div>
+
   <!-- image lightbox -->
   <div class="overlay" id="lightbox">
     <div class="ovhead"><div class="ovtitle" id="lbTitle"></div>
@@ -862,7 +883,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.20";
+  const BUILD = "2026-07-29.21";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -876,6 +897,7 @@
       const last = Number(sessionStorage.getItem("scarletReloadAt") || 0);
       if (Date.now() - last < 60000) return;
       if (typeof dc !== "undefined" && dc && dc.readyState === "open") return;
+      if (typeof xiWs !== "undefined" && xiWs && xiWs.readyState === 1) return;
       sessionStorage.setItem("scarletReloadAt", String(Date.now()));
       location.replace(clean + "?v=" + Date.now());
     } catch (e) {}
@@ -884,13 +906,14 @@
   setInterval(checkForUpdate, 10 * 60 * 1000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) checkForUpdate(); });
   let TOKEN = localStorage.getItem("scarletToken") || "";
-  let SESSION_URL = "", APP_URL = "";
+  let SESSION_URL = "", APP_URL = "", ELEVEN_URL = "";
   function applyToken() {
     // The token travels ONLY as a request header (injected below), never in the
     // URL — so it can't land in server request logs. The "?v=2" keeps existing
     // "&op=..." concatenations valid.
     SESSION_URL = API_BASE + "/realtime-session?v=2";
     APP_URL = API_BASE + "/app-api?v=2";
+    ELEVEN_URL = API_BASE + "/eleven-session?v=2";
   }
   // Inject the auth header on every call to our own API.
   const _fetch = window.fetch.bind(window);
@@ -1335,6 +1358,30 @@
   audioEl.playsInline = true; // iOS: keep playback inline and steady
 
   let pc = null, dc = null, micTrack = null, muted = true; // opens muted by design
+  // ElevenLabs engine state (premium voice; raw WebSocket + PCM — the page's
+  // CSP forbids external SDKs, so the protocol is implemented inline).
+  let xiWs = null, xiCtx = null, xiProc = null, xiSrcNode = null, xiStream = null;
+  let xiNextT = 0, xiPlaying = [], xiOutRate = 16000, xiSpeakTimer = null;
+  const voiceOpen = () => !!((dc && dc.readyState === "open") || (xiWs && xiWs.readyState === 1));
+  // Unified "talk to her" layer: every feature speaks through these two, and
+  // they route to whichever engine is live.
+  function sendHerText(text) {            // user message that wants a spoken reply
+    if (dc && dc.readyState === "open") {
+      dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+        content: [{ type: "input_text", text }] } }));
+      dc.send(JSON.stringify({ type: "response.create" }));
+    } else if (xiWs && xiWs.readyState === 1) {
+      xiWs.send(JSON.stringify({ type: "user_message", text }));
+    }
+  }
+  function sendHerContext(text) {         // background info; no reply requested
+    if (dc && dc.readyState === "open") {
+      dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
+        content: [{ type: "input_text", text }] } }));
+    } else if (xiWs && xiWs.readyState === 1) {
+      xiWs.send(JSON.stringify({ type: "contextual_update", text }));
+    }
+  }
   // Half-duplex gate: while Scarlet speaks, the mic is hard-silenced so her own
   // voice from the speaker can never reach the turn detector and cut her off —
   // she always finishes a thought start to end. Reopens ~0.4s after she stops.
@@ -1568,10 +1615,10 @@
   async function ensureLive() {
     // Ido chose to talk — an active mute must never swallow his voice.
     if (muted) { muted = false; applyMute(); }
-    if (dc && dc.readyState === "open") return true;
+    if (voiceOpen()) return true;
     await start();
-    for (let i = 0; i < 40 && !(dc && dc.readyState === "open"); i++) await new Promise((r) => setTimeout(r, 150));
-    return !!(dc && dc.readyState === "open");
+    for (let i = 0; i < 40 && !voiceOpen(); i++) await new Promise((r) => setTimeout(r, 150));
+    return voiceOpen();
   }
   // Dictate-in-place: every text box that talks to Scarlet has a 🎙 that
   // transcribes speech straight into the field — no jumping to the Live tab.
@@ -1593,20 +1640,16 @@
     switchTab("chat");
     const ok = await ensureLive();
     if (!ok) return;
-    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
-      content: [{ type: "input_text", text: sigContext(it) + "\n\nHis instruction: " + instruction +
-        "\n\nIf a reply/message is wanted, use compose_draft with the matching channel — the draft shows in his Draft window; do NOT read it aloud, just say it's on screen. Revise via revise_draft as he reacts; approve_draft only on his explicit approval." }] } }));
-    dc.send(JSON.stringify({ type: "response.create" }));
+    sendHerText(sigContext(it) + "\n\nHis instruction: " + instruction +
+      "\n\nIf a reply/message is wanted, use compose_draft with the matching channel — the draft shows in his Draft window; do NOT read it aloud, just say it's on screen. Revise via revise_draft as he reacts; approve_draft only on his explicit approval.");
   }
   async function talkSignal(it) {
     if (!it.read_at) { it.read_at = new Date().toISOString(); markSig([it.id], "inbox_read"); }
     switchTab("live");
     const ok = await ensureLive();
     if (!ok) return;
-    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
-      content: [{ type: "input_text", text: sigContext(it) +
-        "\n\nHe's about to tell you by voice what to do with it. Briefly acknowledge you see it, then wait for his instruction." }] } }));
-    dc.send(JSON.stringify({ type: "response.create" }));
+    sendHerText(sigContext(it) +
+      "\n\nHe's about to tell you by voice what to do with it. Briefly acknowledge you see it, then wait for his instruction.");
   }
   /* ---------- Channel-native views: each channel mirrors its real app ----- */
   const chan = { mode: "list", chat: null, timer: null };
@@ -2198,11 +2241,9 @@
   async function talkReminder(it) {
     switchTab("live");
     const ok = await ensureLive(); if (!ok) return;
-    dc.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user",
-      content: [{ type: "input_text", text: 'Ido is looking at this reminder: "' + (it.title || "") + '"' +
-        (it.notes ? " (notes: " + it.notes + ")" : "") +
-        ".\n\nHe's about to tell you by voice what to do with it — reschedule it, change it, add detail, or act on it. Briefly acknowledge, then listen." }] } }));
-    dc.send(JSON.stringify({ type: "response.create" }));
+    sendHerText('Ido is looking at this reminder: "' + (it.title || "") + '"' +
+      (it.notes ? " (notes: " + it.notes + ")" : "") +
+      ".\n\nHe's about to tell you by voice what to do with it — reschedule it, change it, add detail, or act on it. Briefly acknowledge, then listen.");
   }
   function renderReminders() {
     const feed = document.getElementById("notesFeed");
@@ -2948,8 +2989,241 @@
     }
   }
 
+  /* ============================================================
+     SETTINGS — extensible preferences (voice engine, voice, …)
+  ============================================================ */
+  const scGet = (k, d) => { try { return localStorage.getItem("scarlet_" + k) ?? d; } catch (e) { return d; } };
+  const scSet = (k, v) => { try { localStorage.setItem("scarlet_" + k, v); } catch (e) {} };
+  const ENGINES = [
+    { id: "openai", name: "Classic", desc: "OpenAI realtime — fast and reliable" },
+    { id: "eleven", name: "Premium · ElevenLabs", desc: "The most human voice — emotional, warm (beta)" },
+  ];
+  let prevAudio = null;
+  function renderSettings() {
+    const eng = scGet("engine", "openai");
+    const engEl = document.getElementById("setEngine");
+    engEl.innerHTML = "";
+    for (const e of ENGINES) {
+      const b = document.createElement("button");
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:0 0 8px;padding:13px 14px;" +
+        "border-radius:14px;border:1px solid rgba(255,150,160," + (eng === e.id ? ".55" : ".16") + ");" +
+        "background:rgba(255,199,206," + (eng === e.id ? ".16" : ".04") + ");color:#f5e9e7;font:inherit";
+      b.innerHTML = '<div style="font-size:15.5px;font-weight:650">' + (eng === e.id ? "● " : "○ ") + e.name +
+        '</div><div style="font-size:12.5px;color:#c9a2a4;margin-top:2px">' + e.desc + "</div>";
+      b.addEventListener("click", () => { scSet("engine", e.id); renderSettings(); });
+      engEl.appendChild(b);
+    }
+    renderVoices();
+  }
+  async function renderVoices() {
+    const el = document.getElementById("setVoices");
+    if (scGet("engine", "openai") !== "eleven") {
+      el.innerHTML = '<div class="ovnote" style="text-align:left;padding:8px 2px">Pick the ElevenLabs engine to choose a voice.</div>';
+      return;
+    }
+    el.innerHTML = '<div class="ovnote" style="text-align:left;padding:8px 2px">Loading voices…</div>';
+    try {
+      const r = await fetch(ELEVEN_URL + "&voices=1");
+      const d = await r.json();
+      const cur = scGet("voice11", d.current || "");
+      el.innerHTML = "";
+      for (const v of d.voices || []) {
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex;align-items:center;gap:9px;margin:0 0 8px";
+        const b = document.createElement("button");
+        b.style.cssText = "flex:1;text-align:left;padding:12px 14px;border-radius:14px;font:inherit;color:#f5e9e7;" +
+          "border:1px solid rgba(255,150,160," + (cur === v.id ? ".55" : ".16") + ");" +
+          "background:rgba(255,199,206," + (cur === v.id ? ".16" : ".04") + ")";
+        b.innerHTML = '<div style="font-size:15px;font-weight:650">' + (cur === v.id ? "● " : "○ ") + esc(v.name) +
+          (v.desc ? '</div><div style="font-size:12px;color:#c9a2a4;margin-top:2px">' + esc(v.desc) + "</div>" : "</div>");
+        b.addEventListener("click", async () => {
+          scSet("voice11", v.id);
+          renderVoices();
+          // Tell the server so the agent speaks with this voice from now on.
+          fetch(ELEVEN_URL + "&setvoice=" + encodeURIComponent(v.id), { method: "POST" }).catch(() => {});
+        });
+        row.appendChild(b);
+        if (v.preview) {
+          const p = document.createElement("button");
+          p.style.cssText = "width:44px;height:44px;border-radius:50%;border:1px solid rgba(255,150,160,.25);" +
+            "background:rgba(255,255,255,.07);color:#ffd9dd;font-size:16px;flex:none";
+          p.textContent = "▶";
+          p.addEventListener("click", () => {
+            if (prevAudio) { prevAudio.pause(); prevAudio = null; }
+            prevAudio = new Audio(v.preview);
+            prevAudio.play().catch(() => {});
+          });
+          row.appendChild(p);
+        }
+        el.appendChild(row);
+      }
+      if (!(d.voices || []).length) el.innerHTML = '<div class="ovnote" style="text-align:left;padding:8px 2px">No voices yet — they’re being prepared.</div>';
+    } catch (e) {
+      el.innerHTML = '<div class="ovnote" style="text-align:left;padding:8px 2px">Couldn’t load voices — try again in a moment.</div>';
+    }
+  }
+  document.getElementById("settingsBtn").addEventListener("click", () => {
+    document.getElementById("settingsWin").classList.add("on");
+    renderSettings();
+  });
+  document.getElementById("settingsClose").addEventListener("click", () => {
+    document.getElementById("settingsWin").classList.remove("on");
+    if (prevAudio) { prevAudio.pause(); prevAudio = null; }
+  });
+
+  function showLiveUI(engine) {
+    mainBtn.textContent = "End";
+    mainBtn.classList.add("live");
+    muteBtn.style.display = "flex";
+    chatBtn.style.display = "flex";
+    // Vision (photos + live camera) rides the OpenAI engine only.
+    camBtn.style.display = engine === "eleven" ? "none" : "flex";
+    liveBtn.style.display = engine === "eleven" ? "none" : "flex";
+    fileBtn.style.display = "flex";
+    document.body.classList.add("showchat");
+    chatBtn.classList.add("on");
+    applyMute();
+  }
+
+  /* ---- ElevenLabs live call: raw WS + PCM in both directions ---- */
+  function xiFlush() {
+    for (const src of xiPlaying.splice(0)) { try { src.stop(); } catch (e) {} }
+    xiNextT = 0;
+    clearTimeout(xiSpeakTimer);
+    orbwrap.classList.remove("speaking");
+    document.body.classList.remove("sc-speaking");
+    setMicGate(false);
+    if (!muted && voiceOpen()) setStatus("Listening…");
+  }
+  function xiSpeakingCheck() {
+    clearTimeout(xiSpeakTimer);
+    if (!xiCtx) return;
+    const remain = xiNextT - xiCtx.currentTime;
+    if (remain > 0.05) { xiSpeakTimer = setTimeout(xiSpeakingCheck, Math.min(remain * 1000 + 100, 1500)); return; }
+    orbwrap.classList.remove("speaking");
+    document.body.classList.remove("sc-speaking");
+    setMicGate(false);
+    if (!muted && voiceOpen()) setStatus("Listening…");
+  }
+  function xiPlay(b64) {
+    if (!xiCtx) return;
+    const bin = atob(b64);
+    const n = bin.length >> 1;
+    const f32 = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = (bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8)) << 16 >> 16;
+      f32[i] = v / 32768;
+    }
+    const buf = xiCtx.createBuffer(1, n, xiOutRate);
+    buf.getChannelData(0).set(f32);
+    const src = xiCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(xiCtx.destination);
+    const t = Math.max(xiCtx.currentTime + 0.08, xiNextT);
+    src.start(t);
+    xiNextT = t + buf.duration;
+    xiPlaying.push(src);
+    src.onended = () => { const i = xiPlaying.indexOf(src); if (i >= 0) xiPlaying.splice(i, 1); };
+    orbwrap.classList.add("speaking");
+    document.body.classList.add("sc-speaking");
+    setMicGate(true);
+    if (!muted) setStatus("Scarlet is speaking…");
+    xiSpeakingCheck();
+  }
+  function xiEvent(ev) {
+    const t = ev.type;
+    if (t === "conversation_initiation_metadata") {
+      const m = String((ev.conversation_initiation_metadata_event || {}).agent_output_audio_format || "pcm_16000").match(/(\d{4,6})/);
+      if (m) xiOutRate = Number(m[1]);
+      return;
+    }
+    if (t === "audio") {
+      const a = ev.audio_event;
+      if (a && a.audio_base_64) xiPlay(a.audio_base_64);
+      return;
+    }
+    if (t === "agent_response") {
+      const x = ev.agent_response_event;
+      if (x && x.agent_response) { herLine = null; addMsg("her", x.agent_response.trim()); }
+      return;
+    }
+    if (t === "user_transcript") {
+      const x = ev.user_transcription_event;
+      if (x && x.user_transcript && x.user_transcript.trim()) addMsg("you", x.user_transcript.trim());
+      return;
+    }
+    if (t === "client_tool_call") {
+      const c = ev.client_tool_call || {};
+      callTool(c.tool_name, c.parameters || {}).then((out) => {
+        if (xiWs && xiWs.readyState === 1) {
+          xiWs.send(JSON.stringify({ type: "client_tool_result", tool_call_id: c.tool_call_id,
+            result: String(out).slice(0, 30000), is_error: false }));
+        }
+      });
+      return;
+    }
+    if (t === "interruption") { xiFlush(); return; }
+    if (t === "ping") {
+      const pev = ev.ping_event;
+      if (xiWs && xiWs.readyState === 1) xiWs.send(JSON.stringify({ type: "pong", event_id: pev && pev.event_id }));
+      return;
+    }
+  }
+  async function startEleven() {
+    mainBtn.disabled = true;
+    setStatus("Waking her up…");
+    try {
+      const r = await fetch(ELEVEN_URL, { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!d.signed_url) throw new Error(d.error || ("session " + r.status));
+
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      xiStream = ms;
+      micTrack = ms.getAudioTracks()[0];
+      micTrack.enabled = !muted;
+
+      xiCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await xiCtx.resume().catch(() => {});
+      xiSrcNode = xiCtx.createMediaStreamSource(ms);
+      xiProc = xiCtx.createScriptProcessor(4096, 1, 1);
+      const inRate = xiCtx.sampleRate;
+      xiProc.onaudioprocess = (ev2) => {
+        if (!xiWs || xiWs.readyState !== 1) return;
+        const f = ev2.inputBuffer.getChannelData(0);
+        const ratio = inRate / 16000;
+        const n = Math.floor(f.length / ratio);
+        const out = new Int16Array(n);
+        for (let i = 0; i < n; i++) {
+          const v = Math.max(-1, Math.min(1, f[Math.floor(i * ratio)]));
+          out[i] = v < 0 ? v * 32768 : v * 32767;
+        }
+        const u8 = new Uint8Array(out.buffer);
+        let bin = "";
+        for (let i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]);
+        xiWs.send(JSON.stringify({ user_audio_chunk: btoa(bin) }));
+      };
+      xiSrcNode.connect(xiProc);
+      xiProc.connect(xiCtx.destination); // processor emits silence; needed to keep it running
+
+      xiWs = new WebSocket(d.signed_url);
+      xiWs.onopen = () => { xiWs.send(JSON.stringify({ type: "conversation_initiation_client_data" })); };
+      xiWs.onmessage = (e) => { try { xiEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+      xiWs.onclose = () => reset();
+      showLiveUI("eleven");
+    } catch (e) {
+      console.error(e);
+      const msg = String(e && e.message ? e.message : e);
+      setStatus(/Permission|NotAllowed/.test(msg)
+        ? "Microphone permission is needed — allow it and try again."
+        : ("Couldn't connect — " + msg.slice(0, 80) + " · tap Start again."));
+      cleanup();
+    }
+    mainBtn.disabled = false;
+  }
+
   async function start() {
     if (!SESSION_URL) return;
+    if (scGet("engine", "openai") === "eleven") return startEleven();
     mainBtn.disabled = true;
     setStatus("Waking her up…");
     try {
@@ -2985,16 +3259,7 @@
       if (!resp.ok) throw new Error("call setup failed: " + resp.status);
       await pc.setRemoteDescription({ type: "answer", sdp: await resp.text() });
 
-      mainBtn.textContent = "End";
-      mainBtn.classList.add("live");
-      muteBtn.style.display = "flex";
-      chatBtn.style.display = "flex";
-      camBtn.style.display = "flex";
-      fileBtn.style.display = "flex";
-      liveBtn.style.display = "flex";
-      document.body.classList.add("showchat");
-      chatBtn.classList.add("on");
-      applyMute();
+      showLiveUI("openai");
     } catch (e) {
       console.error(e);
       const msg = String(e && e.message ? e.message : e);
@@ -3017,6 +3282,12 @@
   function cleanup() {
     if (pc) { try { pc.close(); } catch (e) {} }
     pc = null; dc = null; micTrack = null; muted = true;
+    if (xiWs) { const w = xiWs; xiWs = null; try { w.onclose = null; w.close(); } catch (e) {} }
+    if (xiProc) { try { xiProc.disconnect(); } catch (e) {} xiProc = null; }
+    if (xiSrcNode) { try { xiSrcNode.disconnect(); } catch (e) {} xiSrcNode = null; }
+    if (xiStream) { try { xiStream.getTracks().forEach((t) => t.stop()); } catch (e) {} xiStream = null; }
+    if (xiCtx) { try { xiCtx.close(); } catch (e) {} xiCtx = null; }
+    xiPlaying = []; xiNextT = 0; clearTimeout(xiSpeakTimer);
   }
 
   function reset() {
@@ -3058,19 +3329,15 @@
           item: { type: "message", role: "user",
                   content: [{ type: "input_image", image_url: dataUrl }] } }));
         dc.send(JSON.stringify({ type: "response.create" }));
+      } else if (xiWs && xiWs.readyState === 1) {
+        sendHerText("Ido shared a photo, but this voice engine can't see images. Tell him warmly that photo viewing works on the Classic engine (Settings), and ask if he'd like to describe it instead.");
       }
     };
     img.src = URL.createObjectURL(file);
   }
   function sendTextToHer(label, text) {
     const clipped = text.length > 24000 ? text.slice(0, 24000) + "\n[...truncated]" : text;
-    if (dc && dc.readyState === "open") {
-      dc.send(JSON.stringify({ type: "conversation.item.create",
-        item: { type: "message", role: "user",
-                content: [{ type: "input_text",
-                            text: "Ido shared a file: " + label + "\n---\n" + clipped }] } }));
-      dc.send(JSON.stringify({ type: "response.create" }));
-    }
+    sendHerText("Ido shared a file: " + label + "\n---\n" + clipped);
   }
 
   async function pdfToText(file) {
@@ -3167,7 +3434,7 @@
   });
 
   mainBtn.addEventListener("click", async () => {
-    if (pc) { reset(); } else await start();
+    if (pc || xiWs) { reset(); } else await start();
   });
 
   /* ============================================================
@@ -3284,7 +3551,7 @@
   // opens muted and idle), tapping 🎙 also starts it.
   muteBtn.addEventListener("click", () => {
     muted = !muted; applyMute();
-    if (!muted && !pc) start();
+    if (!muted && !pc && !xiWs) start();
   });
   // Stop button: cut off a long/misguided reply without touching the mic.
   // Cancels the model's response and clears whatever audio is still buffered,
@@ -3295,6 +3562,7 @@
         dc.send(JSON.stringify({ type: "response.cancel" }));
         dc.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
       }
+      if (xiWs && xiWs.readyState === 1) xiFlush();
     } catch (e) {}
     document.body.classList.remove("sc-speaking");
     orbwrap.classList.remove("speaking");
