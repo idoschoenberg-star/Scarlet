@@ -453,7 +453,7 @@
   .sig.open .olfull { display:block; }
   .sig.open.hasfull .olsnip { display:none; }
   .olfmeta { font-size:13.5px; color:var(--i1-sub); line-height:1.55; margin-bottom:8px; word-break:break-word; }
-  .olframe { width:100%; border:0; border-radius:12px; background:#fff; min-height:110px; }
+  .olframe { width:100%; border:0; border-radius:12px; background:#0e0b10; min-height:110px; }
   .olloading { font-size:14.5px; color:var(--i1-faint); padding:10px 2px; }
   .olatts { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:flex-start; }
   .olattimg { width:31.5%; border-radius:10px; cursor:pointer; }
@@ -742,7 +742,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.11";
+  const BUILD = "2026-07-29.12";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1279,8 +1279,15 @@
     const fr = document.createElement("iframe");
     fr.className = "olframe";
     fr.setAttribute("sandbox", "allow-same-origin allow-popups");
+    // Dark-mode rendering, the way real mail apps do it: invert the email's
+    // colors (white page → near-black, dark text → light) and re-invert
+    // images so photos and logos keep their true colors. Legible at night,
+    // no white glare.
     fr.srcdoc = '<base target="_blank"><meta name="viewport" content="width=device-width, initial-scale=1">' +
-      "<style>body{margin:0;padding:14px;font:16px/1.5 -apple-system,system-ui,sans-serif;color:#111;background:#fff;word-break:break-word}img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
+      "<style>html{background:#0e0b10}" +
+      "body{margin:0;padding:14px;font:16px/1.55 -apple-system,system-ui,sans-serif;color:#111;background:#fff;word-break:break-word;filter:invert(1) hue-rotate(180deg)}" +
+      "img,picture,video,svg{filter:invert(1) hue-rotate(180deg)}" +
+      "img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
       (d.html || "<i>(no content)</i>");
     const fit = () => { try { fr.style.height = Math.min(fr.contentDocument.body.scrollHeight + 30, 20000) + "px"; } catch (e) {} };
     fr.addEventListener("load", () => { fit(); setTimeout(fit, 600); setTimeout(fit, 2000); });
