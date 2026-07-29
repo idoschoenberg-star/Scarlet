@@ -740,7 +740,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.9";
+  const BUILD = "2026-07-29.10";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1507,8 +1507,10 @@
     const bar = document.createElement("div");
     bar.className = "thbar";
     const sendColors = { wa: "#00a884", im: "#0b93f6", teams: "#5b5fc7" };
-    bar.innerHTML = '<textarea rows="1" placeholder="' + (kind === "teams" ? "Message (staged — you tap Send in Teams)" : "Message") + '" dir="auto"></textarea>' +
-      '<button style="background:' + sendColors[kind] + '">➤</button>';
+    bar.innerHTML =
+      '<button class="thdraft" style="background:#2ea86b" title="Scarlet drafts the reply in your voice — refine and approve in the draft window">✍️</button>' +
+      '<textarea rows="1" placeholder="' + (kind === "teams" ? "Message (staged — you tap Send in Teams)" : "Message") + '" dir="auto"></textarea>' +
+      '<button class="thsend" style="background:' + sendColors[kind] + '">➤</button>';
     feed.appendChild(bar);
     const ta = bar.querySelector("textarea");
     ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 120) + "px"; });
@@ -1519,7 +1521,7 @@
         esc(m.text || "") + '<div class="bts">' + fmtClock(m.ts) + "</div>";
       return b;
     };
-    let lastCount = -1;
+    let lastCount = -1, lastIncoming = "";
     const load = async () => {
       try {
         const op = kind === "wa" ? "&op=wa_thread&jid=" + encodeURIComponent(c.jid || "")
@@ -1528,6 +1530,7 @@
         const j = await (await fetch(APP_URL + op, { signal: AbortSignal.timeout(25000) })).json();
         if (chan.mode !== "thread" || chan.chat !== c) return;
         const msgs = j.messages || [];
+        for (const m of msgs) { if (!m.from_me && m.text) lastIncoming = m.text; }
         if (msgs.length === lastCount) return;
         lastCount = msgs.length;
         box.innerHTML = "";
@@ -1537,7 +1540,29 @@
     };
     load();
     chan.timer = setInterval(() => { if (!ta.value) load(); }, 8000);
-    bar.querySelector("button").addEventListener("click", async () => {
+    // ✍️ Scarlet drafts the reply IN THIS CONVERSATION: whatever is typed in
+    // the box becomes the instruction; the draft appears in the floating
+    // Draft window over the chat — refine there, approve to send here.
+    bar.querySelector(".thdraft").addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      const instr = ta.value.trim();
+      btn.disabled = true; btn.textContent = "…";
+      const channel = kind === "wa" ? "whatsapp" : kind === "im" ? "imessage" : "teams";
+      const recipient = kind === "wa" ? (c.jid || c.name) : kind === "im" ? (c.handle || c.name) : (c.name || "");
+      try {
+        await fetch(APP_URL + "&op=draft_compose", { method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            channel: channel, recipient: recipient,
+            original: lastIncoming || "",
+            instruction: instr || "Draft the appropriate reply to the latest message in this conversation.",
+          }) });
+        ta.value = ""; ta.style.height = "auto";
+        pollDraft();
+      } catch (err) { /* button resets below */ }
+      setTimeout(() => { btn.disabled = false; btn.textContent = "✍️"; }, 2500);
+    });
+    bar.querySelector(".thsend").addEventListener("click", async () => {
       const text = ta.value.trim(); if (!text) return;
       ta.value = ""; ta.style.height = "auto";
       if (kind === "teams") {
