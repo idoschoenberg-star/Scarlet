@@ -502,6 +502,13 @@
     align-items:center; justify-content:flex-end; padding-right:24px; gap:8px;
     color:#fff; font-weight:700; font-size:15.5px; opacity:0; }
   #sigFeed .sigwrap .sig { position:relative; background:#0b0507 !important; }
+  /* Hover Archive button exists in the DOM on every device but is shown only
+     on a desktop with a mouse (rule in the pointer:fine media query below). */
+  .rowarch { display:none; }
+  /* Desktop-only furniture: hidden entirely on phones; the 900px+ media query
+     turns them on. Without this base rule they'd render as stray text below the
+     fixed views on a phone. */
+  #deskHint, #deskKeys { display:none; }
   /* ============ Channel-native views: chat lists, threads, calendar ======= */
   .chrow { display:flex; gap:12px; padding:12px 10px; border-bottom:1px solid rgba(255,255,255,.08);
     align-items:center; cursor:pointer; }
@@ -551,6 +558,73 @@
   .calbtn { border-radius:10px; border:1px solid var(--i1-line); background:var(--i1-card);
     color:var(--i1-ink); padding:9px 14px; font-size:14.5px; min-height:40px; }
   .calbtn.join { background:#2ea86b; color:#fff; border:0; font-weight:700; }
+
+  /* ===================== DESKTOP (responsive) =====================
+     One codebase. Below 900px this is the phone app, untouched. At 900px+
+     it becomes a desktop app: a left tab rail, wider reading columns, and
+     Outlook-style master–detail for Signals (list on the left, the open
+     email on the right). Interactions adapt to the input device — a mouse
+     gets a hover Archive button + full keyboard navigation, while touch
+     keeps swipe-to-archive. Nothing here changes the phone layout. */
+  @media (min-width: 900px) {
+    :root { --rail: 92px; --siglist: 468px; }
+    /* Tab bar → left vertical rail */
+    .tabbar { flex-direction:column; top:0; bottom:0; left:0; right:auto;
+      width:var(--rail); justify-content:flex-start; gap:4px;
+      padding:calc(20px + env(safe-area-inset-top)) 8px 20px;
+      border-top:0; border-right:1px solid rgba(255,150,160,.12); }
+    .tab { max-width:none; width:100%; padding:13px 0; border-radius:14px; }
+    .tab .ic { font-size:24px; }
+    .tab .dot { margin-left:46px; margin-top:0; }
+    /* Every view sits to the right of the rail */
+    .view { left:var(--rail); padding-bottom:22px; }
+    /* Comfortable, capped reading widths for the single-column tabs */
+    .feed, .composer { max-width:780px; }
+    #viewGallery .gfeed { max-width:760px; }
+    #todayFeed, #notesFeed { max-width:740px; }
+
+    /* ---- Signals: master–detail ---- */
+    #viewSignals.active { left:var(--rail); right:auto; width:var(--siglist);
+      align-items:stretch; border-right:1px solid rgba(255,255,255,.08);
+      padding-bottom:0; }
+    #viewSignals .chathead, #viewSignals .sigfilter, #viewSignals .sigfeed { max-width:none; }
+    #viewSignals .sigfeed { padding-bottom:40px; }
+    /* The email reader docks into the space to the right of the list */
+    #readerWin { left:calc(var(--rail) + var(--siglist)); right:0; width:auto;
+      border-left:1px solid rgba(255,255,255,.08); }
+    .rdscroll, .rdact { max-width:940px; margin-left:auto; margin-right:auto; width:100%; }
+    /* Reading-pane placeholder shown when Signals is open but nothing is selected */
+    #deskHint { display:none; position:fixed; top:0; bottom:0;
+      left:calc(var(--rail) + var(--siglist)); right:0; z-index:40;
+      flex-direction:column; align-items:center; justify-content:center; gap:14px;
+      text-align:center; color:#8f6f72; font-size:15px; letter-spacing:.02em; padding:40px; }
+    #deskHint .dhmark { font-size:40px; opacity:.5; }
+    html[data-wide="1"][data-sig="1"][data-chan="0"]:not(.reader-open) #deskHint { display:flex; }
+    /* Keyboard-shortcut footer pinned under the list */
+    #deskKeys { display:none; }
+    html[data-wide="1"][data-sig="1"] #deskKeys { display:block; position:fixed;
+      left:var(--rail); width:var(--siglist); bottom:0; z-index:6;
+      font-size:11.5px; color:#9b8285; text-align:center; padding:7px 8px;
+      background:rgba(11,5,7,.92); border-top:1px solid rgba(255,255,255,.06);
+      border-right:1px solid rgba(255,255,255,.08);
+      backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+    /* Keyboard selection highlight on a signal row */
+    #sigFeed .sig.sel { background:rgba(124,188,249,.13) !important;
+      box-shadow:inset 3px 0 0 #7cbcf9; }
+    /* Draft window docks bottom-right instead of spanning the phone width */
+    #draftWin { left:auto !important; right:24px !important; bottom:24px !important;
+      width:min(520px, 42vw); }
+  }
+  /* Hover Archive button on email rows — only where a mouse actually exists,
+     because swipe-to-archive is unavailable without a touch surface. */
+  @media (min-width: 900px) and (pointer: fine) {
+    .sigwrap .rowarch { display:block; position:absolute; top:9px; right:12px; z-index:4;
+      opacity:0; transition:opacity .12s ease; background:#217346; color:#fff;
+      border:0; border-radius:9px; font-size:13px; font-weight:700;
+      padding:6px 11px; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.4); }
+    .sigwrap:hover .rowarch { opacity:1; }
+    .chrow, .sig, .fchip, .tab, .calbtn { cursor:pointer; }
+  }
 </style>
 </head>
 <body>
@@ -733,6 +807,12 @@
     <div style="padding:0 14px 10px;font-size:11px;color:#9c7a80">Type above or just tell Scarlet by voice — the draft updates here.</div>
   </div>
 
+  <!-- Desktop only: reading-pane placeholder + keyboard-shortcut footer.
+       Both are hidden entirely on phones via CSS (they live inside 900px+
+       media queries) so the touch layout is untouched. -->
+  <div id="deskHint"><div class="dhmark">📬</div><div>Select a signal to read it here.<br>Use ↑ ↓ to move, Enter to open.</div></div>
+  <div id="deskKeys">↑ ↓ move · Enter open · E archive · Esc close</div>
+
   <!-- image lightbox -->
   <div class="overlay" id="lightbox">
     <div class="ovhead"><div class="ovtitle" id="lbTitle"></div>
@@ -752,10 +832,26 @@
   // Ido's unlock code, kept in localStorage, and (when enrolled) released
   // only after Face ID.
   const API_BASE = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1";
+  // Responsive environment detection. We branch on *capability*, not screen
+  // size alone: a wide window turns on the desktop layout, while the presence
+  // of a fine pointer (mouse/trackpad) decides whether we offer hover controls
+  // and keyboard nav vs. touch swipes. A touchscreen laptop gets both.
+  const mqWide = matchMedia("(min-width: 900px)");
+  const mqFine = matchMedia("(pointer: fine)");
+  function applyEnv() {
+    const de = document.documentElement;
+    de.dataset.wide = mqWide.matches ? "1" : "0";
+    de.dataset.pointer = mqFine.matches ? "fine" : "coarse";
+    if (!de.dataset.sig) de.dataset.sig = "0";
+    if (!de.dataset.chan) de.dataset.chan = "0";
+  }
+  mqWide.addEventListener("change", applyEnv);
+  mqFine.addEventListener("change", applyEnv);
+  applyEnv();
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.17";
+  const BUILD = "2026-07-29.18";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -819,6 +915,7 @@
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
+    document.documentElement.dataset.sig = name === "signals" ? "1" : "0";
     for (const k of ["live", "today", "signals", "notes", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
@@ -1279,6 +1376,8 @@
     graph:            { tag: "Update",   color: "#9c9c9c" },
   };
   let sigItems = [], sigFilter = "all";
+  // Desktop keyboard-navigation cursor into the visible signal rows (-1 = none).
+  let deskSel = -1;
   // Cards Ido opened stay open across background refreshes — they collapse
   // only when he taps them again, never on their own.
   const sigOpen = new Set();
@@ -1346,6 +1445,7 @@
   }
   function closeReader() {
     document.getElementById("readerWin").style.display = "none";
+    document.documentElement.classList.remove("reader-open");
     readerIt = null;
     document.getElementById("rdInstr").value = "";
   }
@@ -1381,6 +1481,7 @@
     document.getElementById("rdMeta").textContent = "";
     document.getElementById("rdBody").innerHTML = '<div class="olloading">Loading full email…</div>';
     document.getElementById("readerWin").style.display = "flex";
+    document.documentElement.classList.add("reader-open");
     if (!it.read_at) { it.read_at = new Date().toISOString(); markSig([it.id], "inbox_read"); }
     fillReader(it);
   }
@@ -1740,6 +1841,11 @@
   function renderSignals() {
     const feed = document.getElementById("sigFeed");
     const cv = CHAN_VIEWS[sigFilter];
+    // Desktop: a channel chip (WhatsApp/Teams/iMessage/Calendar) renders its
+    // own view in the list column, so the right-hand reading pane hint is
+    // suppressed; the plain email list restores it.
+    document.documentElement.dataset.chan = cv ? "1" : "0";
+    deskSel = -1;
     if (cv) { cv(feed); return; }
     const items = sigItems.filter((i) => sigFilter === "all" || i.source === sigFilter);
     if (!items.length) {
@@ -1891,6 +1997,15 @@
         bg.textContent = "🗄 Archive";
         wrap.appendChild(bg);
         wrap.appendChild(card);
+        // Mouse/keyboard parity for swipe-to-archive: a hover Archive button
+        // (CSS reveals it only on a fine pointer) and the keyboard "E" shortcut
+        // both run the exact same optimistic archive as the swipe.
+        const rowArch = document.createElement("button");
+        rowArch.className = "rowarch";
+        rowArch.textContent = "🗄 Archive";
+        rowArch.title = "Archive (E)";
+        rowArch.addEventListener("click", (e) => { e.stopPropagation(); archiveNow(true); });
+        wrap.appendChild(rowArch);
         // pan-y: keep vertical scrolling native, but horizontal drags are OURS —
         // without this, iOS Safari hijacks the swipe and the gesture dies.
         card.style.touchAction = "pan-y";
@@ -1939,6 +2054,65 @@
     stopChanTimer(); chan.mode = "list"; chan.chat = null;
     document.querySelectorAll("#sigFilter .fchip").forEach((c) => c.classList.toggle("active", c === b));
     renderSignals();
+  });
+
+  /* ============================================================
+     DESKTOP KEYBOARD NAVIGATION
+     Active only on a wide screen and only when the user isn't typing.
+     In the Signals list: ↑/↓ (or j/k) move a highlight, Enter opens the
+     selected row (email → reader, chat → thread), E archives an email.
+     In the open email reader: ↑/↓ step to the previous/next email, E
+     archives, Esc closes. Esc also backs out of a channel thread. Every
+     one of these has an on-screen equivalent — the keyboard is a shortcut,
+     never the only way. */
+  const deskRows = () => Array.from(document.querySelectorAll("#sigFeed .sig"));
+  function deskSelect(i) {
+    const rows = deskRows();
+    if (!rows.length) { deskSel = -1; return; }
+    deskSel = Math.max(0, Math.min(rows.length - 1, i));
+    rows.forEach((r, idx) => r.classList.toggle("sel", idx === deskSel));
+    rows[deskSel].scrollIntoView({ block: "nearest" });
+  }
+  function openRelativeEmail(dir) {
+    if (!readerIt) return;
+    const list = sigItems
+      .filter((i) => sigFilter === "all" || i.source === sigFilter)
+      .filter((i) => i.source === "outlook_mail" || i.source === "gmail");
+    const idx = list.findIndex((i) => i.id === readerIt.id);
+    if (idx < 0) return;
+    const nx = list[idx + dir];
+    if (nx) openReader(nx);
+  }
+  document.addEventListener("keydown", (e) => {
+    if (document.documentElement.dataset.wide !== "1") return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return;
+    const readerOpen = document.getElementById("readerWin").style.display !== "none" && readerIt;
+    if (e.key === "Escape") {
+      if (document.getElementById("lightbox").classList.contains("on")) { document.getElementById("lbClose").click(); return; }
+      if (document.getElementById("pdfview").classList.contains("on")) { document.getElementById("pdfClose").click(); return; }
+      if (readerOpen) { closeReader(); return; }
+      if (activeTab === "signals" && CHAN_VIEWS[sigFilter] && chan.mode === "thread") {
+        chan.mode = "list"; chan.chat = null; renderSignals(); return;
+      }
+      return;
+    }
+    if (readerOpen) {
+      if (e.key === "e" || e.key === "E") { document.getElementById("rdArch").click(); e.preventDefault(); }
+      else if (e.key === "ArrowDown" || e.key === "j") { openRelativeEmail(1); e.preventDefault(); }
+      else if (e.key === "ArrowUp" || e.key === "k") { openRelativeEmail(-1); e.preventDefault(); }
+      return;
+    }
+    if (activeTab !== "signals" || CHAN_VIEWS[sigFilter]) return;
+    if (e.key === "ArrowDown" || e.key === "j") { deskSelect(deskSel + 1); e.preventDefault(); }
+    else if (e.key === "ArrowUp" || e.key === "k") { deskSelect(deskSel < 0 ? 0 : deskSel - 1); e.preventDefault(); }
+    else if (e.key === "Enter") { const r = deskRows()[deskSel]; if (r) { r.click(); e.preventDefault(); } }
+    else if (e.key === "e" || e.key === "E") {
+      const r = deskRows()[deskSel];
+      const b = r && (r.closest(".sigwrap") || r).querySelector(".rowarch");
+      if (b) { b.click(); e.preventDefault(); }
+    }
   });
 
   /* ============================================================
