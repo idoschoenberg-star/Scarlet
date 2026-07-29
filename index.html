@@ -460,6 +460,54 @@
   .olattimg.big { width:100%; }
   .olattchip { border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink);
     border-radius:10px; padding:9px 12px; font-size:14px; min-height:40px; }
+  /* ============ Channel-native views: chat lists, threads, calendar ======= */
+  .chrow { display:flex; gap:12px; padding:12px 10px; border-bottom:1px solid rgba(255,255,255,.08);
+    align-items:center; cursor:pointer; }
+  .chav { width:47px; height:47px; border-radius:50%; flex:none; display:flex; align-items:center;
+    justify-content:center; font-weight:700; color:#fff; font-size:17px; }
+  .chmain { flex:1; min-width:0; }
+  .chname { font-size:17px; font-weight:650; color:var(--i1-ink); display:flex; align-items:baseline; gap:8px; }
+  .chname span.nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .chts { font-size:13px; color:var(--i1-faint); font-weight:400; flex:none; }
+  .chlast { font-size:15px; color:var(--i1-sub); white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; margin-top:2px; }
+  .thhead { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:8px;
+    padding:9px 4px; background:rgba(16,10,13,.92); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); }
+  .thback { font-size:30px; line-height:1; background:none; border:0; color:#7cbcf9; padding:2px 10px; }
+  .thname { font-size:17px; font-weight:700; color:var(--i1-ink); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .bub { max-width:80%; padding:9px 13px; border-radius:16px; margin:3px 6px; font-size:16px;
+    line-height:1.45; color:#fff; width:fit-content; unicode-bidi:plaintext; word-break:break-word; }
+  .bub.them { background:#26252a; border-bottom-left-radius:6px; }
+  .bub.me { margin-left:auto; border-bottom-right-radius:6px; background:#3a3a40; }
+  .bub.wa.me { background:#005c4b; } .bub.wa.them { background:#202c33; }
+  .bub.im.me { background:#0b93f6; }
+  .bub.teams.me { background:#5b5fc7; } .bub.teams.them { background:#2b2b33; }
+  .bub .bts { font-size:11px; opacity:.6; text-align:right; margin-top:3px; }
+  .bub .bwho { font-size:12.5px; color:#a9b8ff; margin-bottom:2px; font-weight:650; }
+  .bub.sys { background:#173a2a; margin:8px auto; font-size:14.5px; max-width:92%; }
+  .bub.sys a { color:#7ef0b8; font-weight:700; }
+  .thbar { position:sticky; bottom:0; display:flex; gap:8px; padding:10px 6px;
+    background:rgba(16,10,13,.94); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); align-items:flex-end; }
+  .thbar textarea { flex:1; resize:none; border-radius:22px; border:1px solid var(--i1-line);
+    background:var(--i1-card); color:var(--i1-ink); padding:12px 15px; font-size:16px; max-height:120px; }
+  .thbar button { width:47px; height:47px; border-radius:50%; border:0; color:#fff; font-size:19px; flex:none; }
+  .calhead { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:6px;
+    padding:10px 4px; background:rgba(16,10,13,.92); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    font-size:17.5px; font-weight:700; color:var(--i1-ink); }
+  .calnav { background:none; border:0; color:#7cbcf9; font-size:26px; padding:0 12px; }
+  .caltoday { margin-left:auto; font-size:14px; padding:8px 14px; border-radius:10px;
+    border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink); }
+  .calev { display:flex; gap:12px; padding:13px 8px; border-bottom:1px solid rgba(255,255,255,.07); }
+  .caltime { width:76px; flex:none; font-size:14.5px; color:var(--i1-sub); line-height:1.5; }
+  .calbar { width:4px; border-radius:2px; background:#4a9fff; flex:none; }
+  .calmain { flex:1; min-width:0; }
+  .calsubj { font-size:16.5px; font-weight:650; color:var(--i1-ink); }
+  .calloc { font-size:14.5px; color:var(--i1-sub); margin-top:2px; }
+  .calbtns { display:flex; gap:8px; margin-top:9px; }
+  .calbtn { border-radius:10px; border:1px solid var(--i1-line); background:var(--i1-card);
+    color:var(--i1-ink); padding:9px 14px; font-size:14.5px; min-height:40px; }
+  .calbtn.join { background:#2ea86b; color:#fff; border:0; font-weight:700; }
 </style>
 </head>
 <body>
@@ -535,10 +583,10 @@
     <div class="sigfilter" id="sigFilter">
       <button class="fchip active" data-f="all">All</button>
       <button class="fchip" data-f="outlook_mail"><span class="fdot" style="background:#4a9fff"></span>Amwell</button>
-      <button class="fchip" data-f="gmail"><span class="fdot" style="background:#ea4335"></span>Gmail</button>
       <button class="fchip" data-f="whatsapp"><span class="fdot" style="background:#25d366"></span>WhatsApp</button>
-      <button class="fchip" data-f="imessage"><span class="fdot" style="background:#0b93f6"></span>iMessage</button>
       <button class="fchip" data-f="teams"><span class="fdot" style="background:#7b83eb"></span>Teams</button>
+      <button class="fchip" data-f="imessage"><span class="fdot" style="background:#0b93f6"></span>iMessage</button>
+      <button class="fchip" data-f="gmail"><span class="fdot" style="background:#ea4335"></span>Gmail</button>
       <button class="fchip" data-f="outlook_calendar"><span class="fdot" style="background:#e6a23c"></span>Calendar</button>
     </div>
     <div class="sigfeed" id="sigFeed"><div class="ovnote" style="margin-top:30px">Loading your signals…</div></div>
@@ -643,7 +691,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.3";
+  const BUILD = "2026-07-29.4";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1240,7 +1288,9 @@
       const j = await r.json();
       if (swipeActive) return;
       sigItems = (j.events || []).filter((ev) => !(sigHide.get(ev.id) > Date.now()));
-      renderSignals();
+      // Channel-native views (WhatsApp/Teams/iMessage/Calendar) manage their
+      // own refresh — the 10s poll must not stomp an open thread.
+      if (!CHAN_VIEWS[sigFilter]) renderSignals();
       if (sigItems.some((i) => !i.read_at) && activeTab !== "signals") tabs.signals.classList.add("unread");
     } catch (e) { /* keep what we have */ }
   }
@@ -1283,8 +1333,197 @@
         "\n\nHe's about to tell you by voice what to do with it. Briefly acknowledge you see it, then wait for his instruction." }] } }));
     dc.send(JSON.stringify({ type: "response.create" }));
   }
+  /* ---------- Channel-native views: each channel mirrors its real app ----- */
+  const chan = { mode: "list", chat: null, timer: null };
+  function stopChanTimer() { if (chan.timer) { clearInterval(chan.timer); chan.timer = null; } }
+  const CH_CFG = {
+    whatsapp: { op: "wa_chats", color: "#25d366", kind: "wa" },
+    teams: { op: "teams_chats", color: "#7b83eb", kind: "teams" },
+    imessage: { op: "im_chats", color: "#0b93f6", kind: "im" },
+  };
+  function chAv(name, color) {
+    const initials = (String(name || "?").trim().split(/\s+/).slice(0, 2).map((w) => w[0] || "").join("") || "?").toUpperCase();
+    return '<div class="chav" style="background:' + color + '">' + esc(initials) + "</div>";
+  }
+  function fmtClock(ts) {
+    try { return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; }
+  }
+  function localToday() {
+    const d = new Date(), p = (n) => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  }
+  async function chatListView(feed, key) {
+    stopChanTimer();
+    const cfg = CH_CFG[key];
+    feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Loading chats…</div>';
+    try {
+      const j = await (await fetch(APP_URL + "&op=" + cfg.op, { signal: AbortSignal.timeout(25000) })).json();
+      if (sigFilter !== key || chan.mode !== "list") return;
+      const chats = j.chats || [];
+      feed.innerHTML = chats.length ? "" : '<div class="ovnote" style="margin-top:30px">No conversations yet.</div>';
+      for (const c of chats) {
+        const row = document.createElement("div");
+        row.className = "chrow";
+        row.innerHTML = chAv(c.name, cfg.color) +
+          '<div class="chmain"><div class="chname"><span class="nm">' + esc(c.name || "") + "</span>" +
+          '<span class="chts">' + relTime(c.ts) + "</span></div>" +
+          '<div class="chlast">' + (c.from_me ? "You: " : "") + esc(c.last || "") + "</div></div>";
+        row.addEventListener("click", () => {
+          chan.mode = "thread";
+          chan.chat = { kind: cfg.kind, name: c.name, jid: c.jid, handle: c.handle, id: c.id };
+          renderSignals();
+        });
+        feed.appendChild(row);
+      }
+    } catch (e) {
+      if (sigFilter === key) feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Couldn’t load — tap the chip again to retry.</div>';
+    }
+  }
+  async function threadView(feed, kind) {
+    stopChanTimer();
+    const c = chan.chat;
+    feed.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "thhead";
+    head.innerHTML = '<button class="thback">‹</button><div class="thname">' + esc(c.name || "") + "</div>";
+    head.querySelector(".thback").addEventListener("click", () => { stopChanTimer(); chan.mode = "list"; chan.chat = null; renderSignals(); });
+    feed.appendChild(head);
+    const box = document.createElement("div");
+    box.innerHTML = '<div class="ovnote" style="margin-top:24px">Loading…</div>';
+    feed.appendChild(box);
+    const bar = document.createElement("div");
+    bar.className = "thbar";
+    const sendColors = { wa: "#00a884", im: "#0b93f6", teams: "#5b5fc7" };
+    bar.innerHTML = '<textarea rows="1" placeholder="' + (kind === "teams" ? "Message (staged — you tap Send in Teams)" : "Message") + '" dir="auto"></textarea>' +
+      '<button style="background:' + sendColors[kind] + '">➤</button>';
+    feed.appendChild(bar);
+    const ta = bar.querySelector("textarea");
+    ta.addEventListener("input", () => { ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 120) + "px"; });
+    const bubble = (m) => {
+      const b = document.createElement("div");
+      b.className = "bub " + (m.from_me ? "me" : "them") + " " + kind;
+      b.innerHTML = (kind === "teams" && !m.from_me && m.from ? '<div class="bwho">' + esc(m.from) + "</div>" : "") +
+        esc(m.text || "") + '<div class="bts">' + fmtClock(m.ts) + "</div>";
+      return b;
+    };
+    let lastCount = -1;
+    const load = async () => {
+      try {
+        const op = kind === "wa" ? "&op=wa_thread&jid=" + encodeURIComponent(c.jid || "")
+          : kind === "im" ? "&op=im_thread&handle=" + encodeURIComponent(c.handle || "")
+          : "&op=teams_thread&id=" + encodeURIComponent(c.id || "");
+        const j = await (await fetch(APP_URL + op, { signal: AbortSignal.timeout(25000) })).json();
+        if (chan.mode !== "thread" || chan.chat !== c) return;
+        const msgs = j.messages || [];
+        if (msgs.length === lastCount) return;
+        lastCount = msgs.length;
+        box.innerHTML = "";
+        for (const m of msgs) box.appendChild(bubble(m));
+        feed.scrollTop = feed.scrollHeight;
+      } catch (e) { /* keep what's there */ }
+    };
+    load();
+    chan.timer = setInterval(() => { if (!ta.value) load(); }, 8000);
+    bar.querySelector("button").addEventListener("click", async () => {
+      const text = ta.value.trim(); if (!text) return;
+      ta.value = ""; ta.style.height = "auto";
+      if (kind === "teams") {
+        // Teams stays read + staged one-tap send: the message is prepared,
+        // Ido presses Send inside Teams itself.
+        const staged = document.createElement("div");
+        staged.className = "bub sys";
+        staged.textContent = "Staging in Teams…";
+        box.appendChild(staged); feed.scrollTop = feed.scrollHeight;
+        try {
+          const j = await (await fetch(APP_URL + "&op=teams_stage", { method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat: c.name, text: text }) })).json();
+          const link = j.link || j.url || j.deeplink || j.deep_link || "";
+          staged.innerHTML = link
+            ? '✅ Staged. <a href="' + esc(link) + '" target="_blank">Tap here to send it in Teams</a>'
+            : esc(String(j.note || j.error || "✅ Staged — the one-tap Send link is in your Chat tab."));
+        } catch (e) { staged.textContent = "Staging failed — try again."; }
+        return;
+      }
+      const mine = { from_me: true, text: text, ts: new Date().toISOString() };
+      box.appendChild(bubble(mine)); feed.scrollTop = feed.scrollHeight; lastCount++;
+      try {
+        const body = kind === "wa" ? { jid: c.jid, text: text } : { to: c.handle, text: text };
+        const j = await (await fetch(APP_URL + "&op=" + (kind === "wa" ? "wa_send" : "im_send"), { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) })).json();
+        if (/"ok"\s*:\s*false|"error"/i.test(String(j.result || ""))) throw new Error(String(j.result).slice(0, 140));
+      } catch (e) {
+        const errB = document.createElement("div");
+        errB.className = "bub sys";
+        errB.textContent = "⚠️ Didn’t send — " + String(e.message || e).slice(0, 140);
+        box.appendChild(errB); feed.scrollTop = feed.scrollHeight;
+      }
+    });
+  }
+  let calDate = localToday();
+  function shiftCal(days) {
+    const d = new Date(calDate + "T12:00:00");
+    d.setDate(d.getDate() + days);
+    const p = (n) => String(n).padStart(2, "0");
+    calDate = d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  }
+  async function calView(feed) {
+    stopChanTimer();
+    const label = new Date(calDate + "T12:00:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    feed.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "calhead";
+    head.innerHTML = '<button class="calnav" data-d="-1">‹</button><span>' + esc(label) + "</span>" +
+      '<button class="calnav" data-d="1">›</button><button class="caltoday">Today</button>';
+    head.querySelectorAll(".calnav").forEach((b) => b.addEventListener("click", () => { shiftCal(Number(b.dataset.d)); renderSignals(); }));
+    head.querySelector(".caltoday").addEventListener("click", () => { calDate = localToday(); renderSignals(); });
+    feed.appendChild(head);
+    const body = document.createElement("div");
+    body.innerHTML = '<div class="ovnote" style="margin-top:26px">Loading your day…</div>';
+    feed.appendChild(body);
+    const myDate = calDate;
+    try {
+      const j = await (await fetch(APP_URL + "&op=cal_day&date=" + myDate, { signal: AbortSignal.timeout(25000) })).json();
+      if (sigFilter !== "outlook_calendar" || calDate !== myDate) return;
+      const evs = j.events || [];
+      body.innerHTML = evs.length ? "" : '<div class="ovnote" style="margin-top:26px">Nothing scheduled.</div>';
+      for (const ev of evs) {
+        const row = document.createElement("div");
+        row.className = "calev";
+        const t = ev.all_day ? "All day" : (String(ev.start).slice(11, 16) + "<br>" + String(ev.end).slice(11, 16));
+        row.innerHTML = '<div class="caltime">' + t + '</div><div class="calbar"></div>' +
+          '<div class="calmain"><div class="calsubj">' + esc(ev.subject) + "</div>" +
+          ((ev.location || ev.organizer) ? '<div class="calloc">' + esc([ev.location, ev.organizer].filter(Boolean).join(" · ")) + "</div>" : "") +
+          '<div class="calbtns">' +
+          (ev.join ? '<a class="calbtn join" href="' + esc(ev.join) + '" target="_blank">▶ Join</a>' : "") +
+          '<button class="calbtn del">🗑 Delete</button></div></div>';
+        row.querySelector(".del").addEventListener("click", async (e) => {
+          const btn = e.currentTarget;
+          if (!confirm('Delete "' + (ev.subject || "this meeting") + '" from your real Outlook calendar?')) return;
+          btn.textContent = "…"; btn.disabled = true;
+          try {
+            const r = await (await fetch(APP_URL + "&op=cal_delete", { method: "POST",
+              headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: ev.id }) })).json();
+            if (r.ok) row.remove(); else throw new Error("delete failed");
+          } catch (err) { btn.textContent = "Failed — retry"; btn.disabled = false; }
+        });
+        body.appendChild(row);
+      }
+    } catch (e) {
+      if (sigFilter === "outlook_calendar") body.innerHTML = '<div class="ovnote" style="margin-top:26px">Couldn’t load the calendar — tap ‹ or › to retry.</div>';
+    }
+  }
+  const CHAN_VIEWS = {
+    whatsapp: (feed) => chan.mode === "thread" ? threadView(feed, "wa") : chatListView(feed, "whatsapp"),
+    teams: (feed) => chan.mode === "thread" ? threadView(feed, "teams") : chatListView(feed, "teams"),
+    imessage: (feed) => chan.mode === "thread" ? threadView(feed, "im") : chatListView(feed, "imessage"),
+    outlook_calendar: (feed) => calView(feed),
+  };
+
   function renderSignals() {
     const feed = document.getElementById("sigFeed");
+    const cv = CHAN_VIEWS[sigFilter];
+    if (cv) { cv(feed); return; }
     const items = sigItems.filter((i) => sigFilter === "all" || i.source === sigFilter);
     if (!items.length) {
       feed.innerHTML = '<div class="ovnote" style="margin-top:30px">Nothing here yet — new messages appear the moment they arrive.</div>';
@@ -1455,6 +1694,7 @@
   document.getElementById("sigFilter").addEventListener("click", (e) => {
     const b = e.target.closest(".fchip"); if (!b) return;
     sigFilter = b.dataset.f;
+    stopChanTimer(); chan.mode = "list"; chan.chat = null;
     document.querySelectorAll("#sigFilter .fchip").forEach((c) => c.classList.toggle("active", c === b));
     renderSignals();
   });
