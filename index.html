@@ -420,6 +420,34 @@
   .tab.active { background:rgba(255,255,255,.08); }
   .nsectlabel { font-size:11.5px !important; letter-spacing:.16em !important; color:var(--i1-faint) !important; margin:18px 4px 10px; }
 
+  /* ============ Outlook-style Signals list (mirrors Outlook mobile) ======= */
+  #sigFeed .sig {
+    background:transparent !important; border:0 !important; border-radius:0 !important;
+    box-shadow:none !important; backdrop-filter:none; -webkit-backdrop-filter:none;
+    border-bottom:1px solid rgba(255,255,255,.09) !important;
+    margin:0 !important; padding:13px 12px !important;
+  }
+  #sigFeed .sig.open { background:rgba(255,255,255,.06) !important; }
+  #sigFeed .sig.read { opacity:.72; }
+  .olrow { display:flex; gap:12px; align-items:flex-start; }
+  .olav { width:42px; height:42px; border-radius:50%; flex:none; display:flex;
+    align-items:center; justify-content:center; font-size:16px; font-weight:700;
+    color:#fff; letter-spacing:.02em; }
+  .olmain { flex:1; min-width:0; }
+  .olline1 { display:flex; align-items:baseline; gap:8px; }
+  .olwho { font-size:17px; font-weight:600; color:var(--i1-ink); flex:1; min-width:0;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sig:not(.read) .olwho { font-weight:800; }
+  .oltag { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; flex:none; }
+  .olwhen { font-size:13.5px; color:var(--i1-faint); flex:none; }
+  .olsubj { font-size:16.5px; color:var(--i1-ink); margin-top:2px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
+  .sig:not(.read) .olsubj { color:#7cbcf9; font-weight:600; }
+  .olsnip { font-size:15.5px; color:var(--i1-sub); margin-top:2px; line-height:1.5;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical;
+    overflow:hidden; unicode-bidi:plaintext; }
+  .sig.open .olsubj { white-space:normal; }
+  .sig.open .olsnip { -webkit-line-clamp:unset; }
 </style>
 </head>
 <body>
@@ -603,7 +631,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.1";
+  const BUILD = "2026-07-29.2";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1127,12 +1155,17 @@
     if (d < 86400) return Math.floor(d / 3600) + "h";
     return Math.floor(d / 86400) + "d";
   }
+  // Optimistic-archive support: ids hidden locally (until the server catches
+  // up) and a flag so a poll never re-renders mid-swipe and kills the gesture.
+  const sigHide = new Map();
+  let swipeActive = false;
   async function loadSignals() {
     if (!APP_URL) return;
     try {
       const r = await fetch(APP_URL + "&op=inbox", { signal: AbortSignal.timeout(9000) });
       const j = await r.json();
-      sigItems = j.events || [];
+      if (swipeActive) return;
+      sigItems = (j.events || []).filter((ev) => !(sigHide.get(ev.id) > Date.now()));
       renderSignals();
       if (sigItems.some((i) => !i.read_at) && activeTab !== "signals") tabs.signals.classList.add("unread");
     } catch (e) { /* keep what we have */ }
@@ -1199,11 +1232,26 @@
       card.style.setProperty("--sc", m.color);
       const draftable = !!DRAFT_SRC[it.source];
       const emailish = it.source === "outlook_mail" || it.source === "gmail";
+      // Outlook-style row: initials avatar · bold sender + time · subject ·
+      // two-line snippet. The stored preview is "Subject — body" for email.
+      const pv = String(it.preview || "");
+      const sep = emailish ? pv.indexOf(" — ") : -1;
+      const subject = sep > 0 ? pv.slice(0, sep) : "";
+      const snippet = sep > 0 ? pv.slice(sep + 3) : pv;
+      const who = it.sender || m.tag;
+      const initials = (who.trim().split(/\s+/).slice(0, 2).map((w) => w[0] || "").join("") || "?").toUpperCase();
+      const AV = ["#0078d4", "#c239b3", "#ca5010", "#038387", "#8764b8", "#498205", "#d13438", "#986f0b"];
+      let hsh = 0; for (const ch of who) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
       card.innerHTML =
-        '<div class="srow"><span class="stag">' + m.tag + "</span>" +
-        '<span class="swho">' + esc(it.sender || m.tag) + "</span>" +
-        '<span class="swhen">' + relTime(it.received_at) + "</span></div>" +
-        '<div class="sprev">' + esc(it.preview || "(no preview)") + "</div>" +
+        '<div class="olrow">' +
+        '<div class="olav" style="background:' + AV[hsh % AV.length] + '">' + esc(initials) + "</div>" +
+        '<div class="olmain">' +
+        '<div class="olline1"><span class="olwho">' + esc(who) + "</span>" +
+        '<span class="oltag" style="color:' + m.color + '">' + m.tag + "</span>" +
+        '<span class="olwhen">' + relTime(it.received_at) + "</span></div>" +
+        (subject ? '<div class="olsubj">' + esc(subject) + "</div>" : "") +
+        '<div class="olsnip">' + esc(snippet || "(no preview)") + "</div>" +
+        "</div></div>" +
         '<div class="sigact">' +
         (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
         '<div class="row">' +
@@ -1258,20 +1306,41 @@
         else { btn.disabled = false; btn.textContent = "⚠️"; btn.title = "Archive failed — tap to retry"; }
       });
       // One-tap archive from the list + Outlook-style swipe-left-to-archive.
-      // Both perform the REAL archive at the source (Outlook/Gmail).
-      async function archiveNow() {
-        let ok = true;
+      // Both perform the REAL archive at the source (Outlook/Gmail) — but the
+      // UI is OPTIMISTIC: the row slides out and the list closes the gap
+      // immediately (exactly like Outlook); the server call runs behind it.
+      function collapseCard() {
+        const h = card.offsetHeight;
+        card.style.overflow = "hidden";
+        card.style.maxHeight = h + "px";
+        requestAnimationFrame(() => {
+          card.style.transition = "transform .18s ease, opacity .18s ease, max-height .25s ease .04s, padding .25s ease .04s, margin .25s ease .04s, border-width .25s ease .04s";
+          card.style.transform = "translateX(-110%)"; card.style.opacity = "0";
+          card.style.maxHeight = "0px";
+          card.style.paddingTop = "0"; card.style.paddingBottom = "0";
+          card.style.marginTop = "0"; card.style.marginBottom = "0";
+          card.style.borderWidth = "0";
+        });
+        setTimeout(() => card.remove(), 340);
+      }
+      async function archiveNow(fromSwipe) {
+        sigHide.set(it.id, Date.now() + 120000);
+        sigItems = sigItems.filter((x) => x.id !== it.id); sigOpen.delete(it.id);
+        if (fromSwipe) collapseCard(); else renderSignals();
         try {
           const r = await fetch(APP_URL + "&op=inbox_archive", { method: "POST",
             headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [it.id] }) });
-          const d = await r.json(); ok = d.ok !== false;
-        } catch (err) { ok = false; }
-        if (ok) { sigItems = sigItems.filter((x) => x.id !== it.id); sigOpen.delete(it.id); }
-        renderSignals();
+          const d = await r.json();
+          if (d.ok === false) throw new Error("archive rejected");
+        } catch (err) {
+          // Truth wins: un-hide and let the next refresh restore the row.
+          sigHide.delete(it.id);
+          setTimeout(loadSignals, 400);
+        }
       }
       const qarch = card.querySelector(".qarch");
       if (qarch) qarch.addEventListener("click", (e) => {
-        e.stopPropagation(); qarch.textContent = "…"; qarch.disabled = true; archiveNow();
+        e.stopPropagation(); qarch.textContent = "…"; qarch.disabled = true; archiveNow(false);
       });
       if (emailish) {
         // pan-y: keep vertical scrolling native, but horizontal drags are OURS —
@@ -1280,24 +1349,26 @@
         let sx = 0, sy = 0, dx = 0, swiping = false;
         card.addEventListener("touchstart", (e) => {
           if (e.target.closest(".sigact")) return;
-          sx = e.touches[0].clientX; sy = e.touches[0].clientY; dx = 0; swiping = true;
+          sx = e.touches[0].clientX; sy = e.touches[0].clientY; dx = 0; swiping = true; swipeActive = true;
           card.style.transition = "none";
         }, { passive: true });
         card.addEventListener("touchmove", (e) => {
           if (!swiping) return;
           dx = e.touches[0].clientX - sx;
           const dy = e.touches[0].clientY - sy;
-          if (Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx) * 1.5) { swiping = false; card.style.transform = ""; card.style.opacity = "1"; return; }
+          if (Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx) * 1.5) { swiping = false; swipeActive = false; card.style.transform = ""; card.style.opacity = "1"; return; }
           if (dx < 0) { card.style.transform = "translateX(" + dx + "px)"; card.style.opacity = String(Math.max(0.35, 1 + dx / 300)); }
         }, { passive: true });
         card.addEventListener("touchend", () => {
-          if (!swiping) return; swiping = false;
-          card.style.transition = "transform .22s ease, opacity .22s ease";
-          if (dx < -60) { card.style.transform = "translateX(-110%)"; card.style.opacity = "0"; archiveNow(); }
-          else { card.style.transform = ""; card.style.opacity = "1"; }
+          if (!swiping) return; swiping = false; swipeActive = false;
+          if (dx < -60) { archiveNow(true); }
+          else {
+            card.style.transition = "transform .22s ease, opacity .22s ease";
+            card.style.transform = ""; card.style.opacity = "1";
+          }
         });
         card.addEventListener("touchcancel", () => {
-          swiping = false;
+          swiping = false; swipeActive = false;
           card.style.transition = "transform .22s ease, opacity .22s ease";
           card.style.transform = ""; card.style.opacity = "1";
         });
@@ -2346,7 +2417,8 @@
     loadSignals();
     fetchAlarms(); // so a due alarm rings even if Today was never opened
     setInterval(loadSignals, 10000); // near-live Signals: 10s poll + server push
-    setTimeout(() => { if (!pc) start(); }, 300); // opens muted by design
+    // Voice connects ON DEMAND (first tap of the orb / "Talk to Scarlet") —
+    // never at login, so unlocking the app asks for nothing.
   }
   function showLock(withFace) {
     lockEl.classList.add("on");
