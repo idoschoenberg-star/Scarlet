@@ -460,6 +460,28 @@
   .olattimg.big { width:100%; }
   .olattchip { border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink);
     border-radius:10px; padding:9px 12px; font-size:14px; min-height:40px; }
+  /* Full-screen reader */
+  #readerWin { position:fixed; inset:0; z-index:55; background:#0b0507; display:flex; flex-direction:column; }
+  .rdhead { display:flex; align-items:center; gap:8px; padding:calc(8px + env(safe-area-inset-top)) 8px 8px; }
+  #rdBack { font-size:32px; line-height:1; background:none; border:0; color:#7cbcf9; padding:0 12px; }
+  .rdwho { flex:1; min-width:0; }
+  .rdsender { font-size:17px; font-weight:750; color:var(--i1-ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rdtime { font-size:13px; color:var(--i1-faint); }
+  #rdArch { font-size:14.5px; font-weight:700; background:#217346; border:0; border-radius:12px;
+    color:#fff; padding:10px 14px; min-height:44px; }
+  .rdscroll { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; padding:0 12px 16px; }
+  .rdsubj { font-size:19.5px; font-weight:750; color:var(--i1-ink); margin:6px 0 8px; line-height:1.35; unicode-bidi:plaintext; }
+  .rdmeta { font-size:13.5px; color:var(--i1-sub); margin-bottom:10px; line-height:1.5; word-break:break-word; }
+  .rdact { padding:10px 12px calc(12px + env(safe-area-inset-bottom)); display:flex; flex-direction:column;
+    gap:8px; background:rgba(16,10,13,.96); border-top:1px solid rgba(255,255,255,.08); }
+  .rdact .row { display:flex; gap:8px; align-items:flex-end; }
+  .rdact textarea { flex:1; resize:none; border-radius:12px; border:1px solid var(--i1-line);
+    background:var(--i1-card); color:var(--i1-ink); padding:11px 14px; font-size:16px; }
+  #rdDraft { background:#2ea86b; color:#fff; border:0; border-radius:12px; padding:12px;
+    font-size:15.5px; font-weight:700; min-height:46px; }
+  #rdSend { width:46px; height:46px; border-radius:12px; border:0; background:#7cbcf9; color:#08131f; font-size:18px; flex:none; }
+  #rdTalk { background:var(--i1-card); border:1px solid var(--i1-line); color:var(--i1-ink);
+    border-radius:12px; padding:12px; font-size:15.5px; min-height:46px; }
   /* Outlook-style swipe reveal: green Archive label behind the sliding row */
   .sigwrap { position:relative; overflow:hidden; }
   .sigwrap .swipebg { position:absolute; inset:0; background:#217346; display:flex;
@@ -651,6 +673,26 @@
     <button id="alarmStopBtn" style="font-size:19px;font-weight:600;padding:17px 58px;border:none;border-radius:999px;background:#ff5a6a;color:#fff;cursor:pointer">Stop</button>
   </div>
 
+  <!-- Full-screen email reader: opens over everything (immune to list
+       refreshes), reads like Outlook, actions attached at the bottom. -->
+  <div id="readerWin" style="display:none">
+    <div class="rdhead">
+      <button id="rdBack">‹</button>
+      <div class="rdwho"><div class="rdsender" id="rdSender"></div><div class="rdtime" id="rdTime"></div></div>
+      <button id="rdArch" title="Archive — really archives in Outlook/Gmail">🗄 Archive</button>
+    </div>
+    <div class="rdscroll">
+      <div class="rdsubj" id="rdSubj"></div>
+      <div class="rdmeta" id="rdMeta"></div>
+      <div id="rdBody"></div>
+    </div>
+    <div class="rdact">
+      <button id="rdDraft">✍️ Draft reply</button>
+      <div class="row"><textarea id="rdInstr" rows="1" placeholder="Tell Scarlet what to do with this…" dir="auto"></textarea><button id="rdSend">➤</button></div>
+      <button id="rdTalk">🎤 Talk to Scarlet about this</button>
+    </div>
+  </div>
+
   <!-- Drafting studio: the active draft floats above everything; Scarlet
        updates it as Ido revises by voice; approval routes per channel. -->
   <div id="draftWin" style="position:fixed;left:12px;right:12px;bottom:86px;z-index:60;display:none;
@@ -698,7 +740,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.7";
+  const BUILD = "2026-07-29.8";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1226,14 +1268,53 @@
   // up) and a flag so a poll never re-renders mid-swipe and kills the gesture.
   const sigHide = new Map();
   let swipeActive = false;
-  // Full-email reader: fetches the complete body (inline images embedded) and
-  // attachments, rendered in a sandboxed frame — reading = same as Outlook.
+  // Full-email reader: a FULL-SCREEN view (like opening a message in Outlook).
+  // It lives outside the list, so the 10s refresh can never wipe it.
   const fullCache = new Map();
-  async function ensureFull(it, card) {
-    const holder = card.querySelector(".olfull");
-    if (!holder || holder.dataset.done) return;
-    holder.dataset.done = "1";
-    holder.innerHTML = '<div class="olloading">Loading full email…</div>';
+  let readerIt = null;
+  function buildFullEmail(d, holder) {
+    holder.innerHTML = "";
+    const fr = document.createElement("iframe");
+    fr.className = "olframe";
+    fr.setAttribute("sandbox", "allow-same-origin allow-popups");
+    fr.srcdoc = '<base target="_blank"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+      "<style>body{margin:0;padding:14px;font:16px/1.5 -apple-system,system-ui,sans-serif;color:#111;background:#fff;word-break:break-word}img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
+      (d.html || "<i>(no content)</i>");
+    const fit = () => { try { fr.style.height = Math.min(fr.contentDocument.body.scrollHeight + 30, 20000) + "px"; } catch (e) {} };
+    fr.addEventListener("load", () => { fit(); setTimeout(fit, 600); setTimeout(fit, 2000); });
+    holder.appendChild(fr);
+    if (d.attachments && d.attachments.length) {
+      const ar = document.createElement("div"); ar.className = "olatts";
+      for (const a of d.attachments) {
+        if (a.dataUrl && /^image\//.test(a.contentType || "")) {
+          const img = document.createElement("img");
+          img.className = "olattimg"; img.src = a.dataUrl; img.alt = a.name || "";
+          img.addEventListener("click", () => img.classList.toggle("big"));
+          ar.appendChild(img);
+        } else {
+          const chip = document.createElement("button");
+          chip.className = "olattchip";
+          chip.textContent = "📎 " + (a.name || "attachment") + (a.size ? " · " + Math.max(1, Math.round(a.size / 1024)) + " KB" : "");
+          chip.addEventListener("click", () => {
+            if (!a.dataUrl) { alert("This attachment is too large to preview here — open it in Outlook/Gmail."); return; }
+            const bin = atob(a.dataUrl.split(",")[1]);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            window.open(URL.createObjectURL(new Blob([bytes], { type: a.contentType || "application/octet-stream" })), "_blank");
+          });
+          ar.appendChild(chip);
+        }
+      }
+      holder.appendChild(ar);
+    }
+  }
+  function closeReader() {
+    document.getElementById("readerWin").style.display = "none";
+    readerIt = null;
+    document.getElementById("rdInstr").value = "";
+  }
+  async function fillReader(it) {
+    const body = document.getElementById("rdBody");
     try {
       let d = fullCache.get(it.id);
       if (!d) {
@@ -1242,52 +1323,74 @@
         if (d.error) throw new Error(d.error);
         fullCache.set(it.id, d);
       }
-      holder.innerHTML = "";
-      card.classList.add("hasfull");
-      const meta = document.createElement("div");
-      meta.className = "olfmeta";
-      meta.innerHTML = "<div><b>From:</b> " + esc(d.from || "") + "</div>" +
-        (d.to ? "<div><b>To:</b> " + esc(d.to) + "</div>" : "");
-      holder.appendChild(meta);
-      const fr = document.createElement("iframe");
-      fr.className = "olframe";
-      fr.setAttribute("sandbox", "allow-same-origin allow-popups");
-      fr.srcdoc = '<base target="_blank"><meta name="viewport" content="width=device-width, initial-scale=1">' +
-        "<style>body{margin:0;padding:14px;font:16px/1.5 -apple-system,system-ui,sans-serif;color:#111;background:#fff;word-break:break-word}img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
-        (d.html || "<i>(no content)</i>");
-      const fit = () => { try { fr.style.height = Math.min(fr.contentDocument.body.scrollHeight + 30, 20000) + "px"; } catch (e) {} };
-      fr.addEventListener("load", () => { fit(); setTimeout(fit, 600); setTimeout(fit, 2000); });
-      holder.appendChild(fr);
-      if (d.attachments && d.attachments.length) {
-        const ar = document.createElement("div"); ar.className = "olatts";
-        for (const a of d.attachments) {
-          if (a.dataUrl && /^image\//.test(a.contentType || "")) {
-            const img = document.createElement("img");
-            img.className = "olattimg"; img.src = a.dataUrl; img.alt = a.name || "";
-            img.addEventListener("click", () => img.classList.toggle("big"));
-            ar.appendChild(img);
-          } else {
-            const chip = document.createElement("button");
-            chip.className = "olattchip";
-            chip.textContent = "📎 " + (a.name || "attachment") + (a.size ? " · " + Math.max(1, Math.round(a.size / 1024)) + " KB" : "");
-            chip.addEventListener("click", () => {
-              if (!a.dataUrl) { alert("This attachment is too large to preview here — open it in Outlook/Gmail."); return; }
-              const bin = atob(a.dataUrl.split(",")[1]);
-              const bytes = new Uint8Array(bin.length);
-              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-              window.open(URL.createObjectURL(new Blob([bytes], { type: a.contentType || "application/octet-stream" })), "_blank");
-            });
-            ar.appendChild(chip);
-          }
-        }
-        holder.appendChild(ar);
-      }
+      if (readerIt !== it) return;
+      if (d.subject) document.getElementById("rdSubj").textContent = d.subject;
+      document.getElementById("rdMeta").innerHTML =
+        "<b>From:</b> " + esc(d.from || "") + (d.to ? "<br><b>To:</b> " + esc(d.to) : "");
+      buildFullEmail(d, body);
     } catch (e) {
-      holder.dataset.done = "";
-      holder.innerHTML = '<div class="olloading">Couldn’t load the full email — tap here to retry.</div>';
-      holder.firstChild.addEventListener("click", () => ensureFull(it, card));
+      if (readerIt !== it) return;
+      body.innerHTML = '<div class="olloading">Couldn’t load the full email — tap here to retry.</div>';
+      body.firstChild.addEventListener("click", () => { body.innerHTML = '<div class="olloading">Loading…</div>'; fillReader(it); });
     }
   }
+  function openReader(it) {
+    readerIt = it;
+    const m = sigMeta(it.source);
+    document.getElementById("rdSender").textContent = it.sender || m.tag;
+    document.getElementById("rdTime").textContent = relTime(it.received_at);
+    const pv = String(it.preview || "");
+    const sep = pv.indexOf(" — ");
+    document.getElementById("rdSubj").textContent = sep > 0 ? pv.slice(0, sep) : "";
+    document.getElementById("rdMeta").textContent = "";
+    document.getElementById("rdBody").innerHTML = '<div class="olloading">Loading full email…</div>';
+    document.getElementById("readerWin").style.display = "flex";
+    if (!it.read_at) { it.read_at = new Date().toISOString(); markSig([it.id], "inbox_read"); }
+    fillReader(it);
+  }
+  document.getElementById("rdBack").addEventListener("click", closeReader);
+  document.getElementById("rdArch").addEventListener("click", async () => {
+    const it = readerIt; if (!it) return;
+    sigHide.set(it.id, Date.now() + 120000);
+    sigItems = sigItems.filter((x) => x.id !== it.id);
+    closeReader();
+    if (!CHAN_VIEWS[sigFilter]) renderSignals();
+    try {
+      const r = await fetch(APP_URL + "&op=inbox_archive", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [it.id] }) });
+      const d = await r.json();
+      if (d.ok === false) throw new Error("archive rejected");
+    } catch (e) { sigHide.delete(it.id); setTimeout(loadSignals, 400); }
+  });
+  document.getElementById("rdDraft").addEventListener("click", async (e) => {
+    const it = readerIt; if (!it) return;
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = "✍️ Drafting…";
+    const extra = document.getElementById("rdInstr").value.trim();
+    try {
+      await fetch(APP_URL + "&op=draft_compose", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel: DRAFT_SRC[it.source], recipient: it.sender || "",
+          original: it.preview || "",
+          instruction: extra || "Draft the appropriate reply.",
+        }) });
+      if (!it.acted_at) { it.acted_at = new Date().toISOString(); markSig([it.id], "inbox_acted"); }
+      btn.textContent = "✍️ Draft is up — it appears over this email";
+      pollDraft();
+    } catch (err) { btn.textContent = "Failed — try again"; }
+    setTimeout(() => { btn.disabled = false; btn.textContent = "✍️ Draft reply"; }, 4000);
+  });
+  document.getElementById("rdSend").addEventListener("click", () => {
+    const it = readerIt; if (!it) return;
+    const t = document.getElementById("rdInstr").value.trim(); if (!t) return;
+    closeReader();
+    instructSignal(it, t);
+  });
+  document.getElementById("rdTalk").addEventListener("click", () => {
+    const it = readerIt; if (!it) return;
+    closeReader();
+    talkSignal(it);
+  });
   async function loadSignals() {
     if (!APP_URL) return;
     try {
@@ -1296,8 +1399,9 @@
       if (swipeActive) return;
       sigItems = (j.events || []).filter((ev) => !(sigHide.get(ev.id) > Date.now()));
       // Channel-native views (WhatsApp/Teams/iMessage/Calendar) manage their
-      // own refresh — the 10s poll must not stomp an open thread.
-      if (!CHAN_VIEWS[sigFilter]) renderSignals();
+      // own refresh, and an expanded card (open textarea etc.) must never be
+      // wiped mid-use — the 10s poll only re-renders the plain list.
+      if (!CHAN_VIEWS[sigFilter] && !sigOpen.size) renderSignals();
       if (sigItems.some((i) => !i.read_at) && activeTab !== "signals") tabs.signals.classList.add("unread");
     } catch (e) { /* keep what we have */ }
   }
@@ -1587,11 +1691,13 @@
         '<div class="sighint">✍️ opens a first draft in your voice — refine it, then approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact") || e.target.closest(".olfull")) return;
+        // Emails open the FULL-SCREEN reader (Outlook-style); other signals
+        // expand in place.
+        if (emailish) { openReader(it); return; }
         const wasOpen = sigOpen.has(it.id);
         if (wasOpen) { sigOpen.delete(it.id); card.classList.remove("open"); }
         else { sigOpen.add(it.id); card.classList.add("open"); }
         if (!wasOpen && !it.read_at) { it.read_at = new Date().toISOString(); card.classList.add("read"); markSig([it.id], "inbox_read"); }
-        if (!wasOpen && emailish) ensureFull(it, card);
       });
       const draftBtn = card.querySelector(".draft");
       if (draftBtn) draftBtn.addEventListener("click", async (e) => {
