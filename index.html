@@ -466,6 +466,10 @@
     border-radius:10px; color:#fff; font-size:15px; padding:7px 10px; min-height:36px;
     backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); }
   .bmore { color:#7cbcf9; font-size:14px; font-weight:650; white-space:nowrap; }
+  .micbtn { width:46px; height:46px; min-height:44px; flex:none; border-radius:12px;
+    border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink); font-size:17px; }
+  .micbtn.rec { background:#c0273b; color:#fff; border-color:#c0273b; animation:pulse 1s infinite; }
+  .micbtn.busy { opacity:.5; }
   /* News text: comfortable size and CORRECT bidi — Hebrew flows right-to-left
      with punctuation on the right side, English stays left-to-right. */
   .btxt { unicode-bidi:plaintext; text-align:start; font-size:16px !important;
@@ -698,7 +702,7 @@
     </div>
     <div class="rdact">
       <button id="rdDraft">✍️ Draft reply</button>
-      <div class="row"><textarea id="rdInstr" rows="1" placeholder="Tell Scarlet what to do with this…" dir="auto"></textarea><button id="rdSend">➤</button></div>
+      <div class="row"><button id="rdMic" class="micbtn" title="Dictate">🎙</button><textarea id="rdInstr" rows="1" placeholder="Tell Scarlet what to do with this…" dir="auto"></textarea><button id="rdSend">➤</button></div>
       <button id="rdTalk">🎤 Talk to Scarlet about this</button>
     </div>
   </div>
@@ -721,6 +725,7 @@
       <button id="draftDismiss" style="font-size:15px;padding:12px 18px;border:none;border-radius:12px;background:#3a2a2e;color:#e8c9cd;cursor:pointer">Discard</button>
     </div>
     <div id="draftRefineRow" style="display:flex;gap:8px;padding:0 12px 10px">
+      <button id="draftMic" class="micbtn" title="Dictate your instruction">🎙</button>
       <input id="draftRefine" dir="auto" placeholder="Refine: tell her what to change…"
         style="flex:1;font-size:14px;padding:10px 12px;border-radius:10px;border:1px solid #5a3a42;background:#140c0f;color:#fdf3f4">
       <button id="draftRefineBtn" style="font-size:15px;padding:10px 16px;border:none;border-radius:10px;background:#3a2a2e;color:#e8c9cd;cursor:pointer">↻</button>
@@ -750,7 +755,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.14";
+  const BUILD = "2026-07-29.15";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1448,11 +1453,26 @@
       (it.sender ? " from " + it.sender : "") + ':\n"' + (it.preview || "") + '"';
   };
   async function ensureLive() {
+    // Ido chose to talk — an active mute must never swallow his voice.
+    if (muted) { muted = false; applyMute(); }
     if (dc && dc.readyState === "open") return true;
     await start();
     for (let i = 0; i < 40 && !(dc && dc.readyState === "open"); i++) await new Promise((r) => setTimeout(r, 150));
     return !!(dc && dc.readyState === "open");
   }
+  // Dictate-in-place: every text box that talks to Scarlet has a 🎙 that
+  // transcribes speech straight into the field — no jumping to the Live tab.
+  function dictInto(btn, field) {
+    dictate(btn, (t) => {
+      field.value = (field.value ? field.value + " " : "") + t;
+      field.dispatchEvent(new Event("input"));
+      field.focus();
+    });
+  }
+  document.getElementById("draftMic").addEventListener("click", (e) =>
+    dictInto(e.currentTarget, document.getElementById("draftRefine")));
+  document.getElementById("rdMic").addEventListener("click", (e) =>
+    dictInto(e.currentTarget, document.getElementById("rdInstr")));
   async function instructSignal(it, instruction) {
     it.acted_at = new Date().toISOString();
     markSig([it.id], "inbox_acted");
@@ -1540,6 +1560,7 @@
     const sendColors = { wa: "#00a884", im: "#0b93f6", teams: "#5b5fc7" };
     bar.innerHTML =
       '<button class="thdraft" style="background:#2ea86b" title="Scarlet drafts the reply in your voice — refine and approve in the draft window">✍️</button>' +
+      '<button class="thmic micbtn" title="Dictate">🎙</button>' +
       '<textarea rows="1" placeholder="' + (kind === "teams" ? "Message (staged — you tap Send in Teams)" : "Message") + '" dir="auto"></textarea>' +
       '<button class="thsend" style="background:' + sendColors[kind] + '">➤</button>';
     feed.appendChild(bar);
@@ -1574,6 +1595,7 @@
     // ✍️ Scarlet drafts the reply IN THIS CONVERSATION: whatever is typed in
     // the box becomes the instruction; the draft appears in the floating
     // Draft window over the chat — refine there, approve to send here.
+    bar.querySelector(".thmic").addEventListener("click", (e) => dictInto(e.currentTarget, ta));
     bar.querySelector(".thdraft").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       const instr = ta.value.trim();
@@ -1763,6 +1785,7 @@
         '<div class="sigact">' +
         (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
         '<div class="row">' +
+        '<button class="sigmic micbtn" title="Dictate">🎙</button>' +
         '<textarea rows="1" placeholder="Tell Scarlet what to do…" dir="auto"></textarea>' +
         '<button class="sigbtn send" title="Send instruction">➤</button></div>' +
         '<div class="row"><button class="sigbtn talk" style="flex:1">🎤 Talk to Scarlet about this</button>' +
@@ -1805,6 +1828,8 @@
       card.querySelector(".send").addEventListener("click", () => {
         const t = ta.value.trim(); if (!t) return; ta.value = ""; ta.style.height = "auto"; instructSignal(it, t);
       });
+      const sigMicBtn = card.querySelector(".sigmic");
+      if (sigMicBtn) sigMicBtn.addEventListener("click", (e) => { e.stopPropagation(); dictInto(e.currentTarget, ta); });
       card.querySelector(".talk").addEventListener("click", () => talkSignal(it));
       const archBtn = card.querySelector(".arch");
       if (archBtn) archBtn.addEventListener("click", async (e) => {
