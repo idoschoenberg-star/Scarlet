@@ -461,6 +461,10 @@
   .olattchip { border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink);
     border-radius:10px; padding:9px 12px; font-size:14px; min-height:40px; }
   a.tbullet.tlink { text-decoration:none; color:inherit; display:flex; }
+  .gcard { position:relative; }
+  .garch { position:absolute; top:8px; right:8px; background:rgba(0,0,0,.55); border:0;
+    border-radius:10px; color:#fff; font-size:15px; padding:7px 10px; min-height:36px;
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); }
   .bmore { color:#7cbcf9; font-size:14px; font-weight:650; white-space:nowrap; }
   /* Full-screen reader */
   #readerWin { position:fixed; inset:0; z-index:55; background:#0b0507; display:flex; flex-direction:column; }
@@ -742,7 +746,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.12";
+  const BUILD = "2026-07-29.13";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -850,6 +854,20 @@
     d.textContent = new Date(ph.created_at).toLocaleDateString([], { month: "short", day: "numeric" });
     cap.appendChild(t); cap.appendChild(d);
     card.appendChild(img); card.appendChild(cap);
+    // Archive = hide from the Gallery only. Nothing is deleted anywhere.
+    const arch = document.createElement("button");
+    arch.className = "garch";
+    arch.textContent = "🗄";
+    arch.title = "Remove from Gallery (nothing is deleted)";
+    arch.addEventListener("click", (e) => {
+      e.stopPropagation();
+      card.style.transition = "opacity .2s ease, transform .2s ease";
+      card.style.opacity = "0"; card.style.transform = "scale(.9)";
+      setTimeout(() => card.remove(), 210);
+      fetch(APP_URL + "&op=gallery_archive", { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: [ph.id] }) }).catch(() => {});
+    });
+    card.appendChild(arch);
     card.addEventListener("click", () => openLightbox(ph.media_url, ph.text || ""));
     return card;
   }
