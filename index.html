@@ -471,6 +471,7 @@
     align-items:center; cursor:pointer; }
   .chav { width:47px; height:47px; border-radius:50%; flex:none; display:flex; align-items:center;
     justify-content:center; font-weight:700; color:#fff; font-size:17px; }
+  img.chav { object-fit:cover; background:#3a3a40; }
   .chmain { flex:1; min-width:0; }
   .chname { font-size:17px; font-weight:650; color:var(--i1-ink); display:flex; align-items:baseline; gap:8px; }
   .chname span.nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -697,7 +698,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.6";
+  const BUILD = "2026-07-29.7";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1370,7 +1371,9 @@
       for (const c of chats) {
         const row = document.createElement("div");
         row.className = "chrow";
-        row.innerHTML = chAv(c.name, cfg.color) +
+        row.innerHTML = (c.avatar
+          ? '<img class="chav" src="' + esc(c.avatar) + '" alt="" referrerpolicy="no-referrer" onerror="this.style.display=\'none\'">'
+          : chAv(c.name, cfg.color)) +
           '<div class="chmain"><div class="chname"><span class="nm">' + esc(c.name || "") + "</span>" +
           '<span class="chts">' + relTime(c.ts) + "</span></div>" +
           '<div class="chlast">' + (c.from_me ? "You: " : "") + esc(c.last || "") + "</div></div>";
