@@ -740,7 +740,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.8";
+  const BUILD = "2026-07-29.9";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1632,6 +1632,31 @@
     imessage: (feed) => chan.mode === "thread" ? threadView(feed, "im") : chatListView(feed, "imessage"),
     outlook_calendar: (feed) => calView(feed),
   };
+  // A message signal in the unified list opens straight into its FULL
+  // conversation — exactly like tapping a WhatsApp/iMessage/Teams
+  // notification opens the real chat.
+  function openThreadFromSignal(it) {
+    const meta = it.meta || {};
+    let key = null, chat = null;
+    if (it.source === "whatsapp" && meta.chat_jid) {
+      key = "whatsapp"; chat = { kind: "wa", jid: meta.chat_jid, name: it.sender || "WhatsApp" };
+    } else if (it.source === "imessage" && meta.handle) {
+      key = "imessage"; chat = { kind: "im", handle: meta.handle, name: it.sender || "iMessage" };
+    } else if (it.source === "teams") {
+      const mm = String(meta.resource || "").match(/chats\('([^']+)'\)/);
+      key = "teams";
+      chat = mm ? { kind: "teams", id: mm[1], name: it.sender || "Teams" } : null;
+    }
+    if (!key) return false;
+    if (!it.read_at) { it.read_at = new Date().toISOString(); markSig([it.id], "inbox_read"); }
+    sigFilter = key;
+    document.querySelectorAll("#sigFilter .fchip").forEach((c) => c.classList.toggle("active", c.dataset.f === key));
+    stopChanTimer();
+    if (chat) { chan.mode = "thread"; chan.chat = chat; }
+    else { chan.mode = "list"; chan.chat = null; } // old signal without a chat id → the chat list
+    renderSignals();
+    return true;
+  }
 
   function renderSignals() {
     const feed = document.getElementById("sigFeed");
@@ -1691,9 +1716,11 @@
         '<div class="sighint">✍️ opens a first draft in your voice — refine it, then approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
         if (e.target.closest(".sigact") || e.target.closest(".olfull")) return;
-        // Emails open the FULL-SCREEN reader (Outlook-style); other signals
-        // expand in place.
+        // Emails open the FULL-SCREEN reader (Outlook-style); message signals
+        // open their FULL conversation thread (WhatsApp/iMessage/Teams-style);
+        // everything else expands in place.
         if (emailish) { openReader(it); return; }
+        if (["whatsapp", "imessage", "teams"].includes(it.source) && openThreadFromSignal(it)) return;
         const wasOpen = sigOpen.has(it.id);
         if (wasOpen) { sigOpen.delete(it.id); card.classList.remove("open"); }
         else { sigOpen.add(it.id); card.classList.add("open"); }
