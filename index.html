@@ -460,6 +460,8 @@
   .olattimg.big { width:100%; }
   .olattchip { border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink);
     border-radius:10px; padding:9px 12px; font-size:14px; min-height:40px; }
+  a.tbullet.tlink { text-decoration:none; color:inherit; display:flex; }
+  .bmore { color:#7cbcf9; font-size:14px; font-weight:650; white-space:nowrap; }
   /* Full-screen reader */
   #readerWin { position:fixed; inset:0; z-index:55; background:#0b0507; display:flex; flex-direction:column; }
   .rdhead { display:flex; align-items:center; gap:8px; padding:calc(8px + env(safe-area-inset-top)) 8px 8px; }
@@ -740,7 +742,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.10";
+  const BUILD = "2026-07-29.11";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -2480,7 +2482,12 @@
     if (imgs[0]) nh += '<img class="tnimg" src="' + esc(imgs[0].url) + '" alt="">' +
       (imgs[0].caption ? '<div class="tncap">' + esc(imgs[0].caption) + "</div>" : "");
     for (const b of (news.bullets || [])) {
-      nh += '<div class="tbullet"><span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") + "</span></div>";
+      // Tap a headline → the full article (with its pictures) opens to read.
+      nh += b.link
+        ? '<a class="tbullet tlink" href="' + esc(b.link) + '" target="_blank" rel="noopener">' +
+          '<span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") +
+          ' <span class="bmore">Read more ›</span></span></a>'
+        : '<div class="tbullet"><span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") + "</span></div>";
     }
     if (!(news.bullets || []).length) nh += '<div class="ovnote">' + (d.refreshing ? "Scarlet is writing your brief — check back in a minute." : "No news brief yet.") + "</div>";
     if (imgs[1]) nh += '<img class="tnimg" src="' + esc(imgs[1].url) + '" alt="">' +
