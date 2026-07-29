@@ -755,7 +755,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.16";
+  const BUILD = "2026-07-29.17";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1451,7 +1451,7 @@
     const m = sigMeta(it.source);
     return "Ido is looking at this " + m.tag + " notification" +
       (it.sender ? " from " + it.sender : "") + ':\n"' + (it.preview || "") + '"' +
-      "\n(signal_id: " + it.id + " — when drafting an email reply to THIS message, pass original_event_id: " + it.id + " to compose_draft so the reply carries all recipients)";
+      "\n(signal_id: " + it.id + " — when drafting an email reply OR forward of THIS message, pass original_event_id: " + it.id + " to compose_draft; use mode 'forward' when sending it onward to someone new so the original attachments ride along)";
   };
   async function ensureLive() {
     // Ido chose to talk — an active mute must never swallow his voice.
