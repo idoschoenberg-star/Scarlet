@@ -691,7 +691,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.4";
+  const BUILD = "2026-07-29.5";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -2371,9 +2371,34 @@
     imessage:      { tag: "iMessage",     color: "#0b93f6", ok: "Approve & Send" },
   };
   let draftCur = null, draftBusy = false;
+  const draftDone = new Set();
   function renderDraft(d) {
     const win = document.getElementById("draftWin");
     if (!d) { win.style.display = "none"; draftCur = null; return; }
+    // Sent/approved: collapse to a small "✓ sent" toast that slips away on its
+    // own — the full window must never sit stuck over the screen after a send.
+    if (d.status === "approved") {
+      if (draftDone.has(d.id)) { win.style.display = "none"; draftCur = null; return; }
+      draftDone.add(d.id);
+      draftCur = d;
+      const ch = DRAFT_CH[d.channel] || { tag: d.channel, color: "#9c9c9c", ok: "Approve" };
+      document.getElementById("draftChip").textContent = ch.tag;
+      document.getElementById("draftChip").style.background = ch.color;
+      document.getElementById("draftTo").textContent = "To: " + (d.recipient || "");
+      document.getElementById("draftRev").textContent = "v" + d.revision;
+      document.getElementById("draftSubj").style.display = "none";
+      document.getElementById("draftBody").style.display = "none";
+      const oc = document.getElementById("draftOutcome");
+      oc.style.display = "block";
+      oc.textContent = "✓ " + (d.outcome || "approved");
+      document.getElementById("draftBtns").style.display = "none";
+      document.getElementById("draftRefineRow").style.display = "none";
+      win.style.display = "flex";
+      setTimeout(() => {
+        if (draftCur && draftCur.id === d.id) { win.style.display = "none"; draftCur = null; }
+      }, 2600);
+      return;
+    }
     const known = draftCur && draftCur.id === d.id && draftCur.revision === d.revision && draftCur.status === d.status;
     draftCur = d;
     if (known) return;
@@ -2384,13 +2409,11 @@
     document.getElementById("draftRev").textContent = "v" + d.revision;
     const sj = document.getElementById("draftSubj");
     sj.textContent = d.subject || ""; sj.style.display = d.subject ? "block" : "none";
-    document.getElementById("draftBody").textContent = d.body || "";
-    const done = d.status === "approved";
-    const oc = document.getElementById("draftOutcome");
-    oc.style.display = done ? "block" : "none";
-    oc.textContent = done ? ("✓ " + (d.outcome || "approved")) : "";
-    document.getElementById("draftBtns").style.display = done ? "none" : "flex";
-    document.getElementById("draftRefineRow").style.display = done ? "none" : "flex";
+    const bd = document.getElementById("draftBody");
+    bd.textContent = d.body || ""; bd.style.display = "block";
+    document.getElementById("draftOutcome").style.display = "none";
+    document.getElementById("draftBtns").style.display = "flex";
+    document.getElementById("draftRefineRow").style.display = "flex";
     document.getElementById("draftApprove").textContent = ch.ok;
     win.style.display = "flex";
   }
