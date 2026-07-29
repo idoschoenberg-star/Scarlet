@@ -448,6 +448,18 @@
     overflow:hidden; unicode-bidi:plaintext; }
   .sig.open .olsubj { white-space:normal; }
   .sig.open .olsnip { -webkit-line-clamp:unset; }
+  /* Full-email reader inside an expanded row */
+  .olfull { display:none; margin-top:10px; }
+  .sig.open .olfull { display:block; }
+  .sig.open.hasfull .olsnip { display:none; }
+  .olfmeta { font-size:13.5px; color:var(--i1-sub); line-height:1.55; margin-bottom:8px; word-break:break-word; }
+  .olframe { width:100%; border:0; border-radius:12px; background:#fff; min-height:110px; }
+  .olloading { font-size:14.5px; color:var(--i1-faint); padding:10px 2px; }
+  .olatts { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; align-items:flex-start; }
+  .olattimg { width:31.5%; border-radius:10px; cursor:pointer; }
+  .olattimg.big { width:100%; }
+  .olattchip { border:1px solid var(--i1-line); background:var(--i1-card); color:var(--i1-ink);
+    border-radius:10px; padding:9px 12px; font-size:14px; min-height:40px; }
 </style>
 </head>
 <body>
@@ -631,7 +643,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.2";
+  const BUILD = "2026-07-29.3";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1159,6 +1171,68 @@
   // up) and a flag so a poll never re-renders mid-swipe and kills the gesture.
   const sigHide = new Map();
   let swipeActive = false;
+  // Full-email reader: fetches the complete body (inline images embedded) and
+  // attachments, rendered in a sandboxed frame — reading = same as Outlook.
+  const fullCache = new Map();
+  async function ensureFull(it, card) {
+    const holder = card.querySelector(".olfull");
+    if (!holder || holder.dataset.done) return;
+    holder.dataset.done = "1";
+    holder.innerHTML = '<div class="olloading">Loading full email…</div>';
+    try {
+      let d = fullCache.get(it.id);
+      if (!d) {
+        const r = await fetch(APP_URL + "&op=inbox_full&id=" + encodeURIComponent(it.id), { signal: AbortSignal.timeout(30000) });
+        d = await r.json();
+        if (d.error) throw new Error(d.error);
+        fullCache.set(it.id, d);
+      }
+      holder.innerHTML = "";
+      card.classList.add("hasfull");
+      const meta = document.createElement("div");
+      meta.className = "olfmeta";
+      meta.innerHTML = "<div><b>From:</b> " + esc(d.from || "") + "</div>" +
+        (d.to ? "<div><b>To:</b> " + esc(d.to) + "</div>" : "");
+      holder.appendChild(meta);
+      const fr = document.createElement("iframe");
+      fr.className = "olframe";
+      fr.setAttribute("sandbox", "allow-same-origin allow-popups");
+      fr.srcdoc = '<base target="_blank"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+        "<style>body{margin:0;padding:14px;font:16px/1.5 -apple-system,system-ui,sans-serif;color:#111;background:#fff;word-break:break-word}img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
+        (d.html || "<i>(no content)</i>");
+      const fit = () => { try { fr.style.height = Math.min(fr.contentDocument.body.scrollHeight + 30, 20000) + "px"; } catch (e) {} };
+      fr.addEventListener("load", () => { fit(); setTimeout(fit, 600); setTimeout(fit, 2000); });
+      holder.appendChild(fr);
+      if (d.attachments && d.attachments.length) {
+        const ar = document.createElement("div"); ar.className = "olatts";
+        for (const a of d.attachments) {
+          if (a.dataUrl && /^image\//.test(a.contentType || "")) {
+            const img = document.createElement("img");
+            img.className = "olattimg"; img.src = a.dataUrl; img.alt = a.name || "";
+            img.addEventListener("click", () => img.classList.toggle("big"));
+            ar.appendChild(img);
+          } else {
+            const chip = document.createElement("button");
+            chip.className = "olattchip";
+            chip.textContent = "📎 " + (a.name || "attachment") + (a.size ? " · " + Math.max(1, Math.round(a.size / 1024)) + " KB" : "");
+            chip.addEventListener("click", () => {
+              if (!a.dataUrl) { alert("This attachment is too large to preview here — open it in Outlook/Gmail."); return; }
+              const bin = atob(a.dataUrl.split(",")[1]);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              window.open(URL.createObjectURL(new Blob([bytes], { type: a.contentType || "application/octet-stream" })), "_blank");
+            });
+            ar.appendChild(chip);
+          }
+        }
+        holder.appendChild(ar);
+      }
+    } catch (e) {
+      holder.dataset.done = "";
+      holder.innerHTML = '<div class="olloading">Couldn’t load the full email — tap here to retry.</div>';
+      holder.firstChild.addEventListener("click", () => ensureFull(it, card));
+    }
+  }
   async function loadSignals() {
     if (!APP_URL) return;
     try {
@@ -1252,6 +1326,7 @@
         (subject ? '<div class="olsubj">' + esc(subject) + "</div>" : "") +
         '<div class="olsnip">' + esc(snippet || "(no preview)") + "</div>" +
         "</div></div>" +
+        (emailish ? '<div class="olfull"></div>' : "") +
         '<div class="sigact">' +
         (draftable ? '<div class="row"><button class="sigbtn draft" style="flex:1;background:#2ea86b;color:#fff;font-weight:700">✍️ Draft reply</button></div>' : "") +
         '<div class="row">' +
@@ -1263,11 +1338,12 @@
           : "") + "</div>" +
         '<div class="sighint">✍️ opens a first draft in your voice — refine it, then approve before anything sends.</div></div>';
       card.addEventListener("click", (e) => {
-        if (e.target.closest(".sigact")) return;
+        if (e.target.closest(".sigact") || e.target.closest(".olfull")) return;
         const wasOpen = sigOpen.has(it.id);
         if (wasOpen) { sigOpen.delete(it.id); card.classList.remove("open"); }
         else { sigOpen.add(it.id); card.classList.add("open"); }
         if (!wasOpen && !it.read_at) { it.read_at = new Date().toISOString(); card.classList.add("read"); markSig([it.id], "inbox_read"); }
+        if (!wasOpen && emailish) ensureFull(it, card);
       });
       const draftBtn = card.querySelector(".draft");
       if (draftBtn) draftBtn.addEventListener("click", async (e) => {
