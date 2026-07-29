@@ -466,6 +466,10 @@
     border-radius:10px; color:#fff; font-size:15px; padding:7px 10px; min-height:36px;
     backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px); }
   .bmore { color:#7cbcf9; font-size:14px; font-weight:650; white-space:nowrap; }
+  /* News text: comfortable size and CORRECT bidi — Hebrew flows right-to-left
+     with punctuation on the right side, English stays left-to-right. */
+  .btxt { unicode-bidi:plaintext; text-align:start; font-size:16px !important;
+    line-height:1.6 !important; color:var(--i1-ink); }
   /* Full-screen reader */
   #readerWin { position:fixed; inset:0; z-index:55; background:#0b0507; display:flex; flex-direction:column; }
   .rdhead { display:flex; align-items:center; gap:8px; padding:calc(8px + env(safe-area-inset-top)) 8px 8px; }
@@ -746,7 +750,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.13";
+  const BUILD = "2026-07-29.14";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -2510,9 +2514,9 @@
       // Tap a headline → the full article (with its pictures) opens to read.
       nh += b.link
         ? '<a class="tbullet tlink" href="' + esc(b.link) + '" target="_blank" rel="noopener">' +
-          '<span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") +
+          '<span class="bsrc">' + esc(b.source || "") + '</span><span class="btxt" dir="auto">' + esc(b.text || "") +
           ' <span class="bmore">Read more ›</span></span></a>'
-        : '<div class="tbullet"><span class="bsrc">' + esc(b.source || "") + "</span><span>" + esc(b.text || "") + "</span></div>";
+        : '<div class="tbullet"><span class="bsrc">' + esc(b.source || "") + '</span><span class="btxt" dir="auto">' + esc(b.text || "") + "</span></div>";
     }
     if (!(news.bullets || []).length) nh += '<div class="ovnote">' + (d.refreshing ? "Scarlet is writing your brief — check back in a minute." : "No news brief yet.") + "</div>";
     if (imgs[1]) nh += '<img class="tnimg" src="' + esc(imgs[1].url) + '" alt="">' +
