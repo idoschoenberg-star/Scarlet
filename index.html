@@ -8,7 +8,18 @@
 <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'none'; script-src 'unsafe-inline'">
 <meta http-equiv="Cache-Control" content="no-cache, must-revalidate">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<!-- Home Screen / Dock identity: a real app icon + name, so saving to the
+     Home Screen (iOS) or the Dock (macOS) shows the Scarlet orb, not a page
+     screenshot, and launches full-screen with no browser chrome. Relative
+     paths resolve against wherever the page was loaded from. -->
+<meta name="apple-mobile-web-app-title" content="Scarlet">
+<meta name="application-name" content="Scarlet">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+<link rel="manifest" href="manifest.webmanifest">
 <title>Scarlet</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
@@ -851,7 +862,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.18";
+  const BUILD = "2026-07-29.19";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
