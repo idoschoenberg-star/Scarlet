@@ -923,7 +923,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.29";
+  const BUILD = "2026-07-30.30";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1681,8 +1681,10 @@
       "\n(signal_id: " + it.id + " — when drafting an email reply OR forward of THIS message, pass original_event_id: " + it.id + " to compose_draft; use mode 'forward' when sending it onward to someone new so the original attachments ride along)";
   };
   async function ensureLive() {
-    // Ido chose to talk — an active mute must never swallow his voice.
-    if (muted) { muted = false; applyMute(); }
+    // Ido chose to talk — an active mute must never swallow his voice…
+    // unless he deliberately made the mute STICKY (turned it off himself);
+    // then it stays off until he taps 🎙, everywhere including Talk.
+    if (muted && scGet("mic", "on") !== "off") { muted = false; applyMute(); }
     if (voiceOpen()) return true;
     await start();
     for (let i = 0; i < 40 && !voiceOpen(); i++) await new Promise((r) => setTimeout(r, 150));
@@ -3427,6 +3429,11 @@
   }
 
   function cleanup() {
+    // Silence FIRST, disconnect second — tearing down a live connection with
+    // audio still flowing lets a final burst/pop escape the speaker.
+    try { xiFlush(); } catch (e) {}
+    try { audioEl.pause(); audioEl.srcObject = null; } catch (e) {}
+    if (xiOutEl) { try { xiOutEl.pause(); xiOutEl.srcObject = null; } catch (e) {} }
     if (pc) { try { pc.close(); } catch (e) {} }
     // Release the microphone for real — closing the connection alone leaves
     // the capture track alive and the mic indicator on.
@@ -3747,6 +3754,9 @@
   // opens muted and idle), tapping 🎙 also starts it.
   muteBtn.addEventListener("click", () => {
     muted = !muted; applyMute();
+    // The mic choice STICKS (like the speaker): off stays off across opens
+    // until Ido flips it back.
+    scSet("mic", muted ? "off" : "on");
     if (!muted && !pc && !xiWs) start();
   });
   document.getElementById("spkBtn").addEventListener("click", () => {
