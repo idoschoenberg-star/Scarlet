@@ -36,10 +36,14 @@
     box-shadow:0 8px 30px rgba(210,35,70,.4); }
 </style>
 <script>
-  // Launched from the installed icon → straight into the conversation.
+  // Straight into the conversation, always — from the installed icon, the
+  // Action Button, or any normal open. The install landing (icon + how-to)
+  // shows ONLY when explicitly requested with ?install=1, so Add to Home
+  // Screen can still capture the Talk identity.
+  var wantsInstall = new URLSearchParams(location.search).get("install") === "1";
   var standalone = (navigator.standalone === true) ||
     (window.matchMedia && matchMedia("(display-mode: standalone)").matches);
-  if (standalone) location.replace("index.html#talk");
+  if (standalone || !wantsInstall) location.replace("index.html#talk");
 </script>
 </head>
 <body>
