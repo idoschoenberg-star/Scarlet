@@ -923,7 +923,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.30";
+  const BUILD = "2026-07-30.31";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3602,6 +3602,34 @@
   // back-forward cache) and may come back — that must NOT kill a live call.
   window.addEventListener("pagehide", (e) => { if (!e.persisted) { try { cleanup(); } catch (err) {} } });
   window.addEventListener("beforeunload", () => { try { cleanup(); } catch (err) {} });
+  // iOS keeps the page's audio alive for a moment while the app leaves the
+  // screen (the "noise after closing"). The instant the app is hidden, hard-
+  // silence both directions; restore on return. And an instance launched as
+  // TALK snaps back to the Talk page every time it comes to the foreground —
+  // pressing the Talk icon while the full app is showing works again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      try {
+        if (micTrack) micTrack.enabled = false;
+        xiFlush();
+        audioEl.muted = true;
+        if (xiOutEl) xiOutEl.muted = true;
+        if (dc && dc.readyState === "open") {
+          dc.send(JSON.stringify({ type: "response.cancel" }));
+          dc.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
+        }
+      } catch (e) {}
+      return;
+    }
+    try { applySpeaker(); applyMute(); } catch (e) {}
+    try {
+      if (sessionStorage.getItem("scarletTalkApp") === "1" &&
+          !document.body.classList.contains("talkmode")) {
+        talkIntent = true;
+        consumeTalkIntent();
+      }
+    } catch (e) {}
+  });
 
   /* ============================================================
      LOCK — unlock code once per device, Face ID afterwards
@@ -3622,9 +3650,10 @@
     if (!talkIntent) return;
     talkIntent = false;
     try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    try { sessionStorage.setItem("scarletTalkApp", "1"); } catch (e) {}
     document.body.classList.add("talkmode", "showchat");
     switchTab("live");
-    ensureLive(); // unmutes + starts whichever engine is selected
+    ensureLive(); // starts whichever engine is selected (sticky mic respected)
   }
   window.addEventListener("hashchange", () => {
     // The Action Button re-opens the same URL while the app is already alive.
