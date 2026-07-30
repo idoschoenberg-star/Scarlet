@@ -945,7 +945,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.36";
+  const BUILD = "2026-07-30.37";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1509,7 +1509,16 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(args || {}),
       });
-      return await r.text();
+      const text = await r.text();
+      // Navigation hand-off: render the one-tap button right in the transcript
+      // (a browser can only open Apple Maps from a human tap).
+      if (name === "navigate_to") {
+        try {
+          const d = JSON.parse(text);
+          if (d.ok && d.maps_url) addNavCard(d.name || "your destination", d.maps_url);
+        } catch (e2) {}
+      }
+      return text;
     } catch (e) {
       return JSON.stringify({ error: String(e) });
     }
@@ -3041,6 +3050,21 @@
   });
   setInterval(pollDraft, 4000);
 
+  function addNavCard(name, url) {
+    const wrap = addMsg("her", "");
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "🧭 Navigate to " + name;
+    a.style.cssText = "display:block;text-align:center;margin:6px 0 2px;padding:16px;border-radius:14px;" +
+      "background:#2ea86b;color:#fff;font-weight:700;font-size:16px;text-decoration:none;" +
+      "box-shadow:0 6px 22px rgba(46,168,107,.35)";
+    wrap.appendChild(a);
+    document.body.classList.add("showchat");
+    chatBtn.classList.add("on");
+    chat.scrollTop = chat.scrollHeight;
+  }
   function addMsg(cls, text) {
     const d = document.createElement("div");
     d.className = "lmsg " + cls;
