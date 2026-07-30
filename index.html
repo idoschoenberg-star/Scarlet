@@ -945,7 +945,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.35";
+  const BUILD = "2026-07-30.36";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3251,6 +3251,7 @@
     applyMute();
     applyOutput();
     applySpeaker();
+    reportLocation(); // she should know where he is (weather, directions)
   }
 
   /* ---- ElevenLabs live call: raw WS + PCM in both directions ---- */
@@ -3401,6 +3402,24 @@
     }
     mainBtn.disabled = false;
   }
+
+  // Location: with Ido's one-time permission, the app shares his position so
+  // Scarlet can answer weather/directions/nearby without him naming a place.
+  // Sent at session start and every 10 minutes while the app is open; never
+  // more than one browser prompt ever (the grant persists like the mic's).
+  let lastLocAt = 0;
+  function reportLocation() {
+    if (!navigator.geolocation || !APP_URL) return;
+    if (Date.now() - lastLocAt < 8 * 60_000) return;
+    navigator.geolocation.getCurrentPosition((pos) => {
+      lastLocAt = Date.now();
+      fetch(APP_URL + "&op=location", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat: pos.coords.latitude, lng: pos.coords.longitude,
+          accuracy: pos.coords.accuracy }) }).catch(() => {});
+    }, () => {}, { enableHighAccuracy: false, maximumAge: 300000, timeout: 8000 });
+  }
+  setInterval(() => { if (!document.hidden && voiceOpen()) reportLocation(); }, 10 * 60_000);
 
   async function start() {
     if (!SESSION_URL) return;
