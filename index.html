@@ -578,6 +578,7 @@
   body.talkmode .view { padding-bottom:16px; }
   body.talkmode #liveBtn, body.talkmode #camBtn, body.talkmode #fileBtn,
   body.talkmode #settingsBtn, body.talkmode #hint { display:none !important; }
+  body.talkmode #muteBtn, body.talkmode #spkBtn, body.talkmode #chatBtn { display:flex !important; }
   body.talkmode .livechat { max-height:38vh; }
   body.talkmode #mainBtn.live { background:#c0273b; border:0; color:#fff;
     font-size:17px; font-weight:700; max-width:340px; padding:17px 20px;
@@ -922,7 +923,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.28";
+  const BUILD = "2026-07-30.29";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3204,6 +3205,7 @@
     mainBtn.textContent = "End";
     mainBtn.classList.add("live");
     muteBtn.style.display = "flex";
+    document.getElementById("spkBtn").style.display = "flex";
     chatBtn.style.display = "flex";
     // Vision (photos + live camera) rides the OpenAI engine only.
     camBtn.style.display = engine === "eleven" ? "none" : "flex";
@@ -3447,6 +3449,7 @@
     mainBtn.textContent = "Start talking";
     mainBtn.classList.remove("live");
     muteBtn.style.display = "none";
+    document.getElementById("spkBtn").style.display = "none";
     chatBtn.style.display = "none";
     camBtn.style.display = "none";
     fileBtn.style.display = "none";
