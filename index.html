@@ -843,6 +843,8 @@
       <div id="setVoices"><div class="ovnote">Pick the ElevenLabs engine to choose a voice.</div></div>
       <div class="nsectlabel" style="margin-top:22px" id="setOutLabel">Sound output — this device</div>
       <div id="setOutput"></div>
+      <div class="nsectlabel" style="margin-top:22px">Face ID — this device</div>
+      <div id="setLock"></div>
       <div style="margin-top:26px;font-size:12.5px;color:#9b8285;line-height:1.6">
         Changes apply the next time you start a voice conversation.<br>
         More settings will appear here over time.
@@ -888,7 +890,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.23";
+  const BUILD = "2026-07-30.24";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3117,10 +3119,33 @@
       wrap.appendChild(n);
     }
   }
+  function renderLockMode() {
+    const el = document.getElementById("setLock");
+    if (!el) return;
+    const cur = scGet("lockmode", "h8");
+    const OPTS = [
+      { id: "h8", name: "Once every 8 hours", desc: "One Face ID in the morning covers the day (recommended)" },
+      { id: "h24", name: "Once a day", desc: "A single Face ID per 24 hours" },
+      { id: "always", name: "Every open", desc: "Maximum protection — Face ID on every launch" },
+    ];
+    el.innerHTML = "";
+    for (const o of OPTS) {
+      const b = document.createElement("button");
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:0 0 8px;padding:12px 14px;" +
+        "border-radius:14px;font:inherit;color:#f5e9e7;" +
+        "border:1px solid rgba(255,150,160," + (cur === o.id ? ".55" : ".16") + ");" +
+        "background:rgba(255,199,206," + (cur === o.id ? ".16" : ".04") + ")";
+      b.innerHTML = '<div style="font-size:15px;font-weight:650">' + (cur === o.id ? "● " : "○ ") + o.name +
+        '</div><div style="font-size:12px;color:#c9a2a4;margin-top:2px">' + o.desc + "</div>";
+      b.addEventListener("click", () => { scSet("lockmode", o.id); renderLockMode(); });
+      el.appendChild(b);
+    }
+  }
   document.getElementById("settingsBtn").addEventListener("click", () => {
     document.getElementById("settingsWin").classList.add("on");
     renderSettings();
     renderOutputs();
+    renderLockMode();
   });
   document.getElementById("settingsClose").addEventListener("click", () => {
     document.getElementById("settingsWin").classList.remove("on");
@@ -3526,6 +3551,33 @@
   const faceBtn = document.getElementById("faceBtn");
   const codeModeBtn = document.getElementById("codeModeBtn");
 
+  // "Easy button": opening the app with #talk means "I want to speak NOW" —
+  // straight to the Live tab, session started, mic open. Wired to the iPhone
+  // Action Button via a one-line Shortcut that opens the URL with #talk.
+  let talkIntent = /(^|#)talk$/.test(location.hash);
+  function consumeTalkIntent() {
+    if (!talkIntent) return;
+    talkIntent = false;
+    try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    switchTab("live");
+    ensureLive(); // unmutes + starts whichever engine is selected
+  }
+  window.addEventListener("hashchange", () => {
+    // The Action Button re-opens the same URL while the app is already alive.
+    if (/(^|#)talk$/.test(location.hash)) {
+      talkIntent = true;
+      if (!lockEl.classList.contains("on")) consumeTalkIntent();
+    }
+  });
+  // Face ID cadence: how often Scarlet demands a fresh Face ID on this device.
+  // The phone itself is biometrics-locked, so a grace window (default 8h —
+  // one Face ID in the morning) keeps the second factor without the friction.
+  const GRACE = { always: 0, h8: 8 * 3600_000, h24: 24 * 3600_000 };
+  const inGrace = () => {
+    const g = GRACE[scGet("lockmode", "h8")] ?? GRACE.h8;
+    return g > 0 && Date.now() - Number(scGet("unlockedAt", "0")) < g;
+  };
+  const markUnlocked = () => scSet("unlockedAt", String(Date.now()));
   function boot() {
     lockEl.classList.remove("on");
     applyToken();
@@ -3534,7 +3586,9 @@
     fetchAlarms(); // so a due alarm rings even if Today was never opened
     setInterval(loadSignals, 10000); // near-live Signals: 10s poll + server push
     // Voice connects ON DEMAND (first tap of the orb / "Talk to Scarlet") —
-    // never at login, so unlocking the app asks for nothing.
+    // never at login, so unlocking the app asks for nothing... unless the app
+    // was opened with the explicit talk intent, which IS the demand.
+    consumeTalkIntent();
   }
   function showLock(withFace) {
     lockEl.classList.add("on");
@@ -3596,10 +3650,11 @@
         faceBtn.style.display = "block";
         codeModeBtn.textContent = "Not now";
         codeModeBtn.style.display = "block";
-        faceBtn.onclick = async () => { await enrollFace(); boot(); };
-        codeModeBtn.onclick = () => boot();
+        faceBtn.onclick = async () => { await enrollFace(); markUnlocked(); boot(); };
+        codeModeBtn.onclick = () => { markUnlocked(); boot(); };
         return;
       }
+      markUnlocked();
       boot();
     } catch (e) {
       lockNote.textContent = "Private. Yours alone.";
@@ -3611,7 +3666,7 @@
   unlockBtn.addEventListener("click", tryUnlock);
   lockCode.addEventListener("keydown", (e) => { if (e.key === "Enter") tryUnlock(); });
   faceBtn.addEventListener("click", async () => {
-    if (await faceGate()) boot();
+    if (await faceGate()) { markUnlocked(); boot(); }
     else lockErr.textContent = "Face ID didn't confirm — try again or use the code.";
   });
   codeModeBtn.addEventListener("click", () => {
@@ -3622,7 +3677,11 @@
 
   window.addEventListener("load", () => {
     if (!TOKEN) { showLock(false); return; }
-    if (localStorage.getItem("scarletCredId")) { showLock(true); return; }
+    if (localStorage.getItem("scarletCredId")) {
+      if (inGrace()) { boot(); return; } // one Face ID per grace window, not per open
+      showLock(true);
+      return;
+    }
     boot();
   });
   // Unmuting IS the intent to talk: if the voice line isn't up yet (the app
