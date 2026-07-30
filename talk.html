@@ -6,9 +6,11 @@
 <meta name="theme-color" content="#0b0507">
 <title>Scarlet Talk</title>
 <!-- Scarlet Talk: a second Home-Screen/Dock identity that opens straight into
-     a live conversation. This shell only carries the Talk icon + name, then
-     hands off to the main app with the talk intent (same origin, so the
-     device token and settings are shared). -->
+     a live conversation. In a NORMAL BROWSER TAB this page stays put (so
+     Add to Home Screen / Add to Dock captures THIS page's icon and name);
+     only when launched from the installed icon (standalone) does it hand off
+     to the main app with the talk intent. Same origin, so the device token
+     and settings are shared. -->
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -17,8 +19,36 @@
 <link rel="apple-touch-icon" href="talk-icon-180.png">
 <link rel="icon" type="image/png" sizes="192x192" href="talk-icon-192.png">
 <link rel="manifest" href="manifest-talk.webmanifest">
-<style>html,body{background:#0b0507;height:100%;margin:0}</style>
-<script>location.replace("index.html#talk");</script>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; }
+  body { background:#0b0507; color:#f5e9e7; font-family:-apple-system,"SF Pro Display",Segoe UI,sans-serif;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:22px;
+    text-align:center; padding:32px 26px calc(32px + env(safe-area-inset-bottom)); }
+  .art { width:132px; height:132px; border-radius:30px; box-shadow:0 14px 44px rgba(230,50,80,.35); }
+  h1 { font-size:24px; font-weight:300; letter-spacing:.3em; text-indent:.3em; text-transform:uppercase;
+    color:#fbeaea; text-shadow:0 0 20px rgba(255,80,110,.35); }
+  p { font-size:15px; line-height:1.7; color:#c9a2a4; max-width:30em; }
+  p b { color:#ffd9dd; font-weight:600; }
+  .go { display:inline-block; margin-top:6px; padding:16px 34px; border-radius:999px; border:0;
+    font:inherit; font-size:16.5px; font-weight:600; color:#fff; cursor:pointer; text-decoration:none;
+    background:linear-gradient(135deg, #d92446, #8c1130);
+    box-shadow:0 8px 30px rgba(210,35,70,.4); }
+</style>
+<script>
+  // Launched from the installed icon → straight into the conversation.
+  var standalone = (navigator.standalone === true) ||
+    (window.matchMedia && matchMedia("(display-mode: standalone)").matches);
+  if (standalone) location.replace("index.html#talk");
+</script>
 </head>
-<body></body>
+<body>
+  <img class="art" src="talk-icon-512.png" alt="Scarlet Talk">
+  <h1>Scarlet&nbsp;Talk</h1>
+  <p>Save this page as your one-press talk button:<br>
+     <b>iPhone</b> — Share&nbsp;□↑ → <b>Add to Home Screen</b><br>
+     <b>Mac</b> — File → <b>Add to Dock</b><br>
+     Opening it from that icon starts the conversation instantly.</p>
+  <a class="go" href="index.html#talk">Start talking now ›</a>
+</body>
 </html>
