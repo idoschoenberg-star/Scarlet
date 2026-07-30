@@ -684,6 +684,15 @@
 <body>
   <div class="bg"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
   <button id="fullAppLink">‹ Full Scarlet</button>
+  <div id="guideBar" style="display:none;position:fixed;top:max(14px, env(safe-area-inset-top));right:16px;
+       left:auto;z-index:31;align-items:center;gap:10px;background:rgba(46,168,107,.16);
+       border:1px solid rgba(46,168,107,.5);border-radius:14px;padding:9px 12px;
+       backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)">
+    <span id="guideDest" style="font-size:13.5px;color:#a7f0c4;font-weight:650;max-width:46vw;
+       overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🧭</span>
+    <button id="guideStop" style="border:0;border-radius:10px;background:rgba(255,90,106,.25);
+       color:#ffd9dd;font:inherit;font-size:12.5px;font-weight:700;padding:7px 11px">Stop</button>
+  </div>
   <div id="tapTalk" style="display:none;position:fixed;inset:0;z-index:80;background:rgba(7,3,4,.94);
        backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);flex-direction:column;
        align-items:center;justify-content:center;gap:18px;cursor:pointer">
@@ -945,7 +954,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.37";
+  const BUILD = "2026-07-30.38";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1516,6 +1525,12 @@
         try {
           const d = JSON.parse(text);
           if (d.ok && d.maps_url) addNavCard(d.name || "your destination", d.maps_url);
+        } catch (e2) {}
+      }
+      if (name === "guide_me") {
+        try {
+          const d = JSON.parse(text);
+          if (d.ok && d.steps && d.steps.length) startGuidance(d);
         } catch (e2) {}
       }
       return text;
@@ -3050,6 +3065,60 @@
   });
   setInterval(pollDraft, 4000);
 
+  /* ---- Live guidance: she walks him there, turn by turn, in her voice ---- */
+  let guide = null;
+  function distM(aLat, aLng, bLat, bLng) {
+    const R = 6371000, rad = Math.PI / 180;
+    const dLa = (bLat - aLat) * rad, dLo = (bLng - aLng) * rad;
+    const h = Math.sin(dLa / 2) ** 2 +
+      Math.cos(aLat * rad) * Math.cos(bLat * rad) * Math.sin(dLo / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+  function endGuidance(notifyHer) {
+    if (!guide) return;
+    try { navigator.geolocation.clearWatch(guide.watchId); } catch (e) {}
+    document.getElementById("guideBar").style.display = "none";
+    guide = null;
+    if (notifyHer) sendHerContext("[guidance] Ido stopped the live guidance.");
+  }
+  function startGuidance(d) {
+    endGuidance(false);
+    const bar = document.getElementById("guideBar");
+    document.getElementById("guideDest").textContent = "🧭 " + (d.name || "On our way");
+    bar.style.display = "flex";
+    // announce radius: how close to a turn before she speaks it; pass radius:
+    // when we consider the maneuver done and move to the next one.
+    const walk = d.mode !== "driving" && d.mode !== "cycling";
+    guide = {
+      steps: d.steps, idx: 0, name: d.name, watchId: null,
+      annR: walk ? 65 : 220, passR: walk ? 22 : 60,
+      announcedIdx: -1, lastSay: 0,
+    };
+    guide.watchId = navigator.geolocation.watchPosition((pos) => {
+      if (!guide) return;
+      const la = pos.coords.latitude, lo = pos.coords.longitude;
+      const st = guide.steps[guide.idx];
+      if (!st) { endGuidance(false); return; }
+      const dm = distM(la, lo, st.lat, st.lng);
+      const isLast = guide.idx >= guide.steps.length - 1;
+      if (dm <= guide.annR && guide.announcedIdx !== guide.idx && Date.now() - guide.lastSay > 5000) {
+        guide.announcedIdx = guide.idx;
+        guide.lastSay = Date.now();
+        if (isLast) {
+          sendHerText("[guidance] He has ARRIVED at " + (guide.name || "the destination") +
+            ". Tell him warmly, very briefly, in his language. Guidance is over.");
+          const doneName = guide.name;
+          setTimeout(() => { if (guide && guide.name === doneName) endGuidance(false); }, 5000);
+        } else {
+          sendHerText("[guidance] Say ONLY this short instruction in his language: \"In " +
+            Math.round(dm) + " meters, " + st.instr + "\"");
+        }
+      }
+      if (dm <= guide.passR && !isLast) { guide.idx++; }
+    }, () => {}, { enableHighAccuracy: true, maximumAge: 3000, timeout: 15000 });
+  }
+  document.getElementById("guideStop").addEventListener("click", () => endGuidance(true));
+
   function addNavCard(name, url) {
     const wrap = addMsg("her", "");
     const a = document.createElement("a");
@@ -3521,6 +3590,7 @@
     if (xiStream) { try { xiStream.getTracks().forEach((t) => t.stop()); } catch (e) {} xiStream = null; }
     if (xiCtx) { try { xiCtx.close(); } catch (e) {} xiCtx = null; }
     xiPlaying = []; xiNextT = 0; xiDest = null; xiGain = null; clearTimeout(xiSpeakTimer);
+    try { endGuidance(false); } catch (e) {}
   }
 
   function reset() {
