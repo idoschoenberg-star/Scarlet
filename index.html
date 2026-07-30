@@ -932,7 +932,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.32";
+  const BUILD = "2026-07-30.33";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -2868,16 +2868,20 @@
     } catch (e) {}
   }
   function alarmBeep() {
-    try {
-      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
-      o.type = "sine"; o.frequency.value = 880;
-      g.gain.setValueAtTime(0.55, audioCtx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.42);
-      o.connect(g); g.connect(audioCtx.destination);
-      o.start(); o.stop(audioCtx.currentTime + 0.45);
-    } catch (e) {}
+    // Silence means silence: in night mode (speaker off) or while the app is
+    // backgrounded, the alarm shows + vibrates but never chimes.
+    if (!spkMuted && !document.hidden) {
+      try {
+        audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === "suspended") audioCtx.resume();
+        const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+        o.type = "sine"; o.frequency.value = 880;
+        g.gain.setValueAtTime(0.55, audioCtx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.42);
+        o.connect(g); g.connect(audioCtx.destination);
+        o.start(); o.stop(audioCtx.currentTime + 0.45);
+      } catch (e) {}
+    }
     if (navigator.vibrate) navigator.vibrate(350);
   }
   function startRing(a) {
@@ -2888,6 +2892,9 @@
     document.getElementById("alarmRing").style.display = "flex";
     alarmBeep();
     ringTimer = setInterval(alarmBeep, 700);
+    // Never gling forever: after 2 minutes the chime stops on its own (the
+    // full-screen Stop stays up until dismissed).
+    setTimeout(() => clearInterval(ringTimer), 120000);
   }
   async function dismissAlarm(id) {
     alarmItems = alarmItems.filter((x) => x.id !== id);
