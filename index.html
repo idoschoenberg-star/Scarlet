@@ -599,6 +599,9 @@
       align-items:stretch; border-right:1px solid rgba(255,255,255,.08);
       padding-bottom:0; }
     #viewSignals .chathead, #viewSignals .sigfilter, #viewSignals .sigfeed { max-width:none; }
+    /* A mouse can't drag a horizontal chip strip — wrap the channel chips
+       into rows so every choice is always visible and clickable. */
+    #viewSignals .sigfilter { flex-wrap:wrap; overflow-x:visible; row-gap:8px; }
     #viewSignals .sigfeed { padding-bottom:40px; }
     /* The email reader docks into the space to the right of the list */
     #readerWin { left:calc(var(--rail) + var(--siglist)); right:0; width:auto;
@@ -885,7 +888,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.22";
+  const BUILD = "2026-07-29.23";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -951,6 +954,9 @@
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
+    // Leaving (or re-entering) a tab closes the docked email reader — on the
+    // desktop layout it would otherwise stay parked over the new view.
+    try { if (readerIt) closeReader(); } catch (e) {}
     document.documentElement.dataset.sig = name === "signals" ? "1" : "0";
     for (const k of ["live", "today", "signals", "notes", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
