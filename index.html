@@ -570,6 +570,32 @@
     color:var(--i1-ink); padding:9px 14px; font-size:14.5px; min-height:40px; }
   .calbtn.join { background:#2ea86b; color:#fff; border:0; font-weight:700; }
 
+  /* ============ TALK MODE — the one-button conversation page ============
+     Entered via the Scarlet Talk icon / Action Button (#talk). Just the orb,
+     the transcript, mute, a type-to-her row (Wispr Flow friendly) and one big
+     End button. Everything else disappears. */
+  body.talkmode .tabbar { display:none; }
+  body.talkmode .view { padding-bottom:16px; }
+  body.talkmode #liveBtn, body.talkmode #camBtn, body.talkmode #fileBtn,
+  body.talkmode #settingsBtn, body.talkmode #hint { display:none !important; }
+  body.talkmode .livechat { max-height:38vh; }
+  body.talkmode #mainBtn.live { background:#c0273b; border:0; color:#fff;
+    font-size:17px; font-weight:700; max-width:340px; padding:17px 20px;
+    box-shadow:0 8px 30px rgba(192,39,59,.45); }
+  #talkTypeRow { display:none; width:100%; max-width:430px; gap:8px; align-items:center; }
+  body.talkmode #talkTypeRow { display:flex; }
+  #talkInput { flex:1; border-radius:14px; border:1px solid rgba(255,150,160,.22);
+    background:rgba(255,255,255,.07); color:#f8e9ea; padding:13px 15px; font:inherit; font-size:16px; }
+  #talkSend { width:48px; height:48px; border-radius:50%; border:0; font-size:19px;
+    background:linear-gradient(135deg, #d92446, #8c1130); color:#fff; flex:none; }
+  #fullAppLink { display:none; position:fixed; top:max(14px, env(safe-area-inset-top)); left:16px;
+    z-index:30; background:rgba(255,255,255,.08); border:1px solid rgba(255,150,160,.2);
+    color:#e8c9cc; border-radius:12px; padding:8px 13px; font-size:13px; }
+  body.talkmode #fullAppLink { display:block; }
+  @media (min-width: 900px) {
+    body.talkmode .view { left:0; }
+  }
+
   /* ===================== DESKTOP (responsive) =====================
      One codebase. Below 900px this is the phone app, untouched. At 900px+
      it becomes a desktop app: a left tab rail, wider reading columns, and
@@ -643,6 +669,7 @@
 </head>
 <body>
   <div class="bg"><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+  <button id="fullAppLink">‹ Full Scarlet</button>
   <div class="grain"></div><div class="vignette"></div>
 
   <!-- ================= LIVE ================= -->
@@ -673,6 +700,10 @@
       <input type="file" id="imgInput" accept="image/*" hidden>
       <input type="file" id="fileInput" hidden>
       <video id="liveVid" playsinline muted></video>
+      <div id="talkTypeRow">
+        <input id="talkInput" placeholder="Type or dictate long instructions…" dir="auto">
+        <button id="talkSend">➤</button>
+      </div>
       <button class="primary" id="mainBtn">Start talking</button>
     </footer>
     <div class="hint" id="hint">She opens muted — tap the mic button when you're ready to talk.</div>
@@ -890,7 +921,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.25";
+  const BUILD = "2026-07-30.26";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3124,8 +3155,11 @@
     if (!el) return;
     const cur = scGet("lockmode", "h8");
     const OPTS = [
-      { id: "h8", name: "Once every 8 hours", desc: "One Face ID in the morning covers the day (recommended)" },
+      { id: "off", name: "Off — this device", desc: "The device's own Face ID / login is protection enough" },
+      { id: "week", name: "Once a week", desc: "One Face ID per week on this device" },
+      { id: "h48", name: "Every 2 days", desc: "One Face ID per 48 hours" },
       { id: "h24", name: "Once a day", desc: "A single Face ID per 24 hours" },
+      { id: "h8", name: "Once every 8 hours", desc: "One Face ID in the morning covers the day" },
       { id: "always", name: "Every open", desc: "Maximum protection — Face ID on every launch" },
     ];
     el.innerHTML = "";
@@ -3388,6 +3422,7 @@
   }
 
   function reset() {
+    const wasTalk = document.body.classList.contains("talkmode");
     cleanup();
     orbwrap.classList.remove("speaking");
     document.body.classList.remove("sc-speaking");
@@ -3400,7 +3435,7 @@
     liveBtn.style.display = "none";
     stopLive();
     document.body.classList.remove("showchat");
-    setStatus("Tap to wake her");
+    setStatus(wasTalk ? "Ended. Press your Scarlet button anytime." : "Tap to wake her");
   }
 
   function sendImage(file) {
@@ -3559,6 +3594,7 @@
     if (!talkIntent) return;
     talkIntent = false;
     try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    document.body.classList.add("talkmode", "showchat");
     switchTab("live");
     ensureLive(); // unmutes + starts whichever engine is selected
   }
@@ -3572,9 +3608,11 @@
   // Face ID cadence: how often Scarlet demands a fresh Face ID on this device.
   // The phone itself is biometrics-locked, so a grace window (default 8h —
   // one Face ID in the morning) keeps the second factor without the friction.
-  const GRACE = { always: 0, h8: 8 * 3600_000, h24: 24 * 3600_000 };
+  const GRACE = { always: 0, h8: 8 * 3600_000, h24: 24 * 3600_000, h48: 48 * 3600_000, week: 7 * 24 * 3600_000, off: Infinity };
   const inGrace = () => {
-    const g = GRACE[scGet("lockmode", "h8")] ?? GRACE.h8;
+    const mode = scGet("lockmode", "h8");
+    if (mode === "off") return true; // his call: the device's own lock suffices
+    const g = GRACE[mode] ?? GRACE.h8;
     return g > 0 && Date.now() - Number(scGet("unlockedAt", "0")) < g;
   };
   const markUnlocked = () => scSet("unlockedAt", String(Date.now()));
@@ -3689,6 +3727,22 @@
   muteBtn.addEventListener("click", () => {
     muted = !muted; applyMute();
     if (!muted && !pc && !xiWs) start();
+  });
+  // Talk mode: type (or Wispr-Flow-dictate) long instructions while muted,
+  // send when ready — she gets the full text in one piece, uninterrupted.
+  const talkInput = document.getElementById("talkInput");
+  async function sendTypedToHer() {
+    const t = talkInput.value.trim();
+    if (!t) return;
+    talkInput.value = "";
+    addMsg("you", t);
+    const ok = await ensureLive();
+    if (ok) sendHerText(t);
+  }
+  document.getElementById("talkSend").addEventListener("click", sendTypedToHer);
+  talkInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendTypedToHer(); });
+  document.getElementById("fullAppLink").addEventListener("click", () => {
+    document.body.classList.remove("talkmode");
   });
   // Stop button: cut off a long/misguided reply without touching the mic.
   // Cancels the model's response and clears whatever audio is still buffered,
