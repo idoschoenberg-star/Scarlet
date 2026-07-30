@@ -890,7 +890,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.24";
+  const BUILD = "2026-07-30.25";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -3018,7 +3018,7 @@
   const scSet = (k, v) => { try { localStorage.setItem("scarlet_" + k, v); } catch (e) {} };
   const ENGINES = [
     { id: "openai", name: "Classic", desc: "OpenAI realtime — fast and reliable" },
-    { id: "eleven", name: "Premium · ElevenLabs", desc: "The most human voice — emotional, warm (beta)" },
+    { id: "eleven", name: "Premium · ElevenLabs", desc: "The most human voice — English only for now (Hebrew needs the ElevenLabs plan upgrade)" },
   ];
   let prevAudio = null;
   function renderSettings() {
