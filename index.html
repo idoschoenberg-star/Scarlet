@@ -114,6 +114,14 @@
     align-items:center; justify-content:center; padding:0; line-height:1;
     background:rgba(255,255,255,.07); border:1px solid rgba(255,255,255,.16); color:#fff; }
   .rndbtn.on { background:linear-gradient(135deg,#e8b04b,#b97b1e); box-shadow:0 6px 24px rgba(220,160,60,.4); }
+  .rndbtn { flex-direction:column; gap:1px; position:relative; }
+  .rndbtn .ric { font-size:17px; line-height:1.15; }
+  .rndbtn .rlb { font-size:8px; letter-spacing:.08em; text-transform:uppercase; color:#d9b8bc; line-height:1; }
+  /* OFF state: red tint + a clear diagonal slash — unmistakable at a glance */
+  .rndbtn.off { background:rgba(255,90,106,.18); border-color:rgba(255,90,106,.55); }
+  .rndbtn.off::before { content:""; position:absolute; top:50%; left:50%; width:30px; height:2.5px;
+    background:#ff5a6a; border-radius:2px; transform:translate(-50%,-60%) rotate(-45deg);
+    box-shadow:0 0 6px rgba(255,90,106,.6); pointer-events:none; }
   /* Stop button — appears only while Scarlet is speaking, to cut a long reply. */
   #stopBtn { display:none; width:100%; max-width:340px; margin:14px auto 0; padding:15px;
     border:none; border-radius:999px; font:inherit; font-size:16px; font-weight:600; cursor:pointer;
@@ -578,7 +586,12 @@
   body.talkmode .view { padding-bottom:16px; }
   body.talkmode #liveBtn, body.talkmode #camBtn, body.talkmode #fileBtn,
   body.talkmode #settingsBtn, body.talkmode #hint { display:none !important; }
-  body.talkmode #muteBtn, body.talkmode #spkBtn, body.talkmode #chatBtn { display:flex !important; }
+  body.talkmode #muteBtn, body.talkmode #spkBtn { display:flex !important; }
+  /* Talk is a conversation page: the transcript is ALWAYS there (no toggle) */
+  body.talkmode #chatBtn { display:none !important; }
+  body.talkmode .livechat { display:block; }
+  .livechat:empty::before { content:"Your words and hers appear here as text."; display:block;
+    color:#8f6f72; font-size:13px; text-align:center; padding:10px 6px; }
   body.talkmode .livechat { max-height:38vh; }
   body.talkmode #mainBtn.live { background:#c0273b; border:0; color:#fff;
     font-size:17px; font-weight:700; max-width:340px; padding:17px 20px;
@@ -704,9 +717,9 @@
         <button class="rndbtn" id="liveBtn" title="Live view - she sees what you see">👁</button>
         <button class="rndbtn" id="fileBtn" title="Share a file">📎</button>
         <button class="rndbtn" id="camBtn" title="Show her a photo">📷</button>
-        <button class="rndbtn" id="chatBtn" title="Show/hide text">💬</button>
-        <button class="rndbtn" id="spkBtn" title="Her voice on/off — silent mode shows her words as text">🔊</button>
-        <button class="rndbtn" id="muteBtn" title="Mute my microphone">🎙</button>
+        <button class="rndbtn" id="chatBtn" title="Show/hide text"><span class="ric">💬</span><span class="rlb">Text</span></button>
+        <button class="rndbtn" id="spkBtn" title="Her voice on/off — silent mode shows her words as text"><span class="ric">🔊</span><span class="rlb">Voice</span></button>
+        <button class="rndbtn" id="muteBtn" title="My microphone on/off"><span class="ric">🎙</span><span class="rlb">Mic</span></button>
       </div>
       <input type="file" id="imgInput" accept="image/*" hidden>
       <input type="file" id="fileInput" hidden>
@@ -932,7 +945,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.34";
+  const BUILD = "2026-07-30.35";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1429,7 +1442,7 @@
     if (xiOutEl) xiOutEl.muted = spkMuted;
     if (xiGain) xiGain.gain.value = spkMuted ? 0 : 1;
     const b = document.getElementById("spkBtn");
-    if (b) { b.textContent = spkMuted ? "🔇" : "🔊"; b.classList.toggle("on", spkMuted); }
+    if (b) b.classList.toggle("off", spkMuted);
   }
   applySpeaker(); // reflect the persisted night-mode choice from the first paint
   // Route her voice to the output device chosen in Settings ("" = system
@@ -3442,9 +3455,8 @@
 
   function applyMute() {
     if (micTrack) micTrack.enabled = !muted && !micGated;
-    muteBtn.classList.toggle("on", muted);
-    muteBtn.textContent = muted ? "🔇" : "🎙";
-    if (muted) setStatus("Muted — tap 🎙 when you're ready", "muted-note");
+    muteBtn.classList.toggle("off", muted);
+    if (muted) setStatus("Mic is off — tap Mic when you're ready", "muted-note");
     else setStatus("Listening…");
   }
 
