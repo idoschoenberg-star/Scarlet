@@ -932,7 +932,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.33";
+  const BUILD = "2026-07-30.34";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -948,7 +948,11 @@
       if (typeof dc !== "undefined" && dc && dc.readyState === "open") return;
       if (typeof xiWs !== "undefined" && xiWs && xiWs.readyState === 1) return;
       sessionStorage.setItem("scarletReloadAt", String(Date.now()));
-      location.replace(clean + "?v=" + Date.now());
+      // A self-update reload must not eject a Talk session into the full app —
+      // carry the talk intent across the refresh.
+      let keepTalk = /(^|#)talk$/.test(location.hash);
+      try { keepTalk = keepTalk || sessionStorage.getItem("scarletTalkApp") === "1"; } catch (e2) {}
+      location.replace(clean + "?v=" + Date.now() + (keepTalk ? "#talk" : ""));
     } catch (e) {}
   }
   checkForUpdate();
@@ -3705,7 +3709,9 @@
     setInterval(loadSignals, 10000); // near-live Signals: 10s poll + server push
     // Voice connects ON DEMAND (first tap of the orb / "Talk to Scarlet") —
     // never at login, so unlocking the app asks for nothing... unless the app
-    // was opened with the explicit talk intent, which IS the demand.
+    // was opened with the explicit talk intent, which IS the demand. A session
+    // born as TALK stays Talk across reloads (e.g. the self-updater's).
+    try { if (!talkIntent && sessionStorage.getItem("scarletTalkApp") === "1") talkIntent = true; } catch (e) {}
     consumeTalkIntent();
   }
   function showLock(withFace) {
