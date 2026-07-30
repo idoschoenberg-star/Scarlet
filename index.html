@@ -838,6 +838,8 @@
       <div id="setEngine"></div>
       <div class="nsectlabel" style="margin-top:22px">Her voice <span id="setVoiceNote" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
       <div id="setVoices"><div class="ovnote">Pick the ElevenLabs engine to choose a voice.</div></div>
+      <div class="nsectlabel" style="margin-top:22px" id="setOutLabel">Sound output — this device</div>
+      <div id="setOutput"></div>
       <div style="margin-top:26px;font-size:12.5px;color:#9b8285;line-height:1.6">
         Changes apply the next time you start a voice conversation.<br>
         More settings will appear here over time.
@@ -883,7 +885,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-29.21";
+  const BUILD = "2026-07-29.22";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1357,11 +1359,23 @@
   audioEl.autoplay = true;
   audioEl.playsInline = true; // iOS: keep playback inline and steady
 
-  let pc = null, dc = null, micTrack = null, muted = true; // opens muted by design
+  let pc = null, dc = null, micTrack = null, micStream = null, muted = true; // opens muted by design
   // ElevenLabs engine state (premium voice; raw WebSocket + PCM — the page's
   // CSP forbids external SDKs, so the protocol is implemented inline).
   let xiWs = null, xiCtx = null, xiProc = null, xiSrcNode = null, xiStream = null;
   let xiNextT = 0, xiPlaying = [], xiOutRate = 16000, xiSpeakTimer = null;
+  let xiDest = null, xiOutEl = null; // WebAudio → audio element, so her voice obeys the chosen output device
+  // Route her voice to the output device chosen in Settings ("" = system
+  // default). Applies to both engines; falls back to default if the chosen
+  // device was unplugged.
+  async function applyOutput() {
+    const id = scGet("audioOut", "");
+    for (const el of [audioEl, xiOutEl]) {
+      if (el && typeof el.setSinkId === "function") {
+        try { await el.setSinkId(id); } catch (e) { try { await el.setSinkId(""); } catch (e2) {} }
+      }
+    }
+  }
   const voiceOpen = () => !!((dc && dc.readyState === "open") || (xiWs && xiWs.readyState === 1));
   // Unified "talk to her" layer: every feature speaks through these two, and
   // they route to whichever engine is live.
@@ -3062,9 +3076,45 @@
       el.innerHTML = '<div class="ovnote" style="text-align:left;padding:8px 2px">Couldn’t load voices — try again in a moment.</div>';
     }
   }
+  async function renderOutputs() {
+    const wrap = document.getElementById("setOutput");
+    const label = document.getElementById("setOutLabel");
+    if (!wrap || !label) return;
+    const supported = typeof audioEl.setSinkId === "function" &&
+      navigator.mediaDevices && navigator.mediaDevices.enumerateDevices;
+    if (!supported) { wrap.style.display = "none"; label.style.display = "none"; return; }
+    wrap.style.display = ""; label.style.display = "";
+    let outs = [];
+    try {
+      outs = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "audiooutput");
+    } catch (e) {}
+    const cur = scGet("audioOut", "");
+    wrap.innerHTML = "";
+    const mk = (id, name) => {
+      const b = document.createElement("button");
+      b.style.cssText = "display:block;width:100%;text-align:left;margin:0 0 8px;padding:12px 14px;" +
+        "border-radius:14px;font:inherit;color:#f5e9e7;" +
+        "border:1px solid rgba(255,150,160," + (cur === id ? ".55" : ".16") + ");" +
+        "background:rgba(255,199,206," + (cur === id ? ".16" : ".04") + ")";
+      b.textContent = (cur === id ? "● " : "○ ") + name;
+      b.addEventListener("click", () => { scSet("audioOut", id); applyOutput(); renderOutputs(); });
+      wrap.appendChild(b);
+    };
+    mk("", "System default");
+    for (const d of outs) {
+      if (d.deviceId && d.deviceId !== "default") mk(d.deviceId, d.label || "Output " + wrap.children.length);
+    }
+    if (!outs.some((d) => d.label)) {
+      const n = document.createElement("div");
+      n.style.cssText = "font-size:12px;color:#9b8285;line-height:1.5";
+      n.textContent = "Device names appear after your first voice session on this device (microphone permission unlocks them).";
+      wrap.appendChild(n);
+    }
+  }
   document.getElementById("settingsBtn").addEventListener("click", () => {
     document.getElementById("settingsWin").classList.add("on");
     renderSettings();
+    renderOutputs();
   });
   document.getElementById("settingsClose").addEventListener("click", () => {
     document.getElementById("settingsWin").classList.remove("on");
@@ -3083,6 +3133,7 @@
     document.body.classList.add("showchat");
     chatBtn.classList.add("on");
     applyMute();
+    applyOutput();
   }
 
   /* ---- ElevenLabs live call: raw WS + PCM in both directions ---- */
@@ -3118,7 +3169,7 @@
     buf.getChannelData(0).set(f32);
     const src = xiCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(xiCtx.destination);
+    src.connect(xiDest || xiCtx.destination);
     const t = Math.max(xiCtx.currentTime + 0.08, xiNextT);
     src.start(t);
     xiNextT = t + buf.duration;
@@ -3204,6 +3255,16 @@
       };
       xiSrcNode.connect(xiProc);
       xiProc.connect(xiCtx.destination); // processor emits silence; needed to keep it running
+      // Playback path: on browsers with output-device selection (Mac), her
+      // voice goes WebAudio → stream → <audio> so the Settings choice applies;
+      // elsewhere (iPhone) straight to the default output as before.
+      if (typeof audioEl.setSinkId === "function") {
+        xiDest = xiCtx.createMediaStreamDestination();
+        if (!xiOutEl) { xiOutEl = new Audio(); xiOutEl.autoplay = true; xiOutEl.playsInline = true; }
+        xiOutEl.srcObject = xiDest.stream;
+        xiOutEl.play().catch(() => {});
+        applyOutput();
+      } else { xiDest = null; }
 
       xiWs = new WebSocket(d.signed_url);
       xiWs.onopen = () => { xiWs.send(JSON.stringify({ type: "conversation_initiation_client_data" })); };
@@ -3232,6 +3293,7 @@
       if (!tok.client_secret) throw new Error((tok.detail || tok.error || ("session " + tokResp.status)));
 
       const ms = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      micStream = ms;
       micTrack = ms.getAudioTracks()[0];
       micTrack.enabled = !muted;
 
@@ -3281,13 +3343,17 @@
 
   function cleanup() {
     if (pc) { try { pc.close(); } catch (e) {} }
+    // Release the microphone for real — closing the connection alone leaves
+    // the capture track alive and the mic indicator on.
+    if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch (e) {} micStream = null; }
+    if (micTrack) { try { micTrack.stop(); } catch (e) {} }
     pc = null; dc = null; micTrack = null; muted = true;
     if (xiWs) { const w = xiWs; xiWs = null; try { w.onclose = null; w.close(); } catch (e) {} }
     if (xiProc) { try { xiProc.disconnect(); } catch (e) {} xiProc = null; }
     if (xiSrcNode) { try { xiSrcNode.disconnect(); } catch (e) {} xiSrcNode = null; }
     if (xiStream) { try { xiStream.getTracks().forEach((t) => t.stop()); } catch (e) {} xiStream = null; }
     if (xiCtx) { try { xiCtx.close(); } catch (e) {} xiCtx = null; }
-    xiPlaying = []; xiNextT = 0; clearTimeout(xiSpeakTimer);
+    xiPlaying = []; xiNextT = 0; xiDest = null; clearTimeout(xiSpeakTimer);
   }
 
   function reset() {
@@ -3436,6 +3502,12 @@
   mainBtn.addEventListener("click", async () => {
     if (pc || xiWs) { reset(); } else await start();
   });
+  // Closing the window/tab (or navigating away) must end the conversation and
+  // release the microphone — she never keeps listening to a closed window.
+  // persisted=true means the page is only being suspended (iOS app switch /
+  // back-forward cache) and may come back — that must NOT kill a live call.
+  window.addEventListener("pagehide", (e) => { if (!e.persisted) { try { cleanup(); } catch (err) {} } });
+  window.addEventListener("beforeunload", () => { try { cleanup(); } catch (err) {} });
 
   /* ============================================================
      LOCK — unlock code once per device, Face ID afterwards
