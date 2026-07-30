@@ -695,6 +695,7 @@
         <button class="rndbtn" id="fileBtn" title="Share a file">📎</button>
         <button class="rndbtn" id="camBtn" title="Show her a photo">📷</button>
         <button class="rndbtn" id="chatBtn" title="Show/hide text">💬</button>
+        <button class="rndbtn" id="spkBtn" title="Her voice on/off — silent mode shows her words as text">🔊</button>
         <button class="rndbtn" id="muteBtn" title="Mute my microphone">🎙</button>
       </div>
       <input type="file" id="imgInput" accept="image/*" hidden>
@@ -921,7 +922,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.26";
+  const BUILD = "2026-07-30.28";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1404,6 +1405,19 @@
   let xiWs = null, xiCtx = null, xiProc = null, xiSrcNode = null, xiStream = null;
   let xiNextT = 0, xiPlaying = [], xiOutRate = 16000, xiSpeakTimer = null;
   let xiDest = null, xiOutEl = null; // WebAudio → audio element, so her voice obeys the chosen output device
+  let xiGain = null;                 // master gain for her ElevenLabs voice (true silence for night mode)
+  // Night mode: iOS never lets call audio reach true zero via the volume
+  // buttons, so the app itself can silence her voice completely — her words
+  // still stream as text in the transcript. Persisted per device.
+  let spkMuted = (() => { try { return localStorage.getItem("scarlet_spk") === "off"; } catch (e) { return false; } })();
+  function applySpeaker() {
+    audioEl.muted = spkMuted;
+    if (xiOutEl) xiOutEl.muted = spkMuted;
+    if (xiGain) xiGain.gain.value = spkMuted ? 0 : 1;
+    const b = document.getElementById("spkBtn");
+    if (b) { b.textContent = spkMuted ? "🔇" : "🔊"; b.classList.toggle("on", spkMuted); }
+  }
+  applySpeaker(); // reflect the persisted night-mode choice from the first paint
   // Route her voice to the output device chosen in Settings ("" = system
   // default). Applies to both engines; falls back to default if the chosen
   // device was unplugged.
@@ -3020,7 +3034,7 @@
       setMicGate(true);
       orbwrap.classList.add("speaking");
       document.body.classList.add("sc-speaking");
-      if (!muted) setStatus("Scarlet is speaking…");
+      if (!muted) setStatus(spkMuted ? "Scarlet is answering silently — read below" : "Scarlet is speaking…");
     } else if (ev.type === "output_audio_buffer.stopped" || ev.type === "output_audio_buffer.cleared") {
       setMicGate(false);
       orbwrap.classList.remove("speaking");
@@ -3199,6 +3213,7 @@
     chatBtn.classList.add("on");
     applyMute();
     applyOutput();
+    applySpeaker();
   }
 
   /* ---- ElevenLabs live call: raw WS + PCM in both directions ---- */
@@ -3234,7 +3249,7 @@
     buf.getChannelData(0).set(f32);
     const src = xiCtx.createBufferSource();
     src.buffer = buf;
-    src.connect(xiDest || xiCtx.destination);
+    src.connect(xiGain || xiDest || xiCtx.destination);
     const t = Math.max(xiCtx.currentTime + 0.08, xiNextT);
     src.start(t);
     xiNextT = t + buf.duration;
@@ -3243,7 +3258,7 @@
     orbwrap.classList.add("speaking");
     document.body.classList.add("sc-speaking");
     setMicGate(true);
-    if (!muted) setStatus("Scarlet is speaking…");
+    if (!muted) setStatus(spkMuted ? "Scarlet is answering silently — read below" : "Scarlet is speaking…");
     xiSpeakingCheck();
   }
   function xiEvent(ev) {
@@ -3330,6 +3345,9 @@
         xiOutEl.play().catch(() => {});
         applyOutput();
       } else { xiDest = null; }
+      xiGain = xiCtx.createGain();
+      xiGain.connect(xiDest || xiCtx.destination);
+      applySpeaker();
 
       xiWs = new WebSocket(d.signed_url);
       xiWs.onopen = () => { xiWs.send(JSON.stringify({ type: "conversation_initiation_client_data" })); };
@@ -3418,7 +3436,7 @@
     if (xiSrcNode) { try { xiSrcNode.disconnect(); } catch (e) {} xiSrcNode = null; }
     if (xiStream) { try { xiStream.getTracks().forEach((t) => t.stop()); } catch (e) {} xiStream = null; }
     if (xiCtx) { try { xiCtx.close(); } catch (e) {} xiCtx = null; }
-    xiPlaying = []; xiNextT = 0; xiDest = null; clearTimeout(xiSpeakTimer);
+    xiPlaying = []; xiNextT = 0; xiDest = null; xiGain = null; clearTimeout(xiSpeakTimer);
   }
 
   function reset() {
@@ -3727,6 +3745,13 @@
   muteBtn.addEventListener("click", () => {
     muted = !muted; applyMute();
     if (!muted && !pc && !xiWs) start();
+  });
+  document.getElementById("spkBtn").addEventListener("click", () => {
+    spkMuted = !spkMuted;
+    scSet("spk", spkMuted ? "off" : "on");
+    applySpeaker();
+    setStatus(spkMuted ? "Silent mode — her replies appear as text below" : (muted ? "Muted — tap 🎙 when you're ready" : "Listening…"), spkMuted ? "muted-note" : undefined);
+    if (spkMuted) { document.body.classList.add("showchat"); chatBtn.classList.add("on"); }
   });
   // Talk mode: type (or Wispr-Flow-dictate) long instructions while muted,
   // send when ready — she gets the full text in one piece, uninterrupted.
