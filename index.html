@@ -954,7 +954,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-31.41";
+  const BUILD = "2026-07-31.42";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1489,6 +1489,54 @@
   // voice from the speaker can never reach the turn detector and cut her off —
   // she always finishes a thought start to end. Reopens ~0.4s after she stops.
   let micGated = false, gateTimer = null, lastAudioEvt = 0;
+  // Session intent + resilience: wantLive means "Ido is in a call" — a dropped
+  // transport must silently reconnect, not die. wakeLock keeps the screen (and
+  // thus the page) alive so iOS stops suspending mid-conversation.
+  let wantLive = false, reconnecting = false, reconnectTries = 0, wakeLock = null;
+  async function acquireWake() {
+    try {
+      if ("wakeLock" in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request("screen");
+        wakeLock.addEventListener("release", () => { wakeLock = null; });
+      }
+    } catch (e) {}
+  }
+  function releaseWake() { try { if (wakeLock) wakeLock.release(); } catch (e) {} wakeLock = null; }
+  // Tear down ONLY the transport + audio pipeline for a reconnect — never touch
+  // the user's mic/voice choices, session intent, or the live UI.
+  function partialTeardown() {
+    try { if (dc) dc.onmessage = null; } catch (e) {}
+    if (pc) { try { pc.onconnectionstatechange = null; pc.close(); } catch (e) {} }
+    pc = null; dc = null;
+    if (xiWs) { const w = xiWs; xiWs = null; try { w.onclose = null; w.onmessage = null; w.close(); } catch (e) {} }
+    try { audioEl.pause(); audioEl.srcObject = null; } catch (e) {}
+    if (xiOutEl) { try { xiOutEl.pause(); xiOutEl.srcObject = null; } catch (e) {} }
+    if (xiProc) { try { xiProc.disconnect(); } catch (e) {} xiProc = null; }
+    if (xiSrcNode) { try { xiSrcNode.disconnect(); } catch (e) {} xiSrcNode = null; }
+    if (xiStream) { try { xiStream.getTracks().forEach((t) => t.stop()); } catch (e) {} xiStream = null; }
+    if (xiCtx) { try { xiCtx.close(); } catch (e) {} xiCtx = null; }
+    if (micStream) { try { micStream.getTracks().forEach((t) => t.stop()); } catch (e) {} micStream = null; }
+    if (micTrack) { try { micTrack.stop(); } catch (e) {} micTrack = null; }
+    xiPlaying = []; xiNextT = 0; xiDest = null; xiGain = null; micGated = false;
+    orbwrap.classList.remove("speaking"); document.body.classList.remove("sc-speaking");
+  }
+  // A transport died while Ido still wants to talk → rebuild it and carry on.
+  async function onTransportDrop() {
+    if (!wantLive || reconnecting) return;
+    reconnecting = true;
+    const wasMuted = muted, wasSpk = spkMuted;
+    setStatus("Reconnecting…");
+    partialTeardown();
+    const wait = Math.min(700 * Math.pow(2, reconnectTries++), 6000);
+    await new Promise((r) => setTimeout(r, wait));
+    if (!wantLive) { reconnecting = false; return; }
+    try { await start(); } catch (e) {}
+    for (let i = 0; i < 26 && !voiceOpen(); i++) await new Promise((r) => setTimeout(r, 150));
+    muted = wasMuted; spkMuted = wasSpk; applyMute(); applySpeaker();
+    reconnecting = false;
+    if (voiceOpen()) { reconnectTries = 0; if (!muted) setStatus("Listening…"); }
+    else if (wantLive) { onTransportDrop(); } // still down — keep trying with backoff
+  }
   function setMicGate(on) {
     clearTimeout(gateTimer);
     if (on) {
@@ -3136,6 +3184,8 @@
     try {
       if (xiCtx && xiCtx.state === "suspended") xiCtx.resume().catch(() => {});
       if (pc && audioEl.srcObject && audioEl.paused) audioEl.play().catch(() => {});
+      if (wantLive && !reconnecting && !voiceOpen()) { onTransportDrop(); return; }
+      if (wantLive && !wakeLock && !document.hidden) acquireWake();
       if (micGated && Date.now() - lastAudioEvt > 8000) {
         clearTimeout(gateTimer);
         micGated = false;
@@ -3359,6 +3409,7 @@
   });
 
   function showLiveUI(engine) {
+    wantLive = true; reconnectTries = 0; acquireWake();
     mainBtn.textContent = "End";
     mainBtn.classList.add("live");
     muteBtn.style.display = "flex";
@@ -3513,7 +3564,7 @@
       xiWs = new WebSocket(d.signed_url);
       xiWs.onopen = () => { xiWs.send(JSON.stringify({ type: "conversation_initiation_client_data" })); };
       xiWs.onmessage = (e) => { try { xiEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
-      xiWs.onclose = () => reset();
+      xiWs.onclose = () => onTransportDrop();
       showLiveUI("eleven");
     } catch (e) {
       console.error(e);
@@ -3570,7 +3621,12 @@
       dc = pc.createDataChannel("oai-events");
       dc.onmessage = (e) => { try { handleEvent(JSON.parse(e.data)); } catch (err) { console.error(err); } };
       pc.onconnectionstatechange = () => {
-        if (["failed", "closed", "disconnected"].includes(pc.connectionState)) reset();
+        const st = pc.connectionState;
+        if (st === "failed" || st === "closed") onTransportDrop();
+        else if (st === "disconnected") {
+          // ICE hiccups often self-heal; only reconnect if still down after 5s.
+          setTimeout(() => { if (pc && pc.connectionState === "disconnected") onTransportDrop(); }, 5000);
+        }
       };
 
       const offer = await pc.createOffer();
@@ -3625,6 +3681,7 @@
 
   function reset() {
     const wasTalk = document.body.classList.contains("talkmode");
+    wantLive = false; reconnecting = false; releaseWake();
     cleanup();
     orbwrap.classList.remove("speaking");
     document.body.classList.remove("sc-speaking");
