@@ -954,7 +954,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.39";
+  const BUILD = "2026-07-30.40";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -2323,6 +2323,7 @@
         stream.getTracks().forEach((t) => t.stop());
         const blob = new Blob(chunks, { type: dictRec.mimeType || "audio/webm" });
         dictRec = null; btn.classList.remove("rec");
+        btn.textContent = btn.dataset.ic || "🎙";
         if (blob.size < 1200) return;
         btn.classList.add("busy");
         try {
@@ -2336,7 +2337,11 @@
         } catch (e) {}
         btn.classList.remove("busy");
       };
-      dictRec.start(); btn.classList.add("rec");
+      dictRec.start();
+      btn.classList.add("rec");
+      // Unambiguous state: red + ⏹ = recording now, tap to stop.
+      btn.dataset.ic = btn.textContent;
+      btn.textContent = "⏹";
     } catch (e) {}
   }
 
