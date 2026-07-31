@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key><string>Talk</string>
+  <key>UIBackgroundModes</key><array><string>audio</string></array>
+  <key>NSMicrophoneUsageDescription</key><string>Scarlet listens when you talk to her.</string>
+  <key>NSLocationWhenInUseUsageDescription</key><string>So Scarlet can answer weather, distances and directions where you are.</string>
+  <key>ITSAppUsesNonExemptEncryption</key><false/>
+</dict>
+</plist>
