@@ -954,7 +954,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-30.40";
+  const BUILD = "2026-07-31.41";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1488,11 +1488,12 @@
   // Half-duplex gate: while Scarlet speaks, the mic is hard-silenced so her own
   // voice from the speaker can never reach the turn detector and cut her off —
   // she always finishes a thought start to end. Reopens ~0.4s after she stops.
-  let micGated = false, gateTimer = null;
+  let micGated = false, gateTimer = null, lastAudioEvt = 0;
   function setMicGate(on) {
     clearTimeout(gateTimer);
     if (on) {
       micGated = true;
+      lastAudioEvt = Date.now();
       if (micTrack) micTrack.enabled = false;
     } else {
       gateTimer = setTimeout(() => {
@@ -3124,6 +3125,28 @@
   }
   document.getElementById("guideStop").addEventListener("click", () => endGuidance(true));
 
+  // FLOW WATCHDOG: iOS loves to quietly strangle web audio — a notification
+  // chime suspends the AudioContext (her voice dies mid-sentence and never
+  // resumes), a dropped "she finished" event leaves the echo-gate holding the
+  // mic shut forever (she can no longer hear him). Every 1.5s: revive a
+  // suspended context, restart a paused output, and force-release a gate that
+  // has no audio behind it anymore.
+  setInterval(() => {
+    if (!voiceOpen()) return;
+    try {
+      if (xiCtx && xiCtx.state === "suspended") xiCtx.resume().catch(() => {});
+      if (pc && audioEl.srcObject && audioEl.paused) audioEl.play().catch(() => {});
+      if (micGated && Date.now() - lastAudioEvt > 8000) {
+        clearTimeout(gateTimer);
+        micGated = false;
+        if (micTrack) micTrack.enabled = !muted;
+        orbwrap.classList.remove("speaking");
+        document.body.classList.remove("sc-speaking");
+        if (!muted && !document.hidden) setStatus("Listening…");
+      }
+    } catch (e) {}
+  }, 1500);
+
   function addNavCard(name, url) {
     const wrap = addMsg("her", "");
     const a = document.createElement("a");
@@ -3151,6 +3174,7 @@
 
   function handleEvent(ev) {
     if (ev.type === "response.output_audio_transcript.delta" || ev.type === "response.audio_transcript.delta") {
+      lastAudioEvt = Date.now();
       if (!herLine) herLine = addMsg("her", "");
       herLine.textContent += ev.delta || "";
       chat.scrollTop = chat.scrollHeight;
@@ -3386,6 +3410,7 @@
     const src = xiCtx.createBufferSource();
     src.buffer = buf;
     src.connect(xiGain || xiDest || xiCtx.destination);
+    lastAudioEvt = Date.now();
     const t = Math.max(xiCtx.currentTime + 0.08, xiNextT);
     src.start(t);
     xiNextT = t + buf.duration;
@@ -3760,18 +3785,17 @@
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       try {
+        // Instant silence, but REVERSIBLE: mute outputs and the mic without
+        // cancelling her reply — a Control-Center pull or brief app switch
+        // must not kill the conversation mid-sentence.
         if (micTrack) micTrack.enabled = false;
-        xiFlush();
         audioEl.muted = true;
         if (xiOutEl) xiOutEl.muted = true;
-        if (dc && dc.readyState === "open") {
-          dc.send(JSON.stringify({ type: "response.cancel" }));
-          dc.send(JSON.stringify({ type: "output_audio_buffer.clear" }));
-        }
+        if (xiGain) xiGain.gain.value = 0;
       } catch (e) {}
       return;
     }
-    try { applySpeaker(); applyMute(); } catch (e) {}
+    try { applySpeaker(); applyMute(); if (xiCtx && xiCtx.state === "suspended") xiCtx.resume().catch(() => {}); } catch (e) {}
     try {
       if (sessionStorage.getItem("scarletTalkApp") === "1" &&
           !document.body.classList.contains("talkmode")) {
