@@ -152,6 +152,7 @@ final class InboxModel: ObservableObject {
 
 struct InboxView: View {
     @StateObject private var model = InboxModel()
+    @State private var showCompose = false
 
     private let outlookBlue = Color(red: 0.16, green: 0.6, blue: 0.96)
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
@@ -174,6 +175,14 @@ struct InboxView: View {
                         }
                     }
                     ToolbarItem(placement: .topBarTrailing) {
+                        // New mail: Scarlet drafts it in the native studio.
+                        Button {
+                            showCompose = true
+                        } label: {
+                            Image(systemName: "square.and.pencil")
+                        }
+                    }
+                    ToolbarItem(placement: .topBarTrailing) {
                         Button {
                             Task { await model.load() }
                         } label: {
@@ -181,6 +190,10 @@ struct InboxView: View {
                         }
                         .disabled(model.loading)
                     }
+                }
+                .sheet(isPresented: $showCompose) {
+                    DraftView(seed: nil)
+                        .preferredColorScheme(.dark)
                 }
         }
         .task { await model.load() }
@@ -322,6 +335,7 @@ struct MailDetailView: View {
 
     @State private var detail: MailDetail?
     @State private var failed = false
+    @State private var showDraft = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -358,12 +372,29 @@ struct MailDetailView: View {
                 }
             }
             ToolbarItem(placement: .topBarTrailing) {
-                // The drafting studio lives in the full app; native reply later.
-                Link(destination: AppConfig.fullAppURL) {
+                // Tap → the native drafting studio, seeded with this message.
+                // Long-press → the full web app, as a fallback.
+                Menu {
+                    Link(destination: AppConfig.fullAppURL) {
+                        Label("Open full app", systemImage: "arrow.up.forward.app")
+                    }
+                } label: {
                     Text("Reply in Scarlet")
                         .font(.footnote.weight(.semibold))
+                } primaryAction: {
+                    showDraft = true
                 }
             }
+        }
+        .sheet(isPresented: $showDraft) {
+            DraftView(seed: DraftSeed(
+                messageId: message.id,
+                fromName: message.fromName,
+                fromEmail: message.fromEmail,
+                subject: message.subject,
+                preview: message.preview
+            ))
+            .preferredColorScheme(.dark)
         }
         .task {
             model.markRead(message.id)
