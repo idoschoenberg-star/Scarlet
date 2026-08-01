@@ -9,7 +9,7 @@ options:
 settings:
   base:
     MARKETING_VERSION: "1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    CURRENT_PROJECT_VERSION: "2"
     DEVELOPMENT_TEAM: "$(DEVELOPMENT_TEAM)"      # injected by CI from the ASC account
     # Manual distribution signing: automatic signing archives with a development
     # profile, which needs a registered device — impossible on a headless runner.

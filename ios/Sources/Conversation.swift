@@ -5,9 +5,6 @@ import Combine
 /// Native ElevenLabs conversational client. Same protocol the web app speaks,
 /// but over a real AVAudioSession so the conversation never stalls: it keeps
 /// running with the screen locked, and pauses/resumes cleanly on interruptions.
-///
-/// NOTE: this is written against the protocol we already implemented in JS and
-/// will get its compile/tune pass in the first CI build.
 @MainActor
 final class Conversation: ObservableObject {
     enum State { case idle, connecting, listening, speaking }
@@ -21,26 +18,36 @@ final class Conversation: ObservableObject {
     @Published var speakerOn = true
 
     private var ws: URLSessionWebSocketTask?
+    private lazy var wsSession = URLSession(configuration: .default)
     private var token = ""
     private var outputRate: Double = 16000
 
-    // Audio
+    // Reconnect discipline: one loop at a time, only while the user wants live.
+    private var wantLive = false
+    private var reconnecting = false
+    private var observersInstalled = false
+
+    // Audio — built once, reused across reconnects. Re-running mic setup
+    // (a second installTap on the same bus) is an instant NSException crash.
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private var converter: AVAudioConverter?
     private var playFormat: AVAudioFormat?
+    private var audioReady = false
 
     // MARK: lifecycle
 
     func start(token: String) {
         guard state == .idle else { return }
         self.token = token
+        wantLive = true
         state = .connecting
         Task { await connect() }
         observeInterruptions()
     }
 
     func end() {
+        wantLive = false
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -61,19 +68,18 @@ final class Conversation: ObservableObject {
             let (data, _) = try await URLSession.shared.data(for: req)
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let signed = obj?["signed_url"] as? String, let url = URL(string: signed) else {
-                status = "Couldn't start — try again."; state = .idle; return
+                status = "Couldn't start — try again."; state = .idle; wantLive = false; return
             }
-            try startAudioSession()
-            let task = URLSession(configuration: .default).webSocketTask(with: url)
+            try ensureAudio()
+            let task = wsSession.webSocketTask(with: url)
             ws = task
             task.resume()
             send(["type": "conversation_initiation_client_data"])
             listen()
-            startCapture()
             state = .listening
-            status = "Listening…"
+            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
         } catch {
-            status = "Couldn't connect — tap to retry."; state = .idle
+            if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }
     }
 
@@ -82,7 +88,7 @@ final class Conversation: ObservableObject {
             guard let self else { return }
             switch result {
             case .failure:
-                Task { @MainActor in if self.state != .idle { self.reconnectSoon() } }
+                Task { @MainActor in self.scheduleReconnect() }
             case .success(let msg):
                 if case .string(let text) = msg,
                    let data = text.data(using: .utf8),
@@ -94,12 +100,19 @@ final class Conversation: ObservableObject {
         }
     }
 
-    private func reconnectSoon() {
-        // The flow watchdog, native edition: a dropped socket reconnects.
-        guard state != .idle else { return }
+    /// Silent auto-reconnect, native edition of the web app's transport-drop
+    /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
+    private func scheduleReconnect() {
+        guard wantLive, !reconnecting else { return }
+        reconnecting = true
         status = "Reconnecting…"
+        ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        Task { try? await Task.sleep(nanoseconds: 800_000_000); await connect() }
+        Task {
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            if wantLive { await connect() }
+            reconnecting = false
+        }
     }
 
     private func send(_ obj: [String: Any]) {
@@ -115,8 +128,10 @@ final class Conversation: ObservableObject {
         case "conversation_initiation_metadata":
             if let m = ev["conversation_initiation_metadata_event"] as? [String: Any],
                let fmt = m["agent_output_audio_format"] as? String,
-               let hz = Int(fmt.components(separatedBy: CharacterSet(charactersIn: "_")).last ?? "") {
+               let hz = Int(fmt.components(separatedBy: CharacterSet(charactersIn: "_")).last ?? ""),
+               Double(hz) != outputRate {
                 outputRate = Double(hz)
+                rebuildPlayback()
             }
         case "audio":
             if let a = ev["audio_event"] as? [String: Any], let b64 = a["audio_base_64"] as? String {
@@ -170,7 +185,15 @@ final class Conversation: ObservableObject {
         try s.setActive(true)
     }
 
-    private func startCapture() {
+    /// Idempotent: builds the audio graph exactly once; later calls just make
+    /// sure the engine is running.
+    private func ensureAudio() throws {
+        if audioReady {
+            if !engine.isRunning { try engine.start() }
+            return
+        }
+        try startAudioSession()
+
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
@@ -178,18 +201,22 @@ final class Conversation: ObservableObject {
         converter = AVAudioConverter(from: inFormat, to: target)
 
         engine.attach(player)
-        playFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: outputRate,
-                                   channels: 1, interleaved: true)
+        // Player speaks standard Float32 — mixer connections in exotic formats
+        // are exactly the kind of thing AVAudioEngine throws exceptions over.
+        playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
         engine.connect(player, to: engine.mainMixerNode, format: playFormat)
 
+        input.removeTap(onBus: 0)   // never stack taps — a second install crashes
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
             guard let self, let converter = self.converter else { return }
             let ratio = 16000.0 / inFormat.sampleRate
             let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
             guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCap) else { return }
+            var fed = false
             var err: NSError?
             converter.convert(to: out, error: &err) { _, status in
-                status.pointee = .haveData; return buffer
+                if fed { status.pointee = .noDataNow; return nil }
+                fed = true; status.pointee = .haveData; return buffer
             }
             guard err == nil, out.frameLength > 0,
                   let ch = out.int16ChannelData else { return }
@@ -200,7 +227,18 @@ final class Conversation: ObservableObject {
                 self.send(["user_audio_chunk": data.base64EncodedString()])
             }
         }
-        do { try engine.start() } catch { status = "Audio start failed" }
+        engine.prepare()
+        try engine.start()
+        audioReady = true
+    }
+
+    /// Server announced a different output rate — rewire only the player leg.
+    private func rebuildPlayback() {
+        guard audioReady else { return }
+        player.stop()
+        engine.disconnectNodeOutput(player)
+        playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
+        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
     }
 
     private func playPCM(base64: String) {
@@ -208,11 +246,13 @@ final class Conversation: ObservableObject {
               let fmt = playFormat else { return }
         let frames = AVAudioFrameCount(data.count / 2)
         guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames),
-              let ch = buf.int16ChannelData else { return }
+              let ch = buf.floatChannelData else { return }
         buf.frameLength = frames
-        data.withUnsafeBytes { raw in
-            memcpy(ch[0], raw.baseAddress!, data.count)
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let samples = raw.bindMemory(to: Int16.self)
+            for i in 0..<Int(frames) { ch[0][i] = Float(samples[i]) / 32768.0 }
         }
+        if !engine.isRunning { try? engine.start() }
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
@@ -231,15 +271,19 @@ final class Conversation: ObservableObject {
     }
 
     private func stopAudio() {
+        guard audioReady else { return }
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
         engine.stop()
+        audioReady = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     // MARK: interruptions — the flow guarantee
 
     private func observeInterruptions() {
+        guard !observersInstalled else { return }
+        observersInstalled = true
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
             guard let self,
@@ -251,8 +295,7 @@ final class Conversation: ObservableObject {
                     self.player.pause()
                 case .ended:
                     try? self.startAudioSession()
-                    if self.state != .idle, !self.engine.isRunning { try? self.engine.start() }
-                    if self.player.isPlaying == false { self.player.play() }
+                    if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
                 default: break
                 }
             }
@@ -260,7 +303,7 @@ final class Conversation: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in if self.state != .idle, !self.engine.isRunning { try? self.engine.start() } }
+            Task { @MainActor in if self.wantLive, !self.engine.isRunning { try? self.engine.start() } }
         }
     }
 }

@@ -33,5 +33,12 @@ function api(path) {
   out.betaGroups = (JSON.parse(g.b).data || []).map((x) => ({
     id: x.id, name: x.attributes.name, isInternalGroup: x.attributes.isInternalGroup,
   }));
+  // TestFlight crash feedback (best-effort; needs the tester to have shared it).
+  const cr = await api("/v1/apps/" + app.id + "/betaFeedbackCrashSubmissions?limit=5");
+  try {
+    const j = JSON.parse(cr.b);
+    out.crashes = (j.data || []).map((x) => x.attributes);
+    if (!j.data) out.crashesRaw = cr.b.slice(0, 800);
+  } catch (e) { out.crashesRaw = cr.s + " " + cr.b.slice(0, 300); }
   console.log("===STATUS===\n" + JSON.stringify(out, null, 2) + "\n===END===");
 })().catch((e) => { console.error(e); process.exit(1); });
