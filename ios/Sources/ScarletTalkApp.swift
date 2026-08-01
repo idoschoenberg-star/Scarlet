@@ -55,6 +55,16 @@ struct RootView: View {
                 .tag(Tab.chats)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
+        // The Scarlet Presence: a floating capsule on every non-Talk tab so
+        // her state and controls stay visible while Ido reads mail or chats.
+        .overlay(alignment: .bottom) {
+            if tab != .talk {
+                ScarletPresenceView(convo: convo, goToTalk: { tab = .talk })
+                    .padding(.bottom, 58)   // floats above the tab bar
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: tab)
         // "Ask Scarlet about this email": the mail reader posts a notification;
         // this shell (which owns the conversation) switches to Talk and hands
         // her the question — waking the conversation first if it isn't live.

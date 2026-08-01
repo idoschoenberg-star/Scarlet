@@ -1,3 +1,4 @@
+import AVKit
 import Foundation
 import SwiftUI
 import UIKit
@@ -101,6 +102,10 @@ struct ChatMessage: Identifiable {
     /// WhatsApp photo messages: signed https image URL from `media_url`
     /// (valid ~1h). Always nil for Teams / iMessage.
     let mediaURL: URL?
+    /// WhatsApp media MIME type from `media_type` (e.g. "image/jpeg",
+    /// "video/mp4", "audio/ogg"). nil when absent — text messages, legacy
+    /// payloads, other channels.
+    let mediaType: String?
     /// WhatsApp outgoing delivery state: "sent" | "delivered" | "read".
     /// nil when absent — all incoming messages and other channels.
     let status: String?
@@ -310,6 +315,8 @@ final class ChatThreadModel: ObservableObject {
                 // Photo messages (WhatsApp today): tolerate absence — the key
                 // simply isn't there for text messages or other channels.
                 let mediaString = (m["media_url"] as? String) ?? ""
+                // Media MIME type (WhatsApp media only): tolerate absence.
+                let mediaTypeString = (m["media_type"] as? String) ?? ""
                 // Delivery state (WhatsApp outgoing only): tolerate absence.
                 let statusString = (m["status"] as? String) ?? ""
                 return ChatMessage(
@@ -319,6 +326,7 @@ final class ChatThreadModel: ObservableObject {
                     sender: sender,
                     text: (m["text"] as? String) ?? "",
                     mediaURL: mediaString.isEmpty ? nil : URL(string: mediaString),
+                    mediaType: mediaTypeString.isEmpty ? nil : mediaTypeString,
                     status: statusString.isEmpty ? nil : statusString
                 )
             }
@@ -401,7 +409,7 @@ final class ChatThreadModel: ObservableObject {
     private func appendLocal(_ text: String) {
         messages.append(ChatMessage(id: messages.count, ts: Date(),
                                     fromMe: true, sender: "", text: text,
-                                    mediaURL: nil, status: "sent"))
+                                    mediaURL: nil, mediaType: nil, status: "sent"))
         loadStamp += 1
     }
 
@@ -706,6 +714,13 @@ struct ChatThreadView: View {
     @FocusState private var composeFocused: Bool
     /// WhatsApp photo bubbles: tapped image → full-screen viewer sheet.
     @State private var photoItem: WAPhotoItem?
+    /// WhatsApp video bubbles: tapped card → full-screen player sheet.
+    /// (Parallel to photoItem on purpose — keeps the photo path untouched.)
+    @State private var videoItem: WAVideoItem?
+    /// WhatsApp voice notes: inline playback, one at a time. playingVoiceID
+    /// is the ChatMessage.id currently playing (nil when idle/paused).
+    @State private var voicePlayer: AVPlayer?
+    @State private var playingVoiceID: Int?
 
     init(channel: ChatChannel, chat: ChatSummary) {
         self.channel = channel
@@ -744,6 +759,10 @@ struct ChatThreadView: View {
         }
         .onDisappear {
             model.stopPolling()
+            // Voice-note hygiene: a closed thread never keeps playing audio.
+            voicePlayer?.pause()
+            voicePlayer = nil
+            playingVoiceID = nil
             if composeFocused { convo.endTyping() }
             // Stale-guard (MailDetailView pattern): restore the list focus
             // only if this thread still owns it — another screen may have
@@ -760,6 +779,10 @@ struct ChatThreadView: View {
         // WhatsApp photo bubbles: tap → full-screen viewer.
         .sheet(item: $photoItem) { item in
             WAPhotoView(item: item)
+        }
+        // WhatsApp video bubbles: tap → full-screen player.
+        .sheet(item: $videoItem) { item in
+            WAVideoView(item: item)
         }
     }
 
@@ -825,9 +848,30 @@ struct ChatThreadView: View {
         case .whatsapp:
             WhatsAppBubble(message: m,
                            showSender: item.showSender && chat.isGroup,
-                           onImageTap: { url in photoItem = WAPhotoItem(url: url) })
+                           isVoicePlaying: playingVoiceID == m.id,
+                           onImageTap: { url in photoItem = WAPhotoItem(url: url) },
+                           onVideoTap: { url in videoItem = WAVideoItem(url: url) },
+                           onVoiceTap: { url in toggleVoice(url, messageID: m.id) })
         case .imessage:
             IMessageBubble(message: m)
+        }
+    }
+
+    /// Voice-note play/pause: one player at a time. Tapping the playing row
+    /// pauses and clears; tapping another row replaces the current player.
+    /// iOS AVPlayer can't decode ogg/opus — those taps set state but stay
+    /// silent (acceptable v1); m4a/mp3/aac play fine.
+    private func toggleVoice(_ url: URL, messageID: Int) {
+        if playingVoiceID == messageID {
+            voicePlayer?.pause()
+            voicePlayer = nil
+            playingVoiceID = nil
+        } else {
+            voicePlayer?.pause()
+            let p = AVPlayer(url: url)
+            voicePlayer = p
+            playingVoiceID = messageID
+            p.play()
         }
     }
 
@@ -1052,8 +1096,15 @@ struct TeamsMessageCell: View {
 struct WhatsAppBubble: View {
     let message: ChatMessage
     let showSender: Bool
+    /// Voice notes only: whether THIS message is the one currently playing
+    /// (drives the play/pause glyph). The thread view owns the player.
+    var isVoicePlaying: Bool = false
     /// Photo bubbles only: the thread view presents the full-screen viewer.
     var onImageTap: ((URL) -> Void)? = nil
+    /// Video bubbles only: the thread view presents the full-screen player.
+    var onVideoTap: ((URL) -> Void)? = nil
+    /// Voice notes only: the thread view toggles inline playback.
+    var onVoiceTap: ((URL) -> Void)? = nil
 
     private static let outgoing = Color(red: 0.0, green: 0.36, blue: 0.25)
     private static let incoming = Color.white.opacity(0.10)
@@ -1084,7 +1135,14 @@ struct WhatsAppBubble: View {
     @ViewBuilder
     private var bubble: some View {
         if let url = message.mediaURL {
-            mediaBubble(url)
+            if let type = message.mediaType, type.hasPrefix("video/") {
+                videoBubble(url)
+            } else if let type = message.mediaType, type.hasPrefix("audio/") {
+                voiceBubble(url)
+            } else {
+                // image/* or nil media_type: the original photo bubble.
+                mediaBubble(url)
+            }
         } else {
             textBubble
         }
@@ -1153,6 +1211,74 @@ struct WhatsAppBubble: View {
             }
         }
         .frame(width: 230, height: height)
+    }
+
+    /// Video bubble: 230×160 dark card with a centered play glyph; optional
+    /// caption under it (same treatment as photo captions); tap → the thread
+    /// view's full-screen player sheet.
+    private func videoBubble(_ url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            senderLine
+            ZStack {
+                bubbleShape
+                    .fill(Color.black.opacity(0.35))
+                VStack(spacing: 6) {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(.white)
+                    Text("Video")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.8))
+                }
+            }
+            .frame(width: 230, height: 160)
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.system(size: 16))
+                    .foregroundStyle(.white)
+                    .padding(.top, 2)
+                    .padding(.horizontal, 4)
+            }
+            timeLine
+        }
+        .padding(3)
+        .background(message.fromMe ? Self.outgoing : Self.incoming,
+                    in: bubbleShape)
+        .contentShape(bubbleShape)
+        .onTapGesture { onVideoTap?(url) }
+    }
+
+    /// Voice-note bubble: compact row — 30pt play/pause circle in WhatsApp
+    /// green, static waveform glyph, "Voice note" label. Playback is inline,
+    /// owned by the thread view (one player at a time).
+    private func voiceBubble(_ url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            senderLine
+            HStack(spacing: 10) {
+                Button {
+                    onVoiceTap?(url)
+                } label: {
+                    Image(systemName: isVoicePlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 30, height: 30)
+                        .background(Circle().fill(ChatChannel.whatsapp.accent))
+                }
+                .buttonStyle(.plain)
+                Image(systemName: "waveform")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.white.opacity(0.7))
+                Text("Voice note")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            .frame(minWidth: 150, alignment: .leading)
+            timeLine
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(message.fromMe ? Self.outgoing : Self.incoming,
+                    in: bubbleShape)
     }
 
     @ViewBuilder
@@ -1261,6 +1387,50 @@ struct WAPhotoView: View {
             .padding(.top, 12)
             .padding(.trailing, 16)
         }
+    }
+}
+
+// MARK: - WhatsApp full-screen video player
+
+/// Identifiable wrapper so `.sheet(item:)` can drive the player off a URL.
+/// (Parallel to WAPhotoItem — kept separate so the photo path is untouched.)
+struct WAVideoItem: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+/// Full-screen video sheet: VideoPlayer on black, autoplays on appear,
+/// pauses on dismiss; same top-trailing xmark as the photo viewer.
+struct WAVideoView: View {
+    let item: WAVideoItem
+    @Environment(\.dismiss) private var dismiss
+    @State private var player: AVPlayer? = nil
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+            if let player {
+                VideoPlayer(player: player)
+                    .ignoresSafeArea()
+            }
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(.white.opacity(0.15)))
+            }
+            .padding(.top, 12)
+            .padding(.trailing, 16)
+        }
+        .onAppear {
+            let p = AVPlayer(url: item.url)
+            player = p
+            p.play()
+        }
+        .onDisappear { player?.pause() }
     }
 }
 

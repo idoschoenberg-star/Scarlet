@@ -17,6 +17,7 @@ final class Conversation: ObservableObject {
     @Published var micOn = true
     @Published var speakerOn = true
     @Published var loudspeaker = true   // route: iPhone speaker vs. call earpiece
+    @Published var chatMode = false     // text-only: ears closed, voice silent
 
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
@@ -85,6 +86,31 @@ final class Conversation: ObservableObject {
         }
     }
 
+    // MARK: chat mode
+
+    /// Remembered so leaving chat mode restores the mic the way Ido left it.
+    private var micWasOnBeforeChat = true
+
+    /// Chat mode: her ears close and her voice goes silent — she answers in
+    /// text only. Voice mode restores both.
+    func setChatMode(_ on: Bool) {
+        guard on != chatMode else { return }
+        if on {
+            micWasOnBeforeChat = micOn
+            micOn = false
+            speakerOn = false
+            player.volume = 0
+            chatMode = true
+            status = "Chat mode — type to Scarlet"
+        } else {
+            chatMode = false
+            micOn = micWasOnBeforeChat
+            speakerOn = true
+            player.volume = 1
+            if micOn { status = "Listening…" }
+        }
+    }
+
     // Dictation etiquette: while Ido types/dictates into the text row, her
     // live ears close — otherwise Wispr's spoken dictation reaches the mic
     // and she answers before he presses send.
@@ -95,6 +121,7 @@ final class Conversation: ObservableObject {
         status = "Dictation mode — mic paused until you close the keyboard row"
     }
     func endTyping() {
+        guard !chatMode else { return }   // chat mode keeps her ears closed
         micOn = micWasOnBeforeTyping
         if micOn { status = "Listening…" }
     }
@@ -106,6 +133,9 @@ final class Conversation: ObservableObject {
         transcript.append(.init(text: t, fromHer: false))
         send(["type": "user_message", "text": t])
     }
+
+    /// Her most recent line — surfaced by the floating presence capsule.
+    var lastHerLine: String? { transcript.last(where: { $0.fromHer })?.text }
 
     // MARK: ambient focus
 
