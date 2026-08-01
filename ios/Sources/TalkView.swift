@@ -4,12 +4,24 @@ import SwiftUI
 struct TalkView: View {
     @EnvironmentObject var session: AppSession
     @StateObject private var convo = Conversation()
+    @State private var showSettings = false
 
     var body: some View {
         VStack(spacing: 20) {
-            Text("SCARLET").font(.system(size: 22, weight: .thin)).tracking(9)
-                .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-                .padding(.top, 8)
+            ZStack {
+                Text("SCARLET").font(.system(size: 22, weight: .thin)).tracking(9)
+                    .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
+                HStack {
+                    Spacer()
+                    Button { showSettings = true } label: {
+                        Image(systemName: "gearshape")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.white.opacity(0.65))
+                            .frame(width: 44, height: 44)
+                    }
+                }
+            }
+            .padding(.top, 8)
 
             Orb(active: convo.state == .speaking).frame(width: 220, height: 220)
 
@@ -35,9 +47,17 @@ struct TalkView: View {
                                 in: RoundedRectangle(cornerRadius: 30))
                     .foregroundStyle(.white)
             }
-            .padding(.bottom, 8)
+            .padding(.bottom, 2)
+
+            Link(destination: AppConfig.fullAppURL) {
+                Text("Full Scarlet app ›")
+                    .font(.footnote)
+                    .foregroundStyle(Color(red: 0.79, green: 0.64, blue: 0.65))
+            }
+            .padding(.bottom, 6)
         }
         .padding(.horizontal, 24)
+        .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
         .onAppear { convo.start(token: TokenStore.token ?? "") }   // auto-connect: one press → talking
         .onDisappear { convo.end() }
     }
