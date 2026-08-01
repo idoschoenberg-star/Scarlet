@@ -30,13 +30,21 @@ struct ScarletPresenceView: View {
     @State private var expanded = false
 
     private let scarlet = Color(red: 1, green: 0.35, blue: 0.42)
+    /// OPAQUE surface for everything this view draws. Translucent fills over
+    /// a scrolling list read as broken overlap — content bleeds through the
+    /// input field and buttons — so the capsule and the chat panel both sit
+    /// on a solid card.
+    private let surface = Color(red: 0.16, green: 0.055, blue: 0.085)
 
     var body: some View {
-        VStack(spacing: 8) {
+        Group {
             if expanded && convo.chatMode && convo.state != .idle {
-                chatExpansion
+                // Chat mode is ONE solid panel (header + reply peek + input),
+                // never separate stacked pieces floating over the list.
+                chatPanel
+            } else {
+                capsuleBar
             }
-            capsuleBar
         }
         .frame(maxWidth: 360)
         .padding(.horizontal, 14)
@@ -80,9 +88,9 @@ struct ScarletPresenceView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .background(.white.opacity(0.10), in: Capsule())
-        .overlay(Capsule().stroke(.white.opacity(0.15), lineWidth: 1))
-        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+        .background(surface, in: Capsule())
+        .overlay(Capsule().stroke(.white.opacity(0.18), lineWidth: 1))
+        .shadow(color: .black.opacity(0.45), radius: 14, y: 5)
     }
 
     // MARK: orb + status
@@ -168,10 +176,23 @@ struct ScarletPresenceView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: chat-mode expansion
+    // MARK: chat-mode panel (one solid card)
 
-    private var chatExpansion: some View {
-        VStack(spacing: 6) {
+    private var chatPanel: some View {
+        VStack(spacing: 10) {
+            // Header: orb + label + the same three controls. Tapping the
+            // header (not the buttons) collapses back to the capsule.
+            HStack(spacing: 10) {
+                orb
+                Text("Chat with Scarlet")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                controls
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { expanded = false }
             if let line = convo.lastHerLine {
                 Button(action: goToTalk) {
                     Text(line)
@@ -180,12 +201,16 @@ struct ScarletPresenceView: View {
                         .lineLimit(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
-                        .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                 }
                 .buttonStyle(.plain)
             }
             inputRow
         }
+        .padding(12)
+        .background(surface, in: RoundedRectangle(cornerRadius: 22))
+        .overlay(RoundedRectangle(cornerRadius: 22).stroke(.white.opacity(0.18), lineWidth: 1))
+        .shadow(color: .black.opacity(0.45), radius: 14, y: 5)
     }
 
     private var trimmedDraft: String {
@@ -199,7 +224,8 @@ struct ScarletPresenceView: View {
                 .font(.system(size: 14))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.14), lineWidth: 1))
             Button {
                 let t = trimmedDraft
                 guard !t.isEmpty else { return }
@@ -207,13 +233,10 @@ struct ScarletPresenceView: View {
                 draft = ""
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 26))
+                    .font(.system(size: 28))
                     .foregroundStyle(scarlet)
             }
             .disabled(trimmedDraft.isEmpty)
         }
-        .padding(8)
-        .background(.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.15), lineWidth: 1))
     }
 }

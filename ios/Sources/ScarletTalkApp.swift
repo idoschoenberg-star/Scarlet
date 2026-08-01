@@ -1,5 +1,6 @@
 import Combine
 import SwiftUI
+import UIKit
 
 @main
 struct ScarletTalkApp: App {
@@ -36,6 +37,11 @@ struct RootView: View {
     /// so push A → present B → dismiss B must not un-hide wrongly. The
     /// capsule shows only when nobody owns the bottom (list screens).
     @State private var bottomOwners = 0
+    /// Keyboard visibility: the capsule's 58pt tab-bar clearance only makes
+    /// sense while the tab bar is visible. With the keyboard up the tab bar
+    /// is covered, so the capsule hugs the keyboard instead of floating
+    /// mid-list above a phantom bar.
+    @State private var keyboardUp = false
 
     enum Tab: Hashable { case talk, inbox, calendar, chats }
 
@@ -71,12 +77,17 @@ struct RootView: View {
         .overlay(alignment: .bottom) {
             if tab != .talk && !draftSheetVisible && bottomOwners == 0 {
                 ScarletPresenceView(convo: convo, goToTalk: { tab = .talk })
-                    .padding(.bottom, 58)   // floats above the tab bar
+                    .padding(.bottom, keyboardUp ? 8 : 58)   // above tab bar / hugging keyboard
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
         .animation(.easeInOut(duration: 0.2), value: tab)
         .animation(.easeInOut(duration: 0.2), value: bottomOwners)
+        .animation(.easeInOut(duration: 0.2), value: keyboardUp)
         // Any DraftView sheet (voice-attach, reply, new-mail, channel) says
         // when it's up; the capsule yields the screen to it.
         .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
