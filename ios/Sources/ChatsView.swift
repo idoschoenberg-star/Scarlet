@@ -101,6 +101,9 @@ struct ChatMessage: Identifiable {
     /// WhatsApp photo messages: signed https image URL from `media_url`
     /// (valid ~1h). Always nil for Teams / iMessage.
     let mediaURL: URL?
+    /// WhatsApp outgoing delivery state: "sent" | "delivered" | "read".
+    /// nil when absent — all incoming messages and other channels.
+    let status: String?
 }
 
 // MARK: - Dates
@@ -307,13 +310,16 @@ final class ChatThreadModel: ObservableObject {
                 // Photo messages (WhatsApp today): tolerate absence — the key
                 // simply isn't there for text messages or other channels.
                 let mediaString = (m["media_url"] as? String) ?? ""
+                // Delivery state (WhatsApp outgoing only): tolerate absence.
+                let statusString = (m["status"] as? String) ?? ""
                 return ChatMessage(
                     id: index,
                     ts: ChatDates.parse(m["ts"]),
                     fromMe: (m["from_me"] as? Bool) ?? false,
                     sender: sender,
                     text: (m["text"] as? String) ?? "",
-                    mediaURL: mediaString.isEmpty ? nil : URL(string: mediaString)
+                    mediaURL: mediaString.isEmpty ? nil : URL(string: mediaString),
+                    status: statusString.isEmpty ? nil : statusString
                 )
             }
             guard generation == loadGeneration else { return }
@@ -395,7 +401,7 @@ final class ChatThreadModel: ObservableObject {
     private func appendLocal(_ text: String) {
         messages.append(ChatMessage(id: messages.count, ts: Date(),
                                     fromMe: true, sender: "", text: text,
-                                    mediaURL: nil))
+                                    mediaURL: nil, status: "sent"))
         loadStamp += 1
     }
 
@@ -1162,11 +1168,47 @@ struct WhatsAppBubble: View {
     @ViewBuilder
     private var timeLine: some View {
         if let ts = message.ts {
-            Text(ChatTimeFormat.time.string(from: ts))
-                .font(.system(size: 11))
-                .foregroundStyle(.white.opacity(0.55))
-                .frame(maxWidth: .infinity, alignment: .trailing)
+            HStack(spacing: 3) {
+                Text(ChatTimeFormat.time.string(from: ts))
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.55))
+                if message.fromMe {
+                    waTicks(message.status)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
         }
+    }
+
+    /// WhatsApp check marks: single tick (sent), double tick (delivered),
+    /// blue double tick (read). nil → nothing (incoming / unknown).
+    @ViewBuilder
+    private func waTicks(_ status: String?) -> some View {
+        switch status {
+        case "sent":
+            Image(systemName: "checkmark")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.55))
+        case "delivered":
+            waDoubleCheck(.white.opacity(0.55))
+        case "read":
+            waDoubleCheck(Color(red: 0.20, green: 0.60, blue: 0.86))
+        default:
+            EmptyView()
+        }
+    }
+
+    /// Two overlapped checkmarks, the second nudged 4pt right, in a fixed
+    /// 15pt frame so the time row's layout stays stable.
+    private func waDoubleCheck(_ color: Color) -> some View {
+        ZStack(alignment: .leading) {
+            Image(systemName: "checkmark")
+            Image(systemName: "checkmark")
+                .offset(x: 4)
+        }
+        .font(.system(size: 9, weight: .semibold))
+        .foregroundStyle(color)
+        .frame(width: 15, alignment: .leading)
     }
 }
 
