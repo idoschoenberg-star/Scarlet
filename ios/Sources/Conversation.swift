@@ -16,6 +16,7 @@ final class Conversation: ObservableObject {
     @Published var transcript: [Line] = []
     @Published var micOn = true
     @Published var speakerOn = true
+    @Published var loudspeaker = true   // route: iPhone speaker vs. call earpiece
 
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
@@ -57,6 +58,23 @@ final class Conversation: ObservableObject {
 
     func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }
     func toggleSpeaker() { speakerOn.toggle(); player.volume = speakerOn ? 1 : 0 }
+
+    /// Loudspeaker ⇄ earpiece. Only touches the route when the phone itself is
+    /// playing — AirPods/CarPlay keep priority either way.
+    func toggleLoudspeaker() {
+        loudspeaker.toggle()
+        let s = AVAudioSession.sharedInstance()
+        if loudspeaker { routeToSpeakerIfReceiver() }
+        else { try? s.overrideOutputAudioPort(.none) }
+    }
+
+    /// Dictated/typed input: goes to her exactly like speech.
+    func sendText(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        transcript.append(.init(text: t, fromHer: false))
+        send(["type": "user_message", "text": t])
+    }
 
     // MARK: signed URL + socket
 
@@ -190,6 +208,7 @@ final class Conversation: ObservableObject {
     /// sounds "very faint". Force the loudspeaker — but only when the route IS
     /// the earpiece, so AirPods/CarPlay stay untouched.
     private func routeToSpeakerIfReceiver() {
+        guard loudspeaker else { return }
         let s = AVAudioSession.sharedInstance()
         if s.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) {
             try? s.overrideOutputAudioPort(.speaker)

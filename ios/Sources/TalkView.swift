@@ -5,6 +5,9 @@ struct TalkView: View {
     @EnvironmentObject var session: AppSession
     @StateObject private var convo = Conversation()
     @State private var showSettings = false
+    @State private var showType = false
+    @State private var typed = ""
+    @FocusState private var typeFocused: Bool
 
     var body: some View {
         VStack(spacing: 20) {
@@ -32,11 +35,34 @@ struct TalkView: View {
 
             Spacer()
 
-            HStack(spacing: 22) {
+            if showType {
+                HStack(spacing: 8) {
+                    TextField("Type or dictate to Scarlet…", text: $typed, axis: .vertical)
+                        .lineLimit(1...4)
+                        .padding(10)
+                        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                        .focused($typeFocused)
+                        .onSubmit { convo.sendText(typed); typed = "" }
+                    Button {
+                        convo.sendText(typed); typed = ""
+                    } label: {
+                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 30))
+                            .foregroundStyle(Color(red: 1, green: 0.35, blue: 0.42))
+                    }
+                }
+            }
+
+            HStack(spacing: 16) {
                 RoundControl(icon: convo.micOn ? "mic.fill" : "mic.slash.fill",
                              label: "Mic", off: !convo.micOn) { convo.toggleMic() }
                 RoundControl(icon: convo.speakerOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
                              label: "Voice", off: !convo.speakerOn) { convo.toggleSpeaker() }
+                RoundControl(icon: convo.loudspeaker ? "speaker.wave.3.fill" : "ear.fill",
+                             label: "Speaker", off: !convo.loudspeaker) { convo.toggleLoudspeaker() }
+                RoundControl(icon: "keyboard", label: "Type", off: false) {
+                    showType.toggle()
+                    typeFocused = showType
+                }
             }
 
             Button(role: .destructive) {
