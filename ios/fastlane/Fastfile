@@ -3,6 +3,9 @@ default_platform(:ios)
 platform :ios do
   desc "Build Scarlet Talk and push to TestFlight"
   lane :beta do
+    # CI keychain — cloud-managed signing needs somewhere to store the cert key.
+    setup_ci
+
     key = app_store_connect_api_key(
       key_id: ENV["ASC_KEY_ID"],
       issuer_id: ENV["ASC_ISSUER"],
@@ -10,24 +13,19 @@ platform :ios do
       in_house: false
     )
 
-    # Make sure the app record + bundle id exist (idempotent).
-    begin
-      produce(
-        app_identifier: "com.idoschoenberg.scarlettalk",
-        app_name: "Scarlet Talk",
-        language: "English",
-        sku: "scarlettalk",
-        api_key: key
-      )
-    rescue => e
-      UI.message("produce skipped (app likely exists): #{e}")
-    end
+    # NOTE: the App Store Connect *app record* must exist (one-time manual step
+    # in the ASC website) — `produce` can't create it with an API key.
+
+    auth = "-authenticationKeyPath #{ENV['ASC_P8_PATH']} " \
+           "-authenticationKeyID #{ENV['ASC_KEY_ID']} " \
+           "-authenticationKeyIssuerID #{ENV['ASC_ISSUER']}"
 
     build_app(
       project: "ScarletTalk.xcodeproj",
       scheme: "ScarletTalk",
       export_method: "app-store",
-      xcargs: "-allowProvisioningUpdates DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']}",
+      xcargs: "-allowProvisioningUpdates #{auth} DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']}",
+      export_xcargs: "-allowProvisioningUpdates #{auth}",
       export_options: {
         signingStyle: "automatic",
         teamID: ENV["DEVELOPMENT_TEAM"]

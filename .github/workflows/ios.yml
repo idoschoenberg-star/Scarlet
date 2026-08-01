@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -41,9 +41,9 @@ jobs:
           ASC_ISSUER: ${{ inputs.asc_issuer }}
           ASC_KEY_ID: ${{ inputs.asc_key_id }}
           ASC_KEY_PEM_B64: ${{ inputs.asc_key_p8_b64 }}
+          ASC_P8_PATH: ${{ runner.temp }}/asc.p8
           DEVELOPMENT_TEAM: ${{ steps.team.outputs.team }}
         run: |
           export ASC_KEY_PEM="$(printf '%s' "$ASC_KEY_PEM_B64" | base64 --decode)"
           cd ios
-          gem install fastlane -N -v 2.226.0 >/dev/null
           fastlane beta
