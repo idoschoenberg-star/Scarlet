@@ -301,9 +301,18 @@ final class DraftModel: ObservableObject {
             return
         }
         guard let want = draftId else { return }
-        guard let d = try? await Self.fetchActive(), d.id == want else { return }
-        draft = d
-        if phase == .writing && d.status == "draft" { phase = .ready }
+        guard let d = try? await Self.fetchActive() else { return }
+        if d.id == want {
+            draft = d
+            if phase == .writing && d.status == "draft" { phase = .ready }
+        } else if d.status == "draft" {
+            // The active draft IS the window's truth. If voice work replaced
+            // it under a different id (Scarlet revised or re-composed), follow
+            // it instead of showing a stale copy forever.
+            draftId = d.id
+            draft = d
+            if phase == .writing { phase = .ready }
+        }
     }
 
     // MARK: plumbing (same shape as InboxModel: apiBase + x-scarlet-token)
@@ -357,6 +366,10 @@ struct DraftView: View {
 
     @StateObject private var model = DraftModel()
     @Environment(\.dismiss) private var dismiss
+    /// The live conversation: the open draft window rides into her ambient
+    /// focus (with its draft_id) so spoken change requests land on THIS draft.
+    @EnvironmentObject private var convo: Conversation
+    @State private var focusBeforeDraft: String?
 
     @State private var revisionText = ""
     @State private var newTo = ""
@@ -392,6 +405,12 @@ struct DraftView: View {
         }
         .onDisappear {
             model.stopPolling()
+            // Give her ears back whatever was focused before the window
+            // opened — unless another screen already claimed focus.
+            if let previous = focusBeforeDraft,
+               convo.currentFocus?.hasPrefix("[FOCUS] A draft window is OPEN") == true {
+                convo.setFocus(previous)
+            }
         }
         .onChange(of: model.phase) { _, newPhase in
             if newPhase == .saved {
@@ -401,6 +420,24 @@ struct DraftView: View {
                 }
             }
         }
+        // The draft on screen (and each revision of it) is what "the draft"
+        // means in conversation — stream it to her as ambient focus.
+        .onChange(of: draftFocusLine) { _, newLine in
+            guard let newLine else { return }
+            if focusBeforeDraft == nil { focusBeforeDraft = convo.currentFocus }
+            convo.setFocus(newLine)
+        }
+    }
+
+    /// One line per (draft id, revision) — nil until a draft is on screen.
+    private var draftFocusLine: String? {
+        guard let d = model.draft else { return nil }
+        return "[FOCUS] A draft window is OPEN on Ido's screen.\n"
+            + "channel: \(d.channel)\n"
+            + "draft_id: \(d.id)\n"
+            + "recipient: \(d.recipient)\n"
+            + "revision: v\(d.revision)\n"
+            + "Any spoken change request refers to THIS draft — call revise_draft."
     }
 
     // MARK: header

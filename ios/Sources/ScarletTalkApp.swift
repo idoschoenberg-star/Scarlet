@@ -83,6 +83,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $voiceDraftPresented) {
             DraftView(seed: nil, attachToActive: true)
+                .environmentObject(convo)
                 .preferredColorScheme(.dark)
         }
         // Ambient focus: Talk at launch and whenever the tab returns to it;
