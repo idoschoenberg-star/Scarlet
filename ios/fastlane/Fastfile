@@ -1,9 +1,12 @@
 default_platform(:ios)
 
+BUNDLE_ID = "com.idoschoenberg.scarlettalk"
+PROFILE_NAME = "ScarletTalk AppStore"
+
 platform :ios do
   desc "Build Scarlet Talk and push to TestFlight"
   lane :beta do
-    # CI keychain — cloud-managed signing needs somewhere to store the cert key.
+    # CI keychain — the distribution cert's private key lives here for the run.
     setup_ci
 
     key = app_store_connect_api_key(
@@ -13,22 +16,32 @@ platform :ios do
       in_house: false
     )
 
-    # NOTE: the App Store Connect *app record* must exist (one-time manual step
-    # in the ASC website) — `produce` can't create it with an API key.
+    # Manual distribution signing, minted fresh each run via the ASC API.
+    # (team.js already revoked stale certs whose keys died with old runners.)
+    get_certificates(
+      api_key: key,
+      development: false,
+      keychain_path: File.expand_path("~/Library/Keychains/fastlane_tmp_keychain-db"),
+      keychain_password: ""
+    )
 
-    auth = "-authenticationKeyPath #{ENV['ASC_P8_PATH']} " \
-           "-authenticationKeyID #{ENV['ASC_KEY_ID']} " \
-           "-authenticationKeyIssuerID #{ENV['ASC_ISSUER']}"
+    get_provisioning_profile(
+      api_key: key,
+      app_identifier: BUNDLE_ID,
+      provisioning_name: PROFILE_NAME,
+      ignore_profiles_with_different_name: true,
+      force: true
+    )
 
     build_app(
       project: "ScarletTalk.xcodeproj",
       scheme: "ScarletTalk",
       export_method: "app-store",
-      xcargs: "-allowProvisioningUpdates #{auth} DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']}",
-      export_xcargs: "-allowProvisioningUpdates #{auth}",
+      xcargs: "DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']}",
       export_options: {
-        signingStyle: "automatic",
-        teamID: ENV["DEVELOPMENT_TEAM"]
+        signingStyle: "manual",
+        teamID: ENV["DEVELOPMENT_TEAM"],
+        provisioningProfiles: { BUNDLE_ID => PROFILE_NAME }
       }
     )
 

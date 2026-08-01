@@ -28,5 +28,18 @@ function api(method, path, body) {
     try { const j = JSON.parse(c.b); seed = j.data && j.data.attributes && j.data.attributes.seedId; } catch (e) {}
     if (!seed) { console.error("bundleId create failed:", c.s, c.b.slice(0, 500)); process.exit(1); }
   }
-  process.stdout.write(seed);
+
+  // Revoke leftover distribution certs from previous ephemeral runners: their
+  // private keys died with the runner, and the account caps distribution certs,
+  // so without this the pipeline bricks itself after a couple of runs.
+  const certs = await api("GET", "/v1/certificates?filter[certificateType]=DISTRIBUTION,IOS_DISTRIBUTION&limit=200");
+  try {
+    const j = JSON.parse(certs.b);
+    for (const c of (j.data || [])) {
+      const d = await api("DELETE", "/v1/certificates/" + c.id);
+      console.error("revoked stale distribution cert", c.id, "->", d.s);
+    }
+  } catch (e) { console.error("cert cleanup skipped:", e.message); }
+
+  process.stdout.write(seed);   // stdout carries ONLY the Team ID for $(...) capture
 })().catch((e) => { console.error(e); process.exit(1); });
