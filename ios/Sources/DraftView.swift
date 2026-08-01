@@ -18,6 +18,11 @@ struct DraftSeed {
     let fromEmail: String
     let subject: String
     let preview: String
+    /// The original message's To/Cc lines (comma-joined, as `op=mailread`
+    /// returns them). Informational only — approval builds the true
+    /// Reply-All server-side; these let the header show it up front.
+    var toLine: String = ""
+    var ccLine: String = ""
 
     var recipientLine: String {
         var s = ""
@@ -50,6 +55,16 @@ final class DraftModel: ObservableObject {
         let outcome: String
     }
 
+    /// One autocomplete row, as `op=contactsearch` returns it — the server
+    /// ranks by relevance (frequent contacts first), like Outlook's own.
+    struct Contact: Identifiable {
+        let name: String
+        let email: String
+        let title: String
+
+        var id: String { email }
+    }
+
     enum Phase: Equatable {
         case idle       // new-mail form (or nothing started yet)
         case writing    // first compose in flight
@@ -62,10 +77,20 @@ final class DraftModel: ObservableObject {
     @Published var draft: ActiveDraft?
     @Published var phase: Phase = .idle
     @Published var errorText = ""
+    /// To-field autocomplete rows for the new-mail form. Never blocks
+    /// "Start the draft" — free-typed text stays valid (the server resolves
+    /// names at approval).
+    @Published var suggestions: [Contact] = []
 
     private var draftId: String?
     private var pendingCompose: [String: Any]?
     private var timer: Timer?
+    /// The in-flight (debouncing or fetching) contact search, cancelled by
+    /// every keystroke so only the latest query lands.
+    private var searchTask: Task<Void, Never>?
+    /// The exact To text a suggestion tap produced — typing it back should
+    /// not reopen the list.
+    private var pickedSuggestion = ""
     /// Voice-attach mode: Scarlet's compose_draft tool already started the
     /// draft server-side, so this sheet adopts whatever `op=draft_active`
     /// returns instead of composing its own.
@@ -100,6 +125,48 @@ final class DraftModel: ObservableObject {
             "recipient": to,
             "instruction": instr.isEmpty ? "Draft this email." : instr,
         ])
+    }
+
+    /// Outlook-style To-field autocomplete: debounce ~350ms, then ask the
+    /// server for relevance-ranked matches. Skips (and clears) when the text
+    /// already holds an address ("@" or "<"), is under 2 characters, or is
+    /// exactly the suggestion just picked.
+    func searchContacts(_ q: String) {
+        searchTask?.cancel()
+        let text = q.trimmingCharacters(in: .whitespaces)
+        guard text.count >= 2, !text.contains("@"), !text.contains("<"),
+              text != pickedSuggestion else {
+            suggestions = []
+            return
+        }
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if Task.isCancelled { return }
+            // Percent-encode down to alphanumerics before the query string,
+            // same as InboxModel does with Graph ids.
+            let encoded = text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? text
+            guard let data = try? await Self.request("op=contactsearch&q=\(encoded)", method: "GET") else { return }
+            if Task.isCancelled { return }
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let found: [Contact] = ((obj?["contacts"] as? [[String: Any]]) ?? []).compactMap { c in
+                guard let email = c["email"] as? String, !email.isEmpty else { return nil }
+                return Contact(
+                    name: (c["name"] as? String) ?? "",
+                    email: email,
+                    title: (c["title"] as? String) ?? ""
+                )
+            }
+            if Task.isCancelled { return }
+            self?.suggestions = found
+        }
+    }
+
+    /// A suggestion row was tapped: remember the resulting To text so the
+    /// onChange it triggers doesn't reopen the list.
+    func suggestionPicked(_ text: String) {
+        searchTask?.cancel()
+        pickedSuggestion = text
+        suggestions = []
     }
 
     /// Attach mode: the compose is already in flight on the server (started
@@ -295,6 +362,7 @@ struct DraftView: View {
     @State private var newTo = ""
     @State private var newInstruction = ""
     @FocusState private var revisionFocused: Bool
+    @FocusState private var newInstructionFocused: Bool
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
     private let scarletRed = Color(red: 0.75, green: 0.15, blue: 0.23)
@@ -369,9 +437,24 @@ struct DraftView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            // Reply mode: surface the Reply-All audience up front, like
+            // Outlook. Informational only — approval builds the true
+            // Reply-All server-side.
+            if let seed, !seed.toLine.isEmpty {
+                Text(replyAllText(seed))
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.45))
+                    .lineLimit(2)
+            }
             statusLine
                 .frame(minHeight: 18)
         }
+    }
+
+    private func replyAllText(_ seed: DraftSeed) -> String {
+        var s = "Reply-All: " + seed.toLine
+        if !seed.ccLine.isEmpty { s += " · Cc: " + seed.ccLine }
+        return s
     }
 
     private var recipientText: String {
@@ -499,10 +582,17 @@ struct DraftView: View {
                 .autocorrectionDisabled()
                 .padding(12)
                 .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .onChange(of: newTo) { _, newValue in
+                    model.searchContacts(newValue)
+                }
+            if !suggestionRows.isEmpty {
+                suggestionList
+            }
             TextField("What should Scarlet write?", text: $newInstruction, axis: .vertical)
                 .lineLimit(2...5)
                 .padding(12)
                 .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .focused($newInstructionFocused)
             Button {
                 model.startNewMail(recipient: newTo, instruction: newInstruction)
             } label: {
@@ -518,6 +608,55 @@ struct DraftView: View {
             Spacer()
         }
         .padding(.top, 6)
+    }
+
+    /// At most five rows on screen, like Outlook's dropdown.
+    private var suggestionRows: [DraftModel.Contact] {
+        Array(model.suggestions.prefix(5))
+    }
+
+    /// Outlook-style autocomplete dropdown under the To field: name over
+    /// address, styled like the form fields it sits between.
+    private var suggestionList: some View {
+        VStack(spacing: 0) {
+            ForEach(suggestionRows) { contact in
+                Button {
+                    pickSuggestion(contact)
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(contact.name.isEmpty ? contact.email : contact.name)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Text(contact.email)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                if contact.id != suggestionRows.last?.id {
+                    Divider().overlay(.white.opacity(0.10))
+                }
+            }
+        }
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    /// Tap-to-fill: "Name <email>" lands in To, the list closes, and focus
+    /// hops to the instruction field — free typing stays just as valid.
+    private func pickSuggestion(_ contact: DraftModel.Contact) {
+        let line = contact.name.isEmpty
+            ? contact.email
+            : "\(contact.name) <\(contact.email)>"
+        model.suggestionPicked(line)
+        newTo = line
+        newInstructionFocused = true
     }
 
     // MARK: footer (revision bar + actions)

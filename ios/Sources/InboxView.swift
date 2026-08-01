@@ -705,12 +705,16 @@ struct MailDetailView: View {
             }
         }
         .sheet(isPresented: $showDraft) {
+            // The loaded detail carries the original's To/Cc; Reply is only
+            // reachable once it's up, but fall back to empty gracefully.
             DraftView(seed: DraftSeed(
                 messageId: message.id,
                 fromName: message.fromName,
                 fromEmail: message.fromEmail,
                 subject: message.subject,
-                preview: message.preview
+                preview: message.preview,
+                toLine: detail?.to ?? "",
+                ccLine: detail?.cc ?? ""
             ))
             .preferredColorScheme(.dark)
         }
