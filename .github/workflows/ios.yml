@@ -45,6 +45,7 @@ jobs:
           ASC_KEY_PEM_B64: ${{ inputs.asc_key_p8_b64 }}
           ASC_P8_PATH: ${{ runner.temp }}/asc.p8
           DEVELOPMENT_TEAM: ${{ steps.team.outputs.team }}
+          BUILD_NUMBER: ${{ github.run_number }}   # every run ships a unique build number
         run: |
           export ASC_KEY_PEM="$(printf '%s' "$ASC_KEY_PEM_B64" | base64 --decode)"
           cd ios

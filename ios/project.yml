@@ -42,6 +42,10 @@ targets:
     info:
       path: Sources/Info.plist
       properties:
+        # XcodeGen writes literal "1" defaults otherwise — tie the shipped
+        # versions to the build settings so CI's stamp actually ships.
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         CFBundleDisplayName: Talk
         CFBundleIconName: AppIcon
         UILaunchScreen: {}
