@@ -578,6 +578,99 @@
     color:var(--i1-ink); padding:9px 14px; font-size:14.5px; min-height:40px; }
   .calbtn.join { background:#2ea86b; color:#fff; border:0; font-weight:700; }
 
+  /* ============ AMWELL INBOX — Outlook Web lookalike (dark Fluent) ========
+     The real corporate mailbox, styled after outlook.office.com: three-line
+     rows with the blue unread accent bar, hover quick-actions, and a reading
+     pane (docked on desktop, full-screen on the phone). Outlook blue on dark:
+     #2899f5. */
+  #viewInbox .chathead { position:relative; }
+  #oxRefresh { position:absolute; top:calc(max(10px, env(safe-area-inset-top))); right:14px;
+    width:40px; height:40px; border-radius:50%; background:rgba(255,255,255,.07);
+    border:1px solid rgba(255,255,255,.14); color:#cfd6df; font-size:19px; line-height:1; }
+  #oxRefresh.busy { opacity:.45; }
+  .oxrow { position:relative; display:flex; gap:8px; align-items:flex-start;
+    padding:10px 12px 10px 16px; border-bottom:1px solid rgba(255,255,255,.07);
+    cursor:pointer; animation:fadein .25s ease; }
+  /* Outlook's unread mark: a small vertical blue bar on the row's left edge */
+  .oxrow::before { content:""; position:absolute; left:4px; top:10px; bottom:10px;
+    width:3.5px; border-radius:2px; background:transparent; }
+  .oxrow.unread::before { background:#2899f5; }
+  .oxrow.unread { background:rgba(40,153,245,.06); }
+  .oxrow.sel { background:rgba(40,153,245,.14); box-shadow:inset 0 0 0 1px rgba(40,153,245,.25); }
+  .oxmain { flex:1; min-width:0; }
+  .oxline1 { display:flex; align-items:baseline; gap:7px; }
+  .oxfrom { flex:1; min-width:0; font-size:15.5px; font-weight:600; color:var(--i1-ink);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
+  .oxrow.unread .oxfrom { font-weight:800; }
+  .oximp { flex:none; color:#e37d80; font-weight:800; }
+  .oxclip { flex:none; font-size:12.5px; opacity:.85; }
+  .oxwhen { flex:none; font-size:12.5px; color:var(--i1-faint); }
+  .oxrow.unread .oxwhen { color:#2899f5; font-weight:650; }
+  .oxsubj { margin-top:1px; font-size:14.5px; color:#eef1f6; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
+  .oxrow.unread .oxsubj { font-weight:600; }
+  .oxprev { margin-top:1px; font-size:13.5px; color:var(--i1-sub); overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; unicode-bidi:plaintext; }
+  /* Archive quick-action: always visible on touch; hover-revealed with a mouse
+     (rule in the pointer:fine media query below), like OWA's row actions. */
+  .oxarchb { flex:none; align-self:center; border:1px solid rgba(255,255,255,.12);
+    background:rgba(255,255,255,.05); color:#cfd6df; border-radius:9px;
+    font-size:15px; padding:7px 9px; line-height:1; }
+  /* Reading pane: full-screen overlay on the phone; the 900px+ media query
+     docks it beside the list, Outlook-style. */
+  #oxReader { position:fixed; inset:0; z-index:54; background:#0b0507;
+    display:none; flex-direction:column; }
+  #oxReader.on { display:flex; }
+  .oxrhead { display:flex; align-items:center; gap:8px;
+    padding:calc(8px + env(safe-area-inset-top)) 10px 8px;
+    border-bottom:1px solid rgba(255,255,255,.07); }
+  #oxBack { font-size:32px; line-height:1; background:none; border:0; color:#2899f5; padding:0 10px; }
+  .oxactions { display:flex; gap:8px; margin-left:auto; }
+  #oxReply { background:#2899f5; color:#04121f; border:0; border-radius:9px;
+    font-size:14.5px; font-weight:700; padding:10px 16px; min-height:42px; }
+  #oxArchBtn { background:rgba(255,255,255,.06); color:#cfd6df; border:1px solid rgba(255,255,255,.14);
+    border-radius:9px; font-size:14.5px; font-weight:600; padding:10px 14px; min-height:42px; }
+  .oxscroll { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
+    overscroll-behavior:contain; padding:14px 16px calc(24px + env(safe-area-inset-bottom)); }
+  .oxsubject { font-size:20px; font-weight:700; line-height:1.35; color:var(--i1-ink);
+    unicode-bidi:plaintext; }
+  .oxfromrow { display:flex; gap:11px; align-items:center; margin:12px 0 14px; }
+  .oxav { width:42px; height:42px; border-radius:50%; flex:none; display:flex;
+    align-items:center; justify-content:center; font-size:16px; font-weight:700;
+    color:#fff; letter-spacing:.02em; }
+  .oxmeta { flex:1; min-width:0; }
+  .oxsender { font-size:15.5px; font-weight:700; color:var(--i1-ink);
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .oxaddr { font-size:13px; color:var(--i1-sub); line-height:1.5; word-break:break-word; }
+  .oxrtime { flex:none; align-self:flex-start; font-size:12.5px; color:var(--i1-faint); }
+  /* Email HTML renders in a sandboxed iframe on WHITE, like reading in OWA */
+  .oxframe { width:100%; border:0; border-radius:10px; background:#fff; min-height:120px; }
+  .oxempty { display:none; flex:1; flex-direction:column; align-items:center;
+    justify-content:center; gap:12px; text-align:center; color:#8f6f72;
+    font-size:15px; padding:40px; }
+  #oxReader.empty .oxempty { display:flex; }
+  #oxReader.empty .oxrhead, #oxReader.empty .oxscroll { display:none; }
+  @media (min-width: 900px) {
+    :root { --oxw: 420px; }
+    /* Master–detail: the list becomes a 420px column beside the rail… */
+    #viewInbox.active { left:var(--rail); right:auto; width:var(--oxw);
+      align-items:stretch; border-right:1px solid rgba(255,255,255,.08);
+      padding-bottom:22px; }
+    #viewInbox .chathead, #viewInbox .sigfeed { max-width:none; }
+    /* …and the reading pane fills the rest whenever the Inbox tab is open,
+       showing the empty-state hint until a message is selected. */
+    html[data-ox="1"] #oxReader { display:flex; left:calc(var(--rail) + var(--oxw)); right:0;
+      border-left:1px solid rgba(255,255,255,.08); }
+    .oxscroll { max-width:940px; margin-left:auto; margin-right:auto; width:100%; }
+    #oxBack { display:none; }
+  }
+  @media (min-width: 900px) and (pointer: fine) {
+    .oxarchb { position:absolute; right:10px; top:50%; transform:translateY(-50%);
+      opacity:0; transition:opacity .12s ease; background:#26313d;
+      box-shadow:0 2px 10px rgba(0,0,0,.4); }
+    .oxrow:hover .oxarchb { opacity:1; }
+  }
+
   /* ============ TALK MODE — the one-button conversation page ============
      Entered via the Scarlet Talk icon / Action Button (#talk). Just the orb,
      the transcript, mute, a type-to-her row (Wispr Flow friendly) and one big
@@ -772,6 +865,16 @@
     <div class="sigfeed" id="clipFeed" style="display:none"><div class="ovnote" style="margin-top:30px">Loading your clips…</div></div>
   </section>
 
+  <!-- ================= INBOX (Amwell Outlook, live) ================= -->
+  <section class="view" id="viewInbox">
+    <div class="chathead">
+      <div class="name">Inbox</div>
+      <div class="sub" id="inboxSub">Amwell Outlook — your real inbox</div>
+      <button id="oxRefresh" title="Refresh">⟳</button>
+    </div>
+    <div class="sigfeed" id="oxList"><div class="ovnote" style="margin-top:30px">Loading your inbox…</div></div>
+  </section>
+
   <!-- ================= SIGNALS ================= -->
   <section class="view" id="viewSignals">
     <div class="chathead">
@@ -828,6 +931,7 @@
   <nav class="tabbar">
     <button class="tab active" id="tabLive"><span class="ic">🔴</span>Live<span class="dot"></span></button>
     <button class="tab" id="tabToday"><span class="ic">☀️</span>Today<span class="dot"></span></button>
+    <button class="tab" id="tabInbox"><span class="ic">✉️</span>Inbox<span class="dot"></span></button>
     <button class="tab" id="tabSignals"><span class="ic">📥</span>Signals<span class="dot"></span></button>
     <button class="tab" id="tabNotes"><span class="ic">📝</span>Notes<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
@@ -860,6 +964,30 @@
       <div class="row"><button id="rdMic" class="micbtn" title="Dictate">🎙</button><textarea id="rdInstr" rows="1" placeholder="Tell Scarlet what to do with this…" dir="auto"></textarea><button id="rdSend">➤</button></div>
       <button id="rdTalk">🎤 Talk to Scarlet about this</button>
     </div>
+  </div>
+
+  <!-- Amwell Inbox reading pane: full-screen on the phone (with a ‹ back
+       button), docked to the right of the list on desktop — an Outlook-web
+       lookalike over the real mailbox. Reply hands off to the drafting
+       studio; Archive is the real Outlook archive. -->
+  <div id="oxReader" class="empty">
+    <div class="oxrhead">
+      <button id="oxBack">‹</button>
+      <div class="oxactions">
+        <button id="oxReply">↩ Reply</button>
+        <button id="oxArchBtn" title="Archive — really archives in Outlook">🗄 Archive</button>
+      </div>
+    </div>
+    <div class="oxscroll">
+      <div class="oxsubject" id="oxSubj"></div>
+      <div class="oxfromrow">
+        <div class="oxav" id="oxAv"></div>
+        <div class="oxmeta"><div class="oxsender" id="oxSender"></div><div class="oxaddr" id="oxAddr"></div></div>
+        <div class="oxrtime" id="oxRtime"></div>
+      </div>
+      <div id="oxBody"></div>
+    </div>
+    <div class="oxempty"><div style="font-size:40px;opacity:.5">✉️</div><div>Select a message to read it here.</div></div>
   </div>
 
   <!-- Drafting studio: the active draft floats above everything; Scarlet
@@ -954,7 +1082,7 @@
   // Build stamp + self-update: every copy of this page — however it was cached —
   // periodically compares its BUILD against the freshly published source and
   // reloads itself when a newer build exists. A stale copy can never stick.
-  const BUILD = "2026-07-31.42";
+  const BUILD = "2026-08-01.43";
   document.getElementById("lockVer").textContent = "build " + BUILD;
   const _rawFetch = window.fetch.bind(window);
   async function checkForUpdate() {
@@ -1016,9 +1144,11 @@
      TABS
   ============================================================ */
   const views = { live: document.getElementById("viewLive"), today: document.getElementById("viewToday"),
+    inbox: document.getElementById("viewInbox"),
     signals: document.getElementById("viewSignals"), notes: document.getElementById("viewNotes"),
     chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery") };
   const tabs = { live: document.getElementById("tabLive"), today: document.getElementById("tabToday"),
+    inbox: document.getElementById("tabInbox"),
     signals: document.getElementById("tabSignals"), notes: document.getElementById("tabNotes"),
     chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery") };
   let activeTab = "live";
@@ -1027,11 +1157,15 @@
     // Leaving (or re-entering) a tab closes the docked email reader — on the
     // desktop layout it would otherwise stay parked over the new view.
     try { if (readerIt) closeReader(); } catch (e) {}
+    // Same for the Inbox reading pane (data-ox drives its desktop docking).
+    document.documentElement.dataset.ox = name === "inbox" ? "1" : "0";
+    if (name !== "inbox") { try { closeMail(); } catch (e) {} }
     document.documentElement.dataset.sig = name === "signals" ? "1" : "0";
-    for (const k of ["live", "today", "signals", "notes", "chat", "gallery"]) {
+    for (const k of ["live", "today", "inbox", "signals", "notes", "chat", "gallery"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
+    if (name === "inbox") loadInbox(!oxItems.length);
     if (name === "chat") {
       tabs.chat.classList.remove("unread");
       scrollFeed(true);
@@ -1044,6 +1178,7 @@
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
   tabs.today.addEventListener("click", () => switchTab("today"));
+  tabs.inbox.addEventListener("click", () => switchTab("inbox"));
   tabs.signals.addEventListener("click", () => switchTab("signals"));
   tabs.notes.addEventListener("click", () => switchTab("notes"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
@@ -2316,6 +2451,7 @@
       if (document.getElementById("lightbox").classList.contains("on")) { document.getElementById("lbClose").click(); return; }
       if (document.getElementById("pdfview").classList.contains("on")) { document.getElementById("pdfClose").click(); return; }
       if (readerOpen) { closeReader(); return; }
+      if (activeTab === "inbox" && oxCur) { closeMail(); return; }
       if (activeTab === "signals" && CHAN_VIEWS[sigFilter] && chan.mode === "thread") {
         chan.mode = "list"; chan.chat = null; renderSignals(); return;
       }
@@ -2337,6 +2473,188 @@
       if (b) { b.click(); e.preventDefault(); }
     }
   });
+
+  /* ============================================================
+     AMWELL INBOX — an Outlook-web lookalike over the REAL mailbox.
+     op=mailinbox lists it live from Microsoft Graph; opening a message
+     (op=mailread) marks it read in Outlook; Archive (op=mailarchive) is
+     the real Outlook archive move. Reply hands off to the existing
+     drafting studio (draft_compose → floating draft window → approve
+     lands a true threaded Reply-All in Outlook Drafts).
+  ============================================================ */
+  const oxList = document.getElementById("oxList");
+  const oxReaderEl = document.getElementById("oxReader");
+  let oxItems = [], oxCur = null, oxLoading = false;
+  const oxCache = new Map();
+  const OXAV = ["#0078d4", "#c239b3", "#ca5010", "#038387", "#8764b8", "#498205", "#d13438", "#986f0b"];
+  function oxAvColor(who) {
+    let h = 0; for (const ch of who) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+    return OXAV[h % OXAV.length];
+  }
+  function oxInitials(who) {
+    return (String(who || "?").trim().split(/\s+/).slice(0, 2).map((w) => w[0] || "").join("") || "?").toUpperCase();
+  }
+  // Outlook's list time: today → "14:32", anything older → "Jul 30".
+  function oxTime(iso) {
+    if (!iso) return "";
+    const d = new Date(iso);
+    if (d.toDateString() === new Date().toDateString()) {
+      return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  }
+  function oxFullTime(iso) {
+    if (!iso) return "";
+    try { return new Date(iso).toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; }
+  }
+  async function loadInbox(showSpin) {
+    if (!APP_URL || oxLoading) return;
+    oxLoading = true;
+    document.getElementById("oxRefresh").classList.add("busy");
+    if (showSpin) oxList.innerHTML = '<div class="ovnote" style="margin-top:30px">Loading your inbox…</div>';
+    try {
+      const r = await fetch(APP_URL + "&op=mailinbox", { signal: AbortSignal.timeout(25000) });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      oxItems = j.messages || [];
+      renderInbox();
+    } catch (e) {
+      if (!oxItems.length) oxList.innerHTML = '<div class="ovnote" style="margin-top:30px">Couldn’t reach Outlook — try again.</div>';
+    }
+    document.getElementById("oxRefresh").classList.remove("busy");
+    oxLoading = false;
+  }
+  function renderInbox() {
+    if (!oxItems.length) {
+      oxList.innerHTML = '<div class="ovnote" style="margin-top:30px">Inbox is quiet.</div>';
+      return;
+    }
+    oxList.innerHTML = "";
+    for (const m of oxItems) {
+      const row = document.createElement("div");
+      row.className = "oxrow" + (m.unread ? " unread" : "") + (oxCur && oxCur.id === m.id ? " sel" : "");
+      row.innerHTML =
+        '<div class="oxmain">' +
+        '<div class="oxline1"><span class="oxfrom">' + esc(m.from_name || m.from_email || "?") + "</span>" +
+        (m.importance === "high" ? '<span class="oximp" title="High importance">!</span>' : "") +
+        (m.attachments ? '<span class="oxclip" title="Has attachments">📎</span>' : "") +
+        '<span class="oxwhen">' + esc(oxTime(m.received)) + "</span></div>" +
+        '<div class="oxsubj">' + esc(m.subject || "(no subject)") + "</div>" +
+        '<div class="oxprev">' + esc(m.preview || "") + "</div></div>" +
+        '<button class="oxarchb" title="Archive — really archives in Outlook">🗄</button>';
+      row.addEventListener("click", (e) => {
+        if (e.target.closest(".oxarchb")) return;
+        openMail(m);
+      });
+      row.querySelector(".oxarchb").addEventListener("click", () => archiveOxMail(m, row));
+      oxList.appendChild(row);
+    }
+  }
+  // Optimistic archive, like OWA: the row leaves immediately; the real Graph
+  // move runs behind it, and a failure brings the truth back on refresh.
+  function archiveOxMail(m, row) {
+    oxItems = oxItems.filter((x) => x.id !== m.id);
+    if (oxCur && oxCur.id === m.id) closeMail();
+    if (row) {
+      row.style.transition = "opacity .18s ease, transform .18s ease";
+      row.style.opacity = "0"; row.style.transform = "translateX(-40px)";
+      setTimeout(() => { row.remove(); if (!oxItems.length) renderInbox(); }, 190);
+    } else renderInbox();
+    fetch(APP_URL + "&op=mailarchive", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: m.id }) })
+      .then((r) => r.json())
+      .then((d) => { if (d.error || d.ok === false) throw new Error(d.error || "archive rejected"); })
+      .catch(() => setTimeout(() => loadInbox(false), 400));
+  }
+  function closeMail() {
+    oxCur = null;
+    oxReaderEl.classList.remove("on");
+    oxReaderEl.classList.add("empty");
+    document.querySelectorAll("#oxList .oxrow.sel").forEach((r) => r.classList.remove("sel"));
+  }
+  function buildOxFrame(html) {
+    const holder = document.getElementById("oxBody");
+    holder.innerHTML = "";
+    const fr = document.createElement("iframe");
+    fr.className = "oxframe";
+    fr.setAttribute("sandbox", "allow-same-origin");
+    // White page inside the sandbox — corporate email is designed for white,
+    // exactly how OWA's reading pane shows it.
+    fr.srcdoc = '<meta name="viewport" content="width=device-width, initial-scale=1">' +
+      "<style>body{margin:0;padding:16px;font:15px/1.55 -apple-system,'Segoe UI',system-ui,sans-serif;" +
+      "color:#242424;background:#fff;word-break:break-word}" +
+      "img{max-width:100%;height:auto}table{max-width:100%!important}</style>" +
+      (html || "<i>(no content)</i>");
+    const fit = () => { try { fr.style.height = Math.min(fr.contentDocument.body.scrollHeight + 30, 30000) + "px"; } catch (e) {} };
+    fr.addEventListener("load", () => { fit(); setTimeout(fit, 500); setTimeout(fit, 1800); });
+    holder.appendChild(fr);
+  }
+  async function openMail(m) {
+    oxCur = m;
+    m.unread = false; // the server marks it read in Outlook on op=mailread
+    oxReaderEl.classList.add("on");
+    oxReaderEl.classList.remove("empty");
+    const who = m.from_name || m.from_email || "?";
+    document.getElementById("oxSubj").textContent = m.subject || "(no subject)";
+    const av = document.getElementById("oxAv");
+    av.textContent = oxInitials(who); av.style.background = oxAvColor(who);
+    document.getElementById("oxSender").textContent = who;
+    document.getElementById("oxAddr").textContent = m.from_email ? "From: " + m.from_email : "";
+    document.getElementById("oxRtime").textContent = oxFullTime(m.received);
+    document.getElementById("oxBody").innerHTML = '<div class="olloading">Loading…</div>';
+    document.querySelector("#oxReader .oxscroll").scrollTop = 0;
+    renderInbox(); // reflect read + selected states in the list
+    try {
+      let d = oxCache.get(m.id);
+      if (!d) {
+        const r = await fetch(APP_URL + "&op=mailread&id=" + encodeURIComponent(m.id), { signal: AbortSignal.timeout(30000) });
+        d = await r.json();
+        if (d.error) throw new Error(d.error);
+        oxCache.set(m.id, d);
+      }
+      if (oxCur !== m) return;
+      document.getElementById("oxAddr").innerHTML =
+        "<b>From:</b> " + esc(d.from || m.from_email || "") +
+        (d.to ? "<br><b>To:</b> " + esc(d.to) : "") +
+        (d.cc ? "<br><b>Cc:</b> " + esc(d.cc) : "");
+      buildOxFrame(d.html);
+    } catch (e) {
+      if (oxCur !== m) return;
+      const body = document.getElementById("oxBody");
+      body.innerHTML = '<div class="olloading">Couldn’t reach Outlook — tap here to try again.</div>';
+      body.firstChild.addEventListener("click", () => { oxCache.delete(m.id); openMail(m); });
+    }
+  }
+  document.getElementById("oxBack").addEventListener("click", closeMail);
+  document.getElementById("oxRefresh").addEventListener("click", () => loadInbox(true));
+  document.getElementById("oxArchBtn").addEventListener("click", () => {
+    if (oxCur) archiveOxMail(oxCur, null);
+  });
+  // Reply → the existing drafting studio: Scarlet composes in Ido's voice,
+  // the floating draft window opens over the reader, and Approve lands a
+  // TRUE threaded Reply-All in his Outlook Drafts folder.
+  document.getElementById("oxReply").addEventListener("click", async (e) => {
+    const m = oxCur; if (!m) return;
+    const btn = e.currentTarget; btn.disabled = true; btn.textContent = "✍️ Drafting…";
+    try {
+      await fetch(APP_URL + "&op=draft_compose", { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          channel: "email_outlook",
+          recipient: (m.from_name ? m.from_name + " " : "") + (m.from_email ? "<" + m.from_email + ">" : ""),
+          original: (m.subject ? m.subject + " — " : "") + (m.preview || ""),
+          message_id: m.id,
+          instruction: "Draft the appropriate reply.",
+        }) });
+      btn.textContent = "✍️ Draft is up — refine & approve";
+      pollDraft();
+    } catch (err) { btn.textContent = "Failed — try again"; }
+    setTimeout(() => { btn.disabled = false; btn.textContent = "↩ Reply"; }, 4000);
+  });
+  // Fresh on every visit, and quietly kept current while the tab is open.
+  setInterval(() => {
+    if (activeTab === "inbox" && !document.hidden) loadInbox(false);
+  }, 60000);
 
   /* ============================================================
      NOTES & REMINDERS
