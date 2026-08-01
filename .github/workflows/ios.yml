@@ -16,6 +16,8 @@ jobs:
       - name: Tools
         run: |
           brew install xcodegen >/dev/null || brew upgrade xcodegen || true
+          # App Store uploads require the iOS 26 SDK; the image default is 16.4.
+          sudo xcode-select -s /Applications/Xcode_26.3.app
           echo "Xcode: $(xcodebuild -version | head -1)"
 
       - name: Write ASC key

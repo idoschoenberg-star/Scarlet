@@ -16,9 +16,6 @@ settings:
     # CI creates the cert + this named profile via the ASC API before building.
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Distribution"
-    # XcodeGen's setting presets inject CODE_SIGN_IDENTITY[sdk=iphoneos*] =
-    # "iPhone Developer"; the sdk-conditional form beats the plain one, so it
-    # must be overridden explicitly.
     "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Distribution"
     PROVISIONING_PROFILE_SPECIFIER: "ScarletTalk AppStore"
     SWIFT_VERSION: "5.9"
@@ -38,14 +35,19 @@ targets:
         CODE_SIGN_IDENTITY: "Apple Distribution"
         "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Distribution"
         PROVISIONING_PROFILE_SPECIFIER: "ScarletTalk AppStore"
-        INFOPLIST_KEY_CFBundleDisplayName: "Talk"
-        INFOPLIST_KEY_UILaunchScreen_Generation: true
-        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait"
-        # Native audio powers — the whole reason for going native.
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
-        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
-      properties:
-        UIBackgroundModes: [audio]
-        ITSAppUsesNonExemptEncryption: false
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"              # iPhone-only
+    # XcodeGen GENERATES Info.plist at this path from these properties —
+    # anything not listed here does not ship, so every key lives here.
     info:
       path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: Talk
+        CFBundleIconName: AppIcon
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes: [audio]
+        NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
+        ITSAppUsesNonExemptEncryption: false
