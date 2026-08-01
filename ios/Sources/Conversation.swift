@@ -107,6 +107,22 @@ final class Conversation: ObservableObject {
         send(["type": "user_message", "text": t])
     }
 
+    // MARK: ambient focus
+
+    /// What Ido is looking at right now (open email, inbox list, Talk
+    /// screen). Not published — pure bookkeeping, like hasAutoStarted.
+    private(set) var currentFocus: String?
+
+    /// Screen changes ride to her as `contextual_update` — ElevenLabs'
+    /// non-interrupting context event: she learns it without it counting as
+    /// a user turn, so nothing barges into the conversation.
+    func setFocus(_ text: String?) {
+        guard text != currentFocus else { return }
+        currentFocus = text
+        guard state == .listening || state == .speaking else { return }
+        send(["type": "contextual_update", "text": text ?? "[FOCUS] Nothing focused."])
+    }
+
     // MARK: signed URL + socket
 
     private func connect() async {
@@ -127,6 +143,11 @@ final class Conversation: ObservableObject {
             listen()
             state = .listening
             status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            // A fresh socket knows nothing about the screen — replay the
+            // current focus so a reconnect regains ambient context.
+            if let focus = currentFocus {
+                send(["type": "contextual_update", "text": focus])
+            }
         } catch {
             if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }
@@ -222,6 +243,17 @@ final class Conversation: ObservableObject {
             } catch { out = "{\"error\":\"tool failed\"}" }
             send(["type": "client_tool_result", "tool_call_id": callId,
                   "result": String(out.prefix(30000)), "is_error": false])
+            // A voice-started draft: compose_draft came back with a draft id,
+            // so tell the shell to open the drafting table over whatever
+            // screen is showing.
+            if name == "compose_draft",
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let draftId = obj["draft_id"] as? String, !draftId.isEmpty {
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: nil)
+                }
+            }
         }
     }
 

@@ -16,6 +16,15 @@ extension Notification.Name {
     /// the live Conversation) observes it, switches to Talk, and delivers the
     /// question.
     static let scarletAskAboutEmail = Notification.Name("scarletAskAboutEmail")
+    /// Posted by Conversation when the compose_draft voice tool starts a
+    /// draft; RootView presents the drafting sheet in attach mode.
+    static let scarletVoiceDraftStarted = Notification.Name("scarletVoiceDraftStarted")
+}
+
+/// The list-level ambient-focus line, shared by the list's own appearance
+/// and the reader's dismissal so both report the exact same thing.
+private func inboxBrowsingFocus(_ tab: MailTab) -> String {
+    "[FOCUS] Ido is browsing his Amwell inbox list (\(tab.title) tab). No single email is open."
 }
 
 // MARK: - Wire types
@@ -313,6 +322,7 @@ struct SenderAvatar: View {
 
 struct InboxView: View {
     @StateObject private var model = InboxModel()
+    @EnvironmentObject private var convo: Conversation
     @State private var showCompose = false
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
@@ -331,6 +341,13 @@ struct InboxView: View {
             .sheet(isPresented: $showCompose) {
                 DraftView(seed: nil)
                     .preferredColorScheme(.dark)
+            }
+            // Ambient focus: the list reports itself whenever it's the
+            // visible screen (tab selected, reader popped) and again when
+            // the Focused|Other pill flips.
+            .onAppear { convo.setFocus(inboxBrowsingFocus(model.tab)) }
+            .onChange(of: model.tab) { _, newTab in
+                convo.setFocus(inboxBrowsingFocus(newTab))
             }
         }
         // .task re-runs every time this tab is selected → auto-refresh on
@@ -651,6 +668,7 @@ struct InboxRow: View {
 struct MailDetailView: View {
     let message: MailMessage
     @ObservedObject var model: InboxModel
+    @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
 
     @State private var detail: MailDetail?
@@ -699,6 +717,15 @@ struct MailDetailView: View {
         .task {
             model.markRead(message.id)
             await fetch()
+        }
+        // Ambient focus: this email while the reader is up; back to the list
+        // on the way out — unless another screen (say, the Talk tab) already
+        // claimed focus during the transition.
+        .onAppear { convo.setFocus(emailFocus) }
+        .onDisappear {
+            if convo.currentFocus == emailFocus {
+                convo.setFocus(inboxBrowsingFocus(model.tab))
+            }
         }
     }
 
@@ -884,6 +911,19 @@ struct MailDetailView: View {
             return Self.stampFormat.string(from: date)
         }
         return detail?.received ?? ""
+    }
+
+    /// The ambient-focus line for this message. Built from the list row alone
+    /// (never the loaded detail) so it's byte-identical on appear and
+    /// disappear — the disappear handler compares against it.
+    private var emailFocus: String {
+        let received = message.received.map { Self.stampFormat.string(from: $0) } ?? ""
+        return "[FOCUS] Ido is viewing a work email in his Amwell inbox.\n"
+            + "from: \(message.fromName) <\(message.fromEmail)>\n"
+            + "subject: \(message.subject)\n"
+            + "received: \(received)\n"
+            + "message_id: \(message.id)\n"
+            + "preview: \(String(message.preview.prefix(280)))"
     }
 }
 

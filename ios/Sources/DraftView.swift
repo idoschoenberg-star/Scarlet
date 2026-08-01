@@ -66,6 +66,10 @@ final class DraftModel: ObservableObject {
     private var draftId: String?
     private var pendingCompose: [String: Any]?
     private var timer: Timer?
+    /// Voice-attach mode: Scarlet's compose_draft tool already started the
+    /// draft server-side, so this sheet adopts whatever `op=draft_active`
+    /// returns instead of composing its own.
+    private var adoptActive = false
 
     // MARK: intents
 
@@ -96,6 +100,25 @@ final class DraftModel: ObservableObject {
             "recipient": to,
             "instruction": instr.isEmpty ? "Draft this email." : instr,
         ])
+    }
+
+    /// Attach mode: the compose is already in flight on the server (started
+    /// by voice) — find the active draft and follow it.
+    func attachToActive() {
+        guard draftId == nil else { return }
+        adoptActive = true
+        phase = .writing
+        startPolling()
+        Task {
+            if let d = try? await Self.fetchActive() { adopt(d) }
+            // If the compose hasn't landed yet, the poll adopts it when it does.
+        }
+    }
+
+    private func adopt(_ d: ActiveDraft) {
+        draftId = d.id
+        draft = d
+        if phase == .writing && d.status == "draft" { phase = .ready }
     }
 
     /// Re-run the last failed compose.
@@ -201,7 +224,16 @@ final class DraftModel: ObservableObject {
     }
 
     private func pollTick() async {
-        guard let want = draftId, phase == .writing || phase == .ready else { return }
+        guard phase == .writing || phase == .ready else { return }
+        if adoptActive {
+            // Adopt whatever the server calls active — the voice flow may
+            // replace the draft entirely. Active-nil (approved or dismissed
+            // by voice) keeps the last draft on screen rather than blanking.
+            guard let d = try? await Self.fetchActive() else { return }
+            adopt(d)
+            return
+        }
+        guard let want = draftId else { return }
         guard let d = try? await Self.fetchActive(), d.id == want else { return }
         draft = d
         if phase == .writing && d.status == "draft" { phase = .ready }
@@ -252,6 +284,9 @@ struct DraftView: View {
     /// nil → new-mail mode (recipient + instruction form first).
     let seed: DraftSeed?
     var instruction: String = "Reply helpfully in Ido's voice."
+    /// Voice-attach mode: skip composing and adopt the active server draft
+    /// (Scarlet's compose_draft tool already started it).
+    var attachToActive: Bool = false
 
     @StateObject private var model = DraftModel()
     @Environment(\.dismiss) private var dismiss
@@ -281,7 +316,9 @@ struct DraftView: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .onAppear {
-            if let seed {
+            if attachToActive {
+                model.attachToActive()
+            } else if let seed {
                 model.startReply(seed: seed, instruction: instruction)
             }
         }
@@ -367,7 +404,7 @@ struct DraftView: View {
             Text("Saved in Outlook Drafts").font(.footnote)
                 .foregroundStyle(Color(red: 0.55, green: 0.85, blue: 0.62))
         case .idle:
-            if seed == nil && model.draft == nil {
+            if seed == nil && !attachToActive && model.draft == nil {
                 Text("A fresh email from your Amwell address").font(.footnote).foregroundStyle(.secondary)
             }
         }
@@ -383,7 +420,7 @@ struct DraftView: View {
             writingCard
         } else if !model.errorText.isEmpty {
             errorRetry
-        } else if seed == nil {
+        } else if seed == nil && !attachToActive {
             newMailForm
         } else {
             Spacer()

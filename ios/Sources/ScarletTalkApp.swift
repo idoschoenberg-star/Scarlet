@@ -26,8 +26,14 @@ struct ScarletTalkApp: App {
 struct RootView: View {
     @StateObject private var convo = Conversation()
     @State private var tab: Tab = .talk
+    @State private var voiceDraftPresented = false
 
     enum Tab: Hashable { case talk, inbox }
+
+    /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
+    /// own (list vs. open email) from its onAppears.
+    private static let talkFocus =
+        "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
     var body: some View {
         TabView(selection: $tab) {
@@ -36,6 +42,7 @@ struct RootView: View {
                 .tabItem { Label("Talk", systemImage: "waveform") }
                 .tag(Tab.talk)
             InboxView()
+                .environmentObject(convo)
                 .tabItem { Label("Inbox", systemImage: "envelope.fill") }
                 .tag(Tab.inbox)
         }
@@ -59,6 +66,22 @@ struct RootView: View {
                 }
                 convo.sendText(text)
             }
+        }
+        // Scarlet started a draft by voice (compose_draft tool): open the
+        // drafting table over whatever screen Ido is on. The sheet attaches
+        // to the active server-side draft instead of composing its own.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { _ in
+            voiceDraftPresented = true
+        }
+        .sheet(isPresented: $voiceDraftPresented) {
+            DraftView(seed: nil, attachToActive: true)
+                .preferredColorScheme(.dark)
+        }
+        // Ambient focus: Talk at launch and whenever the tab returns to it;
+        // switching to Inbox lets that hierarchy report itself.
+        .onAppear { convo.setFocus(Self.talkFocus) }
+        .onChange(of: tab) { _, newTab in
+            if newTab == .talk { convo.setFocus(Self.talkFocus) }
         }
     }
 }
