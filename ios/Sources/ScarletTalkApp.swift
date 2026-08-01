@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 @main
@@ -24,16 +25,41 @@ struct ScarletTalkApp: App {
 /// explicit End button (or the OS) ends it.
 struct RootView: View {
     @StateObject private var convo = Conversation()
+    @State private var tab: Tab = .talk
+
+    enum Tab: Hashable { case talk, inbox }
 
     var body: some View {
-        TabView {
+        TabView(selection: $tab) {
             TalkView(convo: convo)
                 .background(ScarletBackground().ignoresSafeArea())
                 .tabItem { Label("Talk", systemImage: "waveform") }
+                .tag(Tab.talk)
             InboxView()
                 .tabItem { Label("Inbox", systemImage: "envelope.fill") }
+                .tag(Tab.inbox)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
+        // "Ask Scarlet about this email": the mail reader posts a notification;
+        // this shell (which owns the conversation) switches to Talk and hands
+        // her the question — waking the conversation first if it isn't live.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletAskAboutEmail)) { note in
+            guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
+            tab = .talk
+            if convo.state == .idle {
+                convo.hasAutoStarted = true
+                convo.start(token: TokenStore.token ?? "")
+            }
+            Task { @MainActor in
+                // Give a cold socket a moment to come up before delivering.
+                var waited = 0
+                while convo.state == .connecting && waited < 40 {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    waited += 1
+                }
+                convo.sendText(text)
+            }
+        }
     }
 }
 

@@ -1,9 +1,21 @@
+import Combine
 import SwiftUI
+import UIKit
 import WebKit
 
 /// Native inbox: the same mailbox the web app shows, read on the phone with
-/// Outlook's anatomy — unread accent bar, sender/subject/preview rows, and
-/// swipe-left to archive. Reading pane renders on white, like real mail.
+/// Outlook mobile's anatomy — sender avatars, unread accent, green full-swipe
+/// Archive, blue Read/Unread swipe, and a reading pane that renders on white
+/// with responsive HTML, exactly like real mail.
+
+// MARK: - Cross-tab wiring
+
+extension Notification.Name {
+    /// Posted by the mail reader's "Ask Scarlet" action; RootView (which owns
+    /// the live Conversation) observes it, switches to Talk, and delivers the
+    /// question.
+    static let scarletAskAboutEmail = Notification.Name("scarletAskAboutEmail")
+}
 
 // MARK: - Wire types
 
@@ -54,14 +66,26 @@ final class InboxModel: ObservableObject {
     @Published var loading = false
     @Published var errorText = ""
 
+    /// Rows archived locally: a refresh must not resurrect them while the
+    /// Graph move is still settling.
+    private var pendingArchiveIds: Set<String> = []
+    /// Local read/unread flips that win over a stale server snapshot until
+    /// the server catches up.
+    private var unreadOverrides: [String: Bool] = [:]
+
     func load() async {
+        guard TokenStore.token != nil else {
+            messages = []
+            errorText = "Locked — unlock Scarlet to see the inbox."
+            return
+        }
         if messages.isEmpty { loading = true }
         errorText = ""
         defer { loading = false }
         do {
             let data = try await Self.request("op=mailinbox", method: "GET")
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            messages = ((obj["messages"] as? [[String: Any]]) ?? []).compactMap { m in
+            var fetched: [MailMessage] = ((obj["messages"] as? [[String: Any]]) ?? []).compactMap { m in
                 guard let id = m["id"] as? String else { return nil }
                 return MailMessage(
                     id: id,
@@ -75,6 +99,22 @@ final class InboxModel: ObservableObject {
                     importance: (m["importance"] as? String) ?? "normal"
                 )
             }
+            let listed = Set(fetched.map { $0.id })
+            // Forget archives Graph has already applied; hide the ones it
+            // hasn't caught up with yet.
+            pendingArchiveIds.formIntersection(listed)
+            fetched.removeAll { pendingArchiveIds.contains($0.id) }
+            for i in fetched.indices {
+                if let want = unreadOverrides[fetched[i].id] {
+                    if fetched[i].unread == want {
+                        unreadOverrides.removeValue(forKey: fetched[i].id)
+                    } else {
+                        fetched[i].unread = want
+                    }
+                }
+            }
+            unreadOverrides = unreadOverrides.filter { listed.contains($0.key) }
+            messages = fetched
         } catch {
             errorText = "Couldn't reach the inbox — check your connection."
         }
@@ -85,6 +125,7 @@ final class InboxModel: ObservableObject {
     func archive(_ message: MailMessage) {
         let index = messages.firstIndex { $0.id == message.id }
         if let index { messages.remove(at: index) }
+        pendingArchiveIds.insert(message.id)
         Task {
             do {
                 let data = try await Self.request("op=mailarchive", method: "POST",
@@ -92,9 +133,28 @@ final class InboxModel: ObservableObject {
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
             } catch {
+                pendingArchiveIds.remove(message.id)
                 let at = min(index ?? messages.count, messages.count)
                 messages.insert(message, at: at)
                 errorText = "Couldn't archive that one — it's back in the list."
+            }
+        }
+    }
+
+    /// Outlook's leading swipe: flip read/unread locally right away, mirror it
+    /// to the real mailbox via `op=mailmark`, revert if the server says no.
+    func toggleRead(_ message: MailMessage) {
+        let nowUnread = !message.unread
+        setUnread(message.id, nowUnread)
+        Task {
+            do {
+                let data = try await Self.request("op=mailmark", method: "POST",
+                                                  body: ["id": message.id, "unread": nowUnread])
+                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
+            } catch {
+                setUnread(message.id, !nowUnread)
+                errorText = "Couldn't change read state — reverted."
             }
         }
     }
@@ -116,8 +176,11 @@ final class InboxModel: ObservableObject {
     }
 
     /// The server marks read on open; mirror it locally so the row un-bolds.
-    func markRead(_ id: String) {
-        if let i = messages.firstIndex(where: { $0.id == id }) { messages[i].unread = false }
+    func markRead(_ id: String) { setUnread(id, false) }
+
+    private func setUnread(_ id: String, _ unread: Bool) {
+        unreadOverrides[id] = unread
+        if let i = messages.firstIndex(where: { $0.id == id }) { messages[i].unread = unread }
     }
 
     // MARK: plumbing
@@ -148,13 +211,72 @@ final class InboxModel: ObservableObject {
     }
 }
 
+// MARK: - Outlook palette
+
+/// Outlook mobile's action colors, shared by list and reader.
+enum OutlookStyle {
+    static let archiveGreen = Color(red: 0.06, green: 0.5, blue: 0.24)
+    static let accentBlue = Color(red: 0.0, green: 0.47, blue: 0.83)
+}
+
+// MARK: - Sender avatar
+
+/// Outlook-style initials circle: deterministic color from the address, so a
+/// sender keeps the same color across launches.
+struct SenderAvatar: View {
+    let name: String
+    let email: String
+    var size: CGFloat = 40
+
+    private static let palette: [Color] = [
+        Color(red: 0.00, green: 0.47, blue: 0.83),
+        Color(red: 0.53, green: 0.34, blue: 0.65),
+        Color(red: 0.80, green: 0.29, blue: 0.16),
+        Color(red: 0.06, green: 0.50, blue: 0.24),
+        Color(red: 0.75, green: 0.21, blue: 0.47),
+        Color(red: 0.09, green: 0.45, blue: 0.50),
+        Color(red: 0.85, green: 0.48, blue: 0.09),
+        Color(red: 0.35, green: 0.38, blue: 0.71),
+    ]
+
+    var body: some View {
+        ZStack {
+            Circle().fill(color)
+            Text(initials)
+                .font(.system(size: size * 0.4, weight: .semibold))
+                .foregroundStyle(.white)
+        }
+        .frame(width: size, height: size)
+    }
+
+    private var seed: String {
+        email.isEmpty ? name.lowercased() : email.lowercased()
+    }
+
+    /// djb2 over UTF-8 — stable across launches (unlike `hashValue`).
+    private var color: Color {
+        var h: UInt32 = 5381
+        for b in seed.utf8 { h = h &* 33 &+ UInt32(b) }
+        return Self.palette[Int(h % UInt32(Self.palette.count))]
+    }
+
+    private var initials: String {
+        let words = name.split(separator: " ").filter { !$0.isEmpty }
+        let letters = words.prefix(2).compactMap { $0.first }
+        if !letters.isEmpty {
+            return letters.map { String($0).uppercased() }.joined()
+        }
+        if let c = email.first ?? name.first { return String(c).uppercased() }
+        return "?"
+    }
+}
+
 // MARK: - Inbox list
 
 struct InboxView: View {
     @StateObject private var model = InboxModel()
     @State private var showCompose = false
 
-    private let outlookBlue = Color(red: 0.16, green: 0.6, blue: 0.96)
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
     var body: some View {
@@ -196,7 +318,13 @@ struct InboxView: View {
                         .preferredColorScheme(.dark)
                 }
         }
+        // .task re-runs every time this tab is selected → auto-refresh on
+        // tab appear; foreground return refreshes too.
         .task { await model.load() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willEnterForegroundNotification)) { _ in
+            Task { await model.load() }
+        }
     }
 
     @ViewBuilder
@@ -240,17 +368,29 @@ struct InboxView: View {
                     NavigationLink {
                         MailDetailView(message: message, model: model)
                     } label: {
-                        InboxRow(message: message, accent: outlookBlue)
+                        InboxRow(message: message, accent: OutlookStyle.accentBlue)
                     }
                     .listRowBackground(Color.clear)
                     .listRowSeparatorTint(.white.opacity(0.12))
+                    // Outlook's swipes: long-swipe left = green Archive,
+                    // long-swipe right = blue Read/Unread flip.
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                         Button {
                             model.archive(message)
                         } label: {
                             Label("Archive", systemImage: "archivebox.fill")
                         }
-                        .tint(outlookBlue)
+                        .tint(OutlookStyle.archiveGreen)
+                    }
+                    .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                        Button {
+                            model.toggleRead(message)
+                        } label: {
+                            Label(message.unread ? "Read" : "Unread",
+                                  systemImage: message.unread
+                                      ? "envelope.open.fill" : "envelope.badge.fill")
+                        }
+                        .tint(OutlookStyle.accentBlue)
                     }
                 }
             }
@@ -261,8 +401,9 @@ struct InboxView: View {
     }
 }
 
-/// One row, Outlook-anatomy on dark: unread accent bar, sender, subject,
-/// one-line preview, trailing time, paperclip and high-importance marks.
+/// One row, Outlook-mobile anatomy on dark: unread accent bar, initials
+/// avatar, sender / subject / one-line preview, trailing time, paperclip on
+/// the subject line, high-importance mark.
 struct InboxRow: View {
     let message: MailMessage
     let accent: Color
@@ -273,56 +414,80 @@ struct InboxRow: View {
                 .fill(accent)
                 .frame(width: 3)
                 .opacity(message.unread ? 1 : 0)
-            VStack(alignment: .leading, spacing: 3) {
+            SenderAvatar(name: senderName, email: message.fromEmail, size: 40)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(senderName)
-                        .font(.subheadline.weight(message.unread ? .bold : .regular))
-                        .foregroundStyle(message.unread ? .white : .white.opacity(0.75))
+                        .font(.system(size: 17, weight: message.unread ? .bold : .semibold))
+                        .foregroundStyle(message.unread ? .white : .white.opacity(0.8))
                         .lineLimit(1)
+                        .truncationMode(.tail)
                     if message.importance == "high" {
                         Text("!")
                             .font(.subheadline.bold())
                             .foregroundStyle(.red)
                     }
-                    if message.attachments {
-                        Image(systemName: "paperclip")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
                     Spacer(minLength: 8)
                     Text(timeLabel)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 13))
+                        .foregroundStyle(message.unread ? accent : .secondary)
                 }
-                Text(message.subject)
-                    .font(.subheadline.weight(message.unread ? .semibold : .regular))
-                    .foregroundStyle(Color(red: 0.96, green: 0.94, blue: 0.94))
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(message.subject)
+                        .font(.system(size: 15, weight: message.unread ? .semibold : .regular))
+                        .foregroundStyle(Color(red: 0.96, green: 0.94, blue: 0.94)
+                            .opacity(message.unread ? 1 : 0.85))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 8)
+                    if message.attachments {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Text(message.preview)
-                    .font(.footnote)
+                    .font(.system(size: 15))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 5)
     }
 
     private var senderName: String {
         message.fromName.isEmpty ? message.fromEmail : message.fromName
     }
 
-    private static let todayFormat: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f
+    private static let timeFormat: DateFormatter = {
+        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
+    }()
+    private static let weekdayFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEE"; return f
     }()
     private static let dayFormat: DateFormatter = {
         let f = DateFormatter(); f.dateFormat = "MMM d"; return f
     }()
+    private static let yearFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d, yyyy"; return f
+    }()
 
+    /// Outlook's ladder: today → time, this week → weekday, this year →
+    /// "MMM d", older → "MMM d, yyyy".
     private var timeLabel: String {
         guard let d = message.received else { return "" }
-        return Calendar.current.isDateInToday(d)
-            ? Self.todayFormat.string(from: d)
-            : Self.dayFormat.string(from: d)
+        let cal = Calendar.current
+        if cal.isDateInToday(d) { return Self.timeFormat.string(from: d) }
+        let days = cal.dateComponents([.day],
+                                      from: cal.startOfDay(for: d),
+                                      to: cal.startOfDay(for: Date())).day ?? 99
+        if days >= 0 && days < 7 { return Self.weekdayFormat.string(from: d) }
+        if cal.component(.year, from: d) == cal.component(.year, from: Date()) {
+            return Self.dayFormat.string(from: d)
+        }
+        return Self.yearFormat.string(from: d)
     }
 }
 
@@ -336,53 +501,33 @@ struct MailDetailView: View {
     @State private var detail: MailDetail?
     @State private var failed = false
     @State private var showDraft = false
+    @State private var showRecipients = false
+
+    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().overlay(.white.opacity(0.15))
-            if let detail {
-                MailBodyView(html: detail.html)
-            } else if failed {
-                VStack(spacing: 12) {
-                    Text("Couldn't open this message.")
-                        .font(.callout).foregroundStyle(.secondary)
-                    Button("Try again") {
-                        failed = false
-                        Task { await fetch() }
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(Color(red: 1, green: 0.35, blue: 0.42))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
+            bodyPane
+            Divider().overlay(.white.opacity(0.15))
+            actionBar
         }
         .background(ScarletBackground().ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    model.archive(message)
-                    dismiss()
-                } label: {
-                    Image(systemName: "archivebox.fill")
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                // Tap → the native drafting studio, seeded with this message.
-                // Long-press → the full web app, as a fallback.
                 Menu {
+                    Button {
+                        askScarlet()
+                    } label: {
+                        Label("Ask Scarlet about this email", systemImage: "sparkles")
+                    }
                     Link(destination: AppConfig.fullAppURL) {
                         Label("Open full app", systemImage: "arrow.up.forward.app")
                     }
                 } label: {
-                    Text("Reply in Scarlet")
-                        .font(.footnote.weight(.semibold))
-                } primaryAction: {
-                    showDraft = true
+                    Image(systemName: "ellipsis.circle")
                 }
             }
         }
@@ -411,28 +556,59 @@ struct MailDetailView: View {
         }
     }
 
+    // MARK: header (compact, Outlook-style: avatar + name + address + Details)
+
     private var header: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 10) {
             Text(subjectText)
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-            if let detail {
-                if !detail.from.isEmpty {
-                    Text("From: \(detail.from)")
-                        .font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                .lineLimit(3)
+                .truncationMode(.tail)
+            HStack(alignment: .center, spacing: 10) {
+                SenderAvatar(name: senderDisplayName, email: senderAddress, size: 40)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(senderDisplayName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if !senderAddress.isEmpty && senderAddress != senderDisplayName {
+                        Text(senderAddress)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
+                    if !receivedText.isEmpty {
+                        Text(receivedText)
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                if !detail.to.isEmpty {
-                    Text("To: \(detail.to)")
-                        .font(.footnote).foregroundStyle(.secondary).lineLimit(2)
-                }
-                if !detail.cc.isEmpty {
-                    Text("Cc: \(detail.cc)")
-                        .font(.footnote).foregroundStyle(.secondary).lineLimit(2)
+                Spacer(minLength: 8)
+                if detail != nil {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) { showRecipients.toggle() }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text("Details").font(.caption)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 10, weight: .semibold))
+                                .rotationEffect(.degrees(showRecipients ? 180 : 0))
+                        }
+                        .foregroundStyle(.secondary)
+                    }
                 }
             }
-            if !receivedText.isEmpty {
-                Text(receivedText)
-                    .font(.caption).foregroundStyle(.secondary)
+            if showRecipients, let detail {
+                VStack(alignment: .leading, spacing: 3) {
+                    if !detail.to.isEmpty {
+                        Text("To: \(detail.to)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                    }
+                    if !detail.cc.isEmpty {
+                        Text("Cc: \(detail.cc)")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -440,9 +616,105 @@ struct MailDetailView: View {
         .padding(.vertical, 12)
     }
 
+    // MARK: body (the WebView is THE scrolling element — smooth like Outlook)
+
+    @ViewBuilder
+    private var bodyPane: some View {
+        if let detail {
+            MailBodyView(html: detail.html)
+        } else if failed {
+            VStack(spacing: 12) {
+                Text("Couldn't open this message.")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Try again") {
+                    failed = false
+                    Task { await fetch() }
+                }
+                .buttonStyle(.bordered)
+                .tint(scarletRose)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ProgressView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: action bar (Reply keeps the native DraftView flow)
+
+    private var actionBar: some View {
+        HStack(spacing: 10) {
+            actionButton("Reply", icon: "arrowshape.turn.up.left.fill",
+                         tint: OutlookStyle.accentBlue) {
+                showDraft = true
+            }
+            actionButton("Archive", icon: "archivebox.fill",
+                         tint: OutlookStyle.archiveGreen) {
+                model.archive(message)
+                dismiss()
+            }
+            actionButton("Ask Scarlet", icon: "sparkles", tint: scarletRose) {
+                askScarlet()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func actionButton(_ label: String, icon: String, tint: Color,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+                Text(label).font(.footnote.weight(.semibold))
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(tint.opacity(0.22), in: Capsule())
+            .overlay(Capsule().stroke(tint.opacity(0.5), lineWidth: 1))
+            .foregroundStyle(.white)
+        }
+    }
+
+    /// "All Scarlet capabilities" in the reader: hand this email to the live
+    /// conversation (Talk tab) with enough context to act on it.
+    private func askScarlet() {
+        let sender = message.fromName.isEmpty ? message.fromEmail : message.fromName
+        let text = "Regarding the email from \(sender) about '\(message.subject)': "
+            + "summarize it and suggest how to handle it."
+        NotificationCenter.default.post(name: .scarletAskAboutEmail, object: nil,
+                                        userInfo: ["text": text])
+    }
+
+    // MARK: derived strings
+
     private var subjectText: String {
         if let s = detail?.subject, !s.isEmpty { return s }
         return message.subject
+    }
+
+    /// `detail.from` arrives as "Name <address>"; the list row's fields are
+    /// the fallback while the detail loads.
+    private var senderDisplayName: String {
+        if let f = detail?.from, !f.isEmpty {
+            let name = f.components(separatedBy: "<").first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+            if !name.isEmpty { return name }
+        }
+        if !message.fromName.isEmpty { return message.fromName }
+        return message.fromEmail
+    }
+
+    private var senderAddress: String {
+        if let f = detail?.from,
+           let open = f.firstIndex(of: "<"), let close = f.lastIndex(of: ">"),
+           open < close {
+            let addr = String(f[f.index(after: open)..<close])
+                .trimmingCharacters(in: .whitespaces)
+            if !addr.isEmpty { return addr }
+        }
+        return message.fromEmail
     }
 
     private static let stampFormat: DateFormatter = {
@@ -462,30 +734,71 @@ struct MailDetailView: View {
 
 /// Renders the message HTML on white, like Outlook — mail is written for
 /// light backgrounds, so the reading pane stays light inside the dark app.
+/// JavaScript is off, tapped links open in Safari, and the page is wrapped in
+/// a responsive frame so fixed-width newsletters shrink instead of overflow.
 struct MailBodyView: UIViewRepresentable {
     let html: String
 
-    final class Coordinator {
+    final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedHTML: String?
+
+        func webView(_ webView: WKWebView,
+                     decidePolicyFor navigationAction: WKNavigationAction,
+                     decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            // Taps leave for Safari; the webview itself never navigates away.
+            if navigationAction.navigationType == .linkActivated {
+                if let url = navigationAction.request.url,
+                   let scheme = url.scheme?.lowercased(),
+                   ["http", "https", "mailto", "tel"].contains(scheme) {
+                    UIApplication.shared.open(url)
+                }
+                decisionHandler(.cancel)
+                return
+            }
+            // The only allowed frame load is our own loadHTMLString
+            // (about:blank); meta-refresh and friends are blocked.
+            let scheme = navigationAction.request.url?.scheme?.lowercased() ?? "about"
+            decisionHandler(scheme == "about" ? .allow : .cancel)
+        }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeUIView(context: Context) -> WKWebView {
-        let web = WKWebView()
+        let config = WKWebViewConfiguration()
+        let prefs = WKWebpagePreferences()
+        prefs.allowsContentJavaScript = false
+        config.defaultWebpagePreferences = prefs
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = context.coordinator
         web.isOpaque = true
         web.backgroundColor = .white
         web.scrollView.backgroundColor = .white
+        web.scrollView.bounces = true
         return web
     }
 
     func updateUIView(_ web: WKWebView, context: Context) {
         guard context.coordinator.loadedHTML != html else { return }
         context.coordinator.loadedHTML = html
-        let page = """
-        <html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>\
-        <body style="background:#fff;color:#111;font-family:-apple-system;padding:12px">\(html)</body></html>
+        web.loadHTMLString(Self.page(for: html), baseURL: nil)
+    }
+
+    /// Outlook-style reading frame: responsive viewport, fluid images and
+    /// tables, long words wrapped — the classic newsletter-overflow fix.
+    static func page(for html: String) -> String {
         """
-        web.loadHTMLString(page, baseURL: nil)
+        <!DOCTYPE html><html><head>\
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">\
+        <style>\
+        html,body{margin:0;padding:12px;background:#fff;color:#111;font:-apple-system-body;\
+        -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
+        img{max-width:100%!important;height:auto!important}\
+        table{max-width:100%!important;table-layout:auto}\
+        td,th{word-break:break-word}\
+        a{color:#0f6cbd}\
+        </style>\
+        </head><body>\(html)</body></html>
+        """
     }
 }
