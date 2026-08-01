@@ -400,6 +400,13 @@ struct InboxView: View {
                 content
             }
             .background(ScarletBackground().ignoresSafeArea())
+            // Scarlet lives at the bottom of the LIST screen only — part of
+            // its layout, so the pushed reader (with its own action bar)
+            // structurally replaces it.
+            .safeAreaInset(edge: .bottom) {
+                ScarletPresenceView(convo: convo)
+                    .padding(.vertical, 6)
+            }
             // The Outlook-style header row replaces the system bar on the
             // list screen; pushed screens (reader) keep theirs for Back.
             .toolbar(.hidden, for: .navigationBar)
@@ -811,16 +818,8 @@ struct MailDetailView: View {
         // claimed focus during the transition.
         .onAppear {
             convo.setFocus(emailFocus)
-            // This screen owns the bottom edge (Reply/Archive/Ask Scarlet
-            // bar) — the presence capsule must never float over it.
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": true])
         }
         .onDisappear {
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": false])
             if convo.currentFocus == emailFocus {
                 convo.setFocus(inboxBrowsingFocus(model.tab))
             }

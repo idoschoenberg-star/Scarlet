@@ -514,6 +514,12 @@ struct ChatsView: View {
                 content
             }
             .background(ScarletBackground().ignoresSafeArea())
+            // Scarlet lives at the bottom of the LIST screen only — a pushed
+            // thread (with its own compose bar) structurally replaces it.
+            .safeAreaInset(edge: .bottom) {
+                ScarletPresenceView(convo: convo)
+                    .padding(.vertical, 6)
+            }
             // Custom header on the list screen; pushed threads keep the
             // system bar for Back (same pattern as InboxView).
             .toolbar(.hidden, for: .navigationBar)
@@ -748,19 +754,11 @@ struct ChatThreadView: View {
         // the "recent messages" lines reflect what's actually on screen.
         .onAppear {
             convo.setFocus(threadFocus)
-            // This screen owns the bottom edge (compose bar) — the presence
-            // capsule must never float over it.
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": true])
         }
         .onChange(of: model.loadStamp) { _, _ in
             convo.setFocus(threadFocus)
         }
         .onDisappear {
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": false])
             model.stopPolling()
             // Voice-note hygiene: a closed thread never keeps playing audio.
             voicePlayer?.pause()

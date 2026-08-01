@@ -28,20 +28,6 @@ struct RootView: View {
     @StateObject private var convo = Conversation()
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
-    /// True while ANY DraftView sheet is up (it broadcasts its visibility) —
-    /// the presence capsule hides so the sheet is the one Scarlet surface.
-    @State private var draftSheetVisible = false
-    /// How many screens currently OWN the bottom edge (chat thread compose
-    /// bar, mail reader action bar, calendar event detail). A COUNTER, not a
-    /// bool: appear/disappear between sibling screens isn't strictly ordered,
-    /// so push A → present B → dismiss B must not un-hide wrongly. The
-    /// capsule shows only when nobody owns the bottom (list screens).
-    @State private var bottomOwners = 0
-    /// Keyboard visibility: the capsule's 58pt tab-bar clearance only makes
-    /// sense while the tab bar is visible. With the keyboard up the tab bar
-    /// is covered, so the capsule hugs the keyboard instead of floating
-    /// mid-list above a phantom bar.
-    @State private var keyboardUp = false
 
     enum Tab: Hashable { case talk, inbox, calendar, chats }
 
@@ -70,34 +56,13 @@ struct RootView: View {
                 .tag(Tab.chats)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
-        // The Scarlet Presence: a floating capsule on LIST screens of the
-        // non-Talk tabs. Screens that own their bottom edge (open chat
-        // thread, open email, open calendar event) broadcast ownership and
-        // the capsule yields — it never covers a compose bar or action bar.
-        .overlay(alignment: .bottom) {
-            if tab != .talk && !draftSheetVisible && bottomOwners == 0 {
-                ScarletPresenceView(convo: convo, goToTalk: { tab = .talk })
-                    .padding(.bottom, keyboardUp ? 8 : 58)   // above tab bar / hugging keyboard
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIResponder.keyboardWillShowNotification)) { _ in keyboardUp = true }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIResponder.keyboardWillHideNotification)) { _ in keyboardUp = false }
-        .animation(.easeInOut(duration: 0.2), value: tab)
-        .animation(.easeInOut(duration: 0.2), value: bottomOwners)
-        .animation(.easeInOut(duration: 0.2), value: keyboardUp)
-        // Any DraftView sheet (voice-attach, reply, new-mail, channel) says
-        // when it's up; the capsule yields the screen to it.
-        .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
-            draftSheetVisible = (note.userInfo?["visible"] as? Bool) ?? false
-        }
-        // Bottom-edge ownership: counted (clamped at 0) so overlapping
-        // appear/disappear sequences between sibling screens balance out.
-        .onReceive(NotificationCenter.default.publisher(for: .scarletBottomOwned)) { note in
-            let owned = (note.userInfo?["owned"] as? Bool) ?? false
-            bottomOwners = max(0, bottomOwners + (owned ? 1 : -1))
+        // The Scarlet Presence capsule is EMBEDDED inside each list screen
+        // (safeAreaInset in InboxView / CalendarView / ChatsView), not
+        // overlaid here — a pushed detail or a sheet structurally replaces
+        // it, so it can never cover another screen's buttons. This shell
+        // only answers the capsule's "take me to Talk" request.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletGoToTalk)) { _ in
+            tab = .talk
         }
         // "Ask Scarlet about this email": the mail reader posts a notification;
         // this shell (which owns the conversation) switches to Talk and hands

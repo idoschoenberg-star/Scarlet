@@ -6,22 +6,25 @@ import SwiftUI
 /// against it module-wide.
 extension Notification.Name {
     static let scarletDraftSheetVisible = Notification.Name("scarletDraftSheetVisible")
-    /// Bottom-edge ownership: screens whose OWN controls live at the bottom
-    /// edge (chat thread compose bar, mail reader action bar, calendar event
-    /// detail) post ["owned": true] on appear and false on disappear. RootView
-    /// COUNTS owners (not a bool — push/present/dismiss ordering is not LIFO)
-    /// and hides the presence capsule while any owner exists, so it can never
-    /// sit on top of a screen's own bottom controls.
-    static let scarletBottomOwned = Notification.Name("scarletBottomOwned")
+    /// Posted by an embedded capsule when its orb should carry Ido to the
+    /// Talk tab; RootView (which owns tab selection) listens.
+    static let scarletGoToTalk = Notification.Name("scarletGoToTalk")
 }
 
-/// The "Scarlet Presence": a floating capsule shown on every non-Talk tab.
+/// The "Scarlet Presence": a capsule EMBEDDED (via safeAreaInset) at the
+/// bottom of each LIST screen — Inbox list, Calendar agenda, Chats list.
+/// It is part of those screens' layout, not a floating overlay, so a pushed
+/// detail (mail reader, chat thread) or a sheet structurally replaces or
+/// covers it — it can never sit on top of another screen's buttons.
 /// Collapsed by default — just the orb and a status line. Idle → tap to wake
-/// her; live → tap to expand the mic / chat-mode / end controls (and, in
-/// chat mode, a reply peek plus a text row) right there over the tab bar.
+/// her; live → tap to expand the mic / chat-mode / end controls; chat mode
+/// becomes one solid panel with a reply peek and a text row.
 struct ScarletPresenceView: View {
     @ObservedObject var convo: Conversation
-    var goToTalk: () -> Void
+    /// Default: ask RootView (the tab owner) to switch to Talk.
+    var goToTalk: () -> Void = {
+        NotificationCenter.default.post(name: .scarletGoToTalk, object: nil)
+    }
 
     @State private var pulsing = false
     @State private var draft = ""

@@ -364,6 +364,13 @@ struct CalendarView: View {
                 content
             }
             .background(ScarletBackground().ignoresSafeArea())
+            // Scarlet lives at the bottom of the agenda — the event detail
+            // sheet covers the whole screen, so it never collides with the
+            // sheet's own footer buttons.
+            .safeAreaInset(edge: .bottom) {
+                ScarletPresenceView(convo: convo)
+                    .padding(.vertical, 6)
+            }
             // .task re-runs on tab select; foreground return refreshes too.
             // Every open lands the agenda on TODAY — the range starts a week
             // back, so without this jump the list opens on past days. The
@@ -748,16 +755,8 @@ struct CalEventDetailView: View {
         // on the way out — unless another screen already claimed focus.
         .onAppear {
             convo.setFocus(eventFocus)
-            // This sheet owns the bottom edge (Ask Scarlet / Delete footer) —
-            // the presence capsule must never float over it.
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": true])
         }
         .onDisappear {
-            NotificationCenter.default.post(name: .scarletBottomOwned,
-                                            object: nil,
-                                            userInfo: ["owned": false])
             if convo.currentFocus == eventFocus {
                 convo.setFocus(calendarAgendaFocus)
             }
