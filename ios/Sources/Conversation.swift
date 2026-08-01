@@ -183,6 +183,17 @@ final class Conversation: ObservableObject {
         try s.setCategory(.playAndRecord, mode: .voiceChat,
                           options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
         try s.setActive(true)
+        routeToSpeakerIfReceiver()
+    }
+
+    /// Voice-chat sessions love falling back to the phone-call earpiece, which
+    /// sounds "very faint". Force the loudspeaker — but only when the route IS
+    /// the earpiece, so AirPods/CarPlay stay untouched.
+    private func routeToSpeakerIfReceiver() {
+        let s = AVAudioSession.sharedInstance()
+        if s.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) {
+            try? s.overrideOutputAudioPort(.speaker)
+        }
     }
 
     /// Idempotent: builds the audio graph exactly once; later calls just make
@@ -229,6 +240,7 @@ final class Conversation: ObservableObject {
         }
         engine.prepare()
         try engine.start()
+        engine.mainMixerNode.outputVolume = 1.0
         audioReady = true
     }
 
@@ -303,7 +315,10 @@ final class Conversation: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in if self.wantLive, !self.engine.isRunning { try? self.engine.start() } }
+            Task { @MainActor in
+                if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
+                if self.wantLive { self.routeToSpeakerIfReceiver() }
+            }
         }
     }
 }
