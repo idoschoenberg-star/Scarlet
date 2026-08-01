@@ -362,12 +362,18 @@ struct CalendarView: View {
                 content
             }
             .background(ScarletBackground().ignoresSafeArea())
-        }
-        // .task re-runs on tab select; foreground return refreshes too.
-        .task { await model.load() }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { await model.load() }
+            // .task re-runs on tab select; foreground return refreshes too.
+            // Every open lands the agenda on TODAY — the range starts a week
+            // back, so without this jump the list opens on past days.
+            .task {
+                await model.load()
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                goToToday(proxy, animated: false)
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: UIApplication.willEnterForegroundNotification)) { _ in
+                Task { await model.load() }
+            }
         }
         // Ambient focus: the agenda reports itself whenever it's on screen.
         .onAppear { convo.setFocus(calendarAgendaFocus) }
@@ -406,20 +412,24 @@ struct CalendarView: View {
         .padding(.bottom, 6)
     }
 
-    private func goToToday(_ proxy: ScrollViewProxy) {
+    private func goToToday(_ proxy: ScrollViewProxy, animated: Bool = true) {
         let today = Calendar.current.startOfDay(for: Date())
         selectedDay = today
         weekAnchor = calStartOfWeek(today)
-        scrollToDay(today, proxy: proxy)
+        scrollToDay(today, proxy: proxy, animated: animated)
     }
 
     /// Jump the agenda to a day's anchor — or the nearest following loaded
     /// day (empty past/future days have no row), else the last one.
-    private func scrollToDay(_ date: Date, proxy: ScrollViewProxy) {
+    private func scrollToDay(_ date: Date, proxy: ScrollViewProxy, animated: Bool = true) {
         let key = CalDates.dayKey.string(from: date)
         let target = model.days.first(where: { $0.id >= key })?.id ?? model.days.last?.id
         if let target {
-            withAnimation(.easeInOut(duration: 0.25)) {
+            if animated {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(target, anchor: .top)
+                }
+            } else {
                 proxy.scrollTo(target, anchor: .top)
             }
         }
