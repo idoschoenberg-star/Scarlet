@@ -1,4 +1,5 @@
 import Combine
+import QuickLook
 import SwiftUI
 import UIKit
 import WebKit
@@ -59,6 +60,23 @@ struct MailDetail {
     let cc: String
     let received: String
     let html: String
+    let attachments: [MailAttachment]
+}
+
+/// One real (non-inline) attachment on an opened message.
+struct MailAttachment: Identifiable {
+    let id: String
+    let name: String
+    let contentType: String
+    let size: Int
+}
+
+/// What `op=mailattachment` handed back: file bytes to preview, a OneDrive/
+/// SharePoint link to open in Safari, or a user-facing error line.
+enum AttachmentFetchResult {
+    case file(Data)
+    case link(URL)
+    case failure(String)
 }
 
 /// ISO-8601 parsing, shared by list and detail. File-scope (no actor) so any
@@ -205,14 +223,61 @@ final class InboxModel: ObservableObject {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id
         let data = try await Self.request("op=mailread&id=\(encoded)", method: "GET")
         let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        let attachments: [MailAttachment] = ((obj["attachments"] as? [[String: Any]]) ?? [])
+            .compactMap { a in
+                guard let aid = a["id"] as? String, !aid.isEmpty else { return nil }
+                return MailAttachment(
+                    id: aid,
+                    name: (a["name"] as? String) ?? "attachment",
+                    contentType: (a["contentType"] as? String) ?? "",
+                    size: (a["size"] as? Int) ?? 0
+                )
+            }
         return MailDetail(
             subject: Self.stringy(obj["subject"]),
             from: Self.stringy(obj["from"]),
             to: Self.stringy(obj["to"]),
             cc: Self.stringy(obj["cc"]),
             received: Self.stringy(obj["received"]),
-            html: Self.stringy(obj["html"])
+            html: Self.stringy(obj["html"]),
+            attachments: attachments
         )
+    }
+
+    /// Downloads one attachment. The server answers with either the raw file
+    /// bytes (normal case) or a small JSON object — a `link` for OneDrive/
+    /// SharePoint reference attachments, or an `error`. Discrimination: only
+    /// when the Content-Type header says JSON *and* the body parses as a JSON
+    /// object do we treat it as a special case; anything else is the file.
+    func fetchAttachment(messageId: String, attachmentId: String) async throws
+        -> AttachmentFetchResult {
+        let mid = messageId.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
+            ?? messageId
+        let aid = attachmentId.addingPercentEncoding(withAllowedCharacters: .alphanumerics)
+            ?? attachmentId
+        guard let url = URL(string:
+            "\(AppConfig.apiBase)/app-api?v=2&op=mailattachment&id=\(mid)&aid=\(aid)") else {
+            throw URLError(.badURL)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        if contentType.contains("application/json"),
+           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            if let link = obj["link"] as? String, let linkURL = URL(string: link) {
+                return .link(linkURL)
+            }
+            return .failure("Couldn't open that attachment — try again.")
+        }
+        guard !data.isEmpty else {
+            return .failure("Couldn't open that attachment — try again.")
+        }
+        return .file(data)
     }
 
     /// The server marks read on open; mirror it locally so the row un-bolds.
@@ -675,6 +740,12 @@ struct MailDetailView: View {
     @State private var failed = false
     @State private var showDraft = false
     @State private var showRecipients = false
+    /// Attachment currently downloading (its chip swaps icon → spinner).
+    @State private var downloadingAttachmentId: String?
+    /// Small red footnote under the chips; cleared on the next tap.
+    @State private var attachmentError = ""
+    /// Non-nil drives the QuickLook sheet.
+    @State private var previewFile: PreviewFile?
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -682,6 +753,13 @@ struct MailDetailView: View {
         VStack(spacing: 0) {
             header
             Divider().overlay(.white.opacity(0.15))
+            // Outlook puts attachments right under the header, above the
+            // body. A fixed-height horizontal strip: it never joins the
+            // web view's vertical scroll surface.
+            if let detail, !detail.attachments.isEmpty {
+                attachmentsRow(detail.attachments)
+                Divider().overlay(.white.opacity(0.15))
+            }
             bodyPane
             Divider().overlay(.white.opacity(0.15))
             actionBar
@@ -718,6 +796,12 @@ struct MailDetailView: View {
             ))
             .preferredColorScheme(.dark)
         }
+        // QuickLook: pinch-zoom, paging, share — the Outlook attachment
+        // experience, straight from the system viewer.
+        .sheet(item: $previewFile) { file in
+            QuickLookPreview(url: file.url)
+                .ignoresSafeArea()
+        }
         .task {
             model.markRead(message.id)
             await fetch()
@@ -741,6 +825,130 @@ struct MailDetailView: View {
             failed = true
         }
     }
+
+    // MARK: attachments (Outlook-style chip strip under the header)
+
+    private func attachmentsRow(_ attachments: [MailAttachment]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(attachments) { att in
+                        attachmentChip(att)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            if !attachmentError.isEmpty {
+                Text(attachmentError)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 16)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private func attachmentChip(_ att: MailAttachment) -> some View {
+        Button {
+            openAttachment(att)
+        } label: {
+            HStack(spacing: 8) {
+                if downloadingAttachmentId == att.id {
+                    ProgressView()
+                        .frame(width: 24, height: 24)
+                } else {
+                    Image(systemName: Self.attachmentStyle(for: att).icon)
+                        .font(.system(size: 22))
+                        .foregroundStyle(Self.attachmentStyle(for: att).color)
+                        .frame(width: 24, height: 24)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(att.name)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 170, alignment: .leading)
+                    Text(Self.sizeFormat.string(fromByteCount: Int64(att.size)))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.07)))
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.white.opacity(0.10), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Tap → download → QuickLook (bytes), Safari (reference link), or a
+    /// footnote error. One download at a time; errors clear on the next tap.
+    @MainActor
+    private func openAttachment(_ att: MailAttachment) {
+        attachmentError = ""
+        guard downloadingAttachmentId == nil else { return }
+        downloadingAttachmentId = att.id
+        Task {
+            defer { downloadingAttachmentId = nil }
+            do {
+                let result = try await model.fetchAttachment(messageId: message.id,
+                                                             attachmentId: att.id)
+                switch result {
+                case .file(let data):
+                    let url = Self.tempFileURL(for: att.name)
+                    try data.write(to: url, options: .atomic)
+                    previewFile = PreviewFile(url: url)
+                case .link(let url):
+                    UIApplication.shared.open(url)
+                case .failure(let text):
+                    attachmentError = text
+                }
+            } catch {
+                attachmentError = "Couldn't open that attachment — try again."
+            }
+        }
+    }
+
+    /// Temp destination that keeps the real filename (extension included —
+    /// that's what makes QuickLook pick the right renderer) but strips path
+    /// separators so a hostile name can't escape the temp directory.
+    private static func tempFileURL(for name: String) -> URL {
+        var clean = name
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty || clean == "." || clean == ".." { clean = "attachment" }
+        return FileManager.default.temporaryDirectory.appendingPathComponent(clean)
+    }
+
+    /// Outlook's file-type iconography, decided by extension with a
+    /// contentType fallback for extension-less image names.
+    private static func attachmentStyle(for att: MailAttachment)
+        -> (icon: String, color: Color) {
+        let ext = (att.name as NSString).pathExtension.lowercased()
+        switch ext {
+        case "doc", "docx": return ("doc.fill", .blue)
+        case "xls", "xlsx", "csv": return ("tablecells.fill", .green)
+        case "ppt", "pptx": return ("play.rectangle.fill", .orange)
+        case "pdf": return ("doc.richtext.fill", .red)
+        case "png", "jpg", "jpeg", "gif", "heic": return ("photo.fill", .purple)
+        case "zip": return ("archivebox.fill", .gray)
+        default:
+            if att.contentType.lowercased().hasPrefix("image/") {
+                return ("photo.fill", .purple)
+            }
+            return ("paperclip", .gray)
+        }
+    }
+
+    private static let sizeFormat: ByteCountFormatter = {
+        let f = ByteCountFormatter()
+        f.countStyle = .file
+        return f
+    }()
 
     // MARK: header (compact, Outlook-style: avatar + name + address + Details)
 
@@ -999,5 +1207,46 @@ struct MailBodyView: UIViewRepresentable {
         </style>\
         </head><body>\(html)</body></html>
         """
+    }
+}
+
+// MARK: - QuickLook attachment preview
+
+/// Identifiable wrapper so `.sheet(item:)` can drive the QuickLook sheet
+/// from a plain file URL.
+struct PreviewFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+/// The system QuickLook viewer — the same renderer Outlook hands attachments
+/// to: Word/Excel/PowerPoint, PDF and images with pinch-zoom, paging and the
+/// share button, all built in.
+struct QuickLookPreview: UIViewControllerRepresentable {
+    let url: URL
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        let url: URL
+        init(url: URL) { self.url = url }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(_ controller: QLPreviewController,
+                               previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {
+        // `.sheet(item:)` recreates the representable per PreviewFile, so the
+        // coordinator's URL is always current; nothing to refresh here.
     }
 }

@@ -20,15 +20,15 @@ struct ScarletTalkApp: App {
     }
 }
 
-/// Post-unlock shell: Talk and Inbox tabs. The conversation lives HERE, above
-/// the tabs, so switching to Inbox never tears down a live call — only the
-/// explicit End button (or the OS) ends it.
+/// Post-unlock shell: Talk, Inbox, Calendar and Chats tabs. The conversation
+/// lives HERE, above the tabs, so switching pages never tears down a live
+/// call — only the explicit End button (or the OS) ends it.
 struct RootView: View {
     @StateObject private var convo = Conversation()
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
 
-    enum Tab: Hashable { case talk, inbox }
+    enum Tab: Hashable { case talk, inbox, calendar, chats }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -45,6 +45,14 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Inbox", systemImage: "envelope.fill") }
                 .tag(Tab.inbox)
+            CalendarView()
+                .environmentObject(convo)
+                .tabItem { Label("Calendar", systemImage: "calendar") }
+                .tag(Tab.calendar)
+            ChatsView()
+                .environmentObject(convo)
+                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
+                .tag(Tab.chats)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
         // "Ask Scarlet about this email": the mail reader posts a notification;

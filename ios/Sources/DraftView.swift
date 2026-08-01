@@ -411,14 +411,14 @@ struct DraftView: View {
                 Text("Draft")
                     .font(.title3.weight(.semibold))
                     .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-                Text("AMWELL EMAIL")
+                Text(badgeText)
                     .font(.system(size: 10, weight: .bold))
                     .tracking(1.2)
-                    .foregroundStyle(outlookBlue)
+                    .foregroundStyle(badgeColor)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 4)
-                    .background(outlookBlue.opacity(0.16), in: Capsule())
-                    .overlay(Capsule().stroke(outlookBlue.opacity(0.4), lineWidth: 1))
+                    .background(badgeColor.opacity(0.16), in: Capsule())
+                    .overlay(Capsule().stroke(badgeColor.opacity(0.4), lineWidth: 1))
                 Spacer()
                 Button {
                     model.discard()
@@ -463,6 +463,63 @@ struct DraftView: View {
         return ""
     }
 
+    // MARK: channel branding
+    // Voice drafts arrive for any channel (teams/whatsapp/imessage too, via
+    // attach mode) — the badge and approve wording follow the draft itself.
+
+    private var channel: String { model.draft?.channel ?? "email_outlook" }
+
+    private var badgeText: String {
+        switch channel {
+        case "email_gmail": return "GMAIL"
+        case "teams": return "TEAMS"
+        case "whatsapp": return "WHATSAPP"
+        case "imessage": return "IMESSAGE"
+        default: return "AMWELL EMAIL"
+        }
+    }
+
+    private var badgeColor: Color {
+        switch channel {
+        case "email_gmail": return Color(red: 0.92, green: 0.36, blue: 0.31)
+        case "teams": return Color(red: 0.55, green: 0.56, blue: 0.85)
+        case "whatsapp": return Color(red: 0.14, green: 0.80, blue: 0.44)
+        case "imessage": return Color(red: 0.25, green: 0.60, blue: 1.0)
+        default: return outlookBlue
+        }
+    }
+
+    /// What Approve actually does per channel — Outlook stays drafts-only,
+    /// Teams stays staged; Gmail/WhatsApp/iMessage truly send (rules live
+    /// server-side; these labels just tell the truth).
+    private var approveLabel: String {
+        switch channel {
+        case "teams": return "Approve → Stage in Teams"
+        case "whatsapp": return "Approve → Send WhatsApp"
+        case "imessage": return "Approve → Send iMessage"
+        case "email_gmail": return "Approve → Send Gmail"
+        default: return "Approve → Outlook Drafts"
+        }
+    }
+
+    private var savedLabel: String {
+        switch channel {
+        case "teams": return "Staged in Teams ✓"
+        case "whatsapp": return "Sent on WhatsApp ✓"
+        case "imessage": return "Sent by iMessage ✓"
+        case "email_gmail": return "Sent from Gmail ✓"
+        default: return "Saved in Outlook Drafts ✓"
+        }
+    }
+
+    private var approvingLabel: String {
+        switch channel {
+        case "email_outlook": return "Saving to Outlook…"
+        case "teams": return "Staging in Teams…"
+        default: return "Sending…"
+        }
+    }
+
     @ViewBuilder
     private var statusLine: some View {
         switch model.phase {
@@ -479,12 +536,12 @@ struct DraftView: View {
         case .approving:
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small).tint(scarletRose)
-                Text("Saving to Outlook…").font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Text(approvingLabel).font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .ready:
             Text("Ready for your review").font(.footnote).foregroundStyle(.secondary)
         case .saved:
-            Text("Saved in Outlook Drafts").font(.footnote)
+            Text(savedLabel).font(.footnote)
                 .foregroundStyle(Color(red: 0.55, green: 0.85, blue: 0.62))
         case .idle:
             if seed == nil && !attachToActive && model.draft == nil {
@@ -711,14 +768,14 @@ struct DraftView: View {
             } label: {
                 Group {
                     if model.phase == .saved {
-                        Label("Saved in Outlook Drafts ✓", systemImage: "checkmark.circle.fill")
+                        Label(savedLabel, systemImage: "checkmark.circle.fill")
                     } else if model.phase == .approving {
                         HStack(spacing: 8) {
                             ProgressView().tint(.white)
-                            Text("Saving to Outlook…")
+                            Text(approvingLabel)
                         }
                     } else {
-                        Text("Approve → Outlook Drafts")
+                        Text(approveLabel)
                     }
                 }
                 .font(.headline)
