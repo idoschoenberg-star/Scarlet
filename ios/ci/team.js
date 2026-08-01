@@ -41,5 +41,18 @@ function api(method, path, body) {
     }
   } catch (e) { console.error("cert cleanup skipped:", e.message); }
 
+  // Same for provisioning profiles: revoking certs invalidates them, and a
+  // dead profile squatting on the name forces sigh to mint renamed copies.
+  const profs = await api("GET", "/v1/profiles?limit=200");
+  try {
+    const j = JSON.parse(profs.b);
+    for (const p of (j.data || [])) {
+      if ((p.attributes.name || "").startsWith("ScarletTalk AppStore")) {
+        const d = await api("DELETE", "/v1/profiles/" + p.id);
+        console.error("deleted stale profile", p.attributes.name, "->", d.s);
+      }
+    }
+  } catch (e) { console.error("profile cleanup skipped:", e.message); }
+
   process.stdout.write(seed);   // stdout carries ONLY the Team ID for $(...) capture
 })().catch((e) => { console.error(e); process.exit(1); });

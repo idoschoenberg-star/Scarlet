@@ -33,15 +33,19 @@ platform :ios do
       force: true
     )
 
+    # Use the name the profile ACTUALLY got — sigh appends a suffix if the
+    # requested name is taken by a stale profile.
+    profile_name = lane_context[SharedValues::SIGH_NAME] || PROFILE_NAME
+
     build_app(
       project: "ScarletTalk.xcodeproj",
       scheme: "ScarletTalk",
       export_method: "app-store",
-      xcargs: "DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']}",
+      xcargs: "DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']} PROVISIONING_PROFILE_SPECIFIER=#{profile_name.shellescape}",
       export_options: {
         signingStyle: "manual",
         teamID: ENV["DEVELOPMENT_TEAM"],
-        provisioningProfiles: { BUNDLE_ID => PROFILE_NAME }
+        provisioningProfiles: { BUNDLE_ID => profile_name }
       }
     )
 
