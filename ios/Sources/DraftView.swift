@@ -38,6 +38,19 @@ struct DraftSeed {
     }
 }
 
+/// Seed for drafting INTO a chat channel (WhatsApp/iMessage/Teams) straight
+/// from its thread — recipient is the chat's display name (the server
+/// resolves the real address), contextLines ride into Scarlet's focus.
+struct ChannelDraftSeed: Identifiable {
+    let channel: String        // "whatsapp" | "imessage" | "teams"
+    let recipient: String      // chat display name, e.g. "Adam"
+    var contextLines: String = ""   // last ~6 thread lines, "Name: text"
+    var instruction: String = ""    // optional pre-typed ask
+
+    /// `.sheet(item:)` identity — one channel draft per chat at a time.
+    var id: String { channel + recipient }
+}
+
 // MARK: - Model
 
 @MainActor
@@ -111,6 +124,20 @@ final class DraftModel: ObservableObject {
         let original = seed.originalLine
         if !original.isEmpty { body["original"] = original }
         compose(body)
+    }
+
+    /// Channel-draft mode: compose INTO a chat channel (WhatsApp/iMessage/
+    /// Teams) straight from its thread. draft_compose accepts any channel; no
+    /// message_id/original — the server resolves the display name to a real
+    /// address and channel rules govern what Approve does.
+    func startChannelDraft(seed: ChannelDraftSeed, instruction: String) {
+        guard phase == .idle, draftId == nil else { return }
+        let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        compose([
+            "channel": seed.channel,
+            "recipient": seed.recipient,
+            "instruction": instr.isEmpty ? "Draft this message." : instr,
+        ])
     }
 
     /// New-mail mode: no original message — the backend composes fresh and
@@ -363,6 +390,10 @@ struct DraftView: View {
     /// Voice-attach mode: skip composing and adopt the active server draft
     /// (Scarlet's compose_draft tool already started it).
     var attachToActive: Bool = false
+    /// Channel-draft mode: opened from a chat thread (WhatsApp/iMessage/
+    /// Teams). With a pre-typed instruction Scarlet composes immediately;
+    /// without one the sheet asks first (recipient is fixed — the chat).
+    var channelSeed: ChannelDraftSeed? = nil
 
     @StateObject private var model = DraftModel()
     @Environment(\.dismiss) private var dismiss
@@ -399,6 +430,13 @@ struct DraftView: View {
         .onAppear {
             if attachToActive {
                 model.attachToActive()
+            } else if let channelSeed {
+                let instr = channelSeed.instruction
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !instr.isEmpty {
+                    model.startChannelDraft(seed: channelSeed, instruction: instr)
+                }
+                // Empty ask → channelForm collects it first.
             } else if let seed {
                 model.startReply(seed: seed, instruction: instruction)
             }
@@ -430,14 +468,27 @@ struct DraftView: View {
     }
 
     /// One line per (draft id, revision) — nil until a draft is on screen.
+    /// Built deterministically (it feeds onChange): the seed fields are
+    /// constant for the sheet's lifetime, so the line only changes when the
+    /// draft itself does.
     private var draftFocusLine: String? {
         guard let d = model.draft else { return nil }
-        return "[FOCUS] A draft window is OPEN on Ido's screen.\n"
+        var line = "[FOCUS] A draft window is OPEN on Ido's screen.\n"
             + "channel: \(d.channel)\n"
             + "draft_id: \(d.id)\n"
             + "recipient: \(d.recipient)\n"
             + "revision: v\(d.revision)\n"
             + "Any spoken change request refers to THIS draft — call revise_draft."
+        // Conversation grounding: the thread this draft answers rides along so
+        // spoken revisions can reference what was actually said.
+        if let cs = channelSeed, !cs.contextLines.isEmpty {
+            line += "\nconversation with \(cs.recipient):\n\(cs.contextLines)"
+        }
+        // Email grounding: what's being replied to, in one breath.
+        if let seed {
+            line += "\nreplying to: \(seed.fromName) — \(seed.subject)\npreview: \(seed.preview.prefix(200))"
+        }
+        return line
     }
 
     // MARK: header
@@ -497,6 +548,7 @@ struct DraftView: View {
     private var recipientText: String {
         if let r = model.draft?.recipient, !r.isEmpty { return r }
         if let seed { return seed.recipientLine }
+        if let cs = channelSeed { return cs.recipient }
         return ""
     }
 
@@ -504,7 +556,9 @@ struct DraftView: View {
     // Voice drafts arrive for any channel (teams/whatsapp/imessage too, via
     // attach mode) — the badge and approve wording follow the draft itself.
 
-    private var channel: String { model.draft?.channel ?? "email_outlook" }
+    private var channel: String {
+        model.draft?.channel ?? channelSeed?.channel ?? "email_outlook"
+    }
 
     private var badgeText: String {
         switch channel {
@@ -581,7 +635,9 @@ struct DraftView: View {
             Text(savedLabel).font(.footnote)
                 .foregroundStyle(Color(red: 0.55, green: 0.85, blue: 0.62))
         case .idle:
-            if seed == nil && !attachToActive && model.draft == nil {
+            if channelSeed != nil && model.draft == nil {
+                Text("Tell Scarlet what to say").font(.footnote).foregroundStyle(.secondary)
+            } else if seed == nil && !attachToActive && model.draft == nil {
                 Text("A fresh email from your Amwell address").font(.footnote).foregroundStyle(.secondary)
             }
         }
@@ -597,7 +653,10 @@ struct DraftView: View {
             writingCard
         } else if !model.errorText.isEmpty {
             errorRetry
-        } else if seed == nil && !attachToActive {
+        } else if channelSeed != nil {
+            // Channel-draft mode with no pre-typed ask: instruction first.
+            channelForm
+        } else if seed == nil && !attachToActive && channelSeed == nil {
             newMailForm
         } else {
             Spacer()
@@ -699,6 +758,36 @@ struct DraftView: View {
             }
             .disabled(newTo.trimmingCharacters(in: .whitespaces).isEmpty)
             .opacity(newTo.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+
+    /// Channel-draft mode, instruction-first: the recipient is fixed (the
+    /// chat this sheet was opened from), so there's no To field — just the
+    /// ask, then a channel-tinted start button.
+    private var channelForm: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            TextField("What should Scarlet say to \(channelSeed?.recipient ?? "them")?",
+                      text: $newInstruction, axis: .vertical)
+                .lineLimit(2...5)
+                .padding(12)
+                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .focused($newInstructionFocused)
+            Button {
+                if let cs = channelSeed {
+                    model.startChannelDraft(seed: cs, instruction: newInstruction)
+                }
+            } label: {
+                Text("Start the draft")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(15)
+                    .background(badgeColor, in: RoundedRectangle(cornerRadius: 30))
+                    .foregroundStyle(.white)
+            }
+            .disabled(newInstruction.trimmingCharacters(in: .whitespaces).isEmpty)
+            .opacity(newInstruction.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
             Spacer()
         }
         .padding(.top, 6)

@@ -721,6 +721,9 @@ struct ChatThreadView: View {
     /// is the ChatMessage.id currently playing (nil when idle/paused).
     @State private var voicePlayer: AVPlayer?
     @State private var playingVoiceID: Int?
+    /// "Draft with Scarlet": non-nil presents the drafting studio seeded with
+    /// this chat, its recent lines, and whatever was typed in the compose bar.
+    @State private var scarletDraft: ChannelDraftSeed?
 
     init(channel: ChatChannel, chat: ChatSummary) {
         self.channel = channel
@@ -783,6 +786,16 @@ struct ChatThreadView: View {
         // WhatsApp video bubbles: tap → full-screen player.
         .sheet(item: $videoItem) { item in
             WAVideoView(item: item)
+        }
+        // "Draft with Scarlet" (compose-bar sparkles): the drafting studio,
+        // seeded with this chat. On dismiss, reload once — an approved send
+        // appears via the mirror shortly.
+        .sheet(item: $scarletDraft, onDismiss: {
+            Task { await model.load() }
+        }) { seed in
+            DraftView(seed: nil, channelSeed: seed)
+                .environmentObject(convo)
+                .preferredColorScheme(.dark)
         }
     }
 
@@ -919,6 +932,7 @@ struct ChatThreadView: View {
                 stagedCard
             }
             HStack(alignment: .bottom, spacing: 10) {
+                scarletDraftButton
                 TextField(composePlaceholder, text: $composeText, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
@@ -977,6 +991,31 @@ struct ChatThreadView: View {
             }
             .disabled(!canSend)
         }
+    }
+
+    /// "Draft with Scarlet" — 30pt channel-tinted sparkles circle at the
+    /// bar's left. Whatever is typed rides along as the instruction (and the
+    /// field clears); nothing typed → the studio asks first. The last ~6
+    /// thread lines ride along too so the draft never loses its context.
+    private var scarletDraftButton: some View {
+        Button {
+            scarletDraft = ChannelDraftSeed(
+                channel: channel.rawValue,
+                recipient: chat.name,
+                contextLines: recentLines.joined(separator: "\n"),
+                instruction: composeText.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            composeText = ""
+        } label: {
+            Image(systemName: "sparkles")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(channel.accent)
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(channel.accent.opacity(0.18)))
+                .overlay(Circle().stroke(channel.accent.opacity(0.45), lineWidth: 1))
+        }
+        .disabled(model.sending)
+        .padding(.bottom, 3)
     }
 
     private var stagedCard: some View {
