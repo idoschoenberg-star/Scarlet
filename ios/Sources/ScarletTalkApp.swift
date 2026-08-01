@@ -30,6 +30,12 @@ struct RootView: View {
     /// True while ANY DraftView sheet is up (it broadcasts its visibility) —
     /// the presence capsule hides so the sheet is the one Scarlet surface.
     @State private var draftSheetVisible = false
+    /// How many screens currently OWN the bottom edge (chat thread compose
+    /// bar, mail reader action bar, calendar event detail). A COUNTER, not a
+    /// bool: appear/disappear between sibling screens isn't strictly ordered,
+    /// so push A → present B → dismiss B must not un-hide wrongly. The
+    /// capsule shows only when nobody owns the bottom (list screens).
+    @State private var bottomOwners = 0
 
     enum Tab: Hashable { case talk, inbox, calendar, chats }
 
@@ -58,20 +64,29 @@ struct RootView: View {
                 .tag(Tab.chats)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
-        // The Scarlet Presence: a floating capsule on every non-Talk tab so
-        // her state and controls stay visible while Ido reads mail or chats.
+        // The Scarlet Presence: a floating capsule on LIST screens of the
+        // non-Talk tabs. Screens that own their bottom edge (open chat
+        // thread, open email, open calendar event) broadcast ownership and
+        // the capsule yields — it never covers a compose bar or action bar.
         .overlay(alignment: .bottom) {
-            if tab != .talk && !draftSheetVisible {
+            if tab != .talk && !draftSheetVisible && bottomOwners == 0 {
                 ScarletPresenceView(convo: convo, goToTalk: { tab = .talk })
                     .padding(.bottom, 58)   // floats above the tab bar
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: tab)
+        .animation(.easeInOut(duration: 0.2), value: bottomOwners)
         // Any DraftView sheet (voice-attach, reply, new-mail, channel) says
         // when it's up; the capsule yields the screen to it.
         .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
             draftSheetVisible = (note.userInfo?["visible"] as? Bool) ?? false
+        }
+        // Bottom-edge ownership: counted (clamped at 0) so overlapping
+        // appear/disappear sequences between sibling screens balance out.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletBottomOwned)) { note in
+            let owned = (note.userInfo?["owned"] as? Bool) ?? false
+            bottomOwners = max(0, bottomOwners + (owned ? 1 : -1))
         }
         // "Ask Scarlet about this email": the mail reader posts a notification;
         // this shell (which owns the conversation) switches to Talk and hands

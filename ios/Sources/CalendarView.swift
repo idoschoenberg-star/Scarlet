@@ -746,8 +746,18 @@ struct CalEventDetailView: View {
         .task { await fetch() }
         // Ambient focus: this event while the sheet is up; back to the agenda
         // on the way out — unless another screen already claimed focus.
-        .onAppear { convo.setFocus(eventFocus) }
+        .onAppear {
+            convo.setFocus(eventFocus)
+            // This sheet owns the bottom edge (Ask Scarlet / Delete footer) —
+            // the presence capsule must never float over it.
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": true])
+        }
         .onDisappear {
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": false])
             if convo.currentFocus == eventFocus {
                 convo.setFocus(calendarAgendaFocus)
             }

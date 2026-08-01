@@ -809,8 +809,18 @@ struct MailDetailView: View {
         // Ambient focus: this email while the reader is up; back to the list
         // on the way out — unless another screen (say, the Talk tab) already
         // claimed focus during the transition.
-        .onAppear { convo.setFocus(emailFocus) }
+        .onAppear {
+            convo.setFocus(emailFocus)
+            // This screen owns the bottom edge (Reply/Archive/Ask Scarlet
+            // bar) — the presence capsule must never float over it.
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": true])
+        }
         .onDisappear {
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": false])
             if convo.currentFocus == emailFocus {
                 convo.setFocus(inboxBrowsingFocus(model.tab))
             }

@@ -746,11 +746,21 @@ struct ChatThreadView: View {
         }
         // Ambient focus: this thread on appear, then RE-set after each load so
         // the "recent messages" lines reflect what's actually on screen.
-        .onAppear { convo.setFocus(threadFocus) }
+        .onAppear {
+            convo.setFocus(threadFocus)
+            // This screen owns the bottom edge (compose bar) — the presence
+            // capsule must never float over it.
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": true])
+        }
         .onChange(of: model.loadStamp) { _, _ in
             convo.setFocus(threadFocus)
         }
         .onDisappear {
+            NotificationCenter.default.post(name: .scarletBottomOwned,
+                                            object: nil,
+                                            userInfo: ["owned": false])
             model.stopPolling()
             // Voice-note hygiene: a closed thread never keeps playing audio.
             voicePlayer?.pause()
@@ -966,6 +976,11 @@ struct ChatThreadView: View {
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(channel.accent)
                 }
+                // Pin the button to the row's 36pt control height so the
+                // circle centers against the Scarlet pill and field instead
+                // of riding ~12pt high; the tiny caption overhangs evenly
+                // into the bar's paddings (never clipped, never overlapped).
+                .frame(height: 36)
             }
             .disabled(!canSend)
         } else {

@@ -6,6 +6,13 @@ import SwiftUI
 /// against it module-wide.
 extension Notification.Name {
     static let scarletDraftSheetVisible = Notification.Name("scarletDraftSheetVisible")
+    /// Bottom-edge ownership: screens whose OWN controls live at the bottom
+    /// edge (chat thread compose bar, mail reader action bar, calendar event
+    /// detail) post ["owned": true] on appear and false on disappear. RootView
+    /// COUNTS owners (not a bool — push/present/dismiss ordering is not LIFO)
+    /// and hides the presence capsule while any owner exists, so it can never
+    /// sit on top of a screen's own bottom controls.
+    static let scarletBottomOwned = Notification.Name("scarletBottomOwned")
 }
 
 /// The "Scarlet Presence": a floating capsule shown on every non-Talk tab.

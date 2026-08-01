@@ -418,6 +418,9 @@ struct DraftView: View {
         VStack(spacing: 14) {
             header
             content
+                // Keyboard avoidance squeezes the sheet's content; keep the
+                // draft card from collapsing into the header/footer.
+                .frame(minHeight: 120)
             footer
         }
         .padding(.horizontal, 20)
@@ -881,6 +884,9 @@ struct DraftView: View {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 30))
                     .foregroundStyle(canSendInput ? scarletRose : scarletRose.opacity(0.35))
+                    // Same 30pt box as the mic circle, so both flanking
+                    // controls bottom-align identically against the field.
+                    .frame(width: 30, height: 30)
             }
             .disabled(!canSendInput)
         }
