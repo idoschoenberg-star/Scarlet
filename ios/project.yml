@@ -16,6 +16,10 @@ settings:
     # CI creates the cert + this named profile via the ASC API before building.
     CODE_SIGN_STYLE: Manual
     CODE_SIGN_IDENTITY: "Apple Distribution"
+    # XcodeGen's setting presets inject CODE_SIGN_IDENTITY[sdk=iphoneos*] =
+    # "iPhone Developer"; the sdk-conditional form beats the plain one, so it
+    # must be overridden explicitly.
+    "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Distribution"
     PROVISIONING_PROFILE_SPECIFIER: "ScarletTalk AppStore"
     SWIFT_VERSION: "5.9"
 
