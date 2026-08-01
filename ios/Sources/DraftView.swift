@@ -402,11 +402,11 @@ struct DraftView: View {
     @EnvironmentObject private var convo: Conversation
     @State private var focusBeforeDraft: String?
 
+    /// The unified input row's text: pre-draft it's the INSTRUCTION, with a
+    /// draft on screen it's the revision ask.
     @State private var revisionText = ""
     @State private var newTo = ""
-    @State private var newInstruction = ""
     @FocusState private var revisionFocused: Bool
-    @FocusState private var newInstructionFocused: Bool
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
     private let scarletRed = Color(red: 0.75, green: 0.15, blue: 0.23)
@@ -428,6 +428,10 @@ struct DraftView: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .onAppear {
+            // Tell the shell a draft sheet is up (the presence capsule hides).
+            NotificationCenter.default.post(name: .scarletDraftSheetVisible,
+                                            object: nil,
+                                            userInfo: ["visible": true])
             if attachToActive {
                 model.attachToActive()
             } else if let channelSeed {
@@ -436,12 +440,22 @@ struct DraftView: View {
                 if !instr.isEmpty {
                     model.startChannelDraft(seed: channelSeed, instruction: instr)
                 }
-                // Empty ask → channelForm collects it first.
+                // Empty ask → the unified input row collects it.
             } else if let seed {
                 model.startReply(seed: seed, instruction: instruction)
             }
+            // Pre-draft focus: onChange won't fire for the initial value, so
+            // announce the open window here (channel / new-mail modes emit a
+            // line even before any draft exists).
+            if let line = draftFocusLine {
+                if focusBeforeDraft == nil { focusBeforeDraft = convo.currentFocus }
+                convo.setFocus(line)
+            }
         }
         .onDisappear {
+            NotificationCenter.default.post(name: .scarletDraftSheetVisible,
+                                            object: nil,
+                                            userInfo: ["visible": false])
             model.stopPolling()
             // Give her ears back whatever was focused before the window
             // opened — unless another screen already claimed focus.
@@ -467,12 +481,13 @@ struct DraftView: View {
         }
     }
 
-    /// One line per (draft id, revision) — nil until a draft is on screen.
-    /// Built deterministically (it feeds onChange): the seed fields are
-    /// constant for the sheet's lifetime, so the line only changes when the
-    /// draft itself does.
+    /// One line per (draft id, revision) — plus a pre-draft line in channel /
+    /// new-mail mode so the open window announces itself before any draft
+    /// exists. Built deterministically (it feeds onChange): the seed fields
+    /// are constant for the sheet's lifetime, so the line only changes when
+    /// the draft itself does.
     private var draftFocusLine: String? {
-        guard let d = model.draft else { return nil }
+        guard let d = model.draft else { return preDraftFocusLine }
         var line = "[FOCUS] A draft window is OPEN on Ido's screen.\n"
             + "channel: \(d.channel)\n"
             + "draft_id: \(d.id)\n"
@@ -487,6 +502,22 @@ struct DraftView: View {
         // Email grounding: what's being replied to, in one breath.
         if let seed {
             line += "\nreplying to: \(seed.fromName) — \(seed.subject)\npreview: \(seed.preview.prefix(200))"
+        }
+        return line
+    }
+
+    /// No draft yet: the open window itself is the focus — only in channel /
+    /// new-mail mode (email replies auto-compose on appear). Deterministic
+    /// for the sheet's lifetime, so it emits exactly once.
+    private var preDraftFocusLine: String? {
+        guard channelSeed != nil || (seed == nil && !attachToActive) else { return nil }
+        var line = "[FOCUS] A draft window is OPEN on Ido's screen.\n"
+            + "channel: \(channel)\n"
+            + "recipient: \(channelSeed?.recipient ?? "not chosen yet")\n"
+            + "NO draft started yet — his next words are the INSTRUCTION; "
+            + "call compose_draft for this channel and recipient."
+        if let cs = channelSeed, !cs.contextLines.isEmpty {
+            line += "\nconversation with \(cs.recipient):\n\(cs.contextLines)"
         }
         return line
     }
@@ -654,8 +685,9 @@ struct DraftView: View {
         } else if !model.errorText.isEmpty {
             errorRetry
         } else if channelSeed != nil {
-            // Channel-draft mode with no pre-typed ask: instruction first.
-            channelForm
+            // Channel-draft mode with no pre-typed ask: the unified input row
+            // below collects it — this is just the hint.
+            channelHint
         } else if seed == nil && !attachToActive && channelSeed == nil {
             newMailForm
         } else {
@@ -727,7 +759,8 @@ struct DraftView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    /// New-mail mode: who and what, then Scarlet writes.
+    /// New-mail mode: just the To field (with autocomplete) — the instruction
+    /// arrives through the unified input row below.
     private var newMailForm: some View {
         VStack(alignment: .leading, spacing: 14) {
             TextField("To — a name or an email address…", text: $newTo)
@@ -741,56 +774,26 @@ struct DraftView: View {
             if !suggestionRows.isEmpty {
                 suggestionList
             }
-            TextField("What should Scarlet write?", text: $newInstruction, axis: .vertical)
-                .lineLimit(2...5)
-                .padding(12)
-                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
-                .focused($newInstructionFocused)
-            Button {
-                model.startNewMail(recipient: newTo, instruction: newInstruction)
-            } label: {
-                Text("Start the draft")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(15)
-                    .background(scarletRed, in: RoundedRectangle(cornerRadius: 30))
-                    .foregroundStyle(.white)
-            }
-            .disabled(newTo.trimmingCharacters(in: .whitespaces).isEmpty)
-            .opacity(newTo.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
             Spacer()
         }
         .padding(.top, 6)
     }
 
-    /// Channel-draft mode, instruction-first: the recipient is fixed (the
-    /// chat this sheet was opened from), so there's no To field — just the
-    /// ask, then a channel-tinted start button.
-    private var channelForm: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            TextField("What should Scarlet say to \(channelSeed?.recipient ?? "them")?",
-                      text: $newInstruction, axis: .vertical)
-                .lineLimit(2...5)
-                .padding(12)
-                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
-                .focused($newInstructionFocused)
-            Button {
-                if let cs = channelSeed {
-                    model.startChannelDraft(seed: cs, instruction: newInstruction)
-                }
-            } label: {
-                Text("Start the draft")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(15)
-                    .background(badgeColor, in: RoundedRectangle(cornerRadius: 30))
-                    .foregroundStyle(.white)
-            }
-            .disabled(newInstruction.trimmingCharacters(in: .whitespaces).isEmpty)
-            .opacity(newInstruction.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
-            Spacer()
+    /// Channel-draft mode, no draft yet: the recipient is fixed (the chat
+    /// this sheet was opened from) — a simple hint points at the unified
+    /// input row below.
+    private var channelHint: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "waveform")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("Tell Scarlet what to say to \(channelSeed?.recipient ?? "them") — speak or type below")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
         }
-        .padding(.top, 6)
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// At most five rows on screen, like Outlook's dropdown.
@@ -832,59 +835,130 @@ struct DraftView: View {
     }
 
     /// Tap-to-fill: "Name <email>" lands in To, the list closes, and focus
-    /// hops to the instruction field — free typing stays just as valid.
+    /// hops to the unified input row — free typing stays just as valid.
     private func pickSuggestion(_ contact: DraftModel.Contact) {
         let line = contact.name.isEmpty
             ? contact.email
             : "\(contact.name) <\(contact.email)>"
         model.suggestionPicked(line)
         newTo = line
-        newInstructionFocused = true
+        revisionFocused = true
     }
 
-    // MARK: footer (revision bar + actions)
+    // MARK: footer (unified voice + text input row, present in ALL modes)
 
-    @ViewBuilder
     private var footer: some View {
-        if model.draft != nil {
-            VStack(spacing: 12) {
-                if !model.errorText.isEmpty {
-                    Text(model.errorText)
-                        .font(.footnote)
-                        .foregroundStyle(Color(red: 1, green: 0.45, blue: 0.45))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                HStack(spacing: 8) {
-                    TextField("Tell Scarlet what to change…", text: $revisionText, axis: .vertical)
-                        .lineLimit(1...4)
-                        .padding(10)
-                        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
-                        .focused($revisionFocused)
-                        .disabled(model.phase == .revising || model.phase == .approving || model.phase == .saved)
-                    Button {
-                        sendRevision()
-                    } label: {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 30))
-                            .foregroundStyle(canRevise ? scarletRose : scarletRose.opacity(0.35))
-                    }
-                    .disabled(!canRevise)
-                }
+        VStack(spacing: 12) {
+            if model.draft != nil && !model.errorText.isEmpty {
+                Text(model.errorText)
+                    .font(.footnote)
+                    .foregroundStyle(Color(red: 1, green: 0.45, blue: 0.45))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            inputRow
+            if model.draft != nil {
                 approveRow
             }
         }
     }
 
-    private var canRevise: Bool {
-        model.phase == .ready &&
-        !revisionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    /// THE drafting surface's one input row: [mic] [field] [send]. Pre-draft
+    /// the field carries the instruction; with a draft on screen it carries
+    /// the revision ask. The mic is the voice path to the same place —
+    /// Scarlet's focus + persona route speech as instruction or revision.
+    private var inputRow: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            micButton
+            TextField(inputPlaceholder, text: $revisionText, axis: .vertical)
+                .lineLimit(1...4)
+                .padding(10)
+                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .focused($revisionFocused)
+                .disabled(model.phase == .revising || model.phase == .approving || model.phase == .saved)
+            Button {
+                sendInput()
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 30))
+                    .foregroundStyle(canSendInput ? scarletRose : scarletRose.opacity(0.35))
+            }
+            .disabled(!canSendInput)
+        }
     }
 
-    private func sendRevision() {
-        guard canRevise else { return }
-        model.revise(revisionText)
+    private var inputPlaceholder: String {
+        model.draft == nil
+            ? "Speak or type what Scarlet should write…"
+            : "Speak or type your changes…"
+    }
+
+    private var canSendInput: Bool {
+        let text = revisionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return false }
+        if model.draft != nil { return model.phase == .ready }
+        // Pre-draft: only channel / new-mail mode can start a compose here
+        // (email replies and voice-attach are already in flight on appear).
+        guard model.phase == .idle else { return false }
+        if channelSeed != nil { return true }
+        if seed == nil && !attachToActive {
+            return !newTo.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        return false
+    }
+
+    private func sendInput() {
+        guard canSendInput else { return }
+        let text = revisionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.draft != nil {
+            model.revise(text)
+        } else if let cs = channelSeed {
+            model.startChannelDraft(seed: cs, instruction: text)
+        } else {
+            model.startNewMail(recipient: newTo, instruction: text)
+        }
         revisionText = ""
         revisionFocused = false
+    }
+
+    // MARK: mic (the sheet's ONE voice affordance)
+
+    /// Her ears are hot: mic open and not in text-only chat mode.
+    private var micIsHot: Bool {
+        convo.micOn && !convo.chatMode
+    }
+
+    private var micButton: some View {
+        Button {
+            micTapped()
+        } label: {
+            Image(systemName: micIsHot ? "mic.fill" : "mic.slash.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(micIsHot ? scarletRose : .white.opacity(0.6))
+                .frame(width: 30, height: 30)
+                .background(micIsHot ? scarletRose.opacity(0.18) : .white.opacity(0.08),
+                            in: Circle())
+                .overlay(Circle().stroke(micIsHot ? scarletRose.opacity(0.5) : .white.opacity(0.14),
+                                         lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Idle → wake her with the mic hot; live → exit chat mode toward voice,
+    /// or plain-toggle the mic. Speech then reaches Scarlet, whose focus +
+    /// persona route it as instruction or revision for THIS window.
+    private func micTapped() {
+        if convo.state == .idle {
+            convo.hasAutoStarted = true
+            convo.start(token: TokenStore.token ?? "")
+            if convo.chatMode { convo.setChatMode(false) }
+            if !convo.micOn { convo.toggleMic() }
+        } else if convo.chatMode {
+            // Leaving chat mode IS the voice ask — end with the mic hot.
+            convo.setChatMode(false)
+            if !convo.micOn { convo.toggleMic() }
+        } else {
+            convo.toggleMic()
+        }
     }
 
     private var approveRow: some View {

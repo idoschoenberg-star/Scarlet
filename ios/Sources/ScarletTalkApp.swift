@@ -27,6 +27,9 @@ struct RootView: View {
     @StateObject private var convo = Conversation()
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
+    /// True while ANY DraftView sheet is up (it broadcasts its visibility) —
+    /// the presence capsule hides so the sheet is the one Scarlet surface.
+    @State private var draftSheetVisible = false
 
     enum Tab: Hashable { case talk, inbox, calendar, chats }
 
@@ -58,13 +61,18 @@ struct RootView: View {
         // The Scarlet Presence: a floating capsule on every non-Talk tab so
         // her state and controls stay visible while Ido reads mail or chats.
         .overlay(alignment: .bottom) {
-            if tab != .talk {
+            if tab != .talk && !draftSheetVisible {
                 ScarletPresenceView(convo: convo, goToTalk: { tab = .talk })
                     .padding(.bottom, 58)   // floats above the tab bar
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: tab)
+        // Any DraftView sheet (voice-attach, reply, new-mail, channel) says
+        // when it's up; the capsule yields the screen to it.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
+            draftSheetVisible = (note.userInfo?["visible"] as? Bool) ?? false
+        }
         // "Ask Scarlet about this email": the mail reader posts a notification;
         // this shell (which owns the conversation) switches to Talk and hands
         // her the question — waking the conversation first if it isn't live.

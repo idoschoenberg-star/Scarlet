@@ -1,28 +1,41 @@
 import SwiftUI
 
-/// The "Scarlet Presence": a floating capsule shown on every non-Talk tab so
-/// her state (idle / waking / listening / speaking / chat mode) and the core
-/// controls are always one glance and one tap away. Idle → tap to wake her;
-/// live → mic, chat-mode and end controls; chat mode → a reply peek plus a
-/// text row, right there over the tab bar.
+/// Sheet-visibility broadcast: DraftView posts it on appear/disappear so the
+/// shell can hide this capsule while a drafting surface is up (one Scarlet
+/// entry per screen). Defined here — both DraftView and RootView compile
+/// against it module-wide.
+extension Notification.Name {
+    static let scarletDraftSheetVisible = Notification.Name("scarletDraftSheetVisible")
+}
+
+/// The "Scarlet Presence": a floating capsule shown on every non-Talk tab.
+/// Collapsed by default — just the orb and a status line. Idle → tap to wake
+/// her; live → tap to expand the mic / chat-mode / end controls (and, in
+/// chat mode, a reply peek plus a text row) right there over the tab bar.
 struct ScarletPresenceView: View {
     @ObservedObject var convo: Conversation
     var goToTalk: () -> Void
 
     @State private var pulsing = false
     @State private var draft = ""
+    /// Live-state controls are opt-in: a tap on the capsule opens them, the
+    /// conversation ending closes them again.
+    @State private var expanded = false
 
     private let scarlet = Color(red: 1, green: 0.35, blue: 0.42)
 
     var body: some View {
         VStack(spacing: 8) {
-            if convo.chatMode && convo.state != .idle {
+            if expanded && convo.chatMode && convo.state != .idle {
                 chatExpansion
             }
             capsuleBar
         }
         .frame(maxWidth: 360)
         .padding(.horizontal, 14)
+        .onChange(of: convo.state) { _, newState in
+            if newState == .idle { expanded = false }
+        }
     }
 
     // MARK: capsule
@@ -38,7 +51,11 @@ struct ScarletPresenceView: View {
             }
             .buttonStyle(.plain)
         } else {
+            // Live: the bar itself toggles the controls; the inner control
+            // buttons keep their own taps (child gestures win).
             barContent
+                .contentShape(Capsule())
+                .onTapGesture { expanded.toggle() }
         }
     }
 
@@ -50,7 +67,7 @@ struct ScarletPresenceView: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer(minLength: 0)
-            if convo.state != .idle {
+            if expanded && convo.state != .idle {
                 controls
             }
         }

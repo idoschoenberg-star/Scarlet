@@ -739,16 +739,6 @@ struct ChatThreadView: View {
         .background(ScarletBackground().ignoresSafeArea())
         .navigationTitle(chat.name)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    askScarlet()
-                } label: {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(channel.accent)
-                }
-            }
-        }
         // Refresh on appear, then the 20s heartbeat — only while visible.
         .task {
             await model.load()
@@ -993,10 +983,11 @@ struct ChatThreadView: View {
         }
     }
 
-    /// "Draft with Scarlet" — 30pt channel-tinted sparkles circle at the
-    /// bar's left. Whatever is typed rides along as the instruction (and the
-    /// field clears); nothing typed → the studio asks first. The last ~6
-    /// thread lines ride along too so the draft never loses its context.
+    /// "Scarlet" — the ONE Scarlet control on this screen: a compact labeled
+    /// pill at the bar's left, channel-tinted. Whatever is typed rides along
+    /// as the instruction (and the field clears); nothing typed → the studio
+    /// asks first. The last ~6 thread lines ride along too so the draft never
+    /// loses its context.
     private var scarletDraftButton: some View {
         Button {
             scarletDraft = ChannelDraftSeed(
@@ -1007,15 +998,19 @@ struct ChatThreadView: View {
             )
             composeText = ""
         } label: {
-            Image(systemName: "sparkles")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(channel.accent)
-                .frame(width: 30, height: 30)
-                .background(Circle().fill(channel.accent.opacity(0.18)))
-                .overlay(Circle().stroke(channel.accent.opacity(0.45), lineWidth: 1))
+            HStack(spacing: 5) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Scarlet")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundStyle(channel.accent)
+            .padding(.horizontal, 10)
+            .frame(height: 36)
+            .background(Capsule().fill(channel.accent.opacity(0.18)))
+            .overlay(Capsule().stroke(channel.accent.opacity(0.45), lineWidth: 1))
         }
         .disabled(model.sending)
-        .padding(.bottom, 3)
     }
 
     private var stagedCard: some View {
@@ -1074,17 +1069,6 @@ struct ChatThreadView: View {
             + "channel: \(channel.rawValue)\n"
             + "recent messages:\n"
             + recentLines.joined(separator: "\n")
-    }
-
-    /// "Ask Scarlet" (sparkles): hand this conversation to the live Talk tab —
-    /// the exact same bridge the mail reader uses.
-    private func askScarlet() {
-        let text = "Ido is looking at his \(channel.displayName) conversation with \(chat.name). "
-            + "Recent messages:\n"
-            + recentLines.joined(separator: "\n")
-            + "\nHe wants to ask: "
-        NotificationCenter.default.post(name: .scarletAskAboutEmail, object: nil,
-                                        userInfo: ["text": text])
     }
 }
 
