@@ -59,13 +59,40 @@ final class Conversation: ObservableObject {
     func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }
     func toggleSpeaker() { speakerOn.toggle(); player.volume = speakerOn ? 1 : 0 }
 
-    /// Loudspeaker ⇄ earpiece. Only touches the route when the phone itself is
-    /// playing — AirPods/CarPlay keep priority either way.
+    /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
+    /// "no override" still mean loudspeaker, so the category itself must flip
+    /// too. AirPods/CarPlay keep priority either way.
     func toggleLoudspeaker() {
         loudspeaker.toggle()
+        applyOutputRoute()
+    }
+
+    private func applyOutputRoute() {
         let s = AVAudioSession.sharedInstance()
-        if loudspeaker { routeToSpeakerIfReceiver() }
-        else { try? s.overrideOutputAudioPort(.none) }
+        let phoneIsOutput = s.currentRoute.outputs.allSatisfy {
+            $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
+        }
+        let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+        try? s.setCategory(.playAndRecord, mode: .voiceChat,
+                           options: loudspeaker ? base.union(.defaultToSpeaker) : base)
+        try? s.setActive(true)
+        if phoneIsOutput {
+            try? s.overrideOutputAudioPort(loudspeaker ? .speaker : .none)
+        }
+    }
+
+    // Dictation etiquette: while Ido types/dictates into the text row, her
+    // live ears close — otherwise Wispr's spoken dictation reaches the mic
+    // and she answers before he presses send.
+    private var micWasOnBeforeTyping = true
+    func beginTyping() {
+        micWasOnBeforeTyping = micOn
+        micOn = false
+        status = "Dictation mode — mic paused until you close the keyboard row"
+    }
+    func endTyping() {
+        micOn = micWasOnBeforeTyping
+        if micOn { status = "Listening…" }
     }
 
     /// Dictated/typed input: goes to her exactly like speech.

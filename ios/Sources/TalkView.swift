@@ -62,6 +62,7 @@ struct TalkView: View {
                 RoundControl(icon: "keyboard", label: "Type", off: false) {
                     showType.toggle()
                     typeFocused = showType
+                    if showType { convo.beginTyping() } else { convo.endTyping() }
                 }
             }
 
