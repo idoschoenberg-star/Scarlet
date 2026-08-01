@@ -18,6 +18,10 @@ final class Conversation: ObservableObject {
     @Published var speakerOn = true
     @Published var loudspeaker = true   // route: iPhone speaker vs. call earpiece
 
+    /// Set by TalkView on its first appearance so tab switches never
+    /// re-trigger the auto-connect. Not published — pure bookkeeping.
+    var hasAutoStarted = false
+
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
     private var token = ""

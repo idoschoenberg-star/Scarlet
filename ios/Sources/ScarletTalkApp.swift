@@ -9,13 +9,31 @@ struct ScarletTalkApp: App {
             ZStack {
                 ScarletBackground().ignoresSafeArea()
                 if session.unlocked {
-                    TalkView().environmentObject(session)
+                    RootView().environmentObject(session)
                 } else {
                     UnlockView().environmentObject(session)
                 }
             }
             .preferredColorScheme(.dark)
         }
+    }
+}
+
+/// Post-unlock shell: Talk and Inbox tabs. The conversation lives HERE, above
+/// the tabs, so switching to Inbox never tears down a live call — only the
+/// explicit End button (or the OS) ends it.
+struct RootView: View {
+    @StateObject private var convo = Conversation()
+
+    var body: some View {
+        TabView {
+            TalkView(convo: convo)
+                .background(ScarletBackground().ignoresSafeArea())
+                .tabItem { Label("Talk", systemImage: "waveform") }
+            InboxView()
+                .tabItem { Label("Inbox", systemImage: "envelope.fill") }
+        }
+        .tint(Color(red: 1, green: 0.35, blue: 0.42))
     }
 }
 

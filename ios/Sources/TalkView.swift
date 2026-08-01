@@ -3,7 +3,7 @@ import SwiftUI
 /// The one-pager: breathing orb, live transcript, Mic / Voice, big End button.
 struct TalkView: View {
     @EnvironmentObject var session: AppSession
-    @StateObject private var convo = Conversation()
+    @ObservedObject var convo: Conversation   // owned by RootView, survives tab switches
     @State private var showSettings = false
     @State private var showType = false
     @State private var typed = ""
@@ -15,6 +15,15 @@ struct TalkView: View {
                 Text("SCARLET").font(.system(size: 22, weight: .thin)).tracking(9)
                     .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
                 HStack {
+                    Link(destination: AppConfig.fullAppURL) {
+                        Image("ScarletMark")
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 30, height: 30)
+                            .clipShape(Circle())
+                            .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
+                    }
+                    .frame(width: 44, height: 44)
                     Spacer()
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
@@ -85,8 +94,15 @@ struct TalkView: View {
         }
         .padding(.horizontal, 24)
         .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
-        .onAppear { convo.start(token: TokenStore.token ?? "") }   // auto-connect: one press → talking
-        .onDisappear { convo.end() }
+        // Auto-connect ONCE per app session: one press → talking. Coming back
+        // from the Inbox tab must not restart (or end) a conversation — the
+        // End button is the only way to hang up.
+        .onAppear {
+            if convo.state == .idle && !convo.hasAutoStarted {
+                convo.hasAutoStarted = true
+                convo.start(token: TokenStore.token ?? "")
+            }
+        }
     }
 }
 
