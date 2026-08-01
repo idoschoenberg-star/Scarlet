@@ -1,0 +1,22 @@
+name: ASC status check
+on:
+  workflow_dispatch:
+    inputs:
+      asc_issuer:     { description: "App Store Connect Issuer ID", required: true }
+      asc_key_id:     { description: "ASC Key ID", required: true }
+      asc_key_p8_b64: { description: "ASC .p8 key, base64", required: true }
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Query TestFlight status
+        env:
+          ASC_ISSUER: ${{ inputs.asc_issuer }}
+          ASC_KEY_ID: ${{ inputs.asc_key_id }}
+          ASC_P8_PATH: ${{ runner.temp }}/asc.p8
+        run: |
+          printf '%s' "${{ inputs.asc_key_p8_b64 }}" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          node ios/ci/status.js
