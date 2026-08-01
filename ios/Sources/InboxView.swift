@@ -901,7 +901,7 @@ struct MailDetailView: View {
                     try data.write(to: url, options: .atomic)
                     previewFile = PreviewFile(url: url)
                 case .link(let url):
-                    UIApplication.shared.open(url)
+                    UIApplication.shared.open(url, options: [:], completionHandler: nil)
                 case .failure(let text):
                     attachmentError = text
                 }
@@ -1157,7 +1157,7 @@ struct MailBodyView: UIViewRepresentable {
                 if let url = navigationAction.request.url,
                    let scheme = url.scheme?.lowercased(),
                    ["http", "https", "mailto", "tel"].contains(scheme) {
-                    UIApplication.shared.open(url)
+                    UIApplication.shared.open(url, options: [:], completionHandler: nil)
                 }
                 decisionHandler(.cancel)
                 return

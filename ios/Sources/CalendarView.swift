@@ -629,7 +629,7 @@ struct CalEventRow: View {
             Spacer(minLength: 8)
             if let joinURL, Calendar.current.isDateInToday(event.start) {
                 Button {
-                    UIApplication.shared.open(joinURL)
+                    UIApplication.shared.open(joinURL, options: [:], completionHandler: nil)
                 } label: {
                     Text("Join")
                         .font(.system(size: 14, weight: .semibold))
@@ -792,7 +792,7 @@ struct CalEventDetailView: View {
     private var joinButton: some View {
         if let join = event.join, let url = URL(string: join) {
             Button {
-                UIApplication.shared.open(url)
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "video.fill")
