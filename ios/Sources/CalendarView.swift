@@ -353,6 +353,8 @@ struct CalendarView: View {
     @State private var selectedDay = Calendar.current.startOfDay(for: Date())
     @State private var weekAnchor = calStartOfWeek(Date())
     @State private var sheetEvent: CalEvent?
+    /// One jump-to-today per tab appearance — re-armed in onAppear.
+    @State private var didInitialJump = false
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -364,19 +366,38 @@ struct CalendarView: View {
             .background(ScarletBackground().ignoresSafeArea())
             // .task re-runs on tab select; foreground return refreshes too.
             // Every open lands the agenda on TODAY — the range starts a week
-            // back, so without this jump the list opens on past days.
+            // back, so without this jump the list opens on past days. The
+            // jump retries after layout settles AND re-fires when the data
+            // lands (List rows aren't scrollable the instant state updates).
             .task {
                 await model.load()
-                try? await Task.sleep(nanoseconds: 60_000_000)
-                goToToday(proxy, animated: false)
+                for delayMs in [80, 400, 1000] where !didInitialJump {
+                    try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+                    if !model.days.isEmpty {
+                        goToToday(proxy, animated: false)
+                        didInitialJump = true
+                    }
+                }
+            }
+            .onChange(of: model.days.count) { _, count in
+                guard !didInitialJump, count > 0 else { return }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    goToToday(proxy, animated: false)
+                    didInitialJump = true
+                }
             }
             .onReceive(NotificationCenter.default.publisher(
                 for: UIApplication.willEnterForegroundNotification)) { _ in
                 Task { await model.load() }
             }
         }
-        // Ambient focus: the agenda reports itself whenever it's on screen.
-        .onAppear { convo.setFocus(calendarAgendaFocus) }
+        // Ambient focus: the agenda reports itself whenever it's on screen —
+        // and each re-entry re-arms the jump-to-today.
+        .onAppear {
+            didInitialJump = false
+            convo.setFocus(calendarAgendaFocus)
+        }
         .sheet(item: $sheetEvent) { event in
             CalEventDetailView(event: event, model: model)
                 .preferredColorScheme(.dark)

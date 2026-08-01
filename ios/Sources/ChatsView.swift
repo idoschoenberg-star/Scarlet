@@ -98,6 +98,9 @@ struct ChatMessage: Identifiable {
     /// Teams `from` / WhatsApp `sender`; empty for iMessage and own messages.
     let sender: String
     let text: String
+    /// WhatsApp photo messages: signed https image URL from `media_url`
+    /// (valid ~1h). Always nil for Teams / iMessage.
+    let mediaURL: URL?
 }
 
 // MARK: - Dates
@@ -301,12 +304,16 @@ final class ChatThreadModel: ObservableObject {
                 case .whatsapp: sender = (m["sender"] as? String) ?? ""
                 case .imessage: sender = ""
                 }
+                // Photo messages (WhatsApp today): tolerate absence — the key
+                // simply isn't there for text messages or other channels.
+                let mediaString = (m["media_url"] as? String) ?? ""
                 return ChatMessage(
                     id: index,
                     ts: ChatDates.parse(m["ts"]),
                     fromMe: (m["from_me"] as? Bool) ?? false,
                     sender: sender,
-                    text: (m["text"] as? String) ?? ""
+                    text: (m["text"] as? String) ?? "",
+                    mediaURL: mediaString.isEmpty ? nil : URL(string: mediaString)
                 )
             }
             guard generation == loadGeneration else { return }
@@ -387,7 +394,8 @@ final class ChatThreadModel: ObservableObject {
 
     private func appendLocal(_ text: String) {
         messages.append(ChatMessage(id: messages.count, ts: Date(),
-                                    fromMe: true, sender: "", text: text))
+                                    fromMe: true, sender: "", text: text,
+                                    mediaURL: nil))
         loadStamp += 1
     }
 
@@ -690,6 +698,8 @@ struct ChatThreadView: View {
     @EnvironmentObject private var convo: Conversation
     @State private var composeText = ""
     @FocusState private var composeFocused: Bool
+    /// WhatsApp photo bubbles: tapped image → full-screen viewer sheet.
+    @State private var photoItem: WAPhotoItem?
 
     init(channel: ChatChannel, chat: ChatSummary) {
         self.channel = channel
@@ -740,6 +750,10 @@ struct ChatThreadView: View {
         // close while Ido types/dictates into the compose field.
         .onChange(of: composeFocused) { _, focused in
             if focused { convo.beginTyping() } else { convo.endTyping() }
+        }
+        // WhatsApp photo bubbles: tap → full-screen viewer.
+        .sheet(item: $photoItem) { item in
+            WAPhotoView(item: item)
         }
     }
 
@@ -804,7 +818,8 @@ struct ChatThreadView: View {
             TeamsMessageCell(message: m, accent: channel.accent)
         case .whatsapp:
             WhatsAppBubble(message: m,
-                           showSender: item.showSender && chat.isGroup)
+                           showSender: item.showSender && chat.isGroup,
+                           onImageTap: { url in photoItem = WAPhotoItem(url: url) })
         case .imessage:
             IMessageBubble(message: m)
         }
@@ -1031,6 +1046,8 @@ struct TeamsMessageCell: View {
 struct WhatsAppBubble: View {
     let message: ChatMessage
     let showSender: Bool
+    /// Photo bubbles only: the thread view presents the full-screen viewer.
+    var onImageTap: ((URL) -> Void)? = nil
 
     private static let outgoing = Color(red: 0.0, green: 0.36, blue: 0.25)
     private static let incoming = Color.white.opacity(0.10)
@@ -1047,35 +1064,161 @@ struct WhatsAppBubble: View {
                alignment: message.fromMe ? .trailing : .leading)
     }
 
+    /// The asymmetric-tail WhatsApp corner treatment, shared by the bubble
+    /// background and the photo clip so the image hugs the same shape.
+    private var bubbleShape: UnevenRoundedRectangle {
+        UnevenRoundedRectangle(
+            topLeadingRadius: 18,
+            bottomLeadingRadius: message.fromMe ? 18 : 4,
+            bottomTrailingRadius: message.fromMe ? 4 : 18,
+            topTrailingRadius: 18
+        )
+    }
+
+    @ViewBuilder
     private var bubble: some View {
+        if let url = message.mediaURL {
+            mediaBubble(url)
+        } else {
+            textBubble
+        }
+    }
+
+    private var textBubble: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if showSender && !message.sender.isEmpty {
-                Text(message.sender)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(chatSenderColor(message.sender))
-                    .lineLimit(1)
-            }
+            senderLine
             Text(message.text)
                 .font(.system(size: 16))
                 .foregroundStyle(.white)
-            if let ts = message.ts {
-                Text(ChatTimeFormat.time.string(from: ts))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.55))
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
+            timeLine
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(
-            message.fromMe ? Self.outgoing : Self.incoming,
-            in: UnevenRoundedRectangle(
-                topLeadingRadius: 18,
-                bottomLeadingRadius: message.fromMe ? 18 : 4,
-                bottomTrailingRadius: message.fromMe ? 4 : 18,
-                topTrailingRadius: 18
-            )
-        )
+        .background(message.fromMe ? Self.outgoing : Self.incoming,
+                    in: bubbleShape)
+    }
+
+    /// Photo bubble: tight 3pt padding around the image; optional caption
+    /// under it in the same bubble; same background/corner treatment.
+    private func mediaBubble(_ url: URL) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            senderLine
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image
+                        .resizable()
+                        .scaledToFill()
+                        .frame(maxWidth: 230, maxHeight: 300)
+                        .clipped()
+                        .clipShape(bubbleShape)
+                } else if phase.error != nil {
+                    mediaPlaceholder(height: 80, loading: false)
+                } else {
+                    mediaPlaceholder(height: 200, loading: true)
+                }
+            }
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.system(size: 16))
+                    .foregroundStyle(.white)
+                    .padding(.top, 2)
+                    .padding(.horizontal, 4)
+            }
+            timeLine
+        }
+        .padding(3)
+        .background(message.fromMe ? Self.outgoing : Self.incoming,
+                    in: bubbleShape)
+        .contentShape(bubbleShape)
+        .onTapGesture { onImageTap?(url) }
+    }
+
+    private func mediaPlaceholder(height: CGFloat, loading: Bool) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color.white.opacity(0.08))
+            if loading {
+                ProgressView()
+                    .tint(.white.opacity(0.7))
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+        }
+        .frame(width: 230, height: height)
+    }
+
+    @ViewBuilder
+    private var senderLine: some View {
+        if showSender && !message.sender.isEmpty {
+            Text(message.sender)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(chatSenderColor(message.sender))
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private var timeLine: some View {
+        if let ts = message.ts {
+            Text(ChatTimeFormat.time.string(from: ts))
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.55))
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+}
+
+// MARK: - WhatsApp full-screen photo viewer
+
+/// Identifiable wrapper so `.sheet(item:)` can drive the viewer off a URL.
+/// (Distinct from InboxView's PreviewFile/QuickLookPreview attachment names.)
+struct WAPhotoItem: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+/// Full-screen photo sheet: image scaledToFit on black, xmark to dismiss.
+struct WAPhotoView: View {
+    let item: WAPhotoItem
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Color.black.ignoresSafeArea()
+            AsyncImage(url: item.url) { phase in
+                if let image = phase.image {
+                    image
+                        .resizable()
+                        .scaledToFit()
+                } else if phase.error != nil {
+                    VStack(spacing: 8) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 36))
+                        Text("Couldn't load this photo")
+                            .font(.footnote)
+                    }
+                    .foregroundStyle(.white.opacity(0.55))
+                } else {
+                    ProgressView()
+                        .tint(.white)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(.white.opacity(0.15)))
+            }
+            .padding(.top, 12)
+            .padding(.trailing, 16)
+        }
     }
 }
 
