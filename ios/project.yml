@@ -64,6 +64,15 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         UIBackgroundModes: [audio]
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        # Hands-free launch via the "Talk to Scarlet" App Intent. Pure AppIntents
+        # need NO com.apple.developer.siri entitlement (that would require the
+        # provisioning profile to carry it, breaking CI signing) — only this
+        # plist string, plus an alternate app name so Siri hears "Scarlet" even
+        # though the app's display name is "Talk".
+        NSSiriUsageDescription: 'Scarlet uses Siri so you can start a hands-free conversation by voice — just say "Talk to Scarlet".'
+        INAlternativeAppNames:
+          - INAlternativeAppNameKey: Scarlet
+            INAlternativeAppNamePronunciationHintKey: Scarlet
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
         NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."

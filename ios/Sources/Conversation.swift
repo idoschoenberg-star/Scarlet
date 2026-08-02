@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Combine
+import UIKit   // background-task assertion so the car session survives a locked screen
 
 /// Native ElevenLabs conversational client. Same protocol the web app speaks,
 /// but over a real AVAudioSession so the conversation never stalls: it keeps
@@ -18,6 +19,10 @@ final class Conversation: ObservableObject {
     @Published var speakerOn = true
     @Published var loudspeaker = true   // route: iPhone speaker vs. call earpiece
     @Published var chatMode = false     // text-only: ears closed, voice silent
+    /// True while the live route output is a car (CarPlay / car Bluetooth):
+    /// hands-free AND eyes-free. Drives the one-time "driving mode" nudge to
+    /// the assistant and is available to the UI. Route-derived, not session.
+    @Published var drivingMode = false
 
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
@@ -35,6 +40,13 @@ final class Conversation: ObservableObject {
     /// A rebuilt socket is a brand-new ElevenLabs conversation with amnesia —
     /// flag it so she's told this is a continuation, not a fresh caller.
     private var resumedSession = false
+
+    /// Background-task assertion held while a live session is backgrounded.
+    /// UIBackgroundModes:[audio] keeps the engine alive while audio plays, but
+    /// this assertion bridges the quiet gaps (nobody speaking) so iOS doesn't
+    /// suspend the socket the moment the screen locks in the car. `.invalid`
+    /// when none is held.
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
     // Running as an iOS app on an Apple-Silicon Mac. Apple's voice-processing
     // audio modes (.voiceChat/.videoChat) engage the AEC I/O unit, which cannot
@@ -86,8 +98,27 @@ final class Conversation: ObservableObject {
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
+        endBackgroundAssertion()
         state = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
+    }
+
+    // MARK: background survival (locked screen in the car)
+
+    /// Take a background-task assertion so a live, backgrounded session isn't
+    /// suspended in a silent gap. Idempotent; the expiration handler releases
+    /// it (the audio background mode still keeps us alive while she speaks).
+    private func beginBackgroundAssertion() {
+        guard bgTask == .invalid else { return }
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "ScarletLiveSession") { [weak self] in
+            Task { @MainActor in self?.endBackgroundAssertion() }
+        }
+    }
+
+    private func endBackgroundAssertion() {
+        guard bgTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(bgTask)
+        bgTask = .invalid
     }
 
     func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }
@@ -196,6 +227,31 @@ final class Conversation: ObservableObject {
         send(["type": "contextual_update", "text": text ?? "[FOCUS] Nothing focused."])
     }
 
+    // MARK: car / eyes-free driving mode
+
+    /// Re-derive `drivingMode` from the live route and, when appropriate, tell
+    /// the assistant once. Called from the route-change observer (announce only
+    /// on the transition INTO a car) and from `connect()` with
+    /// `forceAnnounce: true` (a fresh or rebuilt socket has amnesia, so re-tell
+    /// it if we're already on a car route).
+    private func evaluateDrivingMode(forceAnnounce: Bool = false) {
+        let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let isCar = outs.contains { $0.portType == .carAudio }
+        let becameCar = isCar && !drivingMode
+        drivingMode = isCar
+        if isCar && (becameCar || forceAnnounce) { announceDrivingMode() }
+    }
+
+    /// A single non-interrupting `contextual_update` marking eyes-free driving —
+    /// same channel as ambient focus, so it never counts as a user turn. Orients
+    /// her to speak everything aloud, one item at a time, and never point at the
+    /// screen.
+    private func announceDrivingMode() {
+        guard state == .listening || state == .speaking else { return }
+        send(["type": "contextual_update",
+              "text": "[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action."])
+    }
+
     // MARK: signed URL + socket
 
     private func connect() async {
@@ -231,6 +287,10 @@ final class Conversation: ObservableObject {
                 send(["type": "contextual_update",
                       "text": "[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent])
             }
+            // Car / eyes-free: now that we're connected, re-check the live route.
+            // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
+            // driving mode if we're already on a car route.
+            evaluateDrivingMode(forceAnnounce: true)
         } catch {
             if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }
@@ -507,7 +567,25 @@ final class Conversation: ObservableObject {
             Task { @MainActor in
                 if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
                 if self.wantLive { self.routeToSpeakerIfReceiver() }
+                // Plugging into (or out of) the car flips eyes-free driving mode;
+                // announce only on the transition INTO a car.
+                self.evaluateDrivingMode()
             }
+        }
+        // Background survival: take the assertion when a live session goes to the
+        // background (screen lock in the car), release it on return — the next
+        // background re-takes it. Audio is untouched here; this only guards the
+        // socket/engine against suspension in silent gaps.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wantLive else { return }
+                self.beginBackgroundAssertion()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.endBackgroundAssertion() }
         }
     }
 }

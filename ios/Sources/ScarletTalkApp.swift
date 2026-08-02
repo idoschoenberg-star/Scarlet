@@ -60,6 +60,12 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .scarletGoToTalk)) { _ in
             tab = .talk
         }
+        // "Hey Siri, Talk to Scarlet" (App Intent): wake the live conversation.
+        // Warm launch (app already running) arrives here via the notification;
+        // the cold-launch case is drained in .onAppear below.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletStartFromIntent)) { _ in
+            startFromIntent()
+        }
         // "Ask Scarlet about this email": the mail reader posts a notification;
         // this shell (which owns the conversation) switches to Talk and hands
         // her the question — waking the conversation first if it isn't live.
@@ -98,6 +104,9 @@ struct RootView: View {
             FlightRecorder.reportUncleanExitIfAny()
             FlightRecorder.note(screen: "talk")
             Task { await recoverActiveDraft() }
+            // Cold-launch "Talk to Scarlet": the intent may have fired before
+            // the observer above was listening, so drain the pending flag once.
+            if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
         }
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
@@ -164,6 +173,16 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Desk", systemImage: "checklist") }
                 .tag(Tab.desk)
+        }
+    }
+
+    /// Wake the conversation from the "Talk to Scarlet" App Intent — switch to
+    /// Talk and start a session if one isn't already live.
+    private func startFromIntent() {
+        tab = .talk
+        if convo.state == .idle {
+            convo.hasAutoStarted = true
+            convo.start(token: TokenStore.token ?? "")
         }
     }
 
