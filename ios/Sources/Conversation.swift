@@ -49,6 +49,13 @@ final class Conversation: ObservableObject {
     /// flag it so she's told this is a continuation, not a fresh caller.
     private var resumedSession = false
 
+    /// User messages entered before the socket was live (session idle or still
+    /// connecting). `send(_:)` is a no-op against a nil socket, so anything typed
+    /// or dictated while she's asleep would silently vanish — these are held here
+    /// and flushed exactly once by `flushPendingOutbound()` from `connect()`, the
+    /// moment the socket goes live. Main-actor confined, so it can't race the flush.
+    private var pendingOutbound: [String] = []
+
     /// Background-task assertion held while a live session is backgrounded.
     /// UIBackgroundModes:[audio] keeps the engine alive while audio plays, but
     /// this assertion bridges the quiet gaps (nobody speaking) so iOS doesn't
@@ -102,6 +109,7 @@ final class Conversation: ObservableObject {
 
     func end() {
         wantLive = false
+        pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -198,20 +206,60 @@ final class Conversation: ObservableObject {
         if micOn { status = "Listening…" }
     }
 
-    /// Dictated/typed input: goes to her exactly like speech.
+    /// Dictated/typed input: goes to her exactly like speech. The transcript
+    /// bubble appears immediately; if the session is asleep or still connecting
+    /// the message is queued and the session is woken, so nothing is dropped on
+    /// a nil socket — the queue flushes the instant the socket is live.
     func sendText(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         transcript.append(.init(text: t, fromHer: false))
-        send(["type": "user_message", "text": t])
+        deliverUserMessage(t)
     }
 
     /// A system-initiated turn: reaches her like a user message (so she
     /// SPEAKS, unlike contextual updates) but never shows in the transcript —
     /// used for proactive moments like announcing a recovered draft.
-    func sendSystemNudge(_ text: String) {
-        guard state == .listening || state == .speaking else { return }
-        send(["type": "user_message", "text": text])
+    ///
+    /// `ensureLive` decides what happens when she's asleep: the default `false`
+    /// keeps the old fire-only-if-already-live behavior (a launch-time draft
+    /// recovery must not force a full voice session up on its own); pass `true`
+    /// when the nudge MUST reach her even from idle — e.g. a freshly shared
+    /// photo/document — in which case it wakes the session and flushes on connect.
+    func sendSystemNudge(_ text: String, ensureLive: Bool = false) {
+        if ensureLive {
+            deliverUserMessage(text)
+        } else {
+            guard state == .listening || state == .speaking else { return }
+            send(["type": "user_message", "text": text])
+        }
+    }
+
+    /// Deliver a `user_message` to the live socket, or bring the session up and
+    /// hold the text until it is. Sending directly only when already live means
+    /// we never write to a nil `ws`; `flushPendingOutbound()` drains the queue
+    /// once from `connect()`. Confined to the main actor, so enqueue and flush
+    /// can't race, and an already-live send is never also queued (no double-send).
+    private func deliverUserMessage(_ text: String) {
+        switch state {
+        case .listening, .speaking:
+            send(["type": "user_message", "text": text])
+        case .connecting:
+            pendingOutbound.append(text)
+        case .idle:
+            pendingOutbound.append(text)
+            start(token: TokenStore.token ?? "")
+        }
+    }
+
+    /// Send everything queued while the socket was down, exactly once, in order.
+    /// Called from `connect()` after the socket is live and initial context has
+    /// been replayed, so queued turns land after her focus/continuation setup.
+    private func flushPendingOutbound() {
+        guard !pendingOutbound.isEmpty else { return }
+        let queued = pendingOutbound
+        pendingOutbound.removeAll()
+        for text in queued { send(["type": "user_message", "text": text]) }
     }
 
     /// Her most recent line — surfaced by the floating presence capsule.
@@ -268,7 +316,9 @@ final class Conversation: ObservableObject {
             let (data, _) = try await URLSession.shared.data(for: req)
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let signed = obj?["signed_url"] as? String, let url = URL(string: signed) else {
-                status = "Couldn't start — try again."; state = .idle; wantLive = false; return
+                status = "Couldn't start — try again."; state = .idle; wantLive = false
+                pendingOutbound.removeAll()   // no session is coming — don't replay stale text later
+                return
             }
             try ensureAudio()
             let task = wsSession.webSocketTask(with: url)
@@ -297,6 +347,9 @@ final class Conversation: ObservableObject {
             // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
             // driving mode if we're already on a car route.
             evaluateDrivingMode(forceAnnounce: true)
+            // Socket is live and context is replayed — deliver anything typed,
+            // dictated, or shared while she was asleep/connecting. Exactly once.
+            flushPendingOutbound()
         } catch {
             if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }

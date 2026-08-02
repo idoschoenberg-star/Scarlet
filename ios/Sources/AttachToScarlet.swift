@@ -143,9 +143,11 @@ struct AttachToScarletButton: View {
                 // Ambient focus: sticks even if the conversation isn't live
                 // yet — a later connect replays it.
                 convo.setFocus("[FOCUS] Ido just shared a document with you: \(title) (\(kindWord)). Use analyze_document to read it — it is ALREADY uploaded; do not ask him to send it again.")
-                // Spoken acknowledgement — sendSystemNudge itself no-ops
-                // unless the conversation is live.
-                convo.sendSystemNudge("[SYSTEM] Ido just uploaded \(title). Acknowledge in a few words that you have it and ask what he'd like you to do with it — unless he already told you, in which case call analyze_document now.")
+                // Spoken acknowledgement. ensureLive:true wakes the session if
+                // she's asleep and queues this so it lands the moment the socket
+                // is live — otherwise a photo shared from an idle Talk screen
+                // uploads but she never says a word about it (the old no-op).
+                convo.sendSystemNudge("[SYSTEM] Ido just uploaded \(title). Acknowledge in a few words that you have it and ask what he'd like you to do with it — unless he already told you, in which case call analyze_document now.", ensureLive: true)
             } catch let error as AttachUploadError {
                 alertMessage = error.text
                 showAlert = true

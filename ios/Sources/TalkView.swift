@@ -84,7 +84,8 @@ struct TalkView: View {
                              label: "Voice", off: !convo.speakerOn) { convo.toggleSpeaker() }
                 RoundControl(icon: convo.loudspeaker ? "speaker.wave.3.fill" : "ear.fill",
                              label: "Speaker", off: !convo.loudspeaker) { convo.toggleLoudspeaker() }
-                RoundControl(icon: "keyboard", label: "Type", off: false) {
+                RoundControl(icon: showType ? "keyboard.chevron.compact.down" : "keyboard",
+                             label: "Type", off: showType) {
                     showType.toggle()
                     typeFocused = showType
                     if showType { convo.beginTyping() } else { convo.endTyping() }
