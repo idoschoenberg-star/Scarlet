@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Scarlet for Outlook</title>
+<style>
+  body { background:#160507; color:#fff; margin:0; padding:40px 24px;
+         font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  .wrap { max-width:640px; margin:0 auto; }
+  .logo { width:16px; height:16px; border-radius:50%; background:#ff5a6b;
+          box-shadow:0 0 18px rgba(255,90,107,.65); margin-bottom:18px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .tag { color:rgba(255,255,255,.6); margin:0 0 26px; }
+  code { display:block; background:rgba(255,255,255,.07); border:1px solid rgba(255,90,107,.3);
+         border-radius:8px; padding:12px 14px; margin:10px 0 26px; word-break:break-all;
+         font-size:13px; color:#ff9aa6; }
+  h2 { font-size:14px; margin:22px 0 8px; color:#ff5a6b; }
+  ol { margin:0; padding-left:20px; color:rgba(255,255,255,.8); line-height:1.7; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo"></div>
+  <h1>Scarlet for Outlook</h1>
+  <p class="tag">Scarlet sees what you're reading.</p>
+  <p>Add-in manifest URL — paste it into Outlook's <b>Add from URL</b>:</p>
+  <code>https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/manifest.xml</code>
+  <h2>Outlook on the web / new Outlook</h2>
+  <ol>
+    <li>Open any message &rarr; <b>&hellip;</b> (more actions) &rarr; <b>Get add-ins</b> (or Apps &rarr; Add apps).</li>
+    <li><b>My add-ins</b> &rarr; <b>Custom Addins</b> &rarr; <b>Add a custom add-in</b> &rarr; <b>Add from URL</b>.</li>
+    <li>Paste the manifest URL above and confirm.</li>
+  </ol>
+  <h2>Outlook for Mac</h2>
+  <ol>
+    <li>Add-ins installed via the web flow appear here automatically (same mailbox).</li>
+    <li>Open a message &rarr; <b>&hellip;</b> &rarr; <b>Scarlet</b> &rarr; pin the pane.</li>
+  </ol>
+  <h2>First run</h2>
+  <ol>
+    <li>Open the Scarlet pane on any message.</li>
+    <li>Enter your unlock code once — pairing roams with the mailbox.</li>
+    <li>Pin the pane. Done: Scarlet follows your reading everywhere.</li>
+  </ol>
+</div>
+</body>
+</html>

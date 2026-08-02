@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Scarlet</title>
+<script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+<style>
+  html, body { margin:0; padding:0; height:100%; }
+  body {
+    background:#160507; color:#fff;
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size:14px; -webkit-font-smoothing:antialiased;
+  }
+  .view { display:none; padding:26px 20px; text-align:center; }
+  .logo { width:14px; height:14px; border-radius:50%; background:#ff5a6b;
+          margin:14px auto 18px; box-shadow:0 0 18px rgba(255,90,107,.65); }
+  h1 { font-size:15px; font-weight:600; margin:0 0 6px; letter-spacing:.2px; }
+  p  { margin:6px 0; color:rgba(255,255,255,.72); line-height:1.45; }
+  input[type=password], input[type=text] {
+    width:100%; box-sizing:border-box; margin-top:16px; padding:11px 12px;
+    background:rgba(255,255,255,.06); border:1px solid rgba(255,90,107,.35);
+    border-radius:8px; color:#fff; font-size:14px; outline:none; text-align:center;
+  }
+  input:focus { border-color:#ff5a6b; }
+  button {
+    width:100%; margin-top:12px; padding:11px 12px; border:none; border-radius:8px;
+    background:#ff5a6b; color:#160507; font-size:14px; font-weight:600; cursor:pointer;
+  }
+  button:disabled { opacity:.55; }
+  .err { color:#ff5a6b; font-size:12px; min-height:16px; margin-top:10px; }
+  .subj { color:#fff; font-weight:600; font-size:14px; margin-top:18px;
+          word-wrap:break-word; overflow-wrap:break-word; }
+  .sender { color:rgba(255,255,255,.55); font-size:12px; margin-top:2px; }
+  .when { color:rgba(255,255,255,.38); font-size:11px; margin-top:10px; }
+  .dot { display:none; width:8px; height:8px; border-radius:50%; background:#ff2233;
+         margin:10px auto 0; box-shadow:0 0 8px rgba(255,34,51,.8); }
+  .unpair { display:inline-block; margin-top:26px; color:rgba(255,90,107,.7);
+            font-size:11px; text-decoration:none; border-bottom:1px dotted rgba(255,90,107,.4); }
+</style>
+</head>
+<body>
+
+<div id="pairView" class="view">
+  <div class="logo"></div>
+  <h1>Scarlet</h1>
+  <p>Enter your unlock code to pair this mailbox.</p>
+  <input id="codeInput" type="password" placeholder="Unlock code" autocomplete="off"/>
+  <button id="pairBtn">Pair</button>
+  <div id="pairErr" class="err"></div>
+</div>
+
+<div id="watchView" class="view">
+  <div class="logo"></div>
+  <h1>Scarlet is watching this mailbox with you</h1>
+  <div id="subj" class="subj">&mdash;</div>
+  <div id="sender" class="sender"></div>
+  <div id="when" class="when"></div>
+  <div id="dot" class="dot"></div>
+  <a id="unpairLink" class="unpair" href="#">Unpair</a>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var API = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1/app-api";
+  var TOKEN_KEY = "scarletToken";
+  var token = null;
+  var lastSig = null;
+  var watching = false;
+
+  function el(id) { return document.getElementById(id); }
+  function show(id) {
+    el("pairView").style.display = "none";
+    el("watchView").style.display = "none";
+    el(id).style.display = "block";
+  }
+
+  // -- token storage: roamingSettings (roams with the mailbox) + localStorage
+  function loadToken() {
+    var t = null;
+    try {
+      if (Office.context && Office.context.roamingSettings) {
+        t = Office.context.roamingSettings.get(TOKEN_KEY) || null;
+      }
+    } catch (e) { /* ignore */ }
+    if (!t) {
+      try { t = window.localStorage.getItem(TOKEN_KEY) || null; } catch (e2) { /* ignore */ }
+    }
+    return t;
+  }
+  function saveToken(t) {
+    try {
+      if (Office.context && Office.context.roamingSettings) {
+        Office.context.roamingSettings.set(TOKEN_KEY, t);
+        Office.context.roamingSettings.saveAsync(function () {});
+      }
+    } catch (e) { /* ignore */ }
+    try { window.localStorage.setItem(TOKEN_KEY, t); } catch (e2) { /* ignore */ }
+  }
+  function clearToken() {
+    try {
+      if (Office.context && Office.context.roamingSettings) {
+        Office.context.roamingSettings.remove(TOKEN_KEY);
+        Office.context.roamingSettings.saveAsync(function () {});
+      }
+    } catch (e) { /* ignore */ }
+    try { window.localStorage.removeItem(TOKEN_KEY); } catch (e2) { /* ignore */ }
+  }
+
+  // -- tiny XHR helper (no fetch: old Outlook webviews)
+  function post(url, headers, body, cb) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", url, true);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      for (var k in headers) {
+        if (headers.hasOwnProperty(k)) xhr.setRequestHeader(k, headers[k]);
+      }
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        var data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (e) { data = null; }
+        cb(xhr.status >= 200 && xhr.status < 300, xhr.status, data);
+      };
+      xhr.send(JSON.stringify(body));
+    } catch (e2) {
+      cb(false, 0, null);
+    }
+  }
+
+  // -- pairing: same code → token exchange as the Scarlet web app
+  function pair() {
+    var code = el("codeInput").value.replace(/^\\s+|\\s+$/g, "");
+    if (!code) return;
+    el("pairBtn").disabled = true;
+    el("pairErr").textContent = "";
+    post(API + "?op=unlock", {}, { code: code }, function (ok, status, data) {
+      el("pairBtn").disabled = false;
+      if (ok && data && data.token) {
+        token = data.token;
+        saveToken(token);
+        el("codeInput").value = "";
+        startWatching();
+      } else {
+        el("pairErr").textContent =
+          (data && data.error) ? data.error :
+          (status === 429 ? "too many attempts — wait a few minutes" : "pairing failed");
+      }
+    });
+  }
+
+  // -- focus reporting
+  function currentItemInfo() {
+    var mb = Office.context && Office.context.mailbox;
+    var item = mb ? mb.item : null;
+    if (!item) return null;
+    // Read mode gives plain strings; compose gives objects — skip those.
+    var subject = (typeof item.subject === "string") ? item.subject : "";
+    var sender = "";
+    if (item.from && item.from.displayName !== undefined) {
+      sender = (item.from.displayName || "") + " <" + (item.from.emailAddress || "") + ">";
+    }
+    var messageId = "";
+    if (item.itemId) {
+      try {
+        messageId = mb.convertToRestId(item.itemId, Office.MailboxEnums.RestVersion.v2_0) || "";
+      } catch (e) { messageId = ""; }
+    }
+    var client = "";
+    try { client = mb.diagnostics.hostName || ""; } catch (e2) { client = ""; }
+    return { subject: subject, sender: sender, message_id: messageId, client: client };
+  }
+
+  function report(force) {
+    if (!token) return;
+    var info = currentItemInfo();
+    if (!info || (!info.subject && !info.message_id)) return;
+    var sig = info.subject + "|" + info.sender + "|" + info.message_id;
+    if (!force && sig === lastSig) return; // debounce identical reports
+    post(API + "?op=outlook_focus", { "x-scarlet-token": token }, info,
+      function (ok, status) {
+        if (ok) {
+          lastSig = sig;
+          el("dot").style.display = "none";
+          el("subj").textContent = info.subject || "(no subject)";
+          el("sender").textContent = info.sender;
+          var d = new Date();
+          el("when").textContent = "last reported " + d.toLocaleTimeString();
+        } else {
+          el("dot").style.display = "block"; // quiet red dot — never a popup
+          if (status === 401) { // token revoked/expired: back to pairing
+            token = null;
+            clearToken();
+            show("pairView");
+          }
+        }
+      });
+  }
+
+  function startWatching() {
+    show("watchView");
+    report(true);
+    if (watching) return;
+    watching = true;
+    // Fires on every selection change while the pane is pinned.
+    try {
+      Office.context.mailbox.addHandlerAsync(
+        Office.EventType.ItemChanged,
+        function () { report(false); },
+        function () {}
+      );
+    } catch (e) { /* very old clients: keepalive still covers us */ }
+    // Keepalive so freshness windows keep working while he lingers on one mail.
+    window.setInterval(function () { report(true); }, 120000);
+  }
+
+  function unpair(ev) {
+    if (ev && ev.preventDefault) ev.preventDefault();
+    token = null;
+    clearToken();
+    lastSig = null;
+    show("pairView");
+    return false;
+  }
+
+  Office.onReady(function () {
+    el("pairBtn").onclick = pair;
+    el("unpairLink").onclick = unpair;
+    el("codeInput").onkeydown = function (ev) { if (ev.keyCode === 13) pair(); };
+    token = loadToken();
+    if (token) startWatching();
+    else show("pairView");
+  });
+})();
+</script>
+</body>
+</html>

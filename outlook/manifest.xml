@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OfficeApp
+    xmlns="http://schemas.microsoft.com/office/appforoffice/1.1"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:bt="http://schemas.microsoft.com/office/officeappbasictypes/1.0"
+    xmlns:mailappor="http://schemas.microsoft.com/office/mailappversionoverrides"
+    xsi:type="MailApp">
+  <Id>8c2ef124-255d-42fd-b11e-f167f0303d41</Id>
+  <Version>1.0.0.0</Version>
+  <ProviderName>Scarlet</ProviderName>
+  <DefaultLocale>en-US</DefaultLocale>
+  <DisplayName DefaultValue="Scarlet"/>
+  <Description DefaultValue="Scarlet sees what you're reading."/>
+  <IconUrl DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-64.png"/>
+  <HighResolutionIconUrl DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-128.png"/>
+  <SupportUrl DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/install.html"/>
+  <AppDomains>
+    <AppDomain>https://raw.githack.com</AppDomain>
+    <AppDomain>https://zstkwjgtushnyegxkqeg.supabase.co</AppDomain>
+  </AppDomains>
+  <Hosts>
+    <Host Name="Mailbox"/>
+  </Hosts>
+  <Requirements>
+    <Sets>
+      <Set Name="Mailbox" MinVersion="1.5"/>
+    </Sets>
+  </Requirements>
+  <FormSettings>
+    <Form xsi:type="ItemRead">
+      <DesktopSettings>
+        <SourceLocation DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/pane.html"/>
+        <RequestedHeight>300</RequestedHeight>
+      </DesktopSettings>
+    </Form>
+  </FormSettings>
+  <Permissions>ReadItem</Permissions>
+  <Rule xsi:type="RuleCollection" Mode="Or">
+    <Rule xsi:type="ItemIs" ItemType="Message" FormType="Read"/>
+  </Rule>
+  <DisableEntityHighlighting>false</DisableEntityHighlighting>
+  <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides" xsi:type="VersionOverridesV1_0">
+    <Requirements>
+      <bt:Sets DefaultMinVersion="1.5">
+        <bt:Set Name="Mailbox"/>
+      </bt:Sets>
+    </Requirements>
+    <Hosts>
+      <Host xsi:type="MailHost">
+        <DesktopFormFactor>
+          <ExtensionPoint xsi:type="MessageReadCommandSurface">
+            <OfficeTab id="TabDefault">
+              <Group id="scarletReadGroup">
+                <Label resid="groupLabel"/>
+                <Control xsi:type="Button" id="scarletOpenPaneButton">
+                  <Label resid="paneButtonLabel"/>
+                  <Supertip>
+                    <Title resid="paneSuperTipTitle"/>
+                    <Description resid="paneSuperTipDesc"/>
+                  </Supertip>
+                  <Icon>
+                    <bt:Image size="16" resid="icon16"/>
+                    <bt:Image size="32" resid="icon32"/>
+                    <bt:Image size="80" resid="icon80"/>
+                  </Icon>
+                  <Action xsi:type="ShowTaskpane">
+                    <SourceLocation resid="paneUrl"/>
+                  </Action>
+                </Control>
+              </Group>
+            </OfficeTab>
+          </ExtensionPoint>
+        </DesktopFormFactor>
+      </Host>
+    </Hosts>
+    <Resources>
+      <bt:Images>
+        <bt:Image id="icon16" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-16.png"/>
+        <bt:Image id="icon32" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-32.png"/>
+        <bt:Image id="icon80" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-80.png"/>
+      </bt:Images>
+      <bt:Urls>
+        <bt:Url id="paneUrl" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/pane.html"/>
+      </bt:Urls>
+      <bt:ShortStrings>
+        <bt:String id="groupLabel" DefaultValue="Scarlet"/>
+        <bt:String id="paneButtonLabel" DefaultValue="Open Scarlet"/>
+        <bt:String id="paneSuperTipTitle" DefaultValue="Scarlet"/>
+      </bt:ShortStrings>
+      <bt:LongStrings>
+        <bt:String id="paneSuperTipDesc" DefaultValue="Scarlet sees what you're reading. Pin the pane and it follows along as you move through your inbox."/>
+      </bt:LongStrings>
+    </Resources>
+    <VersionOverrides xmlns="http://schemas.microsoft.com/office/mailappversionoverrides/1.1" xsi:type="VersionOverridesV1_1">
+      <Requirements>
+        <bt:Sets DefaultMinVersion="1.5">
+          <bt:Set Name="Mailbox"/>
+        </bt:Sets>
+      </Requirements>
+      <Hosts>
+        <Host xsi:type="MailHost">
+          <DesktopFormFactor>
+            <ExtensionPoint xsi:type="MessageReadCommandSurface">
+              <OfficeTab id="TabDefault">
+                <Group id="scarletReadGroup">
+                  <Label resid="groupLabel"/>
+                  <Control xsi:type="Button" id="scarletOpenPaneButton">
+                    <Label resid="paneButtonLabel"/>
+                    <Supertip>
+                      <Title resid="paneSuperTipTitle"/>
+                      <Description resid="paneSuperTipDesc"/>
+                    </Supertip>
+                    <Icon>
+                      <bt:Image size="16" resid="icon16"/>
+                      <bt:Image size="32" resid="icon32"/>
+                      <bt:Image size="80" resid="icon80"/>
+                    </Icon>
+                    <Action xsi:type="ShowTaskpane">
+                      <SourceLocation resid="paneUrl"/>
+                      <SupportsPinning>true</SupportsPinning>
+                    </Action>
+                  </Control>
+                </Group>
+              </OfficeTab>
+            </ExtensionPoint>
+          </DesktopFormFactor>
+        </Host>
+      </Hosts>
+      <Resources>
+        <bt:Images>
+          <bt:Image id="icon16" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-16.png"/>
+          <bt:Image id="icon32" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-32.png"/>
+          <bt:Image id="icon80" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/icon-80.png"/>
+        </bt:Images>
+        <bt:Urls>
+          <bt:Url id="paneUrl" DefaultValue="https://raw.githack.com/idoschoenberg-star/scarlet/main/outlook/pane.html"/>
+        </bt:Urls>
+        <bt:ShortStrings>
+          <bt:String id="groupLabel" DefaultValue="Scarlet"/>
+          <bt:String id="paneButtonLabel" DefaultValue="Open Scarlet"/>
+          <bt:String id="paneSuperTipTitle" DefaultValue="Scarlet"/>
+        </bt:ShortStrings>
+        <bt:LongStrings>
+          <bt:String id="paneSuperTipDesc" DefaultValue="Scarlet sees what you're reading. Pin the pane and it follows along as you move through your inbox."/>
+        </bt:LongStrings>
+      </Resources>
+    </VersionOverrides>
+  </VersionOverrides>
+</OfficeApp>
