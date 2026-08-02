@@ -98,7 +98,10 @@ final class Conversation: ObservableObject {
             $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
         }
         let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
-        try? s.setCategory(.playAndRecord, mode: .voiceChat,
+        // .voiceChat is tuned for the EARPIECE and keeps loudspeaker output
+        // quiet-call level; .videoChat is the speakerphone tuning — full
+        // loudspeaker loudness with echo control intact.
+        try? s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
                            options: loudspeaker ? base.union(.defaultToSpeaker) : base)
         try? s.setActive(true)
         if phoneIsOutput {
