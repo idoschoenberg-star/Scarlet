@@ -91,6 +91,9 @@ struct DeskReminder: Identifiable {
     let priority: Int
     var done: Bool
     let updatedAt: Date?
+    /// Manual position from `reminders_list` (`sort_order`, may be null).
+    /// Mutable so drag-to-reorder can assign a fresh fractional order.
+    var sortOrder: Double? = nil
 
     /// Apple priority: 0 = none, 1–3 = the high band that earns the marks.
     var isHighPriority: Bool { priority >= 1 && priority <= 3 }
@@ -223,6 +226,12 @@ final class DeskModel: ObservableObject {
     @Published var macAsleep = false
     @Published var loading = false
     @Published var errorText = ""
+    /// Quick-add failures surface HERE — a small red line under the add bar,
+    /// right where Ido is looking — never as an alert.
+    @Published var addErrorText = ""
+    /// The just-added row's id: briefly tinted so the optimistic insert is
+    /// unmissable at the top of Today.
+    @Published var highlightId: String?
     @Published var remindersUpdated: Date?
     @Published var notesUpdated: Date?
 
@@ -327,18 +336,30 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    /// Quick-add: optimistic insert at the top of Someday (no due date yet),
-    /// then `reminder_add`; on success a quiet reload swaps in the server id,
-    /// on failure the row leaves and the bar apologizes.
+    /// Quick-add: optimistic insert at the TOP of Today — where Ido is
+    /// looking — with a brief highlight, then `reminder_add`. On success a
+    /// silent background reload swaps in the server's row (wherever the
+    /// server files it); on failure the row leaves and a small red line
+    /// under the bar says so.
     func add(_ title: String) {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
+        addErrorText = ""
         let localId = "local-" + UUID().uuidString
         let optimistic = DeskReminder(id: localId, title: t, notes: "",
                                       dueAt: nil, remindAt: nil, priority: 0,
-                                      done: false, updatedAt: Date())
+                                      done: false, updatedAt: Date(),
+                                      sortOrder: nil)
         withAnimation(.snappy(duration: 0.2)) {
             reminders.insert(optimistic, at: 0)
+            highlightId = localId
+        }
+        // The highlight is a moment, not a state — fade it after ~2s.
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if self.highlightId == localId {
+                withAnimation(.easeOut(duration: 0.6)) { self.highlightId = nil }
+            }
         }
         Task {
             do {
@@ -348,16 +369,121 @@ final class DeskModel: ObservableObject {
                 ])
                 let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
                 guard (obj?["ok"] as? Bool) == true else {
-                    throw URLError(.badServerResponse)
+                    let serverError = (obj?["error"] as? String) ?? ""
+                    throw DeskAddError.rejected(serverError)
                 }
+                // Server confirmed — silent refresh (loadReminders only
+                // spins when the list is empty, so nothing flashes).
                 await self.loadReminders()
             } catch {
                 withAnimation(.snappy(duration: 0.2)) {
                     self.reminders.removeAll { $0.id == localId }
+                    if self.highlightId == localId { self.highlightId = nil }
                 }
-                self.errorText = "Couldn't add \"\(t)\" — try again."
+                if let rejected = error as? DeskAddError,
+                   case .rejected(let msg) = rejected, !msg.isEmpty {
+                    self.addErrorText = "Couldn't add \"\(t)\" — \(msg)"
+                } else {
+                    self.addErrorText = "Couldn't add \"\(t)\" — try again."
+                }
             }
         }
+    }
+
+    /// The one failure `add` can name precisely: the server said {ok:false}.
+    private enum DeskAddError: Error {
+        case rejected(String)
+    }
+
+    // MARK: reorder — fractional sort_order, optimistic, revert on failure
+
+    /// Drag-to-reorder within one due section. The moved row gets a
+    /// fractional `sort_order` from its new neighbors, the flat list (and
+    /// the desk-cache) reorders instantly, and `reminder_reorder` fires in
+    /// the background — a failure puts everything back.
+    func move(in section: DeskDueSection, rows: [DeskReminder],
+              from source: IndexSet, to destination: Int) {
+        guard let first = source.first, rows.indices.contains(first) else { return }
+        let movedId = rows[first].id
+        var newRows = rows
+        newRows.move(fromOffsets: source, toOffset: destination)
+        // A drop back onto the same spot is a no-op.
+        guard newRows.map(\.id) != rows.map(\.id),
+              let newIndex = newRows.firstIndex(where: { $0.id == movedId })
+        else { return }
+        let newOrder = Self.fractionalOrder(rows: newRows, index: newIndex)
+        newRows[newIndex].sortOrder = newOrder
+
+        let previousReminders = reminders
+        let previousRaw = rawReminders
+
+        // Rebuild the flat list: this section's slots take the new order,
+        // every other row stays put (grouping is a stable partition).
+        let sectionIds = Set(rows.map(\.id))
+        var queue = newRows
+        reminders = reminders.map { r in
+            guard sectionIds.contains(r.id), !queue.isEmpty else { return r }
+            return queue.removeFirst()
+        }
+        // Mirror into the raw cache rows so a relaunch shows the same order.
+        // Optimistic local- rows have no raw twin, so match on what exists.
+        let rawIds = Set(rawReminders.compactMap { $0["id"] as? String })
+        var rawByOrder: [[String: Any]] = []
+        for row in newRows where rawIds.contains(row.id) {
+            if var raw = rawReminders.first(where: { ($0["id"] as? String) == row.id }) {
+                if row.id == movedId { raw["sort_order"] = newOrder }
+                rawByOrder.append(raw)
+            }
+        }
+        var rawQueue = rawByOrder
+        rawReminders = rawReminders.map { raw in
+            guard let id = raw["id"] as? String, sectionIds.contains(id),
+                  !rawQueue.isEmpty else { return raw }
+            return rawQueue.removeFirst()
+        }
+        saveCache()
+
+        // A just-added row that hasn't reloaded yet has no server id — keep
+        // its local position and let the next refresh settle it.
+        guard !movedId.hasPrefix("local-") else { return }
+        Task {
+            do {
+                let data = try await Self.request([
+                    "op": "reminder_reorder",
+                    "id": movedId,
+                    "sort_order": newOrder,
+                ])
+                let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                guard (obj?["ok"] as? Bool) == true else {
+                    throw URLError(.badServerResponse)
+                }
+            } catch {
+                withAnimation(.snappy(duration: 0.2)) {
+                    self.reminders = previousReminders
+                }
+                self.rawReminders = previousRaw
+                self.saveCache()
+                self.errorText = "Couldn't save the new order — try again."
+            }
+        }
+    }
+
+    /// The dropped row's fractional order: midpoint of its new neighbors.
+    /// A null neighbor order means "bottom" (+infinity); both neighbors
+    /// null (or absent) falls back to (index+1)*1024.
+    static func fractionalOrder(rows: [DeskReminder], index: Int) -> Double {
+        let fallback = Double(index + 1) * 1024
+        let prevVal: Double? = index > 0
+            ? (rows[index - 1].sortOrder ?? Double.infinity) : nil
+        let nextVal: Double = index + 1 < rows.count
+            ? (rows[index + 1].sortOrder ?? Double.infinity) : Double.infinity
+        if let p = prevVal {
+            if p.isFinite && nextVal.isFinite { return (p + nextVal) / 2 }
+            if p.isFinite { return p + 1024 }
+            return fallback
+        }
+        if nextVal.isFinite { return nextVal / 2 }
+        return fallback
     }
 
     // MARK: notes
@@ -408,7 +534,8 @@ final class DeskModel: ObservableObject {
                 remindAt: MailDates.parse(r["remind_at"] as? String),
                 priority: intValue(r["priority"]),
                 done: (r["done"] as? Bool) ?? false,
-                updatedAt: MailDates.parse(r["updated_at"] as? String)
+                updatedAt: MailDates.parse(r["updated_at"] as? String),
+                sortOrder: doubleValue(r["sort_order"])
             )
         }
     }
@@ -464,6 +591,15 @@ final class DeskModel: ObservableObject {
         if let d = v as? Double { return Int(d) }
         if let s = v as? String { return Int(s) ?? 0 }
         return 0
+    }
+
+    /// `sort_order` arrives as a JSON number (or null, or — defensively — a
+    /// string); nil means "no manual position".
+    private static func doubleValue(_ v: Any?) -> Double? {
+        if let d = v as? Double { return d }
+        if let i = v as? Int { return Double(i) }
+        if let s = v as? String { return Double(s) }
+        return nil
     }
 
     // MARK: cache — Documents/desk-cache.json, the local-first snapshot
@@ -536,6 +672,13 @@ struct DeskView: View {
 
     @State private var quickAdd = ""
     @FocusState private var addFocused: Bool
+    /// Non-nil presents the standard drafting window (DraftView) seeded for
+    /// a Desk channel: "apple_note" from the Notes compose button,
+    /// "reminder" from the dictate button beside the quick-add bar.
+    @State private var deskDraftSeed: ChannelDraftSeed?
+    /// Drag handles for the reminders list — flipped by the small Reorder
+    /// toggle in the header (no EditButton needed).
+    @State private var remindersEditMode: EditMode = .inactive
     /// Tapped note → the reading sheet.
     @State private var openNote: DeskNote?
     /// The exact focus line last claimed for an open note; the sheet's
@@ -561,7 +704,7 @@ struct DeskView: View {
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 8) {
                     if model.leaf == .reminders {
-                        quickAddBar
+                        quickAddRow
                     }
                     ScarletPresenceView(convo: convo)
                         .padding(.vertical, 6)
@@ -573,6 +716,8 @@ struct DeskView: View {
             .onAppear { convo.setFocus(browsingFocus) }
             .onChange(of: model.leaf) { _, _ in
                 convo.setFocus(browsingFocus)
+                // Reorder mode belongs to the Reminders leaf alone.
+                remindersEditMode = .inactive
             }
             // Dictation etiquette: her ears close while Ido types into the
             // quick-add row (Conversation's beginTyping/endTyping pattern).
@@ -581,6 +726,17 @@ struct DeskView: View {
             }
             .sheet(item: $openNote, onDismiss: { restoreBrowsingFocus() }) { note in
                 DeskNoteSheet(note: note)
+                    .preferredColorScheme(.dark)
+            }
+            // The standard drafting window (look → amend → commit) for the
+            // Desk's two channels. On dismiss, refresh the visible leaf so
+            // an approved note/reminder shows up right away. DraftView
+            // manages its own focus claim + restore.
+            .sheet(item: $deskDraftSeed, onDismiss: {
+                Task { await model.load() }
+            }) { seed in
+                DraftView(seed: nil, channelSeed: seed)
+                    .environmentObject(convo)
                     .preferredColorScheme(.dark)
             }
         }
@@ -602,6 +758,12 @@ struct DeskView: View {
                     .font(.system(size: 34, weight: .bold))
                     .foregroundStyle(.white)
                 Spacer()
+                if model.leaf == .reminders && !model.reminders.isEmpty {
+                    reorderToggle
+                }
+                if model.leaf == .notes {
+                    newNoteButton
+                }
                 Button {
                     Task { await model.load() }
                 } label: {
@@ -620,6 +782,41 @@ struct DeskView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    /// Small header toggle that flips the reminders list into edit mode so
+    /// the drag handles appear — "Reorder" to start, "Done" to finish.
+    private var reorderToggle: some View {
+        Button {
+            withAnimation(.snappy(duration: 0.25)) {
+                remindersEditMode = remindersEditMode == .active
+                    ? .inactive : .active
+            }
+        } label: {
+            Text(remindersEditMode == .active ? "Done" : "Reorder")
+                .font(.system(size: 15,
+                              weight: remindersEditMode == .active
+                                  ? .semibold : .regular))
+                .foregroundStyle(DeskUI.blue)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Apple-Notes-style compose (square-and-pencil, Notes yellow) — opens
+    /// the standard drafting window on the "apple_note" channel: dictate or
+    /// type the ask, Scarlet tidies it into a note, Approve saves it to
+    /// Apple Notes.
+    private var newNoteButton: some View {
+        Button {
+            deskDraftSeed = ChannelDraftSeed(channel: "apple_note",
+                                             recipient: "Notes")
+        } label: {
+            Image(systemName: "square.and.pencil")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(DeskUI.yellow)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("New Note")
     }
 
     // MARK: segment switcher (native segmented-control look)
@@ -698,6 +895,15 @@ struct DeskView: View {
     /// Overdue / Today / Upcoming / Someday, empty buckets skipped. Grouping
     /// looks only at the due date, so a just-checked row stays put (briefly
     /// faded, still toggleable) until the next refresh sweeps it.
+    ///
+    /// Each bucket is a STABLE partition of the flat list — no client
+    /// re-sort. The server already orders by sort_order (nulls last), then
+    /// due_at, and drag-to-reorder edits the flat list directly, so the
+    /// array order IS the display order.
+    ///
+    /// One exception: a just-added optimistic row (local- id, no due date
+    /// yet) shows at the top of TODAY — where Ido is looking when he adds —
+    /// not buried in Someday. The server's next refresh files it properly.
     private var grouped: [(DeskDueSection, [DeskReminder])] {
         let now = Date()
         let cal = Calendar.current
@@ -706,7 +912,9 @@ struct DeskView: View {
         var upcoming: [DeskReminder] = []
         var someday: [DeskReminder] = []
         for r in model.reminders {
-            if let d = r.dueAt {
+            if r.id.hasPrefix("local-") {
+                today.append(r)
+            } else if let d = r.dueAt {
                 if d < now {
                     overdue.append(r)
                 } else if cal.isDateInToday(d) {
@@ -718,12 +926,8 @@ struct DeskView: View {
                 someday.append(r)
             }
         }
-        let byDue: (DeskReminder, DeskReminder) -> Bool = {
-            ($0.dueAt ?? .distantFuture) < ($1.dueAt ?? .distantFuture)
-        }
-        overdue.sort(by: byDue)
-        today.sort(by: byDue)
-        upcoming.sort(by: byDue)
+        // Optimistic rows sit at the array head (inserted at 0), so the
+        // stable partition already leaves them at the top of Today.
         let all: [(DeskDueSection, [DeskReminder])] = [
             (.overdue, overdue), (.today, today),
             (.upcoming, upcoming), (.someday, someday),
@@ -745,13 +949,22 @@ struct DeskView: View {
                         ) {
                             model.toggle(r)
                         }
-                        .listRowBackground(DeskUI.card)
+                        // A just-added row glows briefly so the optimistic
+                        // insert is unmissable; everyone else keeps the card.
+                        .listRowBackground(r.id == model.highlightId
+                            ? DeskUI.blue.opacity(0.25) : DeskUI.card)
                         .listRowSeparatorTint(DeskUI.separator)
                         // Separator starts at the leading TEXT edge, past
                         // the 32pt checkbox frame + 12pt gap (Reminders style).
                         .alignmentGuide(.listRowSeparatorLeading) { d in
                             d[.leading] + 44
                         }
+                    }
+                    // Drag-to-reorder within the section: local order flips
+                    // instantly; reminder_reorder lands in the background.
+                    .onMove { source, destination in
+                        model.move(in: section, rows: rows,
+                                   from: source, to: destination)
                     }
                 } header: {
                     // Reminders-style bold colored section title, not a chip.
@@ -778,6 +991,9 @@ struct DeskView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
+        // The Reorder header toggle drives edit mode directly (no
+        // EditButton) — iOS 17's List shows the drag handles when active.
+        .environment(\.editMode, $remindersEditMode)
         .refreshable { await model.loadReminders() }
     }
 
@@ -786,6 +1002,43 @@ struct DeskView: View {
 
     private var trimmedQuickAdd: String {
         quickAdd.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The pinned add area: the typed quick-add bar (fast one-liners) with a
+    /// small dictate button beside it (the full draft window: dictate →
+    /// Scarlet polishes → Approve adds the reminder), and — when an add
+    /// fails — a small red line right under the bar.
+    private var quickAddRow: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                quickAddBar
+                dictateReminderButton
+            }
+            if !model.addErrorText.isEmpty {
+                Text(model.addErrorText)
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskUI.red)
+                    .frame(maxWidth: 360, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 14)
+    }
+
+    /// Mic beside the quick-add bar → the standard drafting window on the
+    /// "reminder" channel, for dictate-and-polish instead of a typed line.
+    private var dictateReminderButton: some View {
+        Button {
+            deskDraftSeed = ChannelDraftSeed(channel: "reminder",
+                                             recipient: "Reminders")
+        } label: {
+            Image(systemName: "mic.fill")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(DeskUI.blue)
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(DeskUI.card))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Dictate a reminder")
     }
 
     private var quickAddBar: some View {
@@ -828,7 +1081,6 @@ struct DeskView: View {
                 .fill(DeskUI.card)
         )
         .frame(maxWidth: 360)
-        .padding(.horizontal, 14)
     }
 
     private func submitQuickAdd() {

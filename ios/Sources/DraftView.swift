@@ -495,6 +495,10 @@ struct DraftView: View {
                         outcome = "saved to his Outlook Drafts (corporate mail is never auto-sent)"
                     case "teams":
                         outcome = "staged in Teams for his one-tap send"
+                    case "apple_note":
+                        outcome = "saved to his Apple Notes"
+                    case "reminder":
+                        outcome = "added to his Reminders"
                     default:
                         outcome = "sent"
                     }
@@ -635,6 +639,8 @@ struct DraftView: View {
         case "teams": return "TEAMS"
         case "whatsapp": return "WHATSAPP"
         case "imessage": return "IMESSAGE"
+        case "apple_note": return "NOTE"
+        case "reminder": return "REMINDER"
         default: return "AMWELL EMAIL"
         }
     }
@@ -645,6 +651,10 @@ struct DraftView: View {
         case "teams": return Color(red: 0.55, green: 0.56, blue: 0.85)
         case "whatsapp": return Color(red: 0.14, green: 0.80, blue: 0.44)
         case "imessage": return Color(red: 0.25, green: 0.60, blue: 1.0)
+        // Apple Notes yellow #FFD60A.
+        case "apple_note": return Color(red: 1, green: 214 / 255, blue: 10 / 255)
+        // iOS Reminders blue #0A84FF.
+        case "reminder": return Color(red: 10 / 255, green: 132 / 255, blue: 255 / 255)
         default: return outlookBlue
         }
     }
@@ -658,6 +668,8 @@ struct DraftView: View {
         case "whatsapp": return "Approve → Send WhatsApp"
         case "imessage": return "Approve → Send iMessage"
         case "email_gmail": return "Approve → Send Gmail"
+        case "apple_note": return "Approve → Save to Notes"
+        case "reminder": return "Approve → Add Reminder"
         default: return "Approve → Outlook Drafts"
         }
     }
@@ -668,6 +680,8 @@ struct DraftView: View {
         case "whatsapp": return "Sent on WhatsApp ✓"
         case "imessage": return "Sent by iMessage ✓"
         case "email_gmail": return "Sent from Gmail ✓"
+        case "apple_note": return "Saved to Apple Notes ✓"
+        case "reminder": return "Added to Reminders ✓"
         default: return "Saved in Outlook Drafts ✓"
         }
     }
@@ -676,6 +690,8 @@ struct DraftView: View {
         switch channel {
         case "email_outlook": return "Saving to Outlook…"
         case "teams": return "Staging in Teams…"
+        case "apple_note": return "Saving to Notes…"
+        case "reminder": return "Adding Reminder…"
         default: return "Sending…"
         }
     }

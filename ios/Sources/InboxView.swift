@@ -975,6 +975,16 @@ struct MailDetailView: View {
     @State private var attachmentError = ""
     /// Non-nil drives the QuickLook sheet.
     @State private var previewFile: PreviewFile?
+    /// Display name of the attachment being previewed — feeds the viewer's
+    /// [FOCUS] line so Scarlet knows exactly which file is on screen.
+    @State private var previewName = ""
+    /// The focus line that was active before the attachment viewer opened
+    /// (normally this email's own emailFocus); restored on dismiss.
+    @State private var focusBeforeAttachment: String?
+    /// The attachment focus line the viewer set — the stale-guard comparator:
+    /// restore on dismiss ONLY if focus is still ours (another screen may
+    /// have claimed it while the viewer was up).
+    @State private var attachmentFocusLine: String?
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -1026,10 +1036,13 @@ struct MailDetailView: View {
             .preferredColorScheme(.dark)
         }
         // QuickLook: pinch-zoom, paging, share — the Outlook attachment
-        // experience, straight from the system viewer.
-        .sheet(item: $previewFile) { file in
-            QuickLookPreview(url: file.url)
-                .ignoresSafeArea()
+        // experience, straight from the system viewer. Full-height dark
+        // sheet with a floating ✕ (a bare QLPreviewController draws no Done
+        // button, and its zoom/scroll gestures can eat the swipe-down, so
+        // the ✕ is the guaranteed way out). `onDismiss` covers both paths —
+        // ✕ tap and swipe — and hands focus back to the email reader.
+        .sheet(item: $previewFile, onDismiss: attachmentViewerClosed) { file in
+            attachmentViewer(file)
         }
         .task {
             model.markRead(message.id)
@@ -1130,6 +1143,7 @@ struct MailDetailView: View {
                 case .file(let data):
                     let url = Self.tempFileURL(for: att.name)
                     try data.write(to: url, options: .atomic)
+                    previewName = att.name
                     previewFile = PreviewFile(url: url)
                 case .link(let url):
                     UIApplication.shared.open(url, options: [:], completionHandler: nil)
@@ -1140,6 +1154,72 @@ struct MailDetailView: View {
                 attachmentError = "Couldn't open that attachment — try again."
             }
         }
+    }
+
+    // MARK: attachment viewer (full-height QuickLook + floating ✕ + focus)
+
+    /// The attachment sheet's content: the system QuickLook viewer (pinch
+    /// zoom, Word/PDF/image rendering) under a floating close button. The ✕
+    /// is always visible and always works; swipe-down remains available too.
+    private func attachmentViewer(_ file: PreviewFile) -> some View {
+        ZStack(alignment: .topLeading) {
+            QuickLookPreview(url: file.url)
+                .ignoresSafeArea()
+            Button {
+                previewFile = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Color.black.opacity(0.5)))
+            }
+            .padding(.top, 12)
+            .padding(.leading, 12)
+            .accessibilityLabel("Close attachment")
+        }
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(OutlookStyle.background)
+        .preferredColorScheme(.dark)
+        .onAppear { attachmentViewerOpened() }
+    }
+
+    /// The viewer is up: remember whatever focus was active (normally this
+    /// email's emailFocus) and point Scarlet at the attachment itself.
+    private func attachmentViewerOpened() {
+        let focus = attachmentFocus(filename: previewName)
+        focusBeforeAttachment = convo.currentFocus
+        attachmentFocusLine = focus
+        convo.setFocus(focus)
+    }
+
+    /// The viewer closed (✕ or swipe): hand focus back to the email reader —
+    /// but only if the attachment focus is still the live one; if another
+    /// screen claimed focus while the viewer was up, leave it alone. State
+    /// fully resets so the same or another attachment reopens cleanly.
+    private func attachmentViewerClosed() {
+        if let mine = attachmentFocusLine, convo.currentFocus == mine {
+            convo.setFocus(focusBeforeAttachment ?? emailFocus)
+        }
+        attachmentFocusLine = nil
+        focusBeforeAttachment = nil
+        previewName = ""
+    }
+
+    /// The ambient-focus line while an attachment is full-screen: names the
+    /// exact file, its email, and the tool call that reads it, so "read this
+    /// to me" acts on THIS attachment with no follow-up question.
+    private func attachmentFocus(filename: String) -> String {
+        let sender = message.fromName.isEmpty ? message.fromEmail : message.fromName
+        return "[FOCUS] Ido is viewing an email ATTACHMENT full-screen: "
+            + "'\(filename)' — from the email '\(message.subject)' "
+            + "from \(sender) (message_id: \(message.id)).\n"
+            + "Any request like 'read this', 'summarize what I'm looking at', "
+            + "'what does it say about X', 'תקריאי לי' refers to THIS attachment — "
+            + "call read_email_attachment with message_id '\(message.id)' "
+            + "and attachment_match '\(filename)' and the question. "
+            + "Never ask which attachment he means."
     }
 
     /// Temp destination that keeps the real filename (extension included —
