@@ -28,6 +28,10 @@ struct RootView: View {
     @StateObject private var convo = Conversation()
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
+    /// Draft ids already offered for recovery THIS process — a fresh launch
+    /// (i.e. after a crash) offers again; within one run we don't nag.
+    @State private var recoveredDraftIds: Set<String> = []
+    @Environment(\.scenePhase) private var scenePhase
 
     enum Tab: Hashable { case talk, inbox, calendar, chats, library }
 
@@ -101,7 +105,18 @@ struct RootView: View {
         }
         // Ambient focus: Talk at launch and whenever the tab returns to it;
         // switching to Inbox lets that hierarchy report itself.
-        .onAppear { convo.setFocus(Self.talkFocus) }
+        .onAppear {
+            convo.setFocus(Self.talkFocus)
+            FlightRecorder.reportUncleanExitIfAny()
+            FlightRecorder.note(screen: "talk")
+            Task { await recoverActiveDraft() }
+        }
+        // Coming back to the foreground re-checks for an orphaned draft —
+        // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { Task { await recoverActiveDraft() } }
+            FlightRecorder.note(screen: "phase:\(phase)")
+        }
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
         }
@@ -130,6 +145,35 @@ struct RootView: View {
         }
     }
 
+    /// Crash/kill recovery: if a draft is still open server-side (status
+    /// "draft" — the server keeps them), reopen the drafting table over
+    /// whatever screen we're on. Once per draft per process: a fresh launch
+    /// after a crash offers again; dismissing it doesn't nag within a run.
+    private func recoverActiveDraft() async {
+        guard !voiceDraftPresented else { return }
+        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "draft_active"))
+        comps.queryItems = items
+        guard let url = comps.url else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let draft = obj["draft"] as? [String: Any],
+              let id = draft["id"] as? String, !id.isEmpty,
+              (draft["status"] as? String) == "draft" else { return }
+        // Only resurrect reasonably recent work (48h) — not archaeology.
+        if let ts = draft["updated_at"] as? String,
+           let when = MailDates.parse(ts),
+           Date().timeIntervalSince(when) > 48 * 3600 { return }
+        guard !recoveredDraftIds.contains(id) else { return }
+        recoveredDraftIds.insert(id)
+        FlightRecorder.note(screen: "draft-recovered:\(id)")
+        voiceDraftPresented = true
+    }
+
     /// One desk-focus poll. Returns nil when the Mac is idle/stale or not
     /// on Outlook — the phone then falls back to its own ambient focus.
     private struct DeskFocus { let sig: String; let focusText: String }
@@ -155,6 +199,45 @@ struct RootView: View {
         if !messageId.isEmpty { text += " and message_id \(messageId)" }
         text += ". The draft window opens on his phone; the approved draft appears in Outlook Drafts on his desktop."
         return DeskFocus(sig: subject + "|" + sender, focusText: text)
+    }
+}
+
+/// Flight recorder: a tiny black box. Every screen change stamps local
+/// state; if the app dies without a clean record (crash, freeze-kill, iOS
+/// memory reclaim), the NEXT launch reports what was on screen and when —
+/// so "she froze and everything disappeared" leaves evidence, not mystery.
+enum FlightRecorder {
+    private static let stateKey = "scarlet.flight.state"
+    private static let aliveKey = "scarlet.flight.alive"
+
+    static func note(screen: String) {
+        let d = UserDefaults.standard
+        d.set(["screen": screen, "ts": ISO8601DateFormatter().string(from: Date())],
+              forKey: stateKey)
+        d.set(true, forKey: aliveKey)
+    }
+
+    static func reportUncleanExitIfAny() {
+        let d = UserDefaults.standard
+        guard d.bool(forKey: aliveKey) else { d.set(true, forKey: aliveKey); return }
+        let last = d.dictionary(forKey: stateKey) ?? [:]
+        Task {
+            var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+            var items = comps.queryItems ?? []
+            items.append(URLQueryItem(name: "op", value: "app_event"))
+            comps.queryItems = items
+            guard let url = comps.url else { return }
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: [
+                "kind": "unclean_exit",
+                "detail": ["last_screen": last["screen"] ?? "unknown",
+                           "last_ts": last["ts"] ?? ""],
+            ])
+            _ = try? await URLSession.shared.data(for: req)
+        }
     }
 }
 
