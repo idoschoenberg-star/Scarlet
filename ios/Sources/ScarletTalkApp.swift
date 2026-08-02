@@ -29,7 +29,7 @@ struct RootView: View {
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats }
+    enum Tab: Hashable { case talk, inbox, calendar, chats, library }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -54,6 +54,10 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
                 .tag(Tab.chats)
+            LibraryView()
+                .environmentObject(convo)
+                .tabItem { Label("Library", systemImage: "books.vertical.fill") }
+                .tag(Tab.library)
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
         // The Scarlet Presence capsule is EMBEDDED inside each list screen

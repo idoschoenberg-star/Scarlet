@@ -32,6 +32,9 @@ final class Conversation: ObservableObject {
     private var wantLive = false
     private var reconnecting = false
     private var observersInstalled = false
+    /// A rebuilt socket is a brand-new ElevenLabs conversation with amnesia —
+    /// flag it so she's told this is a continuation, not a fresh caller.
+    private var resumedSession = false
 
     // Audio — built once, reused across reconnects. Re-running mic setup
     // (a second installTap on the same bus) is an instant NSException crash.
@@ -195,6 +198,16 @@ final class Conversation: ObservableObject {
             if let focus = currentFocus {
                 send(["type": "contextual_update", "text": focus])
             }
+            if resumedSession {
+                resumedSession = false
+                // Recent transcript lines ride along so the renewed session
+                // keeps the thread instead of greeting him like a stranger.
+                let recent = transcript.suffix(6)
+                    .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
+                    .joined(separator: "\n")
+                send(["type": "contextual_update",
+                      "text": "[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent])
+            }
         } catch {
             if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }
@@ -222,6 +235,7 @@ final class Conversation: ObservableObject {
     private func scheduleReconnect() {
         guard wantLive, !reconnecting else { return }
         reconnecting = true
+        resumedSession = true
         status = "Reconnecting…"
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
@@ -288,8 +302,11 @@ final class Conversation: ObservableObject {
                 let (data, _) = try await URLSession.shared.data(for: req)
                 out = String(data: data, encoding: .utf8) ?? "{}"
             } catch { out = "{\"error\":\"tool failed\"}" }
+            // 12k cap: every tool result lives in the agent's context for the
+            // REST of the conversation — 30k results made hour-long dialogues
+            // slower and slower until replies timed out entirely.
             send(["type": "client_tool_result", "tool_call_id": callId,
-                  "result": String(out.prefix(30000)), "is_error": false])
+                  "result": String(out.prefix(12000)), "is_error": false])
             // A voice-started draft: compose_draft came back with a draft id,
             // so tell the shell to open the drafting table over whatever
             // screen is showing.
