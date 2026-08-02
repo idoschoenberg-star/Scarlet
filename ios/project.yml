@@ -63,3 +63,6 @@ targets:
       path: Sources/ScarletTalk.entitlements
       properties:
         com.apple.developer.healthkit: true
+        # Real-time HealthKit observer wake-ups while backgrounded — the
+        # data-doctrine path (enableBackgroundDelivery .immediate).
+        com.apple.developer.healthkit.background-delivery: true

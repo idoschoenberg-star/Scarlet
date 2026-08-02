@@ -37,10 +37,7 @@ struct SplitShell: View {
         case chats
         case library
         case health
-        // HEALTH: when HealthView.swift lands, add `case health` here
-        // (between library and settings) — then fill in its title/icon/
-        // shortcut cases below and the one-line hosting case in
-        // `detailColumn`. Until then Health is omitted from the sidebar.
+        case desk
         case settings
 
         var id: String { rawValue }
@@ -53,6 +50,7 @@ struct SplitShell: View {
             case .chats: return "Chats"
             case .library: return "Library"
             case .health: return "Health"
+            case .desk: return "Desk"
             case .settings: return "Settings"
             }
         }
@@ -66,6 +64,7 @@ struct SplitShell: View {
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .library: return "books.vertical.fill"
             case .health: return "heart.fill"
+            case .desk: return "checklist"
             case .settings: return "gearshape.fill"
             }
         }
@@ -79,7 +78,8 @@ struct SplitShell: View {
             case .chats: return "4"
             case .library: return "5"
             case .health: return "6"
-            case .settings: return "7"
+            case .desk: return "7"
+            case .settings: return "8"
             }
         }
     }
@@ -97,8 +97,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .library, .health]
-        // HEALTH: append `.health` here once HealthView.swift lands.
+        [.talk, .inbox, .calendar, .chats, .library, .health, .desk]
     }
 
     var body: some View {
@@ -237,6 +236,10 @@ struct SplitShell: View {
                 .environmentObject(convo)
         case .health:
             HealthView()
+                .environmentObject(convo)
+        case .desk:
+            // Self-contained (Reminders + Apple Notes; serif reading sheet).
+            DeskView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar.

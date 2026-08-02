@@ -2,11 +2,25 @@ import Foundation
 import HealthKit
 import CoreLocation
 
-/// Apple Health sync: reads the last 14 days of activity, sleep, heart and
-/// workout data from HealthKit, pushes it to the backend (`op=health_push`,
-/// same app-api plumbing as the rest of the app — the server upserts days by
-/// date and workouts by start+kind), and keeps the computed payload published
-/// so HealthView renders instantly from exactly the data it pushed.
+/// Apple Health sync + the Withings join + the local-first cache.
+///
+/// Three jobs, in the owner's order of importance:
+///
+/// 1. REAL-TIME, not schedules: HKObserverQuery + immediate background
+///    delivery for steps, active energy, workouts and sleep — when HealthKit
+///    signals a change, an incremental `syncNow()` runs automatically
+///    (debounced to at most one run per 60 s). On-appear and pull-to-refresh
+///    syncs remain.
+/// 2. LOCAL-FIRST: the full render model (days, workouts, Withings measures
+///    and nights) is persisted as JSON at Documents/health-cache.json after
+///    every load and re-loaded synchronously in `init`, so the Health tab
+///    paints instantly — even offline. `lastUpdated` is the honest stamp.
+/// 3. THE WITHINGS JOIN: after pushing local HealthKit data (`op=
+///    health_push`, so the server copy includes today), the merged overview
+///    is read back (`op=health_overview`) — server-side `health_days`
+///    history (30 days), Withings body measures (weight, fat %, muscle,
+///    hydration, HR) and Withings sleep nights (score, stages, night HR) —
+///    and folded into the published model.
 ///
 /// HealthKit caveat coded around throughout: READ authorization status is
 /// deliberately not queryable (getRequestStatus only says whether the sheet
@@ -17,7 +31,7 @@ import CoreLocation
 // MARK: - Published shapes
 
 /// One day of aggregates — the same fields the wire `days` entry carries.
-struct HealthDay: Identifiable {
+struct HealthDay: Identifiable, Codable {
     let date: Date          // local start of day
     let dateKey: String     // "2026-08-02"
     var steps: Int = 0
@@ -38,10 +52,10 @@ struct HealthDay: Identifiable {
 }
 
 /// One workout — the same fields the wire `workouts` entry carries.
-struct HealthWorkout: Identifiable {
+struct HealthWorkout: Identifiable, Codable {
     let start: Date
     let end: Date
-    let kind: String        // "walking", "running", ...
+    let kind: String        // "walking", "running", "strength", ...
     var distanceM: Int = 0
     var kcal: Int = 0
     var avgHR: Int = 0
@@ -50,6 +64,52 @@ struct HealthWorkout: Identifiable {
 
     var id: String { "\(start.timeIntervalSince1970)-\(kind)" }
     var durationMin: Int { max(0, Int(end.timeIntervalSince(start) / 60)) }
+}
+
+/// One Withings scale/device measure (weight_kg, fat_ratio_pct,
+/// muscle_mass_kg, hydration_kg, heart_rate_bpm).
+struct WithingsMeasure: Identifiable, Codable {
+    let metric: String
+    let value: Double
+    let unit: String
+    let measuredAt: Date
+
+    var id: String { "\(metric)-\(measuredAt.timeIntervalSince1970)" }
+}
+
+/// One Withings sleep night, keyed by the wake date.
+struct WithingsNight: Identifiable, Codable {
+    let night: String       // "2026-08-02" (wake date)
+    let date: Date          // local start of the wake day
+    var sleepScore: Int = 0
+    var totalSleepMin: Int = 0
+    var deepMin: Int = 0
+    var remMin: Int = 0
+    var lightMin: Int = 0
+    var awakeMin: Int = 0
+    var hrAvg: Int = 0      // average heart rate during the night, 0 = none
+
+    var id: String { night }
+}
+
+/// Strength vs cardio vs other — the owner's "weights vs steps" split.
+/// Kinds are the app's own vocabulary (see `HealthSync.kindName`):
+/// functional/traditional strength training map to "strength",
+/// coreTraining to "core".
+enum WorkoutCategory: String {
+    case strength, cardio, other
+
+    static let strengthKinds: Set<String> = ["strength", "core"]
+    static let cardioKinds: Set<String> = [
+        "walking", "running", "cycling", "swimming", "hiking",
+        "rowing", "elliptical", "tennis", "pickleball", "hiit",
+    ]
+
+    static func classify(_ kind: String) -> WorkoutCategory {
+        if strengthKinds.contains(kind) { return .strength }
+        if cardioKinds.contains(kind) { return .cardio }
+        return .other
+    }
 }
 
 /// The tab header's at-a-glance numbers.
@@ -72,19 +132,37 @@ final class HealthSync: ObservableObject {
     /// explainer doesn't reappear every launch).
     @Published var authorized: Bool
     @Published var syncing = false
+    /// Last time the server accepted a push.
     @Published var lastSync: Date?
+    /// Last time the published model changed — the "updated Xm ago" stamp.
+    /// Survives restarts via the cache, so offline the stamp stays honest.
+    @Published var lastUpdated: Date?
     @Published var todaySnapshot = TodaySnapshot()
-    /// Local cache of the last computed payload, oldest day first.
+    /// The merged model: local HealthKit window + server history, oldest day
+    /// first. May span up to 120 days once the overview has been read.
     @Published var days: [HealthDay] = []
     /// Newest workout first.
     @Published var workouts: [HealthWorkout] = []
+    /// Withings body measures, oldest first.
+    @Published var withingsMeasures: [WithingsMeasure] = []
+    /// Withings sleep nights, oldest first.
+    @Published var withingsNights: [WithingsNight] = []
     @Published var errorText = ""
 
     private let store = HKHealthStore()
     private static let authorizedKey = "scarlet.healthAuthorized"
 
+    /// Observer machinery (doctrine #1).
+    private var observerQueries: [HKObserverQuery] = []
+    private var observing = false
+    private var lastObserverSync = Date.distantPast
+    private var observerSyncScheduled = false
+    private static let observerDebounce: TimeInterval = 60
+
     private init() {
         authorized = UserDefaults.standard.bool(forKey: Self.authorizedKey)
+        // Local-first: paint from the cache before any query or network call.
+        loadCache()
     }
 
     var available: Bool { HKHealthStore.isHealthDataAvailable() }
@@ -126,8 +204,61 @@ final class HealthSync: ObservableObject {
         if ok {
             authorized = true
             UserDefaults.standard.set(true, forKey: Self.authorizedKey)
+            startObserving()
         } else {
             errorText = "Couldn't open the Health access sheet — try again."
+        }
+    }
+
+    // MARK: real-time observers (doctrine #1)
+
+    /// Registers one HKObserverQuery per change-worthy type and asks for
+    /// immediate background delivery. Idempotent — safe to call on every
+    /// sync. When HealthKit signals, an incremental sync runs, debounced to
+    /// one per `observerDebounce` seconds.
+    func startObserving() {
+        guard available, authorized, !observing else { return }
+        observing = true
+        var types: [HKSampleType] = []
+        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned] {
+            if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
+        }
+        if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(t) }
+        types.append(HKObjectType.workoutType())
+        for type in types {
+            let q = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, error in
+                // Always complete first — that's what keeps background
+                // delivery alive; then hop to the main actor to sync.
+                completion()
+                guard error == nil else { return }
+                Task { @MainActor in self?.healthStoreDidSignal() }
+            }
+            store.execute(q)
+            observerQueries.append(q)
+            // .immediate is a request; the system may clamp some types (e.g.
+            // stepCount is hourly at best in the background). Failure is
+            // non-fatal — foreground observation still fires immediately.
+            store.enableBackgroundDelivery(for: type, frequency: .immediate) { _, _ in }
+        }
+    }
+
+    /// Debounced reaction to an observer firing: sync immediately if the
+    /// last observer-driven sync is older than the debounce window, else
+    /// coalesce into one trailing run.
+    private func healthStoreDidSignal() {
+        let since = Date().timeIntervalSince(lastObserverSync)
+        if since >= Self.observerDebounce {
+            lastObserverSync = Date()
+            Task { await syncNow() }
+        } else if !observerSyncScheduled {
+            observerSyncScheduled = true
+            let delay = Self.observerDebounce - since
+            Task {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                observerSyncScheduled = false
+                lastObserverSync = Date()
+                await syncNow()
+            }
         }
     }
 
@@ -135,6 +266,7 @@ final class HealthSync: ObservableObject {
 
     func syncNow() async {
         guard available, authorized, !syncing else { return }
+        startObserving()
         syncing = true
         errorText = ""
         defer { syncing = false }
@@ -200,17 +332,11 @@ final class HealthSync: ObservableObject {
             newWorkouts.append(out)
         }
 
-        // Publish the local cache first — the view renders even if the push
-        // fails; lastSync only advances when the server accepted the payload.
-        days = newDays
-        workouts = newWorkouts
-        if let today = newDays.last {
-            todaySnapshot = TodaySnapshot(steps: today.steps,
-                                          activeKcal: today.activeKcal,
-                                          exerciseMin: today.exerciseMin,
-                                          sleepMin: today.sleepMin)
-        }
+        // Local-first publish: fresh device data lands immediately (and is
+        // cached), even if every network call below fails.
+        applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: nil)
 
+        // Push, so the server copy includes today...
         do {
             try await Self.push(days: newDays.map(Self.wireDay),
                                 workouts: newWorkouts.map(Self.wireWorkout))
@@ -218,6 +344,119 @@ final class HealthSync: ObservableObject {
         } catch {
             errorText = "Synced locally — couldn't reach the server."
         }
+
+        // ...then the Withings join: read back the merged overview (server
+        // day history + Withings body & sleep) and fold it in.
+        if let overview = try? await Self.fetchOverview(windowDays: 30) {
+            applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: overview)
+        }
+    }
+
+    /// Merge policy: existing model days ∪ server days ∪ local days, with
+    /// local (this device, just read) winning per date; same for workouts,
+    /// keyed by start-minute + kind so ISO second round-trips don't
+    /// duplicate. Withings series replace wholesale when an overview is
+    /// present, and are kept as-is when offline. Everything is trimmed to
+    /// 120 days and cached.
+    private func applyMerged(localDays: [HealthDay], localWorkouts: [HealthWorkout],
+                             overview: Overview?) {
+        var byKey: [String: HealthDay] = [:]
+        for d in days { byKey[d.dateKey] = d }
+        if let o = overview {
+            for d in o.days { byKey[d.dateKey] = d }
+        }
+        for d in localDays { byKey[d.dateKey] = d }
+        days = Array(byKey.values.sorted { $0.date < $1.date }.suffix(120))
+
+        var wByKey: [String: HealthWorkout] = [:]
+        for w in workouts { wByKey[Self.workoutMergeKey(w)] = w }
+        if let o = overview {
+            for w in o.workouts { wByKey[Self.workoutMergeKey(w)] = w }
+        }
+        for w in localWorkouts { wByKey[Self.workoutMergeKey(w)] = w }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -120, to: Date()) ?? .distantPast
+        workouts = wByKey.values.filter { $0.start >= cutoff }.sorted { $0.start > $1.start }
+
+        if let o = overview {
+            withingsMeasures = o.measures.sorted { $0.measuredAt < $1.measuredAt }
+            withingsNights = o.nights.sorted { $0.date < $1.date }
+        }
+
+        refreshTodaySnapshot()
+        lastUpdated = Date()
+        saveCache()
+    }
+
+    private func refreshTodaySnapshot() {
+        let key = Self.dayKey.string(from: Date())
+        let today = days.first(where: { $0.dateKey == key })
+        todaySnapshot = TodaySnapshot(steps: today?.steps ?? 0,
+                                      activeKcal: today?.activeKcal ?? 0,
+                                      exerciseMin: today?.exerciseMin ?? 0,
+                                      sleepMin: today?.sleepMin ?? 0)
+    }
+
+    /// Start times round-trip through ISO seconds on the server, so key by
+    /// start minute + kind.
+    private static func workoutMergeKey(_ w: HealthWorkout) -> String {
+        "\(Int(w.start.timeIntervalSince1970 / 60))-\(w.kind)"
+    }
+
+    // MARK: local-first cache (doctrine #2)
+
+    /// Documents/health-cache.json — the full render model, ISO-8601 dates.
+    private struct HealthCacheFile: Codable {
+        var savedAt: Date
+        var lastSync: Date?
+        var days: [HealthDay]
+        var workouts: [HealthWorkout]
+        var withingsMeasures: [WithingsMeasure]
+        var withingsNights: [WithingsNight]
+    }
+
+    private static var cacheURL: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return docs.appendingPathComponent("health-cache.json")
+    }
+
+    private static let cacheEncoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
+
+    private static let cacheDecoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
+    /// Synchronous by design: called from `init` so the first frame of the
+    /// Health tab already has data — even offline. A missing or corrupt
+    /// cache is simply an empty start.
+    private func loadCache() {
+        guard let data = try? Data(contentsOf: Self.cacheURL),
+              let file = try? Self.cacheDecoder.decode(HealthCacheFile.self, from: data)
+        else { return }
+        days = file.days
+        workouts = file.workouts
+        withingsMeasures = file.withingsMeasures
+        withingsNights = file.withingsNights
+        lastSync = file.lastSync
+        lastUpdated = file.savedAt
+        refreshTodaySnapshot()
+    }
+
+    private func saveCache() {
+        let file = HealthCacheFile(savedAt: lastUpdated ?? Date(),
+                                   lastSync: lastSync,
+                                   days: days,
+                                   workouts: workouts,
+                                   withingsMeasures: withingsMeasures,
+                                   withingsNights: withingsNights)
+        guard let data = try? Self.cacheEncoder.encode(file) else { return }
+        try? data.write(to: Self.cacheURL, options: .atomic)
     }
 
     // MARK: HK queries (each wrapped in a continuation, all non-fatal)
@@ -413,6 +652,17 @@ final class HealthSync: ObservableObject {
         return f
     }()
 
+    /// Server timestamps sometimes carry fractional seconds — accept both.
+    static let isoFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    static func parseISO(_ s: String) -> Date? {
+        iso.date(from: s) ?? isoFractional.date(from: s)
+    }
+
     static func kindName(_ type: HKWorkoutActivityType) -> String {
         switch type {
         case .walking: return "walking"
@@ -479,19 +729,24 @@ final class HealthSync: ObservableObject {
         ]
     }
 
-    // MARK: push (op rides the query string, x-scarlet-token — app convention)
+    // MARK: network (op rides the query string, x-scarlet-token — app convention)
 
-    private static func push(days: [[String: Any]], workouts: [[String: Any]]) async throws {
+    private static func makeRequest(op: String, body: [String: Any]) throws -> URLRequest {
         guard TokenStore.token != nil else { throw URLError(.userAuthenticationRequired) }
         var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
         var qItems = comps.queryItems ?? []
-        qItems.append(URLQueryItem(name: "op", value: "health_push"))
+        qItems.append(URLQueryItem(name: "op", value: op))
         comps.queryItems = qItems
         var req = URLRequest(url: comps.url ?? AppConfig.appAPIURL)
         req.httpMethod = "POST"
         req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONSerialization.data(withJSONObject: [
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return req
+    }
+
+    private static func push(days: [[String: Any]], workouts: [[String: Any]]) async throws {
+        let req = try makeRequest(op: "health_push", body: [
             "days": days,
             "workouts": workouts,
         ])
@@ -501,5 +756,106 @@ final class HealthSync: ObservableObject {
         }
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
+    }
+
+    // MARK: overview read (doctrine #3 — the Withings join)
+
+    /// What `op=health_overview` returns, already parsed into app shapes.
+    private struct Overview {
+        var days: [HealthDay] = []
+        var workouts: [HealthWorkout] = []
+        var measures: [WithingsMeasure] = []
+        var nights: [WithingsNight] = []
+    }
+
+    /// POST op=health_overview {"days": N} → server-side history + Withings.
+    /// Tolerant of partial payloads: any missing array is simply empty, any
+    /// malformed row is skipped.
+    private static func fetchOverview(windowDays: Int) async throws -> Overview {
+        let req = try makeRequest(op: "health_overview", body: ["days": windowDays])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw URLError(.badServerResponse)
+        }
+        guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw URLError(.cannotParseResponse)
+        }
+        var out = Overview()
+
+        for row in (obj["days"] as? [[String: Any]]) ?? [] {
+            guard let key = row["date"] as? String,
+                  let date = dayKey.date(from: key) else { continue }
+            var d = HealthDay(date: date, dateKey: key)
+            d.steps = intVal(row["steps"])
+            d.distanceM = intVal(row["distance_m"])
+            d.activeKcal = intVal(row["active_kcal"])
+            d.exerciseMin = intVal(row["exercise_min"])
+            d.standHours = intVal(row["stand_hours"])
+            d.restingHR = intVal(row["resting_hr"])
+            d.hrvMS = intVal(row["hrv_ms"])
+            d.sleepMin = intVal(row["sleep_min"])
+            d.sleepDeepMin = intVal(row["sleep_deep_min"])
+            d.sleepREMMin = intVal(row["sleep_rem_min"])
+            d.sleepAwakeMin = intVal(row["sleep_awake_min"])
+            out.days.append(d)
+        }
+
+        for row in (obj["workouts"] as? [[String: Any]]) ?? [] {
+            guard let startS = row["start_at"] as? String,
+                  let endS = row["end_at"] as? String,
+                  let start = parseISO(startS),
+                  let end = parseISO(endS),
+                  let kind = row["kind"] as? String else { continue }
+            var w = HealthWorkout(start: start, end: end, kind: kind)
+            w.distanceM = intVal(row["distance_m"])
+            w.kcal = intVal(row["kcal"])
+            w.avgHR = intVal(row["avg_hr"])
+            if let raw = row["route"] as? [[Any]] {
+                w.route = raw.compactMap { pair in
+                    let nums = pair.compactMap { ($0 as? NSNumber)?.doubleValue }
+                    return nums.count >= 2 ? [nums[0], nums[1]] : nil
+                }
+            }
+            out.workouts.append(w)
+        }
+
+        for row in (obj["withings_measures"] as? [[String: Any]]) ?? [] {
+            guard let metric = row["metric"] as? String,
+                  let atS = row["measured_at"] as? String,
+                  let at = parseISO(atS) else { continue }
+            out.measures.append(WithingsMeasure(metric: metric,
+                                                value: dblVal(row["value"]),
+                                                unit: (row["unit"] as? String) ?? "",
+                                                measuredAt: at))
+        }
+
+        for row in (obj["withings_sleep"] as? [[String: Any]]) ?? [] {
+            guard let night = row["night"] as? String,
+                  let date = dayKey.date(from: night) else { continue }
+            var n = WithingsNight(night: night, date: date)
+            n.sleepScore = intVal(row["sleep_score"])
+            n.totalSleepMin = intVal(row["total_sleep_min"])
+            n.deepMin = intVal(row["deep_min"])
+            n.remMin = intVal(row["rem_min"])
+            n.lightMin = intVal(row["light_min"])
+            n.awakeMin = intVal(row["awake_min"])
+            n.hrAvg = intVal(row["hr_avg"])
+            out.nights.append(n)
+        }
+
+        return out
+    }
+
+    /// JSON leniency: numbers may arrive as Int, Double or String.
+    private static func intVal(_ any: Any?) -> Int {
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String, let v = Double(s) { return Int(v) }
+        return 0
+    }
+
+    private static func dblVal(_ any: Any?) -> Double {
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String, let v = Double(s) { return v }
+        return 0
     }
 }
