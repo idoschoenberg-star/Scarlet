@@ -4157,8 +4157,20 @@
   // silence both directions; restore on return. And an instance launched as
   // TALK snaps back to the Talk page every time it comes to the foreground —
   // pressing the Talk icon while the full app is showing works again.
+  // Hide-silencing is a HANDHELD behavior only. On a phone/tablet, "hidden"
+  // means the app left the screen, so we hard-silence both directions to kill
+  // the "noise after closing". On a DESKTOP (Mac), "hidden" also fires whenever
+  // the Scarlet window merely stops being frontmost — the normal state for a
+  // hands-free assistant you talk to while working in another app. Killing the
+  // mic there is exactly the "Scarlet can't listen on my Mac" bug: she went
+  // deaf the instant another window came forward. So desktop stays full-duplex
+  // in the background; only handhelds silence on hide.
+  const HANDHELD = (window.matchMedia &&
+    (matchMedia("(pointer: coarse)").matches ||
+     matchMedia("(display-mode: standalone)").matches));
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      if (!HANDHELD) return; // Mac: keep listening & speaking while backgrounded
       try {
         // Instant silence, but REVERSIBLE: mute outputs and the mic without
         // cancelling her reply — a Control-Center pull or brief app switch
