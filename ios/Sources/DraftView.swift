@@ -698,23 +698,38 @@ struct DraftView: View {
         }
     }
 
+    /// True when the text is dominated by Hebrew — the draft then lays out
+    /// right-to-left exactly as it will read in Outlook/WhatsApp.
+    private func isHebrew(_ s: String) -> Bool {
+        var heb = 0, lat = 0
+        for u in s.unicodeScalars.prefix(400) {
+            if (0x0590...0x05FF).contains(u.value) { heb += 1 }
+            else if (0x41...0x7A).contains(u.value) { lat += 1 }
+        }
+        return heb > lat
+    }
+
     /// The draft itself: an elegant dark card, readable serif-feel body,
-    /// scrollable and selectable.
+    /// scrollable and selectable. Hebrew drafts read right-to-left.
     private func draftCard(_ draft: DraftModel.ActiveDraft) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+        let rtl = isHebrew(draft.body)
+        return ScrollView {
+            VStack(alignment: rtl ? .trailing : .leading, spacing: 12) {
                 if !draft.subject.isEmpty {
                     Text(draft.subject)
                         .font(.headline)
                         .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(rtl ? .trailing : .leading)
+                        .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
                 }
                 Text(draft.body)
                     .font(.system(size: 17))
                     .lineSpacing(4)
                     .foregroundStyle(paper)
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(rtl ? .trailing : .leading)
+                    .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
+                    .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
             }
             .padding(18)
             .padding(.top, 4)
