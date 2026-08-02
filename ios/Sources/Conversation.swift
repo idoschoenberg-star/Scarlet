@@ -48,15 +48,6 @@ final class Conversation: ObservableObject {
     /// when none is held.
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
 
-    // Running as an iOS app on an Apple-Silicon Mac. Apple's voice-processing
-    // audio modes (.voiceChat/.videoChat) engage the AEC I/O unit, which cannot
-    // capture from a pro multichannel interface (e.g. an RME Babyface) here —
-    // the mic goes silent while output still plays, so she "listens" but never
-    // hears. On the Mac we use a plain capture mode with NO voice processing;
-    // our own half-duplex echo gate (echoRisk) already prevents her voice from
-    // looping back, so Apple's AEC isn't needed. iPhone is untouched.
-    private let onMac = ProcessInfo.processInfo.isiOSAppOnMac
-
     // Audio — built once, reused across reconnects. Re-running mic setup
     // (a second installTap on the same bus) is an instant NSException crash.
     private let engine = AVAudioEngine()
@@ -140,11 +131,10 @@ final class Conversation: ObservableObject {
         let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
         // .voiceChat is tuned for the EARPIECE and keeps loudspeaker output
         // quiet-call level; .videoChat is the speakerphone tuning — full
-        // loudspeaker loudness with echo control intact.
-        // On the Mac, .default = no voice-processing so the Babyface input is
-        // read; on iPhone keep the tuned voice/video-chat AEC modes.
-        let mode: AVAudioSession.Mode = onMac ? .default : (loudspeaker ? .videoChat : .voiceChat)
-        try? s.setCategory(.playAndRecord, mode: mode,
+        // loudspeaker loudness with echo control intact. Keep Apple's AEC on
+        // EVERYWHERE including the Mac: turning it off (a pro-interface capture
+        // experiment) let her loudspeaker voice loop back and truncate her.
+        try? s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
                            options: loudspeaker ? base.union(.defaultToSpeaker) : base)
         try? s.setActive(true)
         if phoneIsOutput {
@@ -408,9 +398,7 @@ final class Conversation: ObservableObject {
 
     private func startAudioSession() throws {
         let s = AVAudioSession.sharedInstance()
-        // Mac: plain mode, no voice-processing (see `onMac`) so a pro interface
-        // like the Babyface is actually captured. iPhone: voice-chat AEC.
-        try s.setCategory(.playAndRecord, mode: onMac ? .default : .voiceChat,
+        try s.setCategory(.playAndRecord, mode: .voiceChat,
                           options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
         try s.setActive(true)
         routeToSpeakerIfReceiver()
