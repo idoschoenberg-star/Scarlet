@@ -41,6 +41,23 @@ final class Conversation: ObservableObject {
     private var playFormat: AVAudioFormat?
     private var audioReady = false
 
+    // How many of her audio buffers are scheduled-but-unfinished. This is the
+    // ONLY truthful "is she audibly speaking" signal: the server streams her
+    // audio faster than realtime, so its own idea of the turn ends while the
+    // loudspeaker is still talking. While buffers remain (plus a short reverb
+    // tail) the mic must NOT stream — otherwise her own loudspeaker voice
+    // comes back as "Ido speaking": the server either truncates her (barge-in)
+    // or, with interruptions disabled, transcribes her words as HIS next turn
+    // and she starts answering herself — the freeze/derail after long dialogs.
+    private var pendingBuffers = 0
+    private var speechTailUntil = Date.distantPast
+
+    /// True while sending mic audio would loop her own voice back to her.
+    private var echoRisk: Bool {
+        if chatMode || !speakerOn { return false }   // her voice is silent
+        return pendingBuffers > 0 || Date() < speechTailUntil
+    }
+
     // MARK: lifecycle
 
     func start(token: String) {
@@ -346,7 +363,9 @@ final class Conversation: ObservableObject {
             let bytes = Int(out.frameLength) * 2
             let data = Data(bytes: ch[0], count: bytes)
             Task { @MainActor in
-                guard self.micOn else { return }
+                // Half-duplex: her ears open only when her voice isn't in the
+                // room. Kills echo barge-in AND echo phantom turns at the root.
+                guard self.micOn, !self.echoRisk else { return }
                 self.send(["user_audio_chunk": data.base64EncodedString()])
             }
         }
@@ -380,16 +399,30 @@ final class Conversation: ObservableObject {
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
+        pendingBuffers += 1
         player.scheduleBuffer(buf) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
-                if self.state == .speaking { self.state = .listening; self.status = self.micOn ? "Listening…" : self.status }
+                // She's done only when the LAST queued buffer drains — the
+                // first buffer's completion used to flip state mid-sentence.
+                self.pendingBuffers = max(0, self.pendingBuffers - 1)
+                if self.pendingBuffers == 0 {
+                    // Short grace so the room's reverb tail can't reach the
+                    // mic as a phantom user turn.
+                    self.speechTailUntil = Date().addingTimeInterval(0.35)
+                    if self.state == .speaking {
+                        self.state = .listening
+                        if self.micOn { self.status = "Listening…" }
+                    }
+                }
             }
         }
     }
 
     private func flushPlayback() {
         player.stop()
+        pendingBuffers = 0
+        speechTailUntil = Date.distantPast
         state = .listening
         if micOn { status = "Listening…" }
     }
@@ -398,6 +431,8 @@ final class Conversation: ObservableObject {
         guard audioReady else { return }
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
+        pendingBuffers = 0
+        speechTailUntil = Date.distantPast
         engine.stop()
         audioReady = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
