@@ -522,8 +522,12 @@ final class DeskModel: ObservableObject {
     // MARK: parsing (defensive — the notes payload is the Mac agent's JSON)
 
     static func parseReminders(_ raw: [[String: Any]]) -> [DeskReminder] {
-        raw.compactMap { r in
+        var seen = Set<String>()
+        return raw.compactMap { r in
             guard let id = r["id"] as? String, !id.isEmpty else { return nil }
+            // A repeated reminder id (recurring/duplicated sync) traps the
+            // drag-reorder diffable List at regular width — keep the first.
+            guard seen.insert(id).inserted else { return nil }
             let title = ((r["title"] as? String) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return DeskReminder(

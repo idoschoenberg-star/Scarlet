@@ -97,6 +97,9 @@ final class DraftModel: ObservableObject {
 
     private var draftId: String?
     private var pendingCompose: [String: Any]?
+    /// Set when the sheet closed before compose returned a draft_id — the
+    /// in-flight compose reads it and dismisses the draft it just created.
+    private var dismissRequested = false
     private var timer: Timer?
     /// The in-flight (debouncing or fetching) contact search, cancelled by
     /// every keystroke so only the latest query lands.
@@ -279,11 +282,28 @@ final class DraftModel: ObservableObject {
     /// closes immediately either way.
     func discard() {
         stopPolling()
-        guard let id = draftId else { return }
+        guard let id = draftId else {
+            // A compose is still in flight (no draft_id yet). Remember the
+            // dismiss so compose() cleans up the draft the moment it lands —
+            // otherwise it's created server-side with nothing to close it.
+            if phase == .writing { dismissRequested = true }
+            return
+        }
         Task {
             _ = try? await Self.request("op=draft_action", method: "POST",
                                         body: ["id": id, "action": "dismiss"])
         }
+    }
+
+    /// Called when the sheet CLOSES (incl. swipe-down, which bypasses the ✕ and
+    /// Discard buttons). A draft Ido opened himself (Reply / new mail / channel)
+    /// that was never approved must be dismissed server-side — otherwise it
+    /// stays the "active" draft and a later spoken "send it" would send the
+    /// window he swiped away. Voice-attached drafts belong to the live session,
+    /// so their lifecycle is left to the conversation.
+    func discardIfAbandoned() {
+        guard !adoptActive, phase != .saved else { return }
+        discard()
     }
 
     // MARK: compose + polling
@@ -299,6 +319,9 @@ final class DraftModel: ObservableObject {
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let id = obj?["draft_id"] as? String else { throw URLError(.badServerResponse) }
                 draftId = id
+                // The sheet was closed while this compose was in flight — dismiss
+                // the just-created draft so it doesn't linger as active.
+                if dismissRequested { dismissRequested = false; discard(); return }
                 if let d = try? await Self.fetchActive(), d.id == id {
                     draft = d
                     phase = .ready
@@ -474,6 +497,10 @@ struct DraftView: View {
             NotificationCenter.default.post(name: .scarletDraftSheetVisible,
                                             object: nil,
                                             userInfo: ["visible": false])
+            // Swipe-down must behave like the ✕/Discard buttons for a draft he
+            // opened himself and never approved — never leave it silently
+            // sendable by voice.
+            model.discardIfAbandoned()
             model.stopPolling()
             // Give her ears back whatever was focused before the window
             // opened — unless another screen already claimed focus.

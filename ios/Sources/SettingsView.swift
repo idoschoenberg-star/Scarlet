@@ -25,8 +25,12 @@ final class SettingsModel: ObservableObject {
             let data = try await call("voices=1", method: "GET")
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             currentId = (obj["current"] as? String) ?? currentId
+            var seenV = Set<String>()
             voices = ((obj["voices"] as? [[String: Any]]) ?? []).compactMap { v in
                 guard let id = v["id"] as? String else { return nil }
+                // A duplicate voice id would collide as a ForEach id in the
+                // split-view List — keep the first.
+                guard seenV.insert(id).inserted else { return nil }
                 return VoiceOption(id: id, name: (v["name"] as? String) ?? id,
                                    desc: v["desc"] as? String, preview: v["preview"] as? String)
             }
@@ -37,9 +41,20 @@ final class SettingsModel: ObservableObject {
     }
 
     func select(_ v: VoiceOption) {
+        let previous = currentId
         currentId = v.id
         note = "Voice set to \(v.name) — she'll use it from the next conversation."
-        Task { _ = try? await call("setvoice=\(v.id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? v.id)", method: "POST") }
+        Task {
+            do {
+                _ = try await call("setvoice=\(v.id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? v.id)", method: "POST")
+            } catch {
+                // Don't claim success the server didn't confirm — revert the
+                // checkmark and say so, instead of silently snapping back on the
+                // next open.
+                currentId = previous
+                note = "Couldn't set \(v.name) — check your connection and try again."
+            }
+        }
     }
 
     func preview(_ v: VoiceOption) {
@@ -52,7 +67,10 @@ final class SettingsModel: ObservableObject {
         var req = URLRequest(url: URL(string: AppConfig.elevenURL.absoluteString + "?v=2&" + q)!)
         req.httpMethod = method
         req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
-        let (d, _) = try await URLSession.shared.data(for: req)
+        let (d, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw URLError(.badServerResponse)
+        }
         return d
     }
 }

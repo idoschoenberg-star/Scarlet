@@ -223,8 +223,11 @@ final class LibraryModel: ObservableObject {
 
     private static func parseItems(_ obj: [String: Any]) -> [LibraryItem] {
         let raw = (obj["items"] as? [[String: Any]]) ?? []
+        var seen = Set<String>()
         return raw.compactMap { a in
             guard let id = a["id"] as? String, !id.isEmpty else { return nil }
+            // A duplicate id traps the diffable List at regular width — keep first.
+            guard seen.insert(id).inserted else { return nil }
             let title = (a["title"] as? String) ?? ""
             let urlString = (a["url"] as? String) ?? ""
             return LibraryItem(
@@ -532,7 +535,10 @@ struct LibraryView: View {
             videoItem = WAVideoItem(url: url)
         case .html, .link:
             claimFocus(item)
-            webItem = LibraryWebItem(url: url, title: item.title)
+            // For an HTML artifact, FORCE text/html rendering — object storage
+            // often serves uploaded .html as text/plain (raw source shows) or
+            // octet-stream (blank/download). A plain link keeps normal loading.
+            webItem = LibraryWebItem(url: url, title: item.title, forceHTML: item.kind == .html)
         case .pdf, .file:
             openDocument(item, url: url)
         }
@@ -720,6 +726,7 @@ struct LibraryRow: View {
 struct LibraryWebItem: Identifiable {
     let url: URL
     let title: String
+    var forceHTML: Bool = false
     var id: String { url.absoluteString }
 }
 
@@ -732,7 +739,7 @@ struct LibraryWebSheet: View {
 
     var body: some View {
         NavigationStack {
-            LibraryWebView(url: item.url)
+            LibraryWebView(url: item.url, forceHTML: item.forceHTML)
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle(item.title)
                 .navigationBarTitleDisplayMode(.inline)
@@ -755,6 +762,7 @@ struct LibraryWebSheet: View {
 /// body), so no delegate gymnastics are needed.
 struct LibraryWebView: UIViewRepresentable {
     let url: URL
+    var forceHTML: Bool = false
 
     final class Coordinator {
         var loadedURL: URL?
@@ -774,6 +782,17 @@ struct LibraryWebView: UIViewRepresentable {
     func updateUIView(_ web: WKWebView, context: Context) {
         guard context.coordinator.loadedURL != url else { return }
         context.coordinator.loadedURL = url
-        web.load(URLRequest(url: url))
+        guard forceHTML else { web.load(URLRequest(url: url)); return }
+        // Fetch the bytes and render them AS text/html, ignoring whatever
+        // Content-Type object storage stamped on the file — otherwise a
+        // text/plain header shows raw source and octet-stream shows a blank page.
+        Task {
+            do {
+                let (data, _) = try await URLSession.shared.data(from: url)
+                await MainActor.run { web.load(data, mimeType: "text/html", characterEncodingName: "UTF-8", baseURL: url) }
+            } catch {
+                await MainActor.run { web.load(URLRequest(url: url)) }   // fall back to a normal load
+            }
+        }
     }
 }

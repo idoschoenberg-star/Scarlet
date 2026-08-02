@@ -249,8 +249,13 @@ final class InboxModel: ObservableObject {
         do {
             let data = try await Self.request("op=mailinbox&tab=\(tab.rawValue)", method: "GET")
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            var seen = Set<String>()
             var fetched: [MailMessage] = ((obj["messages"] as? [[String: Any]]) ?? []).compactMap { m in
                 guard let id = m["id"] as? String else { return nil }
+                // Graph can return the same message id twice (delta/paging). A
+                // duplicate id traps the diffable List at regular width (iPad/Mac)
+                // — the exact crash class already fixed in Chats. Keep the first.
+                guard seen.insert(id).inserted else { return nil }
                 return MailMessage(
                     id: id,
                     subject: (m["subject"] as? String) ?? "(no subject)",
@@ -590,6 +595,7 @@ struct InboxView: View {
             .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $showCompose) {
                 DraftView(seed: nil)
+                    .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                     .preferredColorScheme(.dark)
             }
             // Ambient focus: the list reports itself whenever it's the
@@ -676,9 +682,13 @@ struct InboxView: View {
             .background(Capsule().fill(OutlookStyle.pillTrack))
             Spacer()
             if let stamp = model.lastUpdated {
-                Text(Self.updatedLabel(stamp))
-                    .font(.system(size: 11))
-                    .foregroundStyle(OutlookStyle.textSecondary)
+                // Tick every minute so the stamp ages while the list sits idle
+                // (nothing else drives a re-render) — matches the calendar.
+                TimelineView(.everyMinute) { _ in
+                    Text(Self.updatedLabel(stamp))
+                        .font(.system(size: 11))
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -1033,6 +1043,7 @@ struct MailDetailView: View {
                 toLine: detail?.to ?? "",
                 ccLine: detail?.cc ?? ""
             ))
+            .environmentObject(convo)   // DraftView hard-requires it; match every other call site
             .preferredColorScheme(.dark)
         }
         // QuickLook: pinch-zoom, paging, share — the Outlook attachment

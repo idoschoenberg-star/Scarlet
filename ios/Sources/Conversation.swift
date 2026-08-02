@@ -44,6 +44,10 @@ final class Conversation: ObservableObject {
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
     private var reconnecting = false
+    /// The in-flight reconnect sleep — cancellable so End (or a fresh Start)
+    /// during the reconnect window can't resurrect the session or spawn a
+    /// second socket.
+    private var reconnectTask: Task<Void, Never>?
     private var observersInstalled = false
     /// A rebuilt socket is a brand-new ElevenLabs conversation with amnesia —
     /// flag it so she's told this is a continuation, not a fresh caller.
@@ -100,6 +104,9 @@ final class Conversation: ObservableObject {
 
     func start(token: String) {
         guard state == .idle else { return }
+        // Kill any pending reconnect from a prior session so it can't wake a
+        // second socket alongside this fresh one.
+        reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         self.token = token
         wantLive = true
         state = .connecting
@@ -109,6 +116,7 @@ final class Conversation: ObservableObject {
 
     func end() {
         wantLive = false
+        reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
@@ -168,8 +176,10 @@ final class Conversation: ObservableObject {
 
     // MARK: chat mode
 
-    /// Remembered so leaving chat mode restores the mic the way Ido left it.
+    /// Remembered so leaving chat mode restores the mic AND voice the way Ido
+    /// left them — if he'd silenced her voice, chat mode must not turn it back on.
     private var micWasOnBeforeChat = true
+    private var speakerWasOnBeforeChat = true
 
     /// Chat mode: her ears close and her voice goes silent — she answers in
     /// text only. Voice mode restores both.
@@ -177,6 +187,7 @@ final class Conversation: ObservableObject {
         guard on != chatMode else { return }
         if on {
             micWasOnBeforeChat = micOn
+            speakerWasOnBeforeChat = speakerOn
             micOn = false
             speakerOn = false
             player.volume = 0
@@ -185,8 +196,8 @@ final class Conversation: ObservableObject {
         } else {
             chatMode = false
             micOn = micWasOnBeforeChat
-            speakerOn = true
-            player.volume = 1
+            speakerOn = speakerWasOnBeforeChat
+            player.volume = speakerOn ? 1 : 0
             if micOn { status = "Listening…" }
         }
     }
@@ -320,6 +331,9 @@ final class Conversation: ObservableObject {
                 pendingOutbound.removeAll()   // no session is coming — don't replay stale text later
                 return
             }
+            // The user may have tapped End while we were fetching the URL — do
+            // NOT resurrect a session he explicitly hung up on.
+            guard wantLive else { return }
             try ensureAudio()
             let task = wsSession.webSocketTask(with: url)
             ws = task
@@ -377,13 +391,20 @@ final class Conversation: ObservableObject {
     private func scheduleReconnect() {
         guard wantLive, !reconnecting else { return }
         reconnecting = true
-        resumedSession = true
+        // Only claim a "continuation" when a conversation actually happened —
+        // a failed FIRST connect (empty transcript) must greet normally, not
+        // pretend to resume a thread that never existed.
+        resumedSession = !transcript.isEmpty
+        // Reflect the true state: the socket is down. This makes the orb show
+        // the connecting affordance AND makes deliverUserMessage QUEUE typed
+        // text instead of dead-sending it to the nil socket.
+        state = .connecting
         status = "Reconnecting…"
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        Task {
+        reconnectTask = Task {
             try? await Task.sleep(nanoseconds: 900_000_000)
-            if wantLive { await connect() }
+            if wantLive, !Task.isCancelled { await connect() }
             reconnecting = false
         }
     }
@@ -725,7 +746,13 @@ final class Conversation: ObservableObject {
             Task { @MainActor in
                 switch type {
                 case .began:
-                    self.player.pause()
+                    // iOS is about to tear down the audio unit, discarding every
+                    // scheduled buffer WITHOUT firing its completion handler — so
+                    // pendingBuffers would never decrement and the echo gate would
+                    // stay closed forever, leaving her frozen (mic dead, stuck in
+                    // .speaking). Treat the interruption as a barge-in reset: clear
+                    // the gate and return to listening so she recovers on .ended.
+                    self.flushPlayback()
                 case .ended:
                     try? self.startAudioSession()
                     if self.wantLive, !self.engine.isRunning { try? self.engine.start() }

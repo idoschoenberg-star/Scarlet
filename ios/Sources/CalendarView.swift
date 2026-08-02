@@ -20,7 +20,7 @@ private let calendarAgendaFocus = "[FOCUS] Ido is viewing his Amwell calendar (a
 
 /// Start of the week containing `date`, per the current calendar.
 private func calStartOfWeek(_ date: Date) -> Date {
-    let cal = Calendar.current
+    let cal = CalDates.cal
     return cal.dateInterval(of: .weekOfYear, for: date)?.start ?? cal.startOfDay(for: date)
 }
 
@@ -80,14 +80,27 @@ struct CalEventDetail {
 // MARK: - Date plumbing
 
 /// Formatters, static so they're built once. The server sends local
-/// Israel-time strings like "2026-08-01T09:00:00.0000000" — the first 19
-/// characters parse with a fixed pattern in the device's current zone.
+/// Israel-time strings like "2026-08-01T09:00:00.0000000". The whole calendar
+/// is an Israel-wall-clock view: we parse AND display AND bucket days in
+/// Asia/Jerusalem, so it stays correct when Ido's device is on Boston (or any
+/// other) time — otherwise every absolute instant is off by the offset and the
+/// wrong event highlights, the Join button gates on the wrong day, and events
+/// near midnight land in the wrong bucket.
 enum CalDates {
+    static let zone = TimeZone(identifier: "Asia/Jerusalem") ?? .current
+    /// The Israel-pinned calendar every day-boundary check uses (today,
+    /// same-day, start-of-week, add-day). Used in place of Calendar.current
+    /// everywhere in this view so device timezone never skews the grid.
+    static let cal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = zone
+        return c
+    }()
     static let parseFormat: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        f.timeZone = .current
+        f.timeZone = zone
         return f
     }()
     /// "2026-08-01" — query-string dates, day grouping keys, strip dots.
@@ -95,37 +108,42 @@ enum CalDates {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
-        f.timeZone = .current
+        f.timeZone = zone
         return f
     }()
     /// "9:00"
     static let time: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "H:mm"
+        f.timeZone = zone
         return f
     }()
     /// "August 2026"
     static let monthTitle: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "MMMM yyyy"
+        f.timeZone = zone
         return f
     }()
     /// "Friday, August 1"
     static let dayHeader: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEEE, MMMM d"
+        f.timeZone = zone
         return f
     }()
     /// "Friday, Aug 1"
     static let detailDay: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEEE, MMM d"
+        f.timeZone = zone
         return f
     }()
     /// "F" — single-letter weekday for the strip.
     static let weekdayLetter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "EEEEE"
+        f.timeZone = zone
         return f
     }()
 
@@ -227,7 +245,7 @@ final class CalendarModel: ObservableObject {
             inFlight = false
             loading = false
         }
-        let cal = Calendar.current
+        let cal = CalDates.cal
         let today = cal.startOfDay(for: Date())
         guard let rangeStart = cal.date(byAdding: .day, value: -7, to: today),
               let rangeEnd = cal.date(byAdding: .day, value: 21, to: today) else { return }
@@ -251,10 +269,13 @@ final class CalendarModel: ObservableObject {
 
     /// Wire dicts → events. Shared by the network path and the disk cache.
     static func parseEvents(_ raws: [[String: Any]]) -> [CalEvent] {
-        raws.compactMap { e in
+        var seen = Set<String>()
+        return raws.compactMap { e in
             guard let id = e["id"] as? String,
                   let start = CalDates.parse(e["start"] as? String),
                   let end = CalDates.parse(e["end"] as? String) else { return nil }
+            // A repeated Graph id traps the diffable List at regular width — keep first.
+            guard seen.insert(id).inserted else { return nil }
             let subject = (e["subject"] as? String) ?? ""
             return CalEvent(
                 id: id,
@@ -274,7 +295,7 @@ final class CalendarModel: ObservableObject {
     /// Group by local start day. Empty days are skipped except today and
     /// tomorrow, which always appear (they carry the "No events" rows).
     private func rebuild(_ events: [CalEvent]) {
-        let cal = Calendar.current
+        let cal = CalDates.cal
         var byDay: [String: [CalEvent]] = [:]
         for e in events {
             byDay[CalDates.dayKey.string(from: e.start), default: []].append(e)
@@ -399,7 +420,7 @@ final class CalendarModel: ObservableObject {
                                               body: ["id": id])
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard (obj?["ok"] as? Bool) == true else { return false }
-            let cal = Calendar.current
+            let cal = CalDates.cal
             for di in days.indices {
                 days[di].events.removeAll { $0.id == id }
             }
@@ -446,7 +467,7 @@ struct CalendarView: View {
     @StateObject private var model = CalendarModel()
     @EnvironmentObject private var convo: Conversation
 
-    @State private var selectedDay = Calendar.current.startOfDay(for: Date())
+    @State private var selectedDay = CalDates.cal.startOfDay(for: Date())
     @State private var weekAnchor = calStartOfWeek(Date())
     @State private var sheetEvent: CalEvent?
     /// One jump-to-today per tab appearance — re-armed in onAppear.
@@ -556,7 +577,7 @@ struct CalendarView: View {
     }
 
     private func goToToday(_ proxy: ScrollViewProxy, animated: Bool = true) {
-        let today = Calendar.current.startOfDay(for: Date())
+        let today = CalDates.cal.startOfDay(for: Date())
         selectedDay = today
         weekAnchor = calStartOfWeek(today)
         scrollToDay(today, proxy: proxy, animated: animated)
@@ -581,7 +602,7 @@ struct CalendarView: View {
     // MARK: month strip (Outlook's week row)
 
     private var weekDays: [Date] {
-        (0..<7).compactMap { Calendar.current.date(byAdding: .day, value: $0, to: weekAnchor) }
+        (0..<7).compactMap { CalDates.cal.date(byAdding: .day, value: $0, to: weekAnchor) }
     }
 
     private var monthTitle: String {
@@ -632,7 +653,7 @@ struct CalendarView: View {
 
     private func weekChevron(_ icon: String, byDays: Int) -> some View {
         Button {
-            if let moved = Calendar.current.date(byAdding: .day, value: byDays, to: weekAnchor) {
+            if let moved = CalDates.cal.date(byAdding: .day, value: byDays, to: weekAnchor) {
                 withAnimation(.snappy(duration: 0.2)) {
                     weekAnchor = moved
                 }
@@ -650,7 +671,7 @@ struct CalendarView: View {
     /// filled Microsoft-blue circle with a white number, the selected day an
     /// outlined pill — with an event-presence dot underneath.
     private func dayCell(_ day: Date, proxy: ScrollViewProxy) -> some View {
-        let cal = Calendar.current
+        let cal = CalDates.cal
         let isToday = cal.isDateInToday(day)
         let isSelected = cal.isDate(day, inSameDayAs: selectedDay)
         let hasEvents = model.eventDayKeys.contains(CalDates.dayKey.string(from: day))
@@ -754,7 +775,7 @@ struct CalendarView: View {
         Text(dayTitle(day.date))
             .font(.system(size: 13, weight: .semibold).smallCaps())
             .kerning(0.4)
-            .foregroundStyle(Calendar.current.isDateInToday(day.date)
+            .foregroundStyle(CalDates.cal.isDateInToday(day.date)
                 ? CalStyle.accent : Color(calHex: 0x8A8886))
             .padding(.top, 16)
             .padding(.bottom, 2)
@@ -764,7 +785,7 @@ struct CalendarView: View {
     }
 
     private func dayTitle(_ date: Date) -> String {
-        let cal = Calendar.current
+        let cal = CalDates.cal
         let name = CalDates.dayHeader.string(from: date)
         if cal.isDateInToday(date) { return "Today · " + name }
         if cal.isDateInTomorrow(date) { return "Tomorrow · " + name }
@@ -863,7 +884,7 @@ struct CalEventRow: View {
             }
             .padding(.vertical, 10)
             Spacer(minLength: 8)
-            if let joinURL, Calendar.current.isDateInToday(event.start) {
+            if let joinURL, CalDates.cal.isDateInToday(event.start) {
                 Button {
                     UIApplication.shared.open(joinURL, options: [:], completionHandler: nil)
                 } label: {

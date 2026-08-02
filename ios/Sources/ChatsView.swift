@@ -644,6 +644,13 @@ final class ChatThreadModel: ObservableObject {
                 errorText = "Couldn't send — \(err)"
                 return false
             }
+            // A soft failure comes back as HTTP 200 {"ok": false} with no
+            // `error` (e.g. the WhatsApp bridge is logged out). Don't render a
+            // fake "sent" bubble and cache it — treat ok:false as a failure.
+            if let ok = obj["ok"] as? Bool, ok == false {
+                errorText = "Couldn't send — \((obj["status"] as? String) ?? "the bridge isn't connected"). Your text is still here."
+                return false
+            }
             appendLocal(text)
             Task { await load() }
             return true
