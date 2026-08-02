@@ -4165,9 +4165,15 @@
   // mic there is exactly the "Scarlet can't listen on my Mac" bug: she went
   // deaf the instant another window came forward. So desktop stays full-duplex
   // in the background; only handhelds silence on hide.
-  const HANDHELD = (window.matchMedia &&
-    (matchMedia("(pointer: coarse)").matches ||
-     matchMedia("(display-mode: standalone)").matches));
+  // HANDHELD = a real touch device (phone/tablet), NOT "installed as an app".
+  // A Mac reports a FINE pointer even when Scarlet is added to the dock and
+  // runs standalone; an earlier version wrongly treated standalone as handheld,
+  // which put the Mac back on the phone code path and killed the mic whenever
+  // the window wasn't frontmost. The correct test: a coarse pointer AND no fine
+  // pointer available at all — true only on genuine touch-only devices.
+  const HANDHELD = !!(window.matchMedia &&
+    matchMedia("(any-pointer: coarse)").matches &&
+    !matchMedia("(any-pointer: fine)").matches);
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       if (!HANDHELD) return; // Mac: keep listening & speaking while backgrounded
