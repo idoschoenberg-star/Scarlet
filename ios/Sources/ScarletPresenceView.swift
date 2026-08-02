@@ -131,6 +131,11 @@ struct ScarletPresenceView: View {
                 .animation(pulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
                                    : .easeInOut(duration: 0.2),
                            value: pulsing)
+                // Fence the repeatForever pulse in: without this, any layout
+                // shift around the capsule (list refresh, keyboard, stamp
+                // tick) gets captured by the repeating animation and the
+                // whole capsule bounces up and down forever.
+                .geometryGroup()
                 .onAppear { pulsing = shouldPulse }
                 .onChange(of: shouldPulse) { _, now in pulsing = now }
         }
