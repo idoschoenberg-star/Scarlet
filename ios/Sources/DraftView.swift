@@ -209,10 +209,21 @@ final class DraftModel: ObservableObject {
         }
     }
 
+    /// True when THIS window's Approve button did the approving — the view
+    /// then tells Scarlet out loud, so she never re-asks "shall I send it?".
+    /// Voice approvals (her approve_draft tool) leave this false: she already
+    /// knows, the window just closes.
+    var approvedViaButton = false
+
     private func adopt(_ d: ActiveDraft) {
         draftId = d.id
         draft = d
         if phase == .writing && d.status == "draft" { phase = .ready }
+        // Approved by voice while this window is open: show the same green
+        // "sent" state the button shows, then the sheet auto-dismisses.
+        if d.status == "approved" && (phase == .ready || phase == .writing) {
+            phase = .saved
+        }
     }
 
     /// Re-run the last failed compose.
@@ -244,6 +255,7 @@ final class DraftModel: ObservableObject {
     func approve() {
         guard let id = draftId, phase == .ready else { return }
         phase = .approving
+        approvedViaButton = true
         errorText = ""
         Task {
             do {
@@ -332,6 +344,9 @@ final class DraftModel: ObservableObject {
         if d.id == want {
             draft = d
             if phase == .writing && d.status == "draft" { phase = .ready }
+            // Voice approval (her approve_draft tool) — mirror it here so the
+            // button, the green check, and her voice stay one single story.
+            if d.status == "approved" && phase == .ready { phase = .saved }
         } else if d.status == "draft" {
             // The active draft IS the window's truth. If voice work replaced
             // it under a different id (Scarlet revised or re-composed), follow
@@ -469,6 +484,26 @@ struct DraftView: View {
         }
         .onChange(of: model.phase) { _, newPhase in
             if newPhase == .saved {
+                // Button and voice must tell one story: when IDO pressed the
+                // button, say so in her ear — otherwise she keeps offering to
+                // send a draft that's already gone.
+                if model.approvedViaButton {
+                    let ch = model.draft?.channel ?? ""
+                    let outcome: String
+                    switch ch {
+                    case "email_outlook":
+                        outcome = "saved to his Outlook Drafts (corporate mail is never auto-sent)"
+                    case "teams":
+                        outcome = "staged in Teams for his one-tap send"
+                    default:
+                        outcome = "sent"
+                    }
+                    convo.sendSystemNudge(
+                        "[SYSTEM] Ido just pressed the Approve button in the draft window HIMSELF. "
+                        + "The \(ch) draft to \(model.draft?.recipient ?? "the recipient") was \(outcome). "
+                        + "The window is closing by itself. Acknowledge in a couple of words at most "
+                        + "— and do NOT ask whether to send it; it is already done.")
+                }
                 Task {
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
                     dismiss()
