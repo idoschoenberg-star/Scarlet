@@ -80,6 +80,9 @@ struct TalkView: View {
                     typeFocused = showType
                     if showType { convo.beginTyping() } else { convo.endTyping() }
                 }
+                // Hand her a document or a photo — camera, library or Files;
+                // she acknowledges and analyzes it (Claude reads behind her).
+                AttachToScarletButton(convo: convo)
             }
 
             // ONE big button, two faces: Start when she's asleep, End when

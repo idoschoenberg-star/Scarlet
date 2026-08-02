@@ -53,5 +53,6 @@ targets:
           - UIInterfaceOrientationPortrait
         UIBackgroundModes: [audio]
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
         ITSAppUsesNonExemptEncryption: false
