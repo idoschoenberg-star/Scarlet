@@ -78,7 +78,7 @@ final class Conversation: ObservableObject {
         ws = nil
         stopAudio()
         state = .idle
-        status = "Ended. Press your Scarlet button anytime."
+        status = "Ended. Tap Start (or the orb) when you want me back."
     }
 
     func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }

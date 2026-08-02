@@ -36,6 +36,13 @@ struct TalkView: View {
             .padding(.top, 8)
 
             Orb(active: convo.state == .speaking).frame(width: 220, height: 220)
+                // The orb IS the Scarlet button: tapping it while idle wakes her.
+                .onTapGesture {
+                    if convo.state == .idle {
+                        convo.hasAutoStarted = true
+                        convo.start(token: TokenStore.token ?? "")
+                    }
+                }
 
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
@@ -75,15 +82,32 @@ struct TalkView: View {
                 }
             }
 
-            Button(role: .destructive) {
-                convo.end()
-            } label: {
-                Text("End").font(.headline).frame(maxWidth: 340).padding(16)
-                    .background(Color(red: 0.75, green: 0.15, blue: 0.23),
-                                in: RoundedRectangle(cornerRadius: 30))
-                    .foregroundStyle(.white)
+            // ONE big button, two faces: Start when she's asleep, End when
+            // live. Ending never strands him — the same button (or the orb)
+            // brings her back. For long half-day sessions the Mic/Voice
+            // buttons above mute without ending; the session stays alive.
+            if convo.state == .idle {
+                Button {
+                    convo.hasAutoStarted = true
+                    convo.start(token: TokenStore.token ?? "")
+                } label: {
+                    Text("Start").font(.headline).frame(maxWidth: 340).padding(16)
+                        .background(Color(red: 1, green: 0.35, blue: 0.42),
+                                    in: RoundedRectangle(cornerRadius: 30))
+                        .foregroundStyle(.white)
+                }
+                .padding(.bottom, 2)
+            } else {
+                Button(role: .destructive) {
+                    convo.end()
+                } label: {
+                    Text("End").font(.headline).frame(maxWidth: 340).padding(16)
+                        .background(Color(red: 0.75, green: 0.15, blue: 0.23),
+                                    in: RoundedRectangle(cornerRadius: 30))
+                        .foregroundStyle(.white)
+                }
+                .padding(.bottom, 2)
             }
-            .padding(.bottom, 2)
 
             Link(destination: AppConfig.fullAppURL) {
                 Text("Full Scarlet app ›")
