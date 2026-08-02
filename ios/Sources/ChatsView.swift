@@ -354,9 +354,14 @@ final class ChatsDiskCache: @unchecked Sendable {
     func cachedList(_ channel: ChatChannel) -> (chats: [ChatSummary], fetchedAt: Date)? {
         lock.lock(); defer { lock.unlock() }
         guard let entry = payload.lists[channel.rawValue] else { return nil }
-        let chats = entry.chats.map { c in
-            ChatSummary(id: c.id, name: c.name, last: c.last, fromMe: c.fromMe,
-                        ts: c.ts, avatar: c.avatar, isGroup: c.isGroup)
+        // Same uniqueness contract as parseChats: a cache written before the
+        // dedup fix (or by another client) could hold a repeated id, and these
+        // rows feed the very same List — drop duplicates on restore too.
+        var seen = Set<String>()
+        let chats = entry.chats.compactMap { c -> ChatSummary? in
+            guard seen.insert(c.id).inserted else { return nil }
+            return ChatSummary(id: c.id, name: c.name, last: c.last, fromMe: c.fromMe,
+                               ts: c.ts, avatar: c.avatar, isGroup: c.isGroup)
         }
         return (chats, entry.fetchedAt)
     }
@@ -504,6 +509,13 @@ final class ChatListModel: ObservableObject {
     private static func parseChats(_ obj: [String: Any],
                                    channel: ChatChannel) -> [ChatSummary] {
         let raw = (obj["chats"] as? [[String: Any]]) ?? []
+        // Row ids MUST be unique: at regular width the Chats list is hosted in
+        // a NavigationSplitView, whose diffable-backed List traps ("identifiers
+        // are not unique") the instant it applies a snapshot with a repeated
+        // id — which is when a row is selected and the detail pane appears.
+        // Real WhatsApp lists do repeat a jid (a chat returned twice, or two
+        // rows resolving to the same jid), so keep only the first of each id.
+        var seen = Set<String>()
         return raw.compactMap { c in
             let idField: String?
             switch channel {
@@ -512,6 +524,7 @@ final class ChatListModel: ObservableObject {
             case .imessage: idField = c["handle"] as? String
             }
             guard let id = idField, !id.isEmpty else { return nil }
+            guard seen.insert(id).inserted else { return nil }
             let name = (c["name"] as? String) ?? ""
             return ChatSummary(
                 id: id,
