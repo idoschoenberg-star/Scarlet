@@ -105,6 +105,56 @@ struct RootView: View {
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
         }
+        // Desk mode: while the phone sits open on Talk next to his Mac, poll
+        // what he's focused on at the desk. Reading an email in DESKTOP
+        // Outlook flows to Scarlet as [FOCUS] — he speaks to the phone, the
+        // draft opens here, and the approved reply lands back in Outlook.
+        // Only on the Talk tab: inside the app, each screen owns its focus.
+        .task(id: tab) {
+            guard tab == .talk else { return }
+            var lastSig = ""
+            while !Task.isCancelled {
+                if convo.state == .listening || convo.state == .speaking {
+                    if let desk = await Self.fetchMacFocus() {
+                        if desk.sig != lastSig {
+                            lastSig = desk.sig
+                            convo.setFocus(desk.focusText)
+                        }
+                    } else if lastSig != "" {
+                        lastSig = ""
+                        if tab == .talk { convo.setFocus(Self.talkFocus) }
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+            }
+        }
+    }
+
+    /// One desk-focus poll. Returns nil when the Mac is idle/stale or not
+    /// on Outlook — the phone then falls back to its own ambient focus.
+    private struct DeskFocus { let sig: String; let focusText: String }
+    private static func fetchMacFocus() async -> DeskFocus? {
+        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "mac_focus"))
+        comps.queryItems = items
+        guard let url = comps.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        guard let (data, _) = try? await URLSession.shared.data(for: req),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (obj["fresh"] as? Bool) == true,
+              let outlook = obj["outlook"] as? [String: Any],
+              let subject = outlook["subject"] as? String, !subject.isEmpty else { return nil }
+        let sender = (outlook["sender"] as? String) ?? ""
+        let messageId = (outlook["message_id"] as? String) ?? ""
+        var text = "[FOCUS] DESK MODE: Ido is at his Mac, reading in desktop Outlook — \"\(subject)\""
+        if !sender.isEmpty { text += " from \(sender)" }
+        text += ". If he gives a drafting instruction, it refers to THIS email: ONE compose_draft with channel email_outlook"
+        if !messageId.isEmpty { text += " and message_id \(messageId)" }
+        text += ". The draft window opens on his phone; the approved draft appears in Outlook Drafts on his desktop."
+        return DeskFocus(sig: subject + "|" + sender, focusText: text)
     }
 }
 
