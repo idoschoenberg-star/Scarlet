@@ -125,17 +125,6 @@ struct SettingsView: View {
                 // channel pickers, and input gain — for capturing a close mic on
                 // a multichannel interface (e.g. the RME Babyface on the Mac).
                 MicrophoneSettingsSection()
-
-                Section {
-                    Link(destination: AppConfig.fullAppURL) {
-                        HStack {
-                            Image(systemName: "arrow.up.right.square")
-                            Text("Open the full Scarlet app")
-                        }
-                    }
-                } footer: {
-                    Text("Inbox, drafts, news, health and everything else lives in the full app.")
-                }
             }
             .navigationTitle("Settings")
             .toolbar {

@@ -619,17 +619,14 @@ struct InboxView: View {
 
     private var headerBar: some View {
         HStack(spacing: 12) {
-            // Account avatar placeholder ("IS" — no photo available); taps
-            // through to the full web app, as the ScarletMark used to.
-            Link(destination: AppConfig.fullAppURL) {
-                ZStack {
-                    Circle().fill(OutlookStyle.primaryBlue)
-                    Text("IS")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(.white)
-                }
-                .frame(width: 36, height: 36)
+            // Account avatar placeholder ("IS" — no photo available).
+            ZStack {
+                Circle().fill(OutlookStyle.primaryBlue)
+                Text("IS")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
             }
+            .frame(width: 36, height: 36)
             Text("Inbox")
                 .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(.white)
@@ -1022,9 +1019,6 @@ struct MailDetailView: View {
                         askScarlet()
                     } label: {
                         Label("Ask Scarlet about this email", systemImage: "sparkles")
-                    }
-                    Link(destination: AppConfig.fullAppURL) {
-                        Label("Open full app", systemImage: "arrow.up.forward.app")
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")

@@ -9,21 +9,22 @@ struct TalkView: View {
     @State private var typed = ""
     @FocusState private var typeFocused: Bool
 
+    /// The orb yields space to the transcript while he's typing/dictating.
+    private var orbSize: CGFloat { typeFocused ? 110 : 200 }
+
     var body: some View {
         VStack(spacing: 20) {
             ZStack {
                 Text("SCARLET").font(.system(size: 22, weight: .thin)).tracking(9)
                     .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
                 HStack {
-                    Link(destination: AppConfig.fullAppURL) {
-                        Image("ScarletMark")
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 30, height: 30)
-                            .clipShape(Circle())
-                            .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
-                    }
-                    .frame(width: 44, height: 44)
+                    Image("ScarletMark")
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 30, height: 30)
+                        .clipShape(Circle())
+                        .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
+                        .frame(width: 44, height: 44)
                     Spacer()
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
@@ -35,7 +36,11 @@ struct TalkView: View {
             }
             .padding(.top, 8)
 
-            Orb(active: convo.state == .speaking).frame(width: 220, height: 220)
+            // The orb shrinks the moment the keyboard is up, so her written
+            // reply always has room — the whole point of "answering silently".
+            Orb(active: convo.state == .speaking)
+                .frame(width: orbSize, height: orbSize)
+                .animation(.easeInOut(duration: 0.25), value: typeFocused)
                 // The orb IS the Scarlet button: tapping it while idle wakes her.
                 .onTapGesture {
                     if convo.state == .idle {
@@ -47,9 +52,12 @@ struct TalkView: View {
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
 
-            Transcript(lines: convo.transcript).frame(maxHeight: 260)
-
-            Spacer()
+            // Her reply lives here — always a real, readable, scrollable area
+            // (never squeezed to nothing), and it takes any spare height so a
+            // silent answer is easy to read.
+            Transcript(lines: convo.transcript)
+                .frame(minHeight: 150, maxHeight: .infinity)
+                .layoutPriority(1)
 
             if showType {
                 HStack(spacing: 8) {
@@ -121,13 +129,6 @@ struct TalkView: View {
                 }
                 .padding(.bottom, 2)
             }
-
-            Link(destination: AppConfig.fullAppURL) {
-                Text("Full Scarlet app ›")
-                    .font(.footnote)
-                    .foregroundStyle(Color(red: 0.79, green: 0.64, blue: 0.65))
-            }
-            .padding(.bottom, 6)
         }
         .padding(.horizontal, 24)
         .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
