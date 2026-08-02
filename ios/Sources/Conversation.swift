@@ -154,6 +154,14 @@ final class Conversation: ObservableObject {
         send(["type": "user_message", "text": t])
     }
 
+    /// A system-initiated turn: reaches her like a user message (so she
+    /// SPEAKS, unlike contextual updates) but never shows in the transcript —
+    /// used for proactive moments like announcing a recovered draft.
+    func sendSystemNudge(_ text: String) {
+        guard state == .listening || state == .speaking else { return }
+        send(["type": "user_message", "text": text])
+    }
+
     /// Her most recent line — surfaced by the floating presence capsule.
     var lastHerLine: String? { transcript.last(where: { $0.fromHer })?.text }
 

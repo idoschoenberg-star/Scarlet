@@ -172,6 +172,16 @@ struct RootView: View {
         recoveredDraftIds.insert(id)
         FlightRecorder.note(screen: "draft-recovered:\(id)")
         voiceDraftPresented = true
+        // She announces it — Ido should never have to go looking for lost
+        // work. Sent as a hidden system turn so she speaks up proactively.
+        let recipient = (draft["recipient"] as? String) ?? ""
+        let channel = (draft["channel"] as? String) ?? ""
+        convo.sendSystemNudge(
+            "[SYSTEM] The app just recovered a draft that was interrupted mid-work" +
+            (recipient.isEmpty ? "" : " (a \(channel) message to \(recipient))") +
+            ". It is back on his screen now. Tell Ido in ONE warm short sentence that his draft to " +
+            (recipient.isEmpty ? "them" : recipient) +
+            " was interrupted and is back on his screen, and that you can pick up right where you left off. Nothing more.")
     }
 
     /// One desk-focus poll. Returns nil when the Mac is idle/stale or not
