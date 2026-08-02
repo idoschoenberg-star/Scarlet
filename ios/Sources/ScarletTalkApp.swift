@@ -32,8 +32,11 @@ struct RootView: View {
     /// (i.e. after a crash) offers again; within one run we don't nag.
     @State private var recoveredDraftIds: Set<String> = []
     @Environment(\.scenePhase) private var scenePhase
+    /// iPhone keeps the TabView; iPad/Mac (regular width) get the
+    /// three-pane SplitShell — one codebase, presentation by surface.
+    @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, library }
+    enum Tab: Hashable { case talk, inbox, calendar, chats, library, health }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -41,27 +44,12 @@ struct RootView: View {
         "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
     var body: some View {
-        TabView(selection: $tab) {
-            TalkView(convo: convo)
-                .background(ScarletBackground().ignoresSafeArea())
-                .tabItem { Label("Talk", systemImage: "waveform") }
-                .tag(Tab.talk)
-            InboxView()
-                .environmentObject(convo)
-                .tabItem { Label("Inbox", systemImage: "envelope.fill") }
-                .tag(Tab.inbox)
-            CalendarView()
-                .environmentObject(convo)
-                .tabItem { Label("Calendar", systemImage: "calendar") }
-                .tag(Tab.calendar)
-            ChatsView()
-                .environmentObject(convo)
-                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
-                .tag(Tab.chats)
-            LibraryView()
-                .environmentObject(convo)
-                .tabItem { Label("Library", systemImage: "books.vertical.fill") }
-                .tag(Tab.library)
+        Group {
+            if hSize == .regular {
+                SplitShell(convo: convo)
+            } else {
+                phoneTabs
+            }
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
         // The Scarlet Presence capsule is EMBEDDED inside each list screen
@@ -142,6 +130,36 @@ struct RootView: View {
                 }
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
             }
+        }
+    }
+
+    /// The iPhone presentation: five main tabs + Health.
+    private var phoneTabs: some View {
+        TabView(selection: $tab) {
+            TalkView(convo: convo)
+                .background(ScarletBackground().ignoresSafeArea())
+                .tabItem { Label("Talk", systemImage: "waveform") }
+                .tag(Tab.talk)
+            InboxView()
+                .environmentObject(convo)
+                .tabItem { Label("Inbox", systemImage: "envelope.fill") }
+                .tag(Tab.inbox)
+            CalendarView()
+                .environmentObject(convo)
+                .tabItem { Label("Calendar", systemImage: "calendar") }
+                .tag(Tab.calendar)
+            ChatsView()
+                .environmentObject(convo)
+                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
+                .tag(Tab.chats)
+            LibraryView()
+                .environmentObject(convo)
+                .tabItem { Label("Library", systemImage: "books.vertical.fill") }
+                .tag(Tab.library)
+            HealthView()
+                .environmentObject(convo)
+                .tabItem { Label("Health", systemImage: "heart.fill") }
+                .tag(Tab.health)
         }
     }
 

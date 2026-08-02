@@ -55,4 +55,11 @@ targets:
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
+        NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."
         ITSAppUsesNonExemptEncryption: false
+    # XcodeGen GENERATES the entitlements file at this path from these
+    # properties, same as Info.plist above.
+    entitlements:
+      path: Sources/ScarletTalk.entitlements
+      properties:
+        com.apple.developer.healthkit: true
