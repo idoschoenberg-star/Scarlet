@@ -978,19 +978,8 @@ struct DeskView: View {
                         .foregroundStyle(section.headerColor)
                 }
             }
-            // Subtle provenance footer.
-            Section {
-                HStack {
-                    Spacer()
-                    Label("Synced with Apple Reminders",
-                          systemImage: "arrow.triangle.2.circlepath")
-                        .font(.system(size: 11))
-                        .foregroundStyle(DeskUI.gray.opacity(0.7))
-                    Spacer()
-                }
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            }
+            // (No permanent "Synced with Apple Reminders" footer — the header's
+            // "updated Xm ago" stamp already conveys freshness.)
         }
         .listStyle(.insetGrouped)
         .listSectionSpacing(18)
@@ -1028,21 +1017,22 @@ struct DeskView: View {
         .padding(.horizontal, 14)
     }
 
-    /// Mic beside the quick-add bar → the standard drafting window on the
-    /// "reminder" channel, for dictate-and-polish instead of a typed line.
+    /// Beside the quick-add bar → the drafting window on the "reminder"
+    /// channel, to dictate-and-polish instead of typing a bare line. A sparkles
+    /// glyph (not a mic) so it reads as "draft with Scarlet", not inline STT.
     private var dictateReminderButton: some View {
         Button {
             deskDraftSeed = ChannelDraftSeed(channel: "reminder",
                                              recipient: "Reminders")
         } label: {
-            Image(systemName: "mic.fill")
+            Image(systemName: "sparkles")
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(DeskUI.blue)
                 .frame(width: 44, height: 44)
                 .background(Circle().fill(DeskUI.card))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Dictate a reminder")
+        .accessibilityLabel("Draft a reminder with Scarlet")
     }
 
     private var quickAddBar: some View {

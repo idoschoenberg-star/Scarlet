@@ -76,22 +76,16 @@ struct TalkView: View {
                 }
             }
 
-            // Live mic-input meter while a call is up — moves when she's
-            // actually hearing you, so a pro-interface channel can be found
-            // by watching it (a flat meter = that input is silent to her).
-            if convo.state != .idle {
-                MicLevelMeter(level: convo.inputLevel)
-                    .frame(maxWidth: 200)
-                    .padding(.horizontal, 40)
-            }
-
             HStack(spacing: 16) {
                 RoundControl(icon: convo.micOn ? "mic.fill" : "mic.slash.fill",
                              label: "Mic", off: !convo.micOn) { convo.toggleMic() }
                 RoundControl(icon: convo.speakerOn ? "speaker.wave.2.fill" : "speaker.slash.fill",
                              label: "Voice", off: !convo.speakerOn) { convo.toggleSpeaker() }
+                // Output ROUTE (earpiece ⇄ loudspeaker) — a different axis from
+                // "Voice" (whether she speaks at all); labelled so the two audio
+                // buttons don't read as duplicates.
                 RoundControl(icon: convo.loudspeaker ? "speaker.wave.3.fill" : "ear.fill",
-                             label: "Speaker", off: !convo.loudspeaker) { convo.toggleLoudspeaker() }
+                             label: "Output", off: !convo.loudspeaker) { convo.toggleLoudspeaker() }
                 RoundControl(icon: showType ? "keyboard.chevron.compact.down" : "keyboard",
                              label: "Type", off: showType) {
                     showType.toggle()
@@ -189,6 +183,12 @@ struct Transcript: View {
 
 struct RoundControl: View {
     var icon: String, label: String, off: Bool, action: () -> Void
+    // A control in its non-default state (mic/voice muted, output on earpiece,
+    // keyboard open) is tinted AMBER — a distinct "heads-up / changed" cue that
+    // is deliberately NOT the scarlet primary color (which means active/live on
+    // the Start button, orb and send arrow), so a muted Mic no longer reads as
+    // "live".
+    private static let amber = Color(red: 0.96, green: 0.62, blue: 0.22)
     var body: some View {
         Button(action: action) {
             VStack(spacing: 3) {
@@ -196,12 +196,9 @@ struct RoundControl: View {
                 Text(label).font(.system(size: 9, weight: .semibold)).tracking(0.5)
             }
             .frame(width: 62, height: 62)
-            .foregroundStyle(.white)
-            .background((off ? Color(red: 1, green: 0.35, blue: 0.42).opacity(0.18)
-                             : .white.opacity(0.07)),
-                        in: Circle())
-            .overlay(Circle().stroke(off ? Color(red: 1, green: 0.35, blue: 0.42).opacity(0.55)
-                                         : .white.opacity(0.16), lineWidth: 1))
+            .foregroundStyle(off ? Self.amber : .white)
+            .background((off ? Self.amber.opacity(0.16) : .white.opacity(0.07)), in: Circle())
+            .overlay(Circle().stroke(off ? Self.amber.opacity(0.6) : .white.opacity(0.16), lineWidth: 1))
         }
     }
 }

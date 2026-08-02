@@ -74,8 +74,11 @@ enum ChatChannel: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
-        case .teams: return "person.2.fill"
-        case .whatsapp: return "phone.fill"
+        // Distinct, correct-metaphor glyphs: WhatsApp is messaging (a phone
+        // glyph read as a missed call on the row badge); Teams a chat bubble
+        // rather than the generic "group" person.2.
+        case .teams: return "bubble.left.and.text.bubble.right.fill"
+        case .whatsapp: return "bubble.left.fill"
         case .imessage: return "message.fill"
         }
     }
@@ -1301,9 +1304,6 @@ struct ChatThreadView: View {
                 stagedCard
             }
             HStack(alignment: .bottom, spacing: 10) {
-                if channel == .imessage {
-                    imessagePlusButton
-                }
                 scarletDraftButton
                 TextField(composePlaceholder, text: $composeText, axis: .vertical)
                     .lineLimit(1...4)
@@ -1347,22 +1347,6 @@ struct ChatThreadView: View {
     private var canSend: Bool {
         !model.sending &&
         !composeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    /// Messages' gray plus disc. Purely a look-and-feel affordance — it
-    /// focuses the field; sending still goes through the same two paths only.
-    private var imessagePlusButton: some View {
-        Button {
-            composeFocused = true
-        } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(ChatPalette.imGray)
-                .frame(width: 34, height: 34)
-                .background(Circle().fill(Color.white.opacity(0.12)))
-        }
-        .frame(height: 36)
-        .disabled(model.sending)
     }
 
     @ViewBuilder
@@ -1423,7 +1407,8 @@ struct ChatThreadView: View {
             composeText = ""
         } label: {
             HStack(spacing: 5) {
-                Image(systemName: "waveform")
+                // Authoring/AI cue — a waveform read as "record a voice note".
+                Image(systemName: "sparkles")
                     .font(.system(size: 12, weight: .semibold))
                 Text("Scarlet")
                     .font(.system(size: 12, weight: .semibold))

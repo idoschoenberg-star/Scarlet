@@ -563,11 +563,13 @@ struct CalendarView: View {
                 .font(.system(size: 26, weight: .bold))
                 .foregroundStyle(.white)
             Spacer()
+            // Unambiguous "jump to today" — a bare calendar glyph reads as
+            // "add/settings"; the word is clear.
             Button {
                 goToToday(proxy)
             } label: {
-                Image(systemName: "calendar.circle")
-                    .font(.system(size: 24, weight: .medium))
+                Text("Today")
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(CalStyle.accent)
             }
         }

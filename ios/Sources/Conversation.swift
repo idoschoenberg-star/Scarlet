@@ -110,6 +110,7 @@ final class Conversation: ObservableObject {
         self.token = token
         wantLive = true
         state = .connecting
+        status = "Waking her up…"   // don't leave the stale "Ended." line up during connect
         Task { await connect() }
         observeInterruptions()
     }
@@ -209,7 +210,7 @@ final class Conversation: ObservableObject {
     func beginTyping() {
         micWasOnBeforeTyping = micOn
         micOn = false
-        status = "Dictation mode — mic paused until you close the keyboard row"
+        status = "Typing — mic paused. Tap Type again to talk."
     }
     func endTyping() {
         guard !chatMode else { return }   // chat mode keeps her ears closed

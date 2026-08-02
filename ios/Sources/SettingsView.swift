@@ -1,8 +1,7 @@
 import SwiftUI
 import AVFoundation
 
-/// Settings: pick Scarlet's voice (same server voices the web app offers),
-/// plus the doorway to the full Scarlet app.
+/// Settings: pick Scarlet's voice, and tune the microphone input.
 struct VoiceOption: Identifiable {
     let id: String
     let name: String
@@ -118,7 +117,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Scarlet's voice")
                 } footer: {
-                    Text("Tap ▶ to hear a sample. Changes apply from your next conversation.")
+                    Text("Tap play to hear a sample. Changes apply from your next conversation.")
                 }
 
                 // Microphone: live level meter (ground truth), input-device and

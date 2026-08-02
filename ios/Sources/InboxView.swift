@@ -639,14 +639,9 @@ struct InboxView: View {
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(.white)
             }
-            Button {
-                Task { await model.load() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundStyle(.white)
-            }
-            .disabled(model.loading)
+            // (No manual refresh button — pull-to-refresh, tab-appear, and
+            // foreground-return already reload, and the "Updated Xm ago" stamp
+            // shows freshness; the calendar has no such button either.)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -1012,19 +1007,8 @@ struct MailDetailView: View {
         }
         .background(OutlookStyle.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        askScarlet()
-                    } label: {
-                        Label("Ask Scarlet about this email", systemImage: "sparkles")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-            }
-        }
+        // (No overflow menu — "Ask Scarlet" already lives in the action bar; a
+        // single-item ellipsis menu was pure duplication.)
         .sheet(isPresented: $showDraft) {
             // The loaded detail carries the original's To/Cc; Reply is only
             // reachable once it's up, but fall back to empty gracefully.
@@ -1356,12 +1340,16 @@ struct MailDetailView: View {
     /// quiet raised chips. Same three behaviors as always.
     private var actionBar: some View {
         HStack(spacing: 10) {
-            actionButton("Reply", icon: "arrowshape.turn.up.left.fill",
+            // "Reply All" — the draft is a true threaded Reply-All (every
+            // original recipient), so the button says exactly that.
+            actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
                          tint: OutlookStyle.primaryBlue, filled: true) {
                 showDraft = true
             }
+            // Archive is GREEN here too, matching the list swipe — one color per
+            // concept.
             actionButton("Archive", icon: "archivebox.fill",
-                         tint: OutlookStyle.accentBlue) {
+                         tint: OutlookStyle.archiveGreen) {
                 model.archive(message)
                 dismiss()
             }

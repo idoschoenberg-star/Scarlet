@@ -816,10 +816,14 @@ struct DraftView: View {
         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.10), lineWidth: 1))
         .overlay(alignment: .topTrailing) {
-            Text("v\(draft.revision)")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.35))
-                .padding(10)
+            // Only show a revision badge once he's actually revised — "v0" on a
+            // first draft is meaningless noise.
+            if draft.revision > 0 {
+                Text("v\(draft.revision)")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.35))
+                    .padding(10)
+            }
         }
         .opacity(model.phase == .revising ? 0.55 : 1)
         .animation(.easeInOut(duration: 0.2), value: model.phase)
@@ -1087,14 +1091,8 @@ struct DraftView: View {
             }
             .disabled(model.phase != .ready)
             .animation(.easeInOut(duration: 0.25), value: model.phase)
-
-            Button("Discard") {
-                model.discard()
-                dismiss()
-            }
-            .font(.footnote)
-            .foregroundStyle(.white.opacity(0.55))
-            .disabled(model.phase == .approving || model.phase == .saved)
+            // (No footer "Discard" — the always-visible ✕ in the header already
+            // discards; two controls for one action was clutter.)
         }
     }
 }

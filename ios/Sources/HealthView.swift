@@ -1240,16 +1240,22 @@ private struct StatRing: View {
                     .trim(from: 0, to: progress)
                     .stroke(color, style: StrokeStyle(lineWidth: 9, lineCap: .round))
                     .rotationEffect(.degrees(-90))
-                Text("\(Int((progress * 100).rounded()))%")
-                    .font(.system(size: 15, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white)
-                    .contentTransition(.numericText())
+                // The real value is the headline (what he came to read); the
+                // percent-of-goal is the small supporting number.
+                VStack(spacing: 0) {
+                    Text(text)
+                        .font(.system(size: 15, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                        .minimumScaleFactor(0.6)
+                        .lineLimit(1)
+                        .contentTransition(.numericText())
+                    Text("\(Int((progress * 100).rounded()))%")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 6)
             }
             .frame(width: 72, height: 72)
-            Text(text)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white)
-                .contentTransition(.numericText())
             Text(label)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
