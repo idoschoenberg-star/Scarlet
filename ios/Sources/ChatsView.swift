@@ -7,6 +7,52 @@ import UIKit
 /// each list and thread mirroring its native app's dark-mode look. One shared
 /// generic model + row layer, parameterized per channel; the same edge-function
 /// plumbing as the rest of the app (app-api?v=2 + x-scarlet-token).
+///
+/// Speed contract: channel lists and recently opened threads persist to
+/// Documents/chats-cache.json; models load the cache synchronously in init so
+/// every screen paints instantly, then refresh from the network in the
+/// background (no spinners over cached content).
+
+// MARK: - Palette (per-channel native dark-mode colors, no asset catalog)
+
+private extension Color {
+    /// 0xRRGGBB → Color. In-file hex helper; no assets.
+    init(chatHex hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255.0,
+            green: Double((hex >> 8) & 0xFF) / 255.0,
+            blue: Double(hex & 0xFF) / 255.0
+        )
+    }
+}
+
+/// The three apps' dark design languages, sampled from the real clients.
+private enum ChatPalette {
+    // WhatsApp dark
+    static let waBackground = Color(chatHex: 0x0B141A)
+    static let waHeader = Color(chatHex: 0x202C33)
+    static let waOutgoing = Color(chatHex: 0x005C4B)
+    static let waIncoming = Color(chatHex: 0x202C33)
+    static let waText = Color(chatHex: 0xE9EDEF)
+    static let waTime = Color(chatHex: 0x8696A0)
+    static let waChip = Color(chatHex: 0x182229)
+    static let waAccent = Color(chatHex: 0x00A884)
+    static let waField = Color(chatHex: 0x2A3942)
+    static let waReadTick = Color(chatHex: 0x53BDEB)
+    // iMessage dark
+    static let imBackground = Color.black
+    static let imOutgoing = Color(chatHex: 0x0A84FF)
+    static let imIncoming = Color(chatHex: 0x3A3A3C)
+    static let imField = Color(chatHex: 0x1C1C1E)
+    static let imGray = Color(chatHex: 0x8E8E93)
+    // Teams dark
+    static let teamsBackground = Color(chatHex: 0x1F1F1F)
+    static let teamsCard = Color(chatHex: 0x292929)
+    static let teamsAccent = Color(chatHex: 0x7B83EB)
+    static let teamsPurple = Color(chatHex: 0x6264A7)
+    static let teamsPurpleDeep = Color(chatHex: 0x464775)
+    static let teamsText = Color(chatHex: 0xE8E8E8)
+}
 
 // MARK: - Channel
 
@@ -34,13 +80,40 @@ enum ChatChannel: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The channel's page accent. Teams' #6264A7 is brightened for the dark
-    /// background; WhatsApp is its phone-green; iMessage is Messages blue.
+    /// The channel's page accent: WhatsApp #00A884, iMessage #0A84FF,
+    /// Teams #7B83EB (the brand purple, brightened for dark surfaces).
     var accent: Color {
         switch self {
-        case .teams: return Color(red: 0.55, green: 0.56, blue: 0.85)
-        case .whatsapp: return Color(red: 0.14, green: 0.80, blue: 0.44)
-        case .imessage: return Color(red: 0.04, green: 0.52, blue: 1.0)
+        case .teams: return ChatPalette.teamsAccent
+        case .whatsapp: return ChatPalette.waAccent
+        case .imessage: return ChatPalette.imOutgoing
+        }
+    }
+
+    /// The thread screen's full-bleed background — each mirror's native dark.
+    var threadBackground: Color {
+        switch self {
+        case .teams: return ChatPalette.teamsBackground
+        case .whatsapp: return ChatPalette.waBackground
+        case .imessage: return ChatPalette.imBackground
+        }
+    }
+
+    /// The thread's navigation-bar / compose-bar surface.
+    var barSurface: Color {
+        switch self {
+        case .teams: return ChatPalette.teamsBackground
+        case .whatsapp: return ChatPalette.waHeader
+        case .imessage: return ChatPalette.imBackground
+        }
+    }
+
+    /// The compose text field's fill.
+    var fieldSurface: Color {
+        switch self {
+        case .teams: return ChatPalette.teamsCard
+        case .whatsapp: return ChatPalette.waField
+        case .imessage: return ChatPalette.imField
         }
     }
 
@@ -166,6 +239,15 @@ enum ChatTimeFormat {
         if Calendar.current.isDateInToday(d) { return time.string(from: d) }
         return dayAndTime.string(from: d)
     }
+
+    /// "just now" / "3m ago" / "2h ago" / "12/7" — the cache-freshness stamp.
+    static func agoLabel(_ d: Date) -> String {
+        let s = Int(Date().timeIntervalSince(d))
+        if s < 60 { return "just now" }
+        if s < 3600 { return "\(s / 60)m ago" }
+        if s < 86400 { return "\(s / 3600)h ago" }
+        return shortDate.string(from: d)
+    }
 }
 
 // MARK: - Plumbing (same shape as DraftModel: apiBase + v=2 + x-scarlet-token)
@@ -195,6 +277,162 @@ enum ChatsAPI {
     }
 }
 
+// MARK: - Disk cache (Documents/chats-cache.json)
+
+/// Codable mirrors of the wire types. Kept separate so the view-layer types
+/// stay exactly as they were (Identifiable, index ids).
+private struct ChatsCachedChat: Codable {
+    let id: String
+    let name: String
+    let last: String
+    let fromMe: Bool
+    let ts: Date?
+    let avatar: String?
+    let isGroup: Bool
+}
+
+private struct ChatsCachedMessage: Codable {
+    let ts: Date?
+    let fromMe: Bool
+    let sender: String
+    let text: String
+    /// Signed URL string — usually expired by the next launch; the bubble
+    /// shows its placeholder until the background refresh re-signs it.
+    let mediaURL: String?
+    let mediaType: String?
+    let status: String?
+}
+
+private struct ChatsCachedList: Codable {
+    var fetchedAt: Date
+    var chats: [ChatsCachedChat]
+}
+
+private struct ChatsCachedThread: Codable {
+    var fetchedAt: Date
+    var lastUsed: Date
+    var messages: [ChatsCachedMessage]
+}
+
+private struct ChatsCachePayload: Codable {
+    /// channel rawValue → cached list.
+    var lists: [String: ChatsCachedList] = [:]
+    /// "channelRaw|chatID" → cached thread (recently opened only, capped).
+    var threads: [String: ChatsCachedThread] = [:]
+}
+
+/// Synchronous-read, async-write JSON cache. Reads happen in model inits
+/// (instant paint); writes snapshot under a lock and land on a utility queue.
+/// Lock-based (not an actor) so the nonisolated ChatThreadModel.init can read.
+final class ChatsDiskCache: @unchecked Sendable {
+    static let shared = ChatsDiskCache()
+
+    private static let maxThreads = 12
+    private static let maxMessagesPerThread = 300
+
+    private let lock = NSLock()
+    private var payload: ChatsCachePayload
+
+    private static var fileURL: URL? {
+        FileManager.default.urls(for: .documentDirectory,
+                                 in: .userDomainMask).first?
+            .appendingPathComponent("chats-cache.json")
+    }
+
+    private init() {
+        if let url = Self.fileURL,
+           let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode(ChatsCachePayload.self, from: data) {
+            payload = decoded
+        } else {
+            payload = ChatsCachePayload()
+        }
+    }
+
+    // MARK: lists
+
+    func cachedList(_ channel: ChatChannel) -> (chats: [ChatSummary], fetchedAt: Date)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = payload.lists[channel.rawValue] else { return nil }
+        let chats = entry.chats.map { c in
+            ChatSummary(id: c.id, name: c.name, last: c.last, fromMe: c.fromMe,
+                        ts: c.ts, avatar: c.avatar, isGroup: c.isGroup)
+        }
+        return (chats, entry.fetchedAt)
+    }
+
+    func storeList(_ channel: ChatChannel, chats: [ChatSummary]) {
+        let cached = chats.map { c in
+            ChatsCachedChat(id: c.id, name: c.name, last: c.last, fromMe: c.fromMe,
+                            ts: c.ts, avatar: c.avatar, isGroup: c.isGroup)
+        }
+        lock.lock()
+        payload.lists[channel.rawValue] = ChatsCachedList(fetchedAt: Date(),
+                                                          chats: cached)
+        let snapshot = payload
+        lock.unlock()
+        Self.persist(snapshot)
+    }
+
+    // MARK: threads
+
+    func cachedThread(_ channel: ChatChannel, chatID: String) -> [ChatMessage]? {
+        let key = Self.threadKey(channel, chatID)
+        lock.lock()
+        let entry = payload.threads[key]
+        // Touch lastUsed so recently OPENED (not just fetched) threads win
+        // the eviction race. No disk write for a pure read.
+        if var e = entry { e.lastUsed = Date(); payload.threads[key] = e }
+        lock.unlock()
+        guard let entry else { return nil }
+        return entry.messages.enumerated().map { index, m in
+            ChatMessage(id: index, ts: m.ts, fromMe: m.fromMe, sender: m.sender,
+                        text: m.text,
+                        mediaURL: m.mediaURL.flatMap { URL(string: $0) },
+                        mediaType: m.mediaType, status: m.status)
+        }
+    }
+
+    func storeThread(_ channel: ChatChannel, chatID: String, messages: [ChatMessage]) {
+        let cached = messages.suffix(Self.maxMessagesPerThread).map { m in
+            ChatsCachedMessage(ts: m.ts, fromMe: m.fromMe, sender: m.sender,
+                               text: m.text, mediaURL: m.mediaURL?.absoluteString,
+                               mediaType: m.mediaType, status: m.status)
+        }
+        let key = Self.threadKey(channel, chatID)
+        lock.lock()
+        payload.threads[key] = ChatsCachedThread(fetchedAt: Date(),
+                                                 lastUsed: Date(),
+                                                 messages: Array(cached))
+        // Evict least-recently-used threads beyond the cap.
+        if payload.threads.count > Self.maxThreads {
+            let sorted = payload.threads.sorted { $0.value.lastUsed < $1.value.lastUsed }
+            for (staleKey, _) in sorted.prefix(payload.threads.count - Self.maxThreads) {
+                payload.threads.removeValue(forKey: staleKey)
+            }
+        }
+        let snapshot = payload
+        lock.unlock()
+        Self.persist(snapshot)
+    }
+
+    // MARK: write-behind
+
+    private static func threadKey(_ channel: ChatChannel, _ chatID: String) -> String {
+        "\(channel.rawValue)|\(chatID)"
+    }
+
+    /// Encode + write OFF the calling thread; the snapshot is a value copy so
+    /// no lock is held during IO. Last write wins — fine for a mirror cache.
+    private static func persist(_ snapshot: ChatsCachePayload) {
+        DispatchQueue.global(qos: .utility).async {
+            guard let url = fileURL,
+                  let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+}
+
 // MARK: - List model
 
 @MainActor
@@ -203,19 +441,37 @@ final class ChatListModel: ObservableObject {
     @Published var chats: [ChatSummary] = []
     @Published var loading = false
     @Published var errorText = ""
+    /// When the showing channel's rows were last fetched from the network
+    /// (restored from cache on init) — drives the "updated Xm ago" stamp.
+    @Published var updatedAt: Date?
 
     /// Monotonic load token: a slow fetch landing after a channel switch is
     /// dropped (same discipline as InboxModel).
     private var loadGeneration = 0
 
-    /// Segment tap: swap the channel and refetch. The old channel's rows
-    /// clear right away so a slow network never shows Teams rows under
-    /// "WhatsApp".
+    /// Instant paint: the default channel's cached rows load synchronously
+    /// before the first body evaluation; the network refresh reconciles.
+    init() {
+        if let hit = ChatsDiskCache.shared.cachedList(.teams) {
+            _chats = Published(initialValue: hit.chats)
+            _updatedAt = Published(initialValue: hit.fetchedAt)
+        }
+    }
+
+    /// Segment tap: swap the channel, paint its CACHED rows immediately
+    /// (or clear if never fetched — a slow network still never shows Teams
+    /// rows under "WhatsApp"), then refetch in the background.
     func setChannel(_ newChannel: ChatChannel) {
         guard newChannel != channel else { return }
         channel = newChannel
-        chats = []
         errorText = ""
+        if let hit = ChatsDiskCache.shared.cachedList(newChannel) {
+            chats = hit.chats
+            updatedAt = hit.fetchedAt
+        } else {
+            chats = []
+            updatedAt = nil
+        }
         Task { await load() }
     }
 
@@ -236,7 +492,9 @@ final class ChatListModel: ObservableObject {
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             let fetched = Self.parseChats(obj, channel: want)
             guard generation == loadGeneration, want == channel else { return }
-            chats = fetched
+            withAnimation(.snappy) { chats = fetched }
+            updatedAt = Date()
+            ChatsDiskCache.shared.storeList(want, chats: fetched)
         } catch {
             guard generation == loadGeneration, want == channel else { return }
             errorText = "Couldn't reach \(want.displayName) — check your connection."
@@ -290,9 +548,14 @@ final class ChatThreadModel: ObservableObject {
     private var timer: Timer?
     private var loadGeneration = 0
 
+    /// Recently opened threads restore synchronously from the disk cache —
+    /// the conversation paints instantly, then load() reconciles.
     nonisolated init(channel: ChatChannel, chat: ChatSummary) {
         self.channel = channel
         self.chat = chat
+        if let cached = ChatsDiskCache.shared.cachedThread(channel, chatID: chat.id) {
+            _messages = Published(initialValue: cached)
+        }
     }
 
     func load() async {
@@ -334,6 +597,8 @@ final class ChatThreadModel: ObservableObject {
             errorText = ""
             messages = fetched
             loadStamp += 1
+            ChatsDiskCache.shared.storeThread(channel, chatID: chat.id,
+                                              messages: fetched)
         } catch {
             guard generation == loadGeneration else { return }
             if messages.isEmpty {
@@ -406,11 +671,15 @@ final class ChatThreadModel: ObservableObject {
         }
     }
 
+    /// The instant sent-echo: a just-sent message renders immediately, before
+    /// the reconciling load() lands. Cached too, so it survives reopening.
     private func appendLocal(_ text: String) {
         messages.append(ChatMessage(id: messages.count, ts: Date(),
                                     fromMe: true, sender: "", text: text,
                                     mediaURL: nil, mediaType: nil, status: "sent"))
         loadStamp += 1
+        ChatsDiskCache.shared.storeThread(channel, chatID: chat.id,
+                                          messages: messages)
     }
 
     // MARK: 20s heartbeat — only while THIS thread is visible
@@ -449,10 +718,14 @@ private let chatSenderPalette: [Color] = [
     Color(red: 0.70, green: 0.78, blue: 0.98),
 ]
 
-private func chatSenderColor(_ name: String) -> Color {
+private func chatSenderHash(_ name: String) -> UInt32 {
     var h: UInt32 = 5381
     for b in name.lowercased().utf8 { h = h &* 33 &+ UInt32(b) }
-    return chatSenderPalette[Int(h % UInt32(chatSenderPalette.count))]
+    return h
+}
+
+private func chatSenderColor(_ name: String) -> Color {
+    chatSenderPalette[Int(chatSenderHash(name) % UInt32(chatSenderPalette.count))]
 }
 
 /// 44pt chat avatar: Teams data-URI → decoded UIImage, WhatsApp https URL →
@@ -530,16 +803,18 @@ struct ChatsView: View {
                 convo.setFocus(chatsBrowsingFocus(newChannel))
             }
         }
-        // .task re-runs every time this tab is selected → refresh on appear.
+        // .task re-runs every time this tab is selected → refresh on appear
+        // (the cached rows are already painted; this reconciles silently).
         .task { await model.load() }
     }
 
     private var headerBar: some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text("Chats")
                 .font(.system(size: 34, weight: .heavy))
                 .foregroundStyle(.white)
             Spacer()
+            updatedStamp
             Button {
                 Task { await model.load() }
             } label: {
@@ -552,6 +827,19 @@ struct ChatsView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    /// "updated 3m ago" — cache-freshness, re-rendered each minute. Reads as
+    /// a whisper next to the refresh arrow; absent until a first fetch lands.
+    @ViewBuilder
+    private var updatedStamp: some View {
+        if let updated = model.updatedAt {
+            TimelineView(.periodic(from: .now, by: 60)) { _ in
+                Text("updated \(ChatTimeFormat.agoLabel(updated))")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.45))
+            }
+        }
     }
 
     /// Slim three-segment switcher; the selected segment tints in its
@@ -570,7 +858,7 @@ struct ChatsView: View {
 
     private func segment(_ ch: ChatChannel) -> some View {
         Button {
-            model.setChannel(ch)
+            withAnimation(.snappy) { model.setChannel(ch) }
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: ch.icon)
@@ -578,7 +866,7 @@ struct ChatsView: View {
                 Text(ch.displayName)
                     .font(.system(size: 14, weight: .semibold))
             }
-            .foregroundStyle(model.channel == ch ? ch.accent : .white.opacity(0.55))
+            .foregroundStyle(model.channel == ch ? ch.accent : Color.white.opacity(0.55))
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity)
             .background(
@@ -652,16 +940,17 @@ struct ChatsView: View {
     }
 }
 
-/// One chat row: 44pt avatar, name 17pt semibold, 2-line preview ("You: "
-/// when the last message is Ido's), right-aligned relative time; WhatsApp
-/// groups get a tiny person.3.fill glyph before the name.
+/// One chat row: 44pt avatar wearing a small channel-colored glyph badge,
+/// name 17pt semibold, 2-line preview ("You: " when the last message is
+/// Ido's), right-aligned relative time; WhatsApp groups get a tiny
+/// person.3.fill glyph before the name.
 struct ChatListRow: View {
     let chat: ChatSummary
     let channel: ChatChannel
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            ChatAvatarView(name: chat.name, avatar: chat.avatar, size: 44)
+            badgedAvatar
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
@@ -688,6 +977,25 @@ struct ChatListRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    /// The channel identity, worn subtly: a 17pt accent-filled disc with the
+    /// channel glyph, bottom-trailing on the avatar (WhatsApp green /
+    /// iMessage blue / Teams purple).
+    private var badgedAvatar: some View {
+        ZStack(alignment: .bottomTrailing) {
+            ChatAvatarView(name: chat.name, avatar: chat.avatar, size: 44)
+            Circle()
+                .fill(channel.accent)
+                .frame(width: 17, height: 17)
+                .overlay(
+                    Image(systemName: channel.icon)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white)
+                )
+                .overlay(Circle().stroke(Color.black.opacity(0.55), lineWidth: 1.5))
+                .offset(x: 3, y: 3)
+        }
     }
 
     private var preview: String {
@@ -742,10 +1050,16 @@ struct ChatThreadView: View {
             messagesPane
             composeArea
         }
-        .background(ScarletBackground().ignoresSafeArea())
+        // Native-mirror chrome: WhatsApp #0B141A under a #202C33 bar,
+        // iMessage pure black, Teams #1F1F1F — full bleed, dark bar text.
+        .background(channel.threadBackground.ignoresSafeArea())
         .navigationTitle(chat.name)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(channel.barSurface, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         // Refresh on appear, then the 20s heartbeat — only while visible.
+        // Cached messages are already on screen; this reconciles silently.
         .task {
             await model.load()
             model.startPolling()
@@ -785,7 +1099,7 @@ struct ChatThreadView: View {
         .sheet(item: $videoItem) { item in
             WAVideoView(item: item)
         }
-        // "Draft with Scarlet" (compose-bar sparkles): the drafting studio,
+        // "Draft with Scarlet" (compose-bar pill): the drafting studio,
         // seeded with this chat. On dismiss, reload once — an approved send
         // appears via the mirror shortly.
         .sheet(item: $scarletDraft, onDismiss: {
@@ -802,6 +1116,8 @@ struct ChatThreadView: View {
     @ViewBuilder
     private var messagesPane: some View {
         if model.loading && model.messages.isEmpty {
+            // First-ever open of this thread only — cached threads never
+            // see this (they paint instantly and refresh silently).
             ProgressView()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.messages.isEmpty && !model.errorText.isEmpty {
@@ -826,9 +1142,19 @@ struct ChatThreadView: View {
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                 }
-                .onChange(of: model.loadStamp) { _, _ in
+                .refreshable { await model.load() }
+                .onAppear {
+                    // Cached instant paint: land on the newest message
+                    // without waiting for the first network load.
                     if let last = items.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+                .onChange(of: model.loadStamp) { _, _ in
+                    if let last = items.last {
+                        withAnimation(.snappy) {
+                            proxy.scrollTo(last.id, anchor: .bottom)
+                        }
                     }
                 }
             }
@@ -838,16 +1164,35 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func itemView(_ item: ChatThreadItem) -> some View {
         if let date = item.separator {
-            Text(ChatTimeFormat.separatorLabel(date))
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
+            separatorView(date)
                 .id(item.id)
         } else if let m = item.message {
             messageRow(m, item: item)
                 .padding(.top, item.topSpacing)
                 .id(item.id)
+        }
+    }
+
+    /// Per-channel date/time separators: WhatsApp centers a #182229 capsule
+    /// chip; iMessage/Teams center small gray text (Messages-style cluster).
+    @ViewBuilder
+    private func separatorView(_ date: Date) -> some View {
+        switch channel {
+        case .whatsapp:
+            Text(ChatTimeFormat.separatorLabel(date))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(ChatPalette.waTime)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(ChatPalette.waChip))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+        case .imessage, .teams:
+            Text(ChatTimeFormat.separatorLabel(date))
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
         }
     }
 
@@ -864,8 +1209,14 @@ struct ChatThreadView: View {
                            onVideoTap: { url in videoItem = WAVideoItem(url: url) },
                            onVoiceTap: { url in toggleVoice(url, messageID: m.id) })
         case .imessage:
-            IMessageBubble(message: m)
+            IMessageBubble(message: m, showDelivered: m.id == lastSentID)
         }
+    }
+
+    /// The most recent sent message's id — carries the "Delivered" caption
+    /// (Messages shows it under the newest outgoing bubble only).
+    private var lastSentID: Int? {
+        model.messages.last(where: { $0.fromMe })?.id
     }
 
     /// Voice-note play/pause: one player at a time. Tapping the playing row
@@ -930,13 +1281,25 @@ struct ChatThreadView: View {
                 stagedCard
             }
             HStack(alignment: .bottom, spacing: 10) {
+                if channel == .imessage {
+                    imessagePlusButton
+                }
                 scarletDraftButton
                 TextField(composePlaceholder, text: $composeText, axis: .vertical)
                     .lineLimit(1...4)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
-                    .background(.white.opacity(0.08),
+                    .foregroundStyle(channel == .whatsapp
+                        ? ChatPalette.waText : Color.white)
+                    .background(channel.fieldSurface,
                                 in: RoundedRectangle(cornerRadius: 18))
+                    .overlay(
+                        // Messages' hairline pill outline; invisible elsewhere.
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(channel == .imessage
+                                ? Color.white.opacity(0.22) : Color.clear,
+                                lineWidth: 1)
+                    )
                     .focused($composeFocused)
                     .disabled(model.sending)
                 sendButton
@@ -945,15 +1308,41 @@ struct ChatThreadView: View {
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 10)
+        .background(channel.barSurface.ignoresSafeArea(edges: .bottom))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 0.5)
+        }
     }
 
     private var composePlaceholder: String {
-        channel == .teams ? "Stage a Teams message…" : "Message"
+        switch channel {
+        case .teams: return "Stage a Teams message…"
+        case .whatsapp: return "Message"
+        case .imessage: return "iMessage"
+        }
     }
 
     private var canSend: Bool {
         !model.sending &&
         !composeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Messages' gray plus disc. Purely a look-and-feel affordance — it
+    /// focuses the field; sending still goes through the same two paths only.
+    private var imessagePlusButton: some View {
+        Button {
+            composeFocused = true
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(ChatPalette.imGray)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Color.white.opacity(0.12)))
+        }
+        .frame(height: 36)
+        .disabled(model.sending)
     }
 
     @ViewBuilder
@@ -982,10 +1371,12 @@ struct ChatThreadView: View {
             }
             .disabled(!canSend)
         } else {
+            // WhatsApp: #00A884 disc; iMessage: #0A84FF disc — each app's
+            // own send affordance.
             Button {
                 sendTapped()
             } label: {
-                Image(systemName: "arrow.up")
+                Image(systemName: channel == .whatsapp ? "paperplane.fill" : "arrow.up")
                     .font(.system(size: 16, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 36, height: 36)
@@ -1087,48 +1478,94 @@ struct ChatThreadView: View {
 
 // MARK: - Teams message cell
 
-/// Teams mobile look: flat, LEFT-aligned, full-width cells. Sender 13pt
-/// semibold in channel purple ("You" for Ido's), text 16pt on a subtle card
-/// (my messages get a purple-tinted card but stay left-aligned, Teams style),
-/// timestamp 11pt secondary beside the name.
+/// Teams mobile look: flat, LEFT-aligned, full-width blocks — never bubbles.
+/// 32pt initials avatar in the Teams purple family, name 13pt semibold
+/// (accent #7B83EB for "You") + time 11pt gray on one line, 15pt #E8E8E8
+/// text below; Ido's own messages sit on the #292929 hover-card surface.
 struct TeamsMessageCell: View {
     let message: ChatMessage
     let accent: Color
 
+    private var displayName: String {
+        message.fromMe ? "You"
+            : (message.sender.isEmpty ? "—" : message.sender)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(message.fromMe ? "You"
-                     : (message.sender.isEmpty ? "—" : message.sender))
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(accent)
-                    .lineLimit(1)
-                if let ts = message.ts {
-                    Text(ChatTimeFormat.time.string(from: ts))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
+        HStack(alignment: .top, spacing: 10) {
+            TeamsInitialsAvatar(name: message.fromMe ? "Ido" : message.sender,
+                                fromMe: message.fromMe)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(message.fromMe
+                            ? accent : ChatPalette.teamsText)
+                        .lineLimit(1)
+                    if let ts = message.ts {
+                        Text(ChatTimeFormat.time.string(from: ts))
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                Text(message.text)
+                    .font(.system(size: 15))
+                    .foregroundStyle(ChatPalette.teamsText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text(message.text)
-                .font(.system(size: 16))
-                .foregroundStyle(.white.opacity(0.92))
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            message.fromMe ? accent.opacity(0.18) : Color.white.opacity(0.06),
-            in: RoundedRectangle(cornerRadius: 12)
+            message.fromMe ? ChatPalette.teamsCard : Color.clear,
+            in: RoundedRectangle(cornerRadius: 8)
         )
+    }
+}
+
+/// 32pt Teams avatar disc: initials on a purple-family fill (hash-stable per
+/// sender; Ido's own always the brand #6264A7).
+struct TeamsInitialsAvatar: View {
+    let name: String
+    let fromMe: Bool
+
+    private static let purples: [Color] = [
+        ChatPalette.teamsPurple,
+        ChatPalette.teamsAccent,
+        ChatPalette.teamsPurpleDeep,
+    ]
+
+    private var fill: Color {
+        if fromMe { return ChatPalette.teamsPurple }
+        return Self.purples[Int(chatSenderHash(name) % UInt32(Self.purples.count))]
+    }
+
+    private var initials: String {
+        let words = name.split(separator: " ").prefix(2)
+        let letters = words.compactMap { $0.first.map(String.init) }
+        let joined = letters.joined().uppercased()
+        return joined.isEmpty ? "?" : joined
+    }
+
+    var body: some View {
+        Circle()
+            .fill(fill)
+            .frame(width: 32, height: 32)
+            .overlay(
+                Text(initials)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+            )
     }
 }
 
 // MARK: - WhatsApp bubble
 
-/// Classic WhatsApp dark mode: incoming dark-grey left, outgoing deep green
-/// right; 18pt corners with the asymmetric 4pt tail corner; ~75% max width;
-/// tiny time inside the bubble's bottom-trailing; sender name (stable hashed
-/// color) atop incoming bubbles in groups.
+/// WhatsApp dark mode, per the real client: incoming #202C33 left, outgoing
+/// #005C4B right; 12pt corners with the 4pt tail corner; ~75% max width;
+/// #E9EDEF 16pt text; 11pt #8696A0 time bottom-trailing INSIDE the bubble,
+/// delivery ticks after it on Ido's (✓ sent, ✓✓ delivered, ✓✓ #53BDEB read);
+/// sender name (stable hashed color) atop incoming bubbles in groups.
 struct WhatsAppBubble: View {
     let message: ChatMessage
     let showSender: Bool
@@ -1142,9 +1579,6 @@ struct WhatsAppBubble: View {
     /// Voice notes only: the thread view toggles inline playback.
     var onVoiceTap: ((URL) -> Void)? = nil
 
-    private static let outgoing = Color(red: 0.0, green: 0.36, blue: 0.25)
-    private static let incoming = Color.white.opacity(0.10)
-
     var body: some View {
         HStack(spacing: 0) {
             if message.fromMe { Spacer(minLength: 48) }
@@ -1157,15 +1591,20 @@ struct WhatsAppBubble: View {
                alignment: message.fromMe ? .trailing : .leading)
     }
 
-    /// The asymmetric-tail WhatsApp corner treatment, shared by the bubble
-    /// background and the photo clip so the image hugs the same shape.
+    /// The asymmetric-tail WhatsApp corner treatment (12pt rounds, 4pt tail),
+    /// shared by the bubble background and the photo clip so the image hugs
+    /// the same shape.
     private var bubbleShape: UnevenRoundedRectangle {
         UnevenRoundedRectangle(
-            topLeadingRadius: 18,
-            bottomLeadingRadius: message.fromMe ? 18 : 4,
-            bottomTrailingRadius: message.fromMe ? 4 : 18,
-            topTrailingRadius: 18
+            topLeadingRadius: 12,
+            bottomLeadingRadius: message.fromMe ? 12 : 4,
+            bottomTrailingRadius: message.fromMe ? 4 : 12,
+            topTrailingRadius: 12
         )
+    }
+
+    private var bubbleFill: Color {
+        message.fromMe ? ChatPalette.waOutgoing : ChatPalette.waIncoming
     }
 
     @ViewBuilder
@@ -1189,13 +1628,12 @@ struct WhatsAppBubble: View {
             senderLine
             Text(message.text)
                 .font(.system(size: 16))
-                .foregroundStyle(.white)
+                .foregroundStyle(ChatPalette.waText)
             timeLine
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(message.fromMe ? Self.outgoing : Self.incoming,
-                    in: bubbleShape)
+        .background(bubbleFill, in: bubbleShape)
     }
 
     /// Photo bubble: tight 3pt padding around the image; optional caption
@@ -1220,22 +1658,21 @@ struct WhatsAppBubble: View {
             if !message.text.isEmpty {
                 Text(message.text)
                     .font(.system(size: 16))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ChatPalette.waText)
                     .padding(.top, 2)
                     .padding(.horizontal, 4)
             }
             timeLine
         }
         .padding(3)
-        .background(message.fromMe ? Self.outgoing : Self.incoming,
-                    in: bubbleShape)
+        .background(bubbleFill, in: bubbleShape)
         .contentShape(bubbleShape)
         .onTapGesture { onImageTap?(url) }
     }
 
     private func mediaPlaceholder(height: CGFloat, loading: Bool) -> some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 14)
+            RoundedRectangle(cornerRadius: 10)
                 .fill(Color.white.opacity(0.08))
             if loading {
                 ProgressView()
@@ -1271,15 +1708,14 @@ struct WhatsAppBubble: View {
             if !message.text.isEmpty {
                 Text(message.text)
                     .font(.system(size: 16))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(ChatPalette.waText)
                     .padding(.top, 2)
                     .padding(.horizontal, 4)
             }
             timeLine
         }
         .padding(3)
-        .background(message.fromMe ? Self.outgoing : Self.incoming,
-                    in: bubbleShape)
+        .background(bubbleFill, in: bubbleShape)
         .contentShape(bubbleShape)
         .onTapGesture { onVideoTap?(url) }
     }
@@ -1298,23 +1734,22 @@ struct WhatsAppBubble: View {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.white)
                         .frame(width: 30, height: 30)
-                        .background(Circle().fill(ChatChannel.whatsapp.accent))
+                        .background(Circle().fill(ChatPalette.waAccent))
                 }
                 .buttonStyle(.plain)
                 Image(systemName: "waveform")
                     .font(.system(size: 18))
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(ChatPalette.waText.opacity(0.7))
                 Text("Voice note")
                     .font(.system(size: 13))
-                    .foregroundStyle(.white.opacity(0.8))
+                    .foregroundStyle(ChatPalette.waText.opacity(0.8))
             }
             .frame(minWidth: 150, alignment: .leading)
             timeLine
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(message.fromMe ? Self.outgoing : Self.incoming,
-                    in: bubbleShape)
+        .background(bubbleFill, in: bubbleShape)
     }
 
     @ViewBuilder
@@ -1333,7 +1768,7 @@ struct WhatsAppBubble: View {
             HStack(spacing: 3) {
                 Text(ChatTimeFormat.time.string(from: ts))
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.55))
+                    .foregroundStyle(ChatPalette.waTime)
                 if message.fromMe {
                     waTicks(message.status)
                 }
@@ -1342,19 +1777,20 @@ struct WhatsAppBubble: View {
         }
     }
 
-    /// WhatsApp check marks: single tick (sent), double tick (delivered),
-    /// blue double tick (read). nil → nothing (incoming / unknown).
+    /// WhatsApp check marks: single gray tick (sent), double gray tick
+    /// (delivered), double #53BDEB tick (read). nil → nothing (incoming /
+    /// unknown) — the wire already carries the status; this just maps it.
     @ViewBuilder
     private func waTicks(_ status: String?) -> some View {
         switch status {
         case "sent":
             Image(systemName: "checkmark")
                 .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.55))
+                .foregroundStyle(ChatPalette.waTime)
         case "delivered":
-            waDoubleCheck(.white.opacity(0.55))
+            waDoubleCheck(ChatPalette.waTime)
         case "read":
-            waDoubleCheck(Color(red: 0.20, green: 0.60, blue: 0.86))
+            waDoubleCheck(ChatPalette.waReadTick)
         default:
             EmptyView()
         }
@@ -1472,29 +1908,38 @@ struct WAVideoView: View {
 
 // MARK: - iMessage bubble
 
-/// Messages look: outgoing iMessage-blue right, incoming grey left, 17pt
-/// text, 18pt radius, ~75% max width. No per-message timestamps — the shared
-/// >1h separators carry the time.
+/// Apple Messages dark: outgoing #0A84FF right, incoming #3A3A3C left, white
+/// 17pt text, 18pt radius, ~75% max width. No per-message timestamps — the
+/// shared centered gray clusters carry the time; the newest sent bubble wears
+/// an 11pt gray "Delivered" caption, exactly like Messages.
 struct IMessageBubble: View {
     let message: ChatMessage
-
-    private static let outgoing = Color(red: 0.04, green: 0.52, blue: 1.0)
-    private static let incoming = Color(white: 0.22)
+    /// True only for the most recent outgoing message in the thread.
+    var showDelivered: Bool = false
 
     var body: some View {
         HStack(spacing: 0) {
             if message.fromMe { Spacer(minLength: 48) }
-            Text(message.text)
-                .font(.system(size: 17))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    message.fromMe ? Self.outgoing : Self.incoming,
-                    in: RoundedRectangle(cornerRadius: 18)
-                )
-                .frame(maxWidth: 290,
-                       alignment: message.fromMe ? .trailing : .leading)
+            VStack(alignment: message.fromMe ? .trailing : .leading, spacing: 2) {
+                Text(message.text)
+                    .font(.system(size: 17))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(
+                        message.fromMe
+                            ? ChatPalette.imOutgoing : ChatPalette.imIncoming,
+                        in: RoundedRectangle(cornerRadius: 18)
+                    )
+                if showDelivered && message.fromMe {
+                    Text("Delivered")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(ChatPalette.imGray)
+                        .padding(.trailing, 4)
+                }
+            }
+            .frame(maxWidth: 290,
+                   alignment: message.fromMe ? .trailing : .leading)
             if !message.fromMe { Spacer(minLength: 48) }
         }
         .frame(maxWidth: .infinity,

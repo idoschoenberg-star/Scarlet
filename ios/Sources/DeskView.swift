@@ -4,9 +4,39 @@ import UIKit
 
 /// The Desk: Ido's reminders (his real Apple Reminders, two-way synced
 /// server-side) and his Apple Notes (read on demand through the Mac agent),
-/// in the house dark-scarlet look. Local-first: the last fetched lists are
-/// cached to Documents/desk-cache.json and render instantly on open while a
+/// styled to match the REAL Apple Reminders and Apple Notes apps in dark
+/// mode. Local-first: the last fetched lists are cached to
+/// Documents/desk-cache.json and render instantly on open while a
 /// background refresh brings the truth in.
+
+// MARK: - Native dark palette (Apple Reminders / Notes design language)
+
+/// The system dark-mode colors both leaves draw from. Reminders' accent is
+/// iOS blue; Notes' accent is the yellow-amber; everything else is the
+/// shared grouped-dark vocabulary.
+private enum DeskUI {
+    /// Pure black page background (both apps in dark mode).
+    static let background = Color.black
+    /// Grouped inset card surface — #1C1C1E.
+    static let card = Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255)
+    /// Row separators — #38383A.
+    static let separator = Color(red: 56 / 255, green: 56 / 255, blue: 58 / 255)
+    /// Secondary text / empty checkbox ring — #8E8E93.
+    static let gray = Color(red: 142 / 255, green: 142 / 255, blue: 147 / 255)
+    /// Reminders accent — iOS blue #0A84FF.
+    static let blue = Color(red: 10 / 255, green: 132 / 255, blue: 255 / 255)
+    /// Notes accent — yellow-amber #FFD60A.
+    static let yellow = Color(red: 1, green: 214 / 255, blue: 10 / 255)
+    /// Overdue / destructive — #FF453A.
+    static let red = Color(red: 1, green: 69 / 255, blue: 58 / 255)
+    /// Priority "!" marks — #FF9F0A.
+    static let orange = Color(red: 1, green: 159 / 255, blue: 10 / 255)
+    /// Segmented control bed — #767680 at 24% (dark tertiary fill).
+    static let segmentBed = Color(red: 118 / 255, green: 118 / 255, blue: 128 / 255)
+        .opacity(0.24)
+    /// Segmented control selected pill — #636366.
+    static let segmentPill = Color(red: 99 / 255, green: 99 / 255, blue: 102 / 255)
+}
 
 // MARK: - Leaf (segment)
 
@@ -28,6 +58,14 @@ enum DeskLeaf: String, CaseIterable, Identifiable {
         switch self {
         case .reminders: return "checklist"
         case .notes: return "note.text"
+        }
+    }
+
+    /// The leaf's native accent: iOS blue for Reminders, Notes yellow.
+    var accent: Color {
+        switch self {
+        case .reminders: return DeskUI.blue
+        case .notes: return DeskUI.yellow
         }
     }
 }
@@ -54,8 +92,20 @@ struct DeskReminder: Identifiable {
     var done: Bool
     let updatedAt: Date?
 
-    /// Apple priority: 0 = none, 1–3 = the high band that earns the dot.
+    /// Apple priority: 0 = none, 1–3 = the high band that earns the marks.
     var isHighPriority: Bool { priority >= 1 && priority <= 3 }
+
+    /// Reminders-style exclamation prefix. Apple's convention: the lower the
+    /// number, the higher the priority — 1 is "!!!", 3 is "!". Anything
+    /// outside the 1–3 band shows nothing (same visibility rule as before).
+    var priorityMarks: String {
+        switch priority {
+        case 1: return "!!!"
+        case 2: return "!!"
+        case 3: return "!"
+        default: return ""
+        }
+    }
 }
 
 /// One Apple Note title from the Mac agent's `list_notes`. The body arrives
@@ -92,6 +142,17 @@ enum DeskDueSection: String, Hashable {
         case .someday: return "Someday"
         }
     }
+
+    /// Reminders-style header color: Overdue red, Today/Upcoming white,
+    /// Someday gray.
+    var headerColor: Color {
+        switch self {
+        case .overdue: return DeskUI.red
+        case .today: return Color.white
+        case .upcoming: return Color.white
+        case .someday: return DeskUI.gray
+        }
+    }
 }
 
 // MARK: - Dates
@@ -123,7 +184,7 @@ enum DeskDates {
         return f
     }()
 
-    /// Relative due chip: "Today 14:00", "Tomorrow", "Thu 09:30", "12 Sep".
+    /// Relative due line: "Today 14:00", "Tomorrow", "Thu 09:30", "12 Sep".
     /// A midnight due time reads as all-day, so the clock part is dropped.
     static func dueChip(_ d: Date) -> String {
         let cal = Calendar.current
@@ -187,7 +248,9 @@ final class DeskModel: ObservableObject {
     /// (local-first) while the network catches up.
     func setLeaf(_ newLeaf: DeskLeaf) {
         guard newLeaf != leaf else { return }
-        leaf = newLeaf
+        withAnimation(.snappy(duration: 0.25)) {
+            leaf = newLeaf
+        }
         errorText = ""
         Task { await load() }
     }
@@ -235,7 +298,7 @@ final class DeskModel: ObservableObject {
     func toggle(_ reminder: DeskReminder) {
         guard let idx = reminders.firstIndex(where: { $0.id == reminder.id }) else { return }
         let newDone = !reminders[idx].done
-        withAnimation(.easeInOut(duration: 0.15)) {
+        withAnimation(.snappy(duration: 0.2)) {
             reminders[idx].done = newDone
         }
         if let ri = rawReminders.firstIndex(where: { ($0["id"] as? String) == reminder.id }) {
@@ -274,7 +337,7 @@ final class DeskModel: ObservableObject {
         let optimistic = DeskReminder(id: localId, title: t, notes: "",
                                       dueAt: nil, remindAt: nil, priority: 0,
                                       done: false, updatedAt: Date())
-        withAnimation(.easeInOut(duration: 0.15)) {
+        withAnimation(.snappy(duration: 0.2)) {
             reminders.insert(optimistic, at: 0)
         }
         Task {
@@ -289,7 +352,7 @@ final class DeskModel: ObservableObject {
                 }
                 await self.loadReminders()
             } catch {
-                withAnimation(.easeInOut(duration: 0.15)) {
+                withAnimation(.snappy(duration: 0.2)) {
                     self.reminders.removeAll { $0.id == localId }
                 }
                 self.errorText = "Couldn't add \"\(t)\" — try again."
@@ -480,12 +543,10 @@ struct DeskView: View {
     /// (InboxView's stale-guard pattern).
     @State private var openedFocus: String?
 
-    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
-    /// Solid card surface, matching the presence capsule — translucency over
-    /// a scrolling list reads as broken overlap.
-    private let surface = Color(red: 0.16, green: 0.055, blue: 0.085)
-    private let noteTint = Color(red: 0.95, green: 0.78, blue: 0.35)
-    private let priorityTint = Color(red: 0.98, green: 0.62, blue: 0.28)
+    /// The active leaf's accent — blue in Reminders, yellow in Notes.
+    private var leafAccent: Color {
+        model.leaf.accent
+    }
 
     var body: some View {
         NavigationStack {
@@ -494,7 +555,7 @@ struct DeskView: View {
                 leafSwitcher
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .background(DeskUI.background.ignoresSafeArea())
             // Quick-add rides pinned above Scarlet's capsule; both are part
             // of the screen's layout (safeAreaInset), never floating overlays.
             .safeAreaInset(edge: .bottom) {
@@ -532,13 +593,13 @@ struct DeskView: View {
         }
     }
 
-    // MARK: header (big heavy title + refresh + freshness stamp)
+    // MARK: header (big bold title + refresh + freshness stamp)
 
     private var headerBar: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 12) {
                 Text("Desk")
-                    .font(.system(size: 34, weight: .heavy))
+                    .font(.system(size: 34, weight: .bold))
                     .foregroundStyle(.white)
                 Spacer()
                 Button {
@@ -546,14 +607,14 @@ struct DeskView: View {
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(leafAccent)
                 }
                 .disabled(model.loading)
             }
             if let stamp = model.activeUpdated {
                 Text(DeskDates.updatedStamp(stamp))
                     .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.35))
+                    .foregroundStyle(DeskUI.gray)
             }
         }
         .padding(.horizontal, 16)
@@ -561,41 +622,37 @@ struct DeskView: View {
         .padding(.bottom, 6)
     }
 
-    // MARK: segment switcher (two-segment capsule, Library's shelfSwitcher)
+    // MARK: segment switcher (native segmented-control look)
 
     private var leafSwitcher: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 2) {
             ForEach(DeskLeaf.allCases) { l in
                 segment(l)
             }
         }
-        .padding(4)
-        .background(Capsule().fill(.white.opacity(0.06)))
+        .padding(2)
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(DeskUI.segmentBed)
+        )
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
     }
 
     private func segment(_ l: DeskLeaf) -> some View {
-        Button {
+        let selected = model.leaf == l
+        return Button {
             model.setLeaf(l)
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: l.icon)
-                    .font(.system(size: 12, weight: .semibold))
-                Text(l.displayName)
-                    .font(.system(size: 14, weight: .semibold))
-            }
-            .foregroundStyle(model.leaf == l ? scarletRose : .white.opacity(0.55))
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity)
-            .background(
-                Capsule().fill(model.leaf == l
-                    ? scarletRose.opacity(0.18) : Color.clear)
-            )
-            .overlay(
-                Capsule().stroke(model.leaf == l
-                    ? scarletRose.opacity(0.45) : Color.clear, lineWidth: 1)
-            )
+            Text(l.displayName)
+                .font(.system(size: 13, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? l.accent : Color.white)
+                .padding(.vertical, 6)
+                .frame(maxWidth: .infinity)
+                .background(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(selected ? DeskUI.segmentPill : Color.clear)
+                )
         }
         .buttonStyle(.plain)
     }
@@ -640,7 +697,7 @@ struct DeskView: View {
 
     /// Overdue / Today / Upcoming / Someday, empty buckets skipped. Grouping
     /// looks only at the due date, so a just-checked row stays put (briefly
-    /// strikethrough, un-toggleable) until the next refresh sweeps it.
+    /// faded, still toggleable) until the next refresh sweeps it.
     private var grouped: [(DeskDueSection, [DeskReminder])] {
         let now = Date()
         let cal = Calendar.current
@@ -684,42 +741,48 @@ struct DeskView: View {
                     ForEach(rows) { r in
                         DeskReminderRow(
                             reminder: r,
-                            overdue: section == .overdue,
-                            rose: scarletRose,
-                            priorityTint: priorityTint
+                            overdue: section == .overdue
                         ) {
                             model.toggle(r)
                         }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparatorTint(.white.opacity(0.12))
+                        .listRowBackground(DeskUI.card)
+                        .listRowSeparatorTint(DeskUI.separator)
+                        // Separator starts at the leading TEXT edge, past
+                        // the 32pt checkbox frame + 12pt gap (Reminders style).
+                        .alignmentGuide(.listRowSeparatorLeading) { d in
+                            d[.leading] + 44
+                        }
                     }
                 } header: {
+                    // Reminders-style bold colored section title, not a chip.
                     Text(section.title)
-                        .font(.system(size: 12, weight: .bold))
-                        .tracking(1.2)
-                        .textCase(.uppercase)
-                        .foregroundStyle(section == .overdue
-                            ? scarletRose : .white.opacity(0.45))
+                        .font(.system(size: 20, weight: .bold))
+                        .textCase(nil)
+                        .foregroundStyle(section.headerColor)
                 }
             }
             // Subtle provenance footer.
-            HStack {
-                Spacer()
-                Label("Synced with Apple Reminders",
-                      systemImage: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.white.opacity(0.3))
-                Spacer()
+            Section {
+                HStack {
+                    Spacer()
+                    Label("Synced with Apple Reminders",
+                          systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DeskUI.gray.opacity(0.7))
+                    Spacer()
+                }
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
             }
-            .listRowBackground(Color.clear)
-            .listRowSeparator(.hidden)
         }
-        .listStyle(.plain)
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
         .refreshable { await model.loadReminders() }
     }
 
-    // MARK: quick-add (pinned above the presence capsule)
+    // MARK: quick-add — Reminders' "＋ New Reminder" affordance, pinned
+    // above the presence capsule (same add flow and dictation etiquette).
 
     private var trimmedQuickAdd: String {
         quickAdd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -727,32 +790,42 @@ struct DeskView: View {
 
     private var quickAddBar: some View {
         HStack(spacing: 10) {
-            Image(systemName: "plus")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.4))
-            TextField("Add a reminder…", text: $quickAdd)
-                .textFieldStyle(.plain)
-                .foregroundStyle(.white)
-                .submitLabel(.done)
-                .focused($addFocused)
-                .onSubmit { submitQuickAdd() }
+            Image(systemName: "plus.circle.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(DeskUI.blue)
+            ZStack(alignment: .leading) {
+                if quickAdd.isEmpty {
+                    // Reminders paints "New Reminder" in the accent blue.
+                    Text("New Reminder")
+                        .font(.system(size: 17))
+                        .foregroundStyle(DeskUI.blue)
+                        .allowsHitTesting(false)
+                }
+                TextField("", text: $quickAdd)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 17))
+                    .foregroundStyle(.white)
+                    .tint(DeskUI.blue)
+                    .submitLabel(.done)
+                    .focused($addFocused)
+                    .onSubmit { submitQuickAdd() }
+            }
             Button {
                 submitQuickAdd()
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 26))
                     .foregroundStyle(trimmedQuickAdd.isEmpty
-                        ? Color.white.opacity(0.25) : scarletRose)
+                        ? DeskUI.gray.opacity(0.5) : DeskUI.blue)
             }
             .buttonStyle(.plain)
             .disabled(trimmedQuickAdd.isEmpty)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 16).fill(surface))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(.white.opacity(0.08), lineWidth: 1)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(DeskUI.card)
         )
         .frame(maxWidth: 360)
         .padding(.horizontal, 14)
@@ -785,7 +858,7 @@ struct DeskView: View {
                     .multilineTextAlignment(.center)
                 Button("Try again") { Task { await model.loadNotes() } }
                     .buttonStyle(.bordered)
-                    .tint(scarletRose)
+                    .tint(DeskUI.yellow)
             }
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -811,24 +884,28 @@ struct DeskView: View {
             if model.macAsleep {
                 Text("Your home Mac is asleep — showing the last snapshot; notes will refresh when it wakes.")
                     .font(.footnote)
-                    .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+                    .foregroundStyle(DeskUI.yellow)
                     .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
             }
             if !model.errorText.isEmpty {
                 errorRow
             }
-            ForEach(model.notes) { note in
-                Button {
-                    open(note)
-                } label: {
-                    DeskNoteRow(note: note, tint: noteTint)
+            Section {
+                ForEach(model.notes) { note in
+                    Button {
+                        open(note)
+                    } label: {
+                        DeskNoteRow(note: note)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(DeskUI.card)
+                    .listRowSeparatorTint(DeskUI.separator)
                 }
-                .buttonStyle(.plain)
-                .listRowBackground(Color.clear)
-                .listRowSeparatorTint(.white.opacity(0.12))
             }
         }
-        .listStyle(.plain)
+        .listStyle(.insetGrouped)
+        .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
         .refreshable { await model.loadNotes() }
     }
@@ -838,8 +915,9 @@ struct DeskView: View {
     private var errorRow: some View {
         Text(model.errorText)
             .font(.footnote)
-            .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+            .foregroundStyle(DeskUI.red)
             .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
     }
 
     private func retryState(_ message: String) -> some View {
@@ -851,7 +929,7 @@ struct DeskView: View {
                 .multilineTextAlignment(.center)
             Button("Try again") { Task { await model.load() } }
                 .buttonStyle(.bordered)
-                .tint(scarletRose)
+                .tint(leafAccent)
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -888,60 +966,41 @@ struct DeskView: View {
 
 // MARK: - Reminder row
 
-/// One reminder: tappable circle checkbox, title (strikethrough when done),
-/// notes line, relative due chip (rose when overdue), priority dot.
+/// One reminder, Apple Reminders dark style: 22pt circle checkbox (gray
+/// ring → filled blue circle with a white check), orange "!" priority
+/// prefix, white 17pt title that FADES to gray when done (no strikethrough,
+/// like the real app), gray notes line, and a due line that goes red when
+/// overdue.
 struct DeskReminderRow: View {
     let reminder: DeskReminder
     let overdue: Bool
-    let rose: Color
-    let priorityTint: Color
     let onToggle: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Button(action: onToggle) {
-                Image(systemName: reminder.done ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 22, weight: .regular))
-                    .foregroundStyle(reminder.done ? rose : .white.opacity(0.35))
+                checkbox
                     // A comfortable 44pt-ish target without inflating the row.
                     .frame(width: 32, height: 32)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(reminder.title)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(reminder.done ? Color.white.opacity(0.4) : Color.white)
-                    .strikethrough(reminder.done, color: .white.opacity(0.5))
+            VStack(alignment: .leading, spacing: 2) {
+                titleLine
+                    .font(.system(size: 17, weight: .regular))
                     .lineLimit(2)
                     .truncationMode(.tail)
                 if !reminder.notes.isEmpty {
                     Text(reminder.notes)
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 15))
+                        .foregroundStyle(DeskUI.gray)
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
-                if reminder.dueAt != nil || reminder.isHighPriority {
-                    HStack(spacing: 6) {
-                        if let due = reminder.dueAt {
-                            Text(DeskDates.dueChip(due))
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(overdue ? rose : .white.opacity(0.55))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(
-                                    Capsule().fill(overdue
-                                        ? rose.opacity(0.16) : .white.opacity(0.07))
-                                )
-                        }
-                        if reminder.isHighPriority {
-                            Circle()
-                                .fill(priorityTint)
-                                .frame(width: 6, height: 6)
-                        }
-                    }
-                    .padding(.top, 1)
+                if let due = reminder.dueAt {
+                    Text(DeskDates.dueChip(due))
+                        .font(.system(size: 15))
+                        .foregroundStyle(overdue ? DeskUI.red : DeskUI.gray)
                 }
             }
             Spacer(minLength: 8)
@@ -949,43 +1008,58 @@ struct DeskReminderRow: View {
         .padding(.vertical, 4)
         .contentShape(Rectangle())
     }
+
+    /// Empty: 1.5pt gray ring. Done: filled accent circle, white check.
+    @ViewBuilder
+    private var checkbox: some View {
+        ZStack {
+            if reminder.done {
+                Circle()
+                    .fill(DeskUI.blue)
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white)
+            } else {
+                Circle()
+                    .strokeBorder(DeskUI.gray, lineWidth: 1.5)
+            }
+        }
+        .frame(width: 22, height: 22)
+    }
+
+    /// Orange "!!!" / "!!" / "!" prefix, then the title — white while open,
+    /// faded #8E8E93 once done (Reminders fades, it does not strike).
+    private var titleLine: Text {
+        let titleColor: Color = reminder.done ? DeskUI.gray : Color.white
+        let title = Text(reminder.title).foregroundStyle(titleColor)
+        let marks = reminder.priorityMarks
+        if marks.isEmpty { return title }
+        return Text(marks + " ").foregroundStyle(DeskUI.orange) + title
+    }
 }
 
 // MARK: - Note row
 
-/// One note title: doc tile, title, modified stamp, trailing chevron.
+/// One note, Apple Notes dark style: white semibold title over a gray
+/// date line — no doc tile, no chevron.
 struct DeskNoteRow: View {
     let note: DeskNote
-    let tint: Color
 
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(tint.opacity(0.18))
-                Image(systemName: "note.text")
-                    .font(.system(size: 19, weight: .medium))
-                    .foregroundStyle(tint)
+        VStack(alignment: .leading, spacing: 3) {
+            Text(note.title)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let stamp = note.modifiedText {
+                Text(stamp)
+                    .font(.system(size: 15))
+                    .foregroundStyle(DeskUI.gray)
             }
-            .frame(width: 44, height: 44)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(note.title)
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                    .truncationMode(.tail)
-                if let stamp = note.modifiedText {
-                    Text(stamp)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.4))
-                }
-            }
-            Spacer(minLength: 8)
-            Image(systemName: "chevron.right")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.35))
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
     }
 }
@@ -993,8 +1067,9 @@ struct DeskNoteRow: View {
 // MARK: - Note reading sheet
 
 /// The reader: fetches the note body on appearance (`op=note_read` with the
-/// title as the query) and shows it in a quiet serif reading column. Queued
-/// or error from the Mac agent becomes the friendly asleep state.
+/// title as the query) and shows it Apple-Notes style — black page, bold
+/// title as the first line, white 17pt system body. Queued or error from
+/// the Mac agent becomes the friendly asleep state.
 struct DeskNoteSheet: View {
     let note: DeskNote
     @Environment(\.dismiss) private var dismiss
@@ -1005,8 +1080,6 @@ struct DeskNoteSheet: View {
     @State private var alsoMatched: [String] = []
     @State private var asleep = false
     @State private var errorText = ""
-
-    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
     var body: some View {
         NavigationStack {
@@ -1027,12 +1100,12 @@ struct DeskNoteSheet: View {
                     reader
                 }
             }
-            .background(ScarletBackground().ignoresSafeArea())
-            .navigationTitle(shownTitle.isEmpty ? note.title : shownTitle)
+            .background(DeskUI.background.ignoresSafeArea())
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") { dismiss() }
+                        .tint(DeskUI.yellow)
                 }
             }
         }
@@ -1041,20 +1114,26 @@ struct DeskNoteSheet: View {
 
     private var reader: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
+                // Notes puts the title as the bold first line of the page.
+                Text(shownTitle.isEmpty ? note.title : shownTitle)
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundStyle(.white)
+                    .textSelection(.enabled)
                 if !alsoMatched.isEmpty {
                     Text("Also matched: " + alsoMatched.joined(separator: ", "))
                         .font(.system(size: 12))
-                        .foregroundStyle(.white.opacity(0.4))
+                        .foregroundStyle(DeskUI.gray)
                 }
                 Text(text)
-                    .font(.system(.body, design: .serif))
-                    .lineSpacing(5)
-                    .foregroundStyle(.white.opacity(0.92))
+                    .font(.system(size: 17))
+                    .lineSpacing(6)
+                    .foregroundStyle(.white)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(20)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
         }
     }
 
@@ -1069,7 +1148,7 @@ struct DeskNoteSheet: View {
                 Task { await load() }
             }
             .buttonStyle(.bordered)
-            .tint(scarletRose)
+            .tint(DeskUI.yellow)
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

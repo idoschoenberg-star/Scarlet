@@ -2,9 +2,15 @@ import SwiftUI
 import UIKit
 
 /// Native calendar: Ido's Amwell (Outlook) calendar with Outlook mobile's
-/// anatomy on the app's dark Scarlet look — big header, week strip with
-/// today/selection circles and event dots, an agenda grouped by day, and a
-/// detail sheet with Join / RSVP / attendees / Ask Scarlet / Delete.
+/// dark design language — #1B1A19 canvas, #252423 event cards with a 4pt
+/// category bar, blue #479EF5 accents, a week strip with today/selection
+/// circles and event dots, an agenda grouped by day, and a detail sheet with
+/// Join / RSVP / attendees / Ask Scarlet / Delete.
+///
+/// Local-first: fetched events persist to Documents/calendar-cache.json and
+/// are loaded synchronously in the model's init, so the agenda paints
+/// instantly from the last snapshot while a background refresh runs. When a
+/// cache exists there is no spinner — just a quiet "updated Xm ago" stamp.
 
 // MARK: - Ambient focus
 
@@ -43,6 +49,11 @@ struct CalEvent: Identifiable {
         let day = CalDates.detailDay.string(from: start)
         if allDay { return "\(day) · All day" }
         return "\(day) · \(CalDates.time.string(from: start)) – \(CalDates.time.string(from: end))"
+    }
+
+    /// "11:00 – 11:30" — the agenda row's time line.
+    var timeRange: String {
+        "\(CalDates.time.string(from: start)) – \(CalDates.time.string(from: end))"
     }
 }
 
@@ -126,22 +137,44 @@ enum CalDates {
 
 // MARK: - Palette
 
-/// Outlook mobile's calendar colors on dark.
-enum CalStyle {
-    static let busyBlue = Color(red: 0.0, green: 0.47, blue: 0.83)
-    static let oofPurple = Color(red: 0.53, green: 0.34, blue: 0.65)
-    static let freeGreen = Color(red: 0.06, green: 0.5, blue: 0.24)
-    static let acceptGreen = Color(red: 0.16, green: 0.55, blue: 0.32)
-    static let declineRed = Color(red: 0.91, green: 0.28, blue: 0.34)
-    static let rose = Color(red: 1, green: 0.35, blue: 0.42)
+/// In-file hex helper — 0xRRGGBB, sRGB.
+private extension Color {
+    init(calHex hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255.0,
+            green: Double((hex >> 8) & 0xFF) / 255.0,
+            blue: Double(hex & 0xFF) / 255.0
+        )
+    }
+}
 
-    /// Row accent bar by Outlook's show-as state.
+/// Outlook mobile's dark calendar palette.
+enum CalStyle {
+    /// Page canvas — Outlook dark background.
+    static let bg = Color(calHex: 0x1B1A19)
+    /// Event card / sheet surface.
+    static let surface = Color(calHex: 0x252423)
+    /// Slightly lifted surface for the ongoing / up-next card.
+    static let surfaceBright = Color(calHex: 0x2E2D2C)
+    /// Hairlines and dividers.
+    static let separator = Color(calHex: 0x3B3A39)
+    /// Microsoft blue — today marker, selection, primary buttons, default
+    /// category bar.
+    static let accent = Color(calHex: 0x479EF5)
+    static let oofPurple = Color(calHex: 0x8764B8)
+    static let freeGreen = Color(calHex: 0x218C55)
+    static let acceptGreen = Color(calHex: 0x2A8C52)
+    static let declineRed = Color(calHex: 0xE8485A)
+    /// Scarlet's own brand rose — kept for the Ask Scarlet action only.
+    static let rose = Color(calHex: 0xFF596B)
+
+    /// Row accent bar by Outlook's show-as state (default category blue).
     static func bar(for showAs: String) -> Color {
         switch showAs {
-        case "tentative": return busyBlue.opacity(0.45)
+        case "tentative": return accent.opacity(0.45)
         case "oof": return oofPurple
         case "free": return freeGreen
-        default: return busyBlue
+        default: return accent
         }
     }
 }
@@ -163,9 +196,21 @@ final class CalendarModel: ObservableObject {
     @Published var errorText = ""
     /// Days that have at least one event — the month strip's presence dots.
     @Published var eventDayKeys: Set<String> = []
+    /// When the events on screen were last fetched from the server — drives
+    /// the "updated Xm ago" stamp. Survives restarts via the cache.
+    @Published var lastUpdated: Date?
+
+    /// The raw wire dicts behind `days` — what calendar-cache.json stores,
+    /// so cache and network go through the same parser.
+    private var rawEvents: [[String: Any]] = []
 
     /// One load at a time; pull-to-refresh during a `.task` load is a no-op.
     private var inFlight = false
+
+    /// Local-first: paint from the cache synchronously, before any network.
+    init() {
+        loadCache()
+    }
 
     /// One `cal_range` call: 7 days back through 21 days forward (≤42 days).
     func load() async {
@@ -192,27 +237,37 @@ final class CalendarModel: ObservableObject {
         do {
             let data = try await Self.request(query, method: "GET")
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            let events: [CalEvent] = ((obj["events"] as? [[String: Any]]) ?? []).compactMap { e in
-                guard let id = e["id"] as? String,
-                      let start = CalDates.parse(e["start"] as? String),
-                      let end = CalDates.parse(e["end"] as? String) else { return nil }
-                let subject = (e["subject"] as? String) ?? ""
-                return CalEvent(
-                    id: id,
-                    subject: subject.isEmpty ? "(no title)" : subject,
-                    start: start,
-                    end: end,
-                    allDay: (e["all_day"] as? Bool) ?? false,
-                    location: (e["location"] as? String) ?? "",
-                    organizer: (e["organizer"] as? String) ?? "",
-                    join: (e["join"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                    response: (e["response"] as? String) ?? "none",
-                    showAs: (e["show_as"] as? String) ?? "busy"
-                )
+            let raws = (obj["events"] as? [[String: Any]]) ?? []
+            rawEvents = raws
+            lastUpdated = Date()
+            withAnimation(.snappy) {
+                rebuild(Self.parseEvents(raws))
             }
-            rebuild(events)
+            saveCache()
         } catch {
             errorText = "Couldn't reach the calendar — check your connection."
+        }
+    }
+
+    /// Wire dicts → events. Shared by the network path and the disk cache.
+    static func parseEvents(_ raws: [[String: Any]]) -> [CalEvent] {
+        raws.compactMap { e in
+            guard let id = e["id"] as? String,
+                  let start = CalDates.parse(e["start"] as? String),
+                  let end = CalDates.parse(e["end"] as? String) else { return nil }
+            let subject = (e["subject"] as? String) ?? ""
+            return CalEvent(
+                id: id,
+                subject: subject.isEmpty ? "(no title)" : subject,
+                start: start,
+                end: end,
+                allDay: (e["all_day"] as? Bool) ?? false,
+                location: (e["location"] as? String) ?? "",
+                organizer: (e["organizer"] as? String) ?? "",
+                join: (e["join"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                response: (e["response"] as? String) ?? "none",
+                showAs: (e["show_as"] as? String) ?? "busy"
+            )
         }
     }
 
@@ -243,6 +298,39 @@ final class CalendarModel: ObservableObject {
             }
             return Day(id: key, date: date, events: sorted)
         }
+    }
+
+    // MARK: cache — Documents/calendar-cache.json, the local-first snapshot
+
+    static var cacheURL: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory,
+                                            in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return docs.appendingPathComponent("calendar-cache.json")
+    }
+
+    /// Synchronous read at init — the snapshot is small (≤42 days of rows),
+    /// so this is a single fast disk hit that buys an instant first paint.
+    private func loadCache() {
+        guard let data = try? Data(contentsOf: Self.cacheURL),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return }
+        rawEvents = (obj["events"] as? [[String: Any]]) ?? []
+        if let t = obj["fetched_at"] as? Double {
+            lastUpdated = Date(timeIntervalSince1970: t)
+        }
+        rebuild(Self.parseEvents(rawEvents))
+    }
+
+    private func saveCache() {
+        var obj: [String: Any] = ["events": rawEvents]
+        if let d = lastUpdated {
+            obj["fetched_at"] = d.timeIntervalSince1970
+        }
+        guard JSONSerialization.isValidJSONObject(obj),
+              let data = try? JSONSerialization.data(withJSONObject: obj)
+        else { return }
+        try? data.write(to: Self.cacheURL, options: .atomic)
     }
 
     /// Full detail for the sheet. Graph ids carry `+ / =` and friends, so
@@ -279,7 +367,8 @@ final class CalendarModel: ObservableObject {
         }
     }
 
-    /// RSVP: POST, then mirror the new state into the agenda rows.
+    /// RSVP: POST, then mirror the new state into the agenda rows (and the
+    /// cache, so a relaunch paints the same state).
     func respond(id: String, action: String) async -> Bool {
         do {
             let data = try await Self.request("op=cal_respond", method: "POST",
@@ -292,13 +381,18 @@ final class CalendarModel: ObservableObject {
                     days[di].events[ei].response = newResponse
                 }
             }
+            for ri in rawEvents.indices where (rawEvents[ri]["id"] as? String) == id {
+                rawEvents[ri]["response"] = newResponse
+            }
+            saveCache()
             return true
         } catch {
             return false
         }
     }
 
-    /// Delete: POST, drop the row locally, then refresh in the background.
+    /// Delete: POST, drop the row locally (and from the cache), then refresh
+    /// in the background.
     func delete(id: String) async -> Bool {
         do {
             let data = try await Self.request("op=cal_delete", method: "POST",
@@ -315,6 +409,8 @@ final class CalendarModel: ObservableObject {
                     && !cal.isDateInTomorrow(day.date)
             }
             eventDayKeys = Set(days.filter { !$0.events.isEmpty }.map { $0.id })
+            rawEvents.removeAll { ($0["id"] as? String) == id }
+            saveCache()
             Task { await self.load() }
             return true
         } catch {
@@ -361,9 +457,12 @@ struct CalendarView: View {
             VStack(spacing: 0) {
                 headerBar(proxy)
                 monthStrip(proxy)
+                Rectangle()
+                    .fill(CalStyle.separator)
+                    .frame(height: 0.5)
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .background(CalStyle.bg.ignoresSafeArea())
             // Scarlet lives at the bottom of the agenda — the event detail
             // sheet covers the whole screen, so it never collides with the
             // sheet's own footer buttons.
@@ -411,20 +510,36 @@ struct CalendarView: View {
         }
     }
 
+    /// The ongoing event, else the next upcoming one — Outlook's "up next"
+    /// emphasis. All-day events never take it.
+    private var upNextID: String? {
+        let now = Date()
+        var next: (Date, String)?
+        for day in model.days {
+            for e in day.events where !e.allDay {
+                if e.start <= now && now < e.end { return e.id }
+                if e.start > now && (next == nil || e.start < (next?.0 ?? .distantFuture)) {
+                    next = (e.start, e.id)
+                }
+            }
+        }
+        return next?.1
+    }
+
     // MARK: header (avatar · big Calendar title · Today jump)
 
     private func headerBar(_ proxy: ScrollViewProxy) -> some View {
         HStack(spacing: 12) {
             // Account avatar — visual anchor only on this screen.
             ZStack {
-                Circle().fill(Color(white: 0.30))
+                Circle().fill(Color(calHex: 0x4A4948))
                 Text("IS")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.white)
             }
             .frame(width: 38, height: 38)
             Text("Calendar")
-                .font(.system(size: 34, weight: .heavy))
+                .font(.system(size: 26, weight: .bold))
                 .foregroundStyle(.white)
             Spacer()
             Button {
@@ -432,7 +547,7 @@ struct CalendarView: View {
             } label: {
                 Image(systemName: "calendar.circle")
                     .font(.system(size: 24, weight: .medium))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(CalStyle.accent)
             }
         }
         .padding(.horizontal, 16)
@@ -454,7 +569,7 @@ struct CalendarView: View {
         let target = model.days.first(where: { $0.id >= key })?.id ?? model.days.last?.id
         if let target {
             if animated {
-                withAnimation(.easeInOut(duration: 0.25)) {
+                withAnimation(.snappy(duration: 0.25)) {
                     proxy.scrollTo(target, anchor: .top)
                 }
             } else {
@@ -476,10 +591,22 @@ struct CalendarView: View {
 
     private func monthStrip(_ proxy: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(monthTitle)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 4)
+            HStack(alignment: .firstTextBaseline) {
+                Text(monthTitle)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                Spacer()
+                // Quiet freshness stamp — the cache paints instantly, this
+                // says how old that paint is. Re-renders once a minute.
+                if let updated = model.lastUpdated {
+                    TimelineView(.everyMinute) { _ in
+                        Text(Self.agoStamp(updated))
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color(calHex: 0x8A8886))
+                    }
+                }
+            }
+            .padding(.horizontal, 4)
             HStack(spacing: 2) {
                 weekChevron("chevron.left", byDays: -7)
                 ForEach(weekDays, id: \.self) { day in
@@ -492,49 +619,66 @@ struct CalendarView: View {
         .padding(.bottom, 10)
     }
 
+    /// "updated just now" / "updated 5m ago" / "updated 2h ago" / "updated 3d ago".
+    static func agoStamp(_ date: Date) -> String {
+        let s = max(0, Int(Date().timeIntervalSince(date)))
+        if s < 90 { return "updated just now" }
+        let m = s / 60
+        if m < 60 { return "updated \(m)m ago" }
+        let h = m / 60
+        if h < 24 { return "updated \(h)h ago" }
+        return "updated \(h / 24)d ago"
+    }
+
     private func weekChevron(_ icon: String, byDays: Int) -> some View {
         Button {
             if let moved = Calendar.current.date(byAdding: .day, value: byDays, to: weekAnchor) {
-                weekAnchor = moved
+                withAnimation(.snappy(duration: 0.2)) {
+                    weekAnchor = moved
+                }
             }
         } label: {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.7))
+                .foregroundStyle(Color(calHex: 0x8A8886))
                 .frame(width: 22, height: 44)
         }
         .buttonStyle(.plain)
     }
 
-    /// One strip day: weekday letter, number in a circle (today filled blue,
-    /// selected ringed), event-presence dot underneath.
+    /// One strip day: weekday initial small gray, 17pt number — today is a
+    /// filled Microsoft-blue circle with a white number, the selected day an
+    /// outlined pill — with an event-presence dot underneath.
     private func dayCell(_ day: Date, proxy: ScrollViewProxy) -> some View {
         let cal = Calendar.current
         let isToday = cal.isDateInToday(day)
         let isSelected = cal.isDate(day, inSameDayAs: selectedDay)
         let hasEvents = model.eventDayKeys.contains(CalDates.dayKey.string(from: day))
         return Button {
-            selectedDay = cal.startOfDay(for: day)
+            withAnimation(.snappy(duration: 0.2)) {
+                selectedDay = cal.startOfDay(for: day)
+            }
             scrollToDay(day, proxy: proxy)
         } label: {
             VStack(spacing: 3) {
                 Text(CalDates.weekdayLetter.string(from: day))
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color(calHex: 0x8A8886))
                 ZStack {
                     if isToday {
-                        Circle().fill(CalStyle.busyBlue)
+                        Circle().fill(CalStyle.accent)
                     } else if isSelected {
-                        Circle().stroke(CalStyle.busyBlue, lineWidth: 1.5)
+                        Circle().fill(CalStyle.surface)
+                        Circle().stroke(CalStyle.accent, lineWidth: 1.5)
                     }
                     Text("\(cal.component(.day, from: day))")
-                        .font(.system(size: 15, weight: isToday ? .bold : .regular))
+                        .font(.system(size: 17, weight: isToday ? .semibold : .regular))
                         .monospacedDigit()
                         .foregroundStyle(.white)
                 }
-                .frame(width: 32, height: 32)
+                .frame(width: 34, height: 34)
                 Circle()
-                    .fill(Color.white.opacity(hasEvents ? 0.55 : 0))
+                    .fill(hasEvents ? Color(calHex: 0x8A8886) : Color.clear)
                     .frame(width: 4, height: 4)
             }
             .frame(maxWidth: .infinity)
@@ -547,6 +691,7 @@ struct CalendarView: View {
     @ViewBuilder
     private var content: some View {
         if model.loading && model.days.isEmpty {
+            // First run only — once a cache exists this never shows again.
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Checking the calendar…").font(.footnote).foregroundStyle(.secondary)
@@ -561,7 +706,7 @@ struct CalendarView: View {
                     .multilineTextAlignment(.center)
                 Button("Try again") { Task { await model.load() } }
                     .buttonStyle(.bordered)
-                    .tint(CalStyle.rose)
+                    .tint(CalStyle.accent)
             }
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -575,7 +720,7 @@ struct CalendarView: View {
             if !model.errorText.isEmpty {
                 Text(model.errorText)
                     .font(.footnote)
-                    .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+                    .foregroundStyle(Color(calHex: 0xE8B04F))
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
             }
@@ -584,10 +729,17 @@ struct CalendarView: View {
                 if day.events.isEmpty {
                     noEventsRow
                 }
-                ForEach(day.events) { event in
-                    CalEventRow(event: event) { sheetEvent = event }
-                        .listRowBackground(Color.clear)
-                        .listRowSeparatorTint(.white.opacity(0.12))
+                let allDayEvents = day.events.filter { $0.allDay }
+                if !allDayEvents.isEmpty {
+                    allDayChips(allDayEvents)
+                }
+                ForEach(day.events.filter { !$0.allDay }) { event in
+                    CalEventRow(event: event, isUpNext: event.id == upNextID) {
+                        sheetEvent = event
+                    }
+                    .listRowBackground(Color.clear)
+                    .listRowSeparator(.hidden)
+                    .listRowInsets(EdgeInsets(top: 3, leading: 16, bottom: 3, trailing: 16))
                 }
             }
         }
@@ -596,13 +748,15 @@ struct CalendarView: View {
         .refreshable { await model.load() }
     }
 
-    /// "Today · Friday, August 1" / "Tomorrow · …" / "Friday, August 1".
+    /// "TODAY · FRIDAY, AUGUST 1" — Outlook's small-caps gray day header.
     /// The row carries the day's scroll anchor id.
     private func dayHeader(_ day: CalendarModel.Day) -> some View {
         Text(dayTitle(day.date))
-            .font(.system(size: 15, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .padding(.top, 14)
+            .font(.system(size: 13, weight: .semibold).smallCaps())
+            .kerning(0.4)
+            .foregroundStyle(Calendar.current.isDateInToday(day.date)
+                ? CalStyle.accent : Color(calHex: 0x8A8886))
+            .padding(.top, 16)
             .padding(.bottom, 2)
             .id(day.id)
             .listRowBackground(Color.clear)
@@ -620,50 +774,94 @@ struct CalendarView: View {
     private var noEventsRow: some View {
         Text("No events")
             .font(.system(size: 14))
-            .foregroundStyle(.white.opacity(0.35))
-            .padding(.leading, 10)
+            .italic()
+            .foregroundStyle(Color(calHex: 0x797774))
+            .padding(.leading, 4)
             .padding(.vertical, 4)
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
+    }
+
+    /// Compact all-day chips at the top of a day, Outlook style.
+    private func allDayChips(_ events: [CalEvent]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(events) { e in
+                    Button {
+                        sheetEvent = e
+                    } label: {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(CalStyle.bar(for: e.showAs))
+                                .frame(width: 7, height: 7)
+                            Text(e.subject)
+                                .font(.system(size: 13, weight: .semibold))
+                                .strikethrough(e.response == "declined")
+                                .foregroundStyle(e.response == "declined"
+                                    ? Color(calHex: 0x8A8886) : Color.white)
+                                .lineLimit(1)
+                        }
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(CalStyle.surface, in: Capsule())
+                        .overlay(Capsule().stroke(CalStyle.separator, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .listRowBackground(Color.clear)
+        .listRowSeparator(.hidden)
+        .listRowInsets(EdgeInsets(top: 3, leading: 16, bottom: 3, trailing: 16))
     }
 }
 
 // MARK: - Agenda row
 
-/// Outlook mobile's event row: show-as accent bar, start-over-end time
-/// column, subject (struck through when declined), location, and a Join
-/// capsule for today's Teams meetings.
+/// Outlook mobile's event card: #252423 surface, 4pt category bar on the
+/// leading edge, white semibold title, gray time range and location, and a
+/// Join capsule for today's Teams meetings. The ongoing / next-up event gets
+/// a brighter card with a soft blue glow on its bar.
 struct CalEventRow: View {
     let event: CalEvent
+    let isUpNext: Bool
     let onOpen: () -> Void
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
+        HStack(alignment: .center, spacing: 12) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(CalStyle.bar(for: event.showAs))
                 .frame(width: 4)
-                .frame(maxHeight: .infinity)
-            timeColumn
-            VStack(alignment: .leading, spacing: 2) {
+                .shadow(color: isUpNext ? CalStyle.accent.opacity(0.75) : Color.clear,
+                        radius: isUpNext ? 5 : 0)
+                .padding(.vertical, 10)
+                .padding(.leading, 10)
+            VStack(alignment: .leading, spacing: 3) {
                 Text(event.subject)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .strikethrough(event.response == "declined")
                     .foregroundStyle(event.response == "declined"
-                        ? Color.white.opacity(0.5) : Color.white)
+                        ? Color(calHex: 0x8A8886) : Color.white)
                     .lineLimit(2)
                     .truncationMode(.tail)
+                Text(event.timeRange)
+                    .font(.system(size: 13).monospacedDigit())
+                    .foregroundStyle(isUpNext
+                        ? Color(calHex: 0xA8CEF5) : Color(calHex: 0x9E9C9A))
                 if !event.location.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "mappin.and.ellipse")
-                            .font(.system(size: 11))
+                            .font(.system(size: 10))
                         Text(event.location)
                             .font(.system(size: 13))
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color(calHex: 0x8A8886))
                 }
             }
+            .padding(.vertical, 10)
             Spacer(minLength: 8)
             if let joinURL, Calendar.current.isDateInToday(event.start) {
                 Button {
@@ -674,35 +872,28 @@ struct CalEventRow: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
-                        .background(CalStyle.busyBlue, in: Capsule())
+                        .background(CalStyle.accent, in: Capsule())
                 }
                 .buttonStyle(.borderless)
+                .padding(.trailing, 10)
             }
         }
-        .padding(.vertical, 6)
-        .contentShape(Rectangle())
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isUpNext ? CalStyle.surfaceBright : CalStyle.surface)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isUpNext ? CalStyle.accent.opacity(0.4) : Color.clear,
+                        lineWidth: 1)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 10))
         .onTapGesture { onOpen() }
     }
 
     private var joinURL: URL? {
         guard let join = event.join else { return nil }
         return URL(string: join)
-    }
-
-    private var timeColumn: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if event.allDay {
-                Text("All day")
-                    .foregroundStyle(.white.opacity(0.85))
-            } else {
-                Text(CalDates.time.string(from: event.start))
-                    .foregroundStyle(.white.opacity(0.9))
-                Text(CalDates.time.string(from: event.end))
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .font(.system(size: 13).monospacedDigit())
-        .frame(width: 48, alignment: .leading)
     }
 }
 
@@ -732,10 +923,16 @@ struct CalEventDetailView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text(event.subject)
-                        .font(.title2.weight(.semibold))
-                        .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    HStack(alignment: .top, spacing: 10) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(CalStyle.bar(for: event.showAs))
+                            .frame(width: 4)
+                            .padding(.vertical, 3)
+                        Text(event.subject)
+                            .font(.title2.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     infoBlock
                     joinButton
                     rsvpSection
@@ -744,10 +941,10 @@ struct CalEventDetailView: View {
                 }
                 .padding(20)
             }
-            Divider().overlay(.white.opacity(0.15))
+            Divider().overlay(CalStyle.separator)
             footer
         }
-        .background(ScarletBackground().ignoresSafeArea())
+        .background(CalStyle.bg.ignoresSafeArea())
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .task { await fetch() }
@@ -780,10 +977,10 @@ struct CalEventDetailView: View {
         }
     }
 
-    // MARK: when / where / who
+    // MARK: when / where / who — an Outlook-style dark card
 
     private var infoBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             infoRow("clock", event.whenLine)
             if !event.location.isEmpty {
                 infoRow("mappin.and.ellipse", event.location)
@@ -802,6 +999,9 @@ struct CalEventDetailView: View {
                 }
             }
         }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(CalStyle.surface, in: RoundedRectangle(cornerRadius: 12))
     }
 
     private var organizerLine: String {
@@ -818,11 +1018,11 @@ struct CalEventDetailView: View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 13))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(calHex: 0x8A8886))
                 .frame(width: 18)
             Text(text)
                 .font(.system(size: 15))
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(.white.opacity(0.92))
         }
     }
 
@@ -841,7 +1041,7 @@ struct CalEventDetailView: View {
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(14)
-                .background(CalStyle.busyBlue, in: RoundedRectangle(cornerRadius: 14))
+                .background(CalStyle.accent, in: RoundedRectangle(cornerRadius: 14))
                 .foregroundStyle(.white)
             }
         }
@@ -862,14 +1062,14 @@ struct CalEventDetailView: View {
                     rsvpButton("Accept", icon: "checkmark", action: "accept",
                                wants: "accepted", tint: CalStyle.acceptGreen)
                     rsvpButton("Tentative", icon: "questionmark", action: "tentativelyAccept",
-                               wants: "tentativelyAccepted", tint: Color(white: 0.6))
+                               wants: "tentativelyAccepted", tint: Color(calHex: 0x9E9C9A))
                     rsvpButton("Decline", icon: "xmark", action: "decline",
                                wants: "declined", tint: CalStyle.declineRed)
                 }
                 if !actionError.isEmpty {
                     Text(actionError)
                         .font(.footnote)
-                        .foregroundStyle(Color(red: 1, green: 0.45, blue: 0.45))
+                        .foregroundStyle(Color(calHex: 0xF57373))
                 }
             }
         }
@@ -891,9 +1091,9 @@ struct CalEventDetailView: View {
             .minimumScaleFactor(0.8)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
-            .background(selected ? tint.opacity(0.28) : Color.white.opacity(0.06),
+            .background(selected ? tint.opacity(0.28) : CalStyle.surface,
                         in: Capsule())
-            .overlay(Capsule().stroke(selected ? tint : Color.white.opacity(0.12),
+            .overlay(Capsule().stroke(selected ? tint : CalStyle.separator,
                                       lineWidth: 1))
             .foregroundStyle(selected ? tint : Color.white.opacity(0.85))
         }
@@ -922,7 +1122,7 @@ struct CalEventDetailView: View {
         if let d = detail, !d.attendees.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.18)) { showAttendees.toggle() }
+                    withAnimation(.snappy(duration: 0.18)) { showAttendees.toggle() }
                 } label: {
                     HStack(spacing: 5) {
                         Text("Attendees (\(d.attendees.count))")
@@ -968,9 +1168,9 @@ struct CalEventDetailView: View {
     private func responseGlyph(_ response: String) -> (String, Color) {
         switch response {
         case "accepted", "organizer": return ("checkmark", CalStyle.acceptGreen)
-        case "tentativelyAccepted": return ("questionmark", Color(white: 0.6))
+        case "tentativelyAccepted": return ("questionmark", Color(calHex: 0x9E9C9A))
         case "declined": return ("xmark", CalStyle.declineRed)
-        default: return ("minus", Color(white: 0.45))
+        default: return ("minus", Color(calHex: 0x797774))
         }
     }
 
@@ -980,7 +1180,7 @@ struct CalEventDetailView: View {
     private var previewSection: some View {
         if let d = detail, !d.preview.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
-                Divider().overlay(.white.opacity(0.15))
+                Divider().overlay(CalStyle.separator)
                 Text(d.preview)
                     .font(.system(size: 15))
                     .lineSpacing(3)

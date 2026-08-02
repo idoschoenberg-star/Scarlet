@@ -5,10 +5,11 @@ import UIKit
 import WebKit
 
 /// Native inbox: the same mailbox the web app shows, read on the phone with
-/// Outlook mobile's anatomy — Focused|Other pill, date section buckets,
-/// sender avatars, unread blue dot, flagged-row tint, green full-swipe
-/// Archive, blue Read/Unread swipe, and a reading pane that renders on white
-/// with responsive HTML, exactly like real mail.
+/// Outlook mobile's dark-mode anatomy — near-black #1B1A19 canvas, Focused|
+/// Other pill, per-day section headers, Microsoft-palette sender avatars,
+/// unread blue dot, orange Flag / green Archive swipes, and a reader with
+/// the sender card + Outlook-blue action row. The list paints instantly from
+/// a JSON disk cache (Documents/inbox-cache.json) and refreshes underneath.
 
 // MARK: - Cross-tab wiring
 
@@ -41,7 +42,7 @@ struct MailMessage: Identifiable {
     var unread: Bool
     let attachments: Bool
     let importance: String
-    let flagged: Bool
+    var flagged: Bool
 }
 
 /// Outlook's inbox split. Raw values ride the query string (`?tab=other`).
@@ -95,6 +96,84 @@ enum MailDates {
     }
 }
 
+// MARK: - Disk cache (instant paint on launch)
+
+/// One cached row: `MailMessage` mirrored into Codable form so the list can
+/// persist as plain JSON without touching the wire type's shape.
+private struct CachedMessage: Codable {
+    let id: String
+    let subject: String
+    let preview: String
+    let fromName: String
+    let fromEmail: String
+    let received: Date?
+    var unread: Bool
+    let attachments: Bool
+    let importance: String
+    var flagged: Bool
+
+    init(_ m: MailMessage) {
+        id = m.id
+        subject = m.subject
+        preview = m.preview
+        fromName = m.fromName
+        fromEmail = m.fromEmail
+        received = m.received
+        unread = m.unread
+        attachments = m.attachments
+        importance = m.importance
+        flagged = m.flagged
+    }
+
+    var asMessage: MailMessage {
+        MailMessage(id: id, subject: subject, preview: preview, fromName: fromName,
+                    fromEmail: fromEmail, received: received, unread: unread,
+                    attachments: attachments, importance: importance, flagged: flagged)
+    }
+}
+
+/// The whole local mirror — both tabs plus their fetch stamps — persisted as
+/// one JSON file in Documents. Read SYNCHRONOUSLY in `InboxModel.init` so the
+/// list paints before the first network byte arrives; written after every
+/// successful load and every local mutation (archive, read, flag).
+private struct InboxCache: Codable {
+    var focused: [CachedMessage] = []
+    var other: [CachedMessage] = []
+    var focusedStamp: Date?
+    var otherStamp: Date?
+
+    static let url: URL = FileManager.default
+        .urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("inbox-cache.json")
+
+    static func loadSync() -> InboxCache {
+        guard let data = try? Data(contentsOf: url),
+              let cache = try? JSONDecoder().decode(InboxCache.self, from: data) else {
+            return InboxCache()
+        }
+        return cache
+    }
+
+    func rows(for tab: MailTab) -> [CachedMessage] {
+        tab == .focused ? focused : other
+    }
+
+    func stamp(for tab: MailTab) -> Date? {
+        tab == .focused ? focusedStamp : otherStamp
+    }
+
+    mutating func set(rows: [MailMessage], stamp: Date?, for tab: MailTab) {
+        let cached = rows.map { CachedMessage($0) }
+        if tab == .focused {
+            focused = cached
+            if let stamp { focusedStamp = stamp }
+        } else {
+            other = cached
+            if let stamp { otherStamp = stamp }
+        }
+    }
+}
+
 // MARK: - Model
 
 @MainActor
@@ -104,6 +183,10 @@ final class InboxModel: ObservableObject {
     @Published var errorText = ""
     /// Focused | Other pill. Switch via `setTab`, which reloads.
     @Published var tab: MailTab = .focused
+    /// When the current tab's rows last came back from the server (the cache
+    /// stamp on a cold start). Drives the subtle "Updated Xm ago" line that
+    /// replaces spinners whenever cached content is on screen.
+    @Published var lastUpdated: Date?
 
     /// Rows archived locally: a refresh must not resurrect them while the
     /// Graph move is still settling.
@@ -111,17 +194,45 @@ final class InboxModel: ObservableObject {
     /// Local read/unread flips that win over a stale server snapshot until
     /// the server catches up.
     private var unreadOverrides: [String: Bool] = [:]
+    /// Local flag flips (Outlook's leading swipe). There's no server op for
+    /// the flag, so these win over server snapshots and ride the disk cache.
+    private var flagOverrides: [String: Bool] = [:]
     /// Monotonic load token: a load that finishes after a newer one started
     /// (e.g. a slow Focused fetch landing after a switch to Other) is dropped.
     private var loadGeneration = 0
+    /// In-memory copy of the disk mirror; every mutation re-persists it.
+    private var cache: InboxCache
 
-    /// Pill tap: swap the tab and refetch. The old tab's rows clear right
-    /// away so a slow network never shows Focused rows under "Other".
+    /// Local-first: the last snapshot paints synchronously, before the first
+    /// network byte, so opening the tab never shows a spinner over history.
+    init() {
+        cache = InboxCache.loadSync()
+        messages = localized(cache.rows(for: .focused).map { $0.asMessage })
+        lastUpdated = cache.stamp(for: .focused)
+    }
+
+    /// Pill tap: swap the tab, paint that tab's cached rows immediately, and
+    /// refresh underneath. No cache → empty list (first-load path).
     func setTab(_ newTab: MailTab) {
         guard newTab != tab else { return }
         tab = newTab
-        messages = []
+        withAnimation(.snappy) {
+            messages = localized(cache.rows(for: newTab).map { $0.asMessage })
+        }
+        lastUpdated = cache.stamp(for: newTab)
         Task { await load() }
+    }
+
+    /// Cached rows re-filtered through local state: pending archives stay
+    /// hidden and local read/flag flips stay applied across tab hops.
+    private func localized(_ rows: [MailMessage]) -> [MailMessage] {
+        var out = rows
+        out.removeAll { pendingArchiveIds.contains($0.id) }
+        for i in out.indices {
+            if let want = unreadOverrides[out[i].id] { out[i].unread = want }
+            if let want = flagOverrides[out[i].id] { out[i].flagged = want }
+        }
+        return out
     }
 
     func load() async {
@@ -169,9 +280,20 @@ final class InboxModel: ObservableObject {
                         fetched[i].unread = want
                     }
                 }
+                if let want = flagOverrides[fetched[i].id] {
+                    if fetched[i].flagged == want {
+                        flagOverrides.removeValue(forKey: fetched[i].id)
+                    } else {
+                        fetched[i].flagged = want
+                    }
+                }
             }
             unreadOverrides = unreadOverrides.filter { listed.contains($0.key) }
-            messages = fetched
+            flagOverrides = flagOverrides.filter { listed.contains($0.key) }
+            withAnimation(.snappy) { messages = fetched }
+            cache.set(rows: fetched, stamp: Date(), for: tab)
+            lastUpdated = cache.stamp(for: tab)
+            persistCache()
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach the inbox — check your connection."
@@ -182,8 +304,11 @@ final class InboxModel: ObservableObject {
     /// says no, it comes back where it was.
     func archive(_ message: MailMessage) {
         let index = messages.firstIndex { $0.id == message.id }
-        if let index { messages.remove(at: index) }
+        if let index {
+            _ = withAnimation(.snappy) { messages.remove(at: index) }
+        }
         pendingArchiveIds.insert(message.id)
+        syncCacheWithMessages()
         Task {
             do {
                 let data = try await Self.request("op=mailarchive", method: "POST",
@@ -193,10 +318,23 @@ final class InboxModel: ObservableObject {
             } catch {
                 pendingArchiveIds.remove(message.id)
                 let at = min(index ?? messages.count, messages.count)
-                messages.insert(message, at: at)
+                withAnimation(.snappy) { messages.insert(message, at: at) }
+                syncCacheWithMessages()
                 errorText = "Couldn't archive that one — it's back in the list."
             }
         }
+    }
+
+    /// Outlook's leading swipe: flip the follow-up flag. Local-only for now —
+    /// there is no `mailflag` op — so the override map plus the disk cache
+    /// keep it sticky across refreshes and launches.
+    func toggleFlag(_ message: MailMessage) {
+        let nowFlagged = !message.flagged
+        flagOverrides[message.id] = nowFlagged
+        if let i = messages.firstIndex(where: { $0.id == message.id }) {
+            withAnimation(.snappy) { messages[i].flagged = nowFlagged }
+        }
+        syncCacheWithMessages()
     }
 
     /// Outlook's leading swipe: flip read/unread locally right away, mirror it
@@ -286,6 +424,24 @@ final class InboxModel: ObservableObject {
     private func setUnread(_ id: String, _ unread: Bool) {
         unreadOverrides[id] = unread
         if let i = messages.firstIndex(where: { $0.id == id }) { messages[i].unread = unread }
+        syncCacheWithMessages()
+    }
+
+    /// Mirror the visible rows into the current tab's cache slot (fetch stamp
+    /// unchanged — a local flip isn't a server refresh) and write to disk.
+    private func syncCacheWithMessages() {
+        cache.set(rows: messages, stamp: nil, for: tab)
+        persistCache()
+    }
+
+    /// Encode on the main actor (the struct is tiny), write off it — the
+    /// list never blocks on disk.
+    private func persistCache() {
+        let snapshot = cache
+        Task.detached(priority: .utility) {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            try? data.write(to: InboxCache.url, options: .atomic)
+        }
     }
 
     // MARK: plumbing
@@ -318,17 +474,39 @@ final class InboxModel: ObservableObject {
 
 // MARK: - Outlook palette
 
-/// Outlook mobile's action colors, shared by list and reader.
+/// Compact hex constructor, private to this file (no Assets, per house rule).
+private extension Color {
+    init(hex: UInt32) {
+        self.init(red: Double((hex >> 16) & 0xFF) / 255.0,
+                  green: Double((hex >> 8) & 0xFF) / 255.0,
+                  blue: Double(hex & 0xFF) / 255.0)
+    }
+}
+
+/// Outlook mobile's dark-mode design tokens, shared by list and reader.
 enum OutlookStyle {
-    static let archiveGreen = Color(red: 0.06, green: 0.5, blue: 0.24)
-    static let accentBlue = Color(red: 0.0, green: 0.47, blue: 0.83)
-    /// The red follow-up flag glyph on a row's subject line.
-    static let flagRed = Color(red: 0.91, green: 0.28, blue: 0.34)
-    /// Flagged rows sit on a subtle dark-yellow wash, like Outlook mobile.
-    static let flaggedRowTint = Color(red: 0.25, green: 0.20, blue: 0.02).opacity(0.55)
+    /// Near-black canvas behind everything.
+    static let background = Color(hex: 0x1B1A19)
+    /// Raised surfaces: chips, cards, the pill track.
+    static let surface = Color(hex: 0x252423)
+    static let surfaceAlt = Color(hex: 0x292827)
+    /// Hairlines between rows.
+    static let separator = Color(hex: 0x3B3A39)
+    /// Microsoft blue — links, selection, the unread dot.
+    static let accentBlue = Color(hex: 0x479EF5)
+    /// Microsoft blue — filled primary actions.
+    static let primaryBlue = Color(hex: 0x0F6CBD)
+    /// Full-swipe Archive.
+    static let archiveGreen = Color(hex: 0x498205)
+    /// The follow-up flag: glyph, leading swipe.
+    static let flagOrange = Color(hex: 0xCA5010)
+    /// Secondary text: previews, times, section headers.
+    static let textSecondary = Color(hex: 0x979593)
+    /// Flagged rows sit on a whisper of the flag orange.
+    static let flaggedRowTint = Color(hex: 0xCA5010).opacity(0.08)
     /// Focused | Other pill: darker track, lighter capsule for the selection.
-    static let pillTrack = Color(white: 0.16)
-    static let pillSelected = Color(white: 0.33)
+    static let pillTrack = Color(hex: 0x252423)
+    static let pillSelected = Color(hex: 0x3B3A39)
 }
 
 // MARK: - Sender avatar
@@ -340,15 +518,15 @@ struct SenderAvatar: View {
     let email: String
     var size: CGFloat = 40
 
+    /// Microsoft's avatar palette (blue, magenta, orange, teal, purple,
+    /// green) — the colors real Outlook deals to senders.
     private static let palette: [Color] = [
-        Color(red: 0.00, green: 0.47, blue: 0.83),
-        Color(red: 0.53, green: 0.34, blue: 0.65),
-        Color(red: 0.80, green: 0.29, blue: 0.16),
-        Color(red: 0.06, green: 0.50, blue: 0.24),
-        Color(red: 0.75, green: 0.21, blue: 0.47),
-        Color(red: 0.09, green: 0.45, blue: 0.50),
-        Color(red: 0.85, green: 0.48, blue: 0.09),
-        Color(red: 0.35, green: 0.38, blue: 0.71),
+        Color(red: 0.059, green: 0.424, blue: 0.741),  // #0F6CBD blue
+        Color(red: 0.761, green: 0.224, blue: 0.702),  // #C239B3 magenta
+        Color(red: 0.792, green: 0.314, blue: 0.063),  // #CA5010 orange
+        Color(red: 0.012, green: 0.514, blue: 0.529),  // #038387 teal
+        Color(red: 0.529, green: 0.392, blue: 0.722),  // #8764B8 purple
+        Color(red: 0.286, green: 0.510, blue: 0.020),  // #498205 green
     ]
 
     var body: some View {
@@ -361,8 +539,10 @@ struct SenderAvatar: View {
         .frame(width: size, height: size)
     }
 
+    /// Hash the sender's name (Outlook's rule); the address is the fallback
+    /// for nameless senders — and for ChatsView callers that pass email: "".
     private var seed: String {
-        email.isEmpty ? name.lowercased() : email.lowercased()
+        name.isEmpty ? email.lowercased() : name.lowercased()
     }
 
     /// djb2 over UTF-8 — stable across launches (unlike `hashValue`).
@@ -390,8 +570,6 @@ struct InboxView: View {
     @EnvironmentObject private var convo: Conversation
     @State private var showCompose = false
 
-    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
-
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -399,7 +577,7 @@ struct InboxView: View {
                 tabPills
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .background(OutlookStyle.background.ignoresSafeArea())
             // Scarlet lives at the bottom of the LIST screen only — part of
             // its layout, so the pushed reader (with its own action bar)
             // structurally replaces it.
@@ -439,15 +617,15 @@ struct InboxView: View {
             // through to the full web app, as the ScarletMark used to.
             Link(destination: AppConfig.fullAppURL) {
                 ZStack {
-                    Circle().fill(Color(white: 0.30))
+                    Circle().fill(OutlookStyle.primaryBlue)
                     Text("IS")
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(.white)
                 }
-                .frame(width: 38, height: 38)
+                .frame(width: 36, height: 36)
             }
             Text("Inbox")
-                .font(.system(size: 34, weight: .heavy))
+                .font(.system(size: 28, weight: .bold))
                 .foregroundStyle(.white)
             Spacer()
             // New mail: Scarlet drafts it in the native studio.
@@ -472,7 +650,8 @@ struct InboxView: View {
         .padding(.bottom, 6)
     }
 
-    /// Focused | Other, Outlook's pill-in-a-track toggle.
+    /// Focused | Other, Outlook's pill-in-a-track toggle, with the quiet
+    /// freshness stamp on the right — the anti-spinner.
     private var tabPills: some View {
         HStack {
             HStack(spacing: 0) {
@@ -481,10 +660,11 @@ struct InboxView: View {
                         model.setTab(t)
                     } label: {
                         Text(t.title)
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 7)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(model.tab == t
+                                ? Color.white : OutlookStyle.textSecondary)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
                             .background(
                                 Capsule().fill(model.tab == t
                                     ? OutlookStyle.pillSelected : Color.clear)
@@ -495,14 +675,33 @@ struct InboxView: View {
             }
             .background(Capsule().fill(OutlookStyle.pillTrack))
             Spacer()
+            if let stamp = model.lastUpdated {
+                Text(Self.updatedLabel(stamp))
+                    .font(.system(size: 11))
+                    .foregroundStyle(OutlookStyle.textSecondary)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
     }
 
+    /// "Updated just now / 3m ago / 2h ago" — recomputed on every render,
+    /// which each refresh and tab hop triggers anyway.
+    private static func updatedLabel(_ stamp: Date) -> String {
+        let seconds = Int(Date().timeIntervalSince(stamp))
+        if seconds < 90 { return "Updated just now" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "Updated \(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "Updated \(hours)h ago" }
+        return "Updated \(hours / 24)d ago"
+    }
+
     @ViewBuilder
     private var content: some View {
         if model.loading && model.messages.isEmpty {
+            // Only reachable with no cache at all (true first run): content
+            // could not exist yet, so the one spinner in the flow is here.
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Checking the mail…").font(.footnote).foregroundStyle(.secondary)
@@ -517,7 +716,7 @@ struct InboxView: View {
                     .multilineTextAlignment(.center)
                 Button("Try again") { Task { await model.load() } }
                     .buttonStyle(.bordered)
-                    .tint(scarletRose)
+                    .tint(OutlookStyle.accentBlue)
             }
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -538,28 +737,32 @@ struct InboxView: View {
                         .listRowBackground(Color.clear)
                 }
                 ForEach(groups) { group in
-                    // Today's rows lead with no header, like Outlook; older
-                    // buckets get a big bold section title.
-                    if let title = group.title {
-                        Text(title)
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(.top, 18)
-                            .padding(.bottom, 2)
-                            .listRowBackground(Color.clear)
-                            .listRowSeparator(.hidden)
-                    }
+                    // Per-day headers, Outlook style: small caps, quiet gray.
+                    Text(group.title.uppercased())
+                        .font(.system(size: 12, weight: .semibold))
+                        .kerning(0.5)
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                        .padding(.top, 12)
+                        .listRowBackground(Color.clear)
+                        .listRowSeparator(.hidden)
                     ForEach(group.messages) { message in
-                        NavigationLink {
-                            MailDetailView(message: message, model: model)
-                        } label: {
+                        // ZStack + zero-opacity link: full NavigationLink
+                        // behavior without the disclosure chevron Outlook
+                        // doesn't have.
+                        ZStack {
+                            NavigationLink {
+                                MailDetailView(message: message, model: model)
+                            } label: {
+                                EmptyView()
+                            }
+                            .opacity(0)
                             InboxRow(message: message, accent: OutlookStyle.accentBlue)
                         }
                         .listRowBackground(message.flagged
                             ? OutlookStyle.flaggedRowTint : Color.clear)
-                        .listRowSeparatorTint(.white.opacity(0.12))
+                        .listRowSeparatorTint(OutlookStyle.separator)
                         // Outlook's swipes: long-swipe left = green Archive,
-                        // long-swipe right = blue Read/Unread flip.
+                        // long-swipe right = orange Flag (plus Read/Unread).
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             Button {
                                 model.archive(message)
@@ -570,13 +773,21 @@ struct InboxView: View {
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
                             Button {
+                                model.toggleFlag(message)
+                            } label: {
+                                Label(message.flagged ? "Unflag" : "Flag",
+                                      systemImage: message.flagged
+                                          ? "flag.slash.fill" : "flag.fill")
+                            }
+                            .tint(OutlookStyle.flagOrange)
+                            Button {
                                 model.toggleRead(message)
                             } label: {
                                 Label(message.unread ? "Read" : "Unread",
                                       systemImage: message.unread
                                           ? "envelope.open.fill" : "envelope.badge.fill")
                             }
-                            .tint(OutlookStyle.accentBlue)
+                            .tint(OutlookStyle.primaryBlue)
                         }
                     }
                 }
@@ -587,53 +798,65 @@ struct InboxView: View {
         }
     }
 
-    // MARK: date buckets (Outlook grouping: today headerless, then named)
+    // MARK: date buckets (Outlook grouping: one section per day)
 
     private struct MailGroup: Identifiable {
         let id: String
-        let title: String?
+        let title: String
         let messages: [MailMessage]
     }
 
+    /// Group by calendar day, preserving the server's newest-first order.
+    /// Undated strays sink into one "Earlier" bucket.
     private var groups: [MailGroup] {
         let cal = Calendar.current
-        let now = Date()
-        var today: [MailMessage] = []
-        var yesterday: [MailMessage] = []
-        var thisWeek: [MailMessage] = []
-        var earlier: [MailMessage] = []
+        var order: [String] = []
+        var titles: [String: String] = [:]
+        var buckets: [String: [MailMessage]] = [:]
         for m in model.messages {
-            guard let d = m.received else {
-                earlier.append(m)
-                continue
-            }
-            if cal.isDateInToday(d) {
-                today.append(m)
-            } else if cal.isDateInYesterday(d) {
-                yesterday.append(m)
+            let key: String
+            let title: String
+            if let d = m.received {
+                let day = cal.startOfDay(for: d)
+                key = String(Int(day.timeIntervalSince1970))
+                title = Self.dayTitle(day, cal: cal)
             } else {
-                let days = cal.dateComponents([.day],
-                                              from: cal.startOfDay(for: d),
-                                              to: cal.startOfDay(for: now)).day ?? 99
-                if days >= 0 && days < 7 {
-                    thisWeek.append(m)
-                } else {
-                    earlier.append(m)
-                }
+                key = "undated"
+                title = "Earlier"
             }
+            if buckets[key] == nil {
+                order.append(key)
+                titles[key] = title
+            }
+            buckets[key, default: []].append(m)
         }
-        var out: [MailGroup] = []
-        if !today.isEmpty { out.append(MailGroup(id: "today", title: nil, messages: today)) }
-        if !yesterday.isEmpty {
-            out.append(MailGroup(id: "yesterday", title: "Yesterday", messages: yesterday))
+        return order.map { key in
+            MailGroup(id: key, title: titles[key] ?? "", messages: buckets[key] ?? [])
         }
-        if !thisWeek.isEmpty {
-            out.append(MailGroup(id: "thisweek", title: "This Week", messages: thisWeek))
+    }
+
+    private static let weekdayHeaderFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEEE"; return f
+    }()
+    private static let dateHeaderFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "EEEE, MMMM d"; return f
+    }()
+    private static let oldDateHeaderFormat: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMMM d, yyyy"; return f
+    }()
+
+    /// Outlook's header ladder: Today, Yesterday, bare weekday inside the
+    /// last week, "Friday, July 18" this year, full date beyond.
+    private static func dayTitle(_ day: Date, cal: Calendar) -> String {
+        if cal.isDateInToday(day) { return "Today" }
+        if cal.isDateInYesterday(day) { return "Yesterday" }
+        let days = cal.dateComponents([.day], from: day,
+                                      to: cal.startOfDay(for: Date())).day ?? 99
+        if days >= 0 && days < 7 { return weekdayHeaderFormat.string(from: day) }
+        if cal.component(.year, from: day) == cal.component(.year, from: Date()) {
+            return dateHeaderFormat.string(from: day)
         }
-        if !earlier.isEmpty {
-            out.append(MailGroup(id: "earlier", title: "Earlier", messages: earlier))
-        }
-        return out
+        return oldDateHeaderFormat.string(from: day)
     }
 }
 
@@ -645,7 +868,7 @@ struct InboxRow: View {
     let accent: Color
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 10) {
             // Unread marker: an 8pt Outlook-blue dot, centered on the avatar
             // (avatar top pad 2 + radius 20 = 22; dot pad 18 + radius 4 = 22).
             Circle()
@@ -656,10 +879,10 @@ struct InboxRow: View {
             SenderAvatar(name: senderName, email: message.fromEmail, size: 40)
                 .padding(.top, 2)
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(senderName)
-                        .font(.system(size: 17, weight: message.unread ? .bold : .semibold))
-                        .foregroundStyle(message.unread ? .white : .white.opacity(0.8))
+                        .font(.system(size: 15, weight: message.unread ? .bold : .semibold))
+                        .foregroundStyle(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     if message.importance == "high" {
@@ -669,36 +892,35 @@ struct InboxRow: View {
                     }
                     Spacer(minLength: 8)
                     Text(timeLabel)
-                        .font(.system(size: 15))
-                        .foregroundStyle(message.unread ? accent : .secondary)
+                        .font(.system(size: 12))
+                        .foregroundStyle(OutlookStyle.textSecondary)
                 }
                 HStack(spacing: 6) {
                     Text(message.subject)
-                        .font(.system(size: 15, weight: message.unread ? .semibold : .regular))
-                        .foregroundStyle(Color(red: 0.96, green: 0.94, blue: 0.94)
-                            .opacity(message.unread ? 1 : 0.85))
+                        .font(.system(size: 14, weight: message.unread ? .semibold : .regular))
+                        .foregroundStyle(Color.white.opacity(message.unread ? 1.0 : 0.9))
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer(minLength: 8)
                     if message.flagged {
                         Image(systemName: "flag.fill")
                             .font(.system(size: 12))
-                            .foregroundStyle(OutlookStyle.flagRed)
+                            .foregroundStyle(OutlookStyle.flagOrange)
                     }
                     if message.attachments {
                         Image(systemName: "paperclip")
                             .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(OutlookStyle.textSecondary)
                     }
                 }
                 Text(message.preview)
-                    .font(.system(size: 15))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 13))
+                    .foregroundStyle(OutlookStyle.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
             }
         }
-        .padding(.vertical, 5)
+        .padding(.vertical, 6)
     }
 
     private var senderName: String {
@@ -759,19 +981,19 @@ struct MailDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().overlay(.white.opacity(0.15))
+            Divider().overlay(OutlookStyle.separator)
             // Outlook puts attachments right under the header, above the
             // body. A fixed-height horizontal strip: it never joins the
             // web view's vertical scroll surface.
             if let detail, !detail.attachments.isEmpty {
                 attachmentsRow(detail.attachments)
-                Divider().overlay(.white.opacity(0.15))
+                Divider().overlay(OutlookStyle.separator)
             }
             bodyPane
-            Divider().overlay(.white.opacity(0.15))
+            Divider().overlay(OutlookStyle.separator)
             actionBar
         }
-        .background(ScarletBackground().ignoresSafeArea())
+        .background(OutlookStyle.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -885,9 +1107,9 @@ struct MailDetailView: View {
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
-            .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.07)))
+            .background(RoundedRectangle(cornerRadius: 12).fill(OutlookStyle.surface))
             .overlay(RoundedRectangle(cornerRadius: 12)
-                .stroke(Color.white.opacity(0.10), lineWidth: 1))
+                .stroke(OutlookStyle.separator, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -964,8 +1186,8 @@ struct MailDetailView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(subjectText)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white)
                 .lineLimit(3)
                 .truncationMode(.tail)
             HStack(alignment: .center, spacing: 10) {
@@ -1034,7 +1256,7 @@ struct MailDetailView: View {
                     Task { await fetch() }
                 }
                 .buttonStyle(.bordered)
-                .tint(scarletRose)
+                .tint(OutlookStyle.accentBlue)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -1045,14 +1267,16 @@ struct MailDetailView: View {
 
     // MARK: action bar (Reply keeps the native DraftView flow)
 
+    /// Outlook-blue action row: Reply is the filled primary; the rest sit as
+    /// quiet raised chips. Same three behaviors as always.
     private var actionBar: some View {
         HStack(spacing: 10) {
             actionButton("Reply", icon: "arrowshape.turn.up.left.fill",
-                         tint: OutlookStyle.accentBlue) {
+                         tint: OutlookStyle.primaryBlue, filled: true) {
                 showDraft = true
             }
             actionButton("Archive", icon: "archivebox.fill",
-                         tint: OutlookStyle.archiveGreen) {
+                         tint: OutlookStyle.accentBlue) {
                 model.archive(message)
                 dismiss()
             }
@@ -1065,6 +1289,7 @@ struct MailDetailView: View {
     }
 
     private func actionButton(_ label: String, icon: String, tint: Color,
+                              filled: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
@@ -1074,9 +1299,10 @@ struct MailDetailView: View {
             .lineLimit(1)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
-            .background(tint.opacity(0.22), in: Capsule())
-            .overlay(Capsule().stroke(tint.opacity(0.5), lineWidth: 1))
-            .foregroundStyle(.white)
+            .background(filled ? tint : OutlookStyle.surface, in: Capsule())
+            .overlay(Capsule().stroke(
+                filled ? Color.clear : OutlookStyle.separator, lineWidth: 1))
+            .foregroundStyle(filled ? Color.white : tint)
         }
     }
 
@@ -1148,10 +1374,14 @@ struct MailDetailView: View {
     }
 }
 
-/// Renders the message HTML on white, like Outlook — mail is written for
-/// light backgrounds, so the reading pane stays light inside the dark app.
-/// JavaScript is off, tapped links open in Safari, and the page is wrapped in
-/// a responsive frame so fixed-width newsletters shrink instead of overflow.
+/// Renders the message HTML dark, like Outlook mobile's dark reading pane.
+/// Mail is authored for light backgrounds, so instead of guessing at inline
+/// colors the frame uses the classic soft-invert transform (invert +
+/// hue-rotate on the page, re-inverted on images/video) — whites land near
+/// Outlook's #1B1A19, text lands near-white, hues survive, pictures stay
+/// true. JavaScript is off, tapped links open in Safari, and the page is
+/// wrapped in a responsive frame so fixed-width newsletters shrink instead
+/// of overflow.
 struct MailBodyView: UIViewRepresentable {
     let html: String
 
@@ -1188,8 +1418,11 @@ struct MailBodyView: UIViewRepresentable {
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = context.coordinator
         web.isOpaque = true
-        web.backgroundColor = .white
-        web.scrollView.backgroundColor = .white
+        // Outlook's near-black behind the page and in the overscroll.
+        let outlookDark = UIColor(red: 27.0 / 255.0, green: 26.0 / 255.0,
+                                  blue: 25.0 / 255.0, alpha: 1.0)
+        web.backgroundColor = outlookDark
+        web.scrollView.backgroundColor = outlookDark
         web.scrollView.bounces = true
         return web
     }
@@ -1200,14 +1433,21 @@ struct MailBodyView: UIViewRepresentable {
         web.loadHTMLString(Self.page(for: html), baseURL: nil)
     }
 
-    /// Outlook-style reading frame: responsive viewport, fluid images and
-    /// tables, long words wrapped — the classic newsletter-overflow fix.
+    /// Outlook-style dark reading frame: responsive viewport, fluid images
+    /// and tables, long words wrapped, and the soft-invert dark transform.
+    /// The page is authored light (white ground, #111 text, 16px body) and
+    /// the filter flips it: 0.94 invert keeps blacks off pure-white glare,
+    /// hue-rotate(180deg) puts brand colors back near their real hue, and
+    /// media elements get the same filter again to cancel it out.
     static func page(for html: String) -> String {
         """
         <!DOCTYPE html><html><head>\
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">\
         <style>\
-        html,body{margin:0;padding:12px;background:#fff;color:#111;font:-apple-system-body;\
+        html{background:#fff;filter:invert(0.94) hue-rotate(180deg)}\
+        img,video,picture{filter:invert(1) hue-rotate(180deg)}\
+        html,body{margin:0;padding:12px;background:#fff;color:#111;\
+        font:16px -apple-system,system-ui,sans-serif;\
         -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
         img{max-width:100%!important;height:auto!important}\
         table{max-width:100%!important;table-layout:auto}\
