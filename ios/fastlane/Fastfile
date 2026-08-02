@@ -16,24 +16,35 @@ platform :ios do
       in_house: false
     )
 
-    # The app declares the HealthKit entitlement — the App ID must carry the
-    # capability or archiving fails entitlement matching. Idempotent: enabling
-    # an already-enabled capability is a no-op; sigh's force:true below then
-    # regenerates the profile to include it.
+    # The app declares the HealthKit entitlements — the App ID must carry the
+    # capability or archiving fails entitlement matching. Idempotent: an
+    # already-enabled capability is left alone; sigh's force:true below then
+    # regenerates the profile to include it. This must FAIL the run when it
+    # can't do its job — a swallowed error here just moves the failure to the
+    # archive step with a confusing profile message.
     begin
-      Spaceship::ConnectAPI.token = key
-      bundle = Spaceship::ConnectAPI::BundleId.all(filter: { identifier: BUNDLE_ID }).first
-      if bundle
-        has_hk = bundle.get_capabilities.any? { |c| c.capability_type == "HEALTHKIT" }
-        unless has_hk
+      # Spaceship needs a real token, not app_store_connect_api_key's hash.
+      Spaceship::ConnectAPI.auth(
+        key_id: ENV["ASC_KEY_ID"],
+        issuer_id: ENV["ASC_ISSUER"],
+        filepath: ENV["ASC_P8_PATH"]
+      )
+      bundle = Spaceship::ConnectAPI::BundleId.all(filter: { identifier: BUNDLE_ID })
+                                              .find { |b| b.identifier == BUNDLE_ID }
+      UI.user_error!("App ID #{BUNDLE_ID} not found on the developer portal") unless bundle
+      has_hk = bundle.get_capabilities.any? { |c| c.capability_type == "HEALTHKIT" }
+      unless has_hk
+        if bundle.respond_to?(:create_capability)
+          bundle.create_capability("HEALTHKIT")
+        else
           Spaceship::ConnectAPI::BundleIdCapability.create(
             bundle_id_id: bundle.id, capability_type: "HEALTHKIT"
           )
-          UI.message("Enabled HealthKit capability on #{BUNDLE_ID}")
         end
+        UI.message("Enabled HealthKit capability on #{BUNDLE_ID}")
       end
     rescue => e
-      UI.important("HealthKit capability check failed (continuing): #{e.message}")
+      UI.user_error!("HealthKit capability setup failed: #{e.message}")
     end
 
     # Manual distribution signing, minted fresh each run via the ASC API.
