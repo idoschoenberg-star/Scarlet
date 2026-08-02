@@ -103,6 +103,11 @@ struct SettingsView: View {
                     Text("Tap ▶ to hear a sample. Changes apply from your next conversation.")
                 }
 
+                // Microphone: live level meter (ground truth), input-device and
+                // channel pickers, and input gain — for capturing a close mic on
+                // a multichannel interface (e.g. the RME Babyface on the Mac).
+                MicrophoneSettingsSection()
+
                 Section {
                     Link(destination: AppConfig.fullAppURL) {
                         HStack {

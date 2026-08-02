@@ -68,6 +68,15 @@ struct TalkView: View {
                 }
             }
 
+            // Live mic-input meter while a call is up — moves when she's
+            // actually hearing you, so a pro-interface channel can be found
+            // by watching it (a flat meter = that input is silent to her).
+            if convo.state != .idle {
+                MicLevelMeter(level: convo.inputLevel)
+                    .frame(maxWidth: 200)
+                    .padding(.horizontal, 40)
+            }
+
             HStack(spacing: 16) {
                 RoundControl(icon: convo.micOn ? "mic.fill" : "mic.slash.fill",
                              label: "Mic", off: !convo.micOn) { convo.toggleMic() }

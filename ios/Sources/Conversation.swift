@@ -24,6 +24,14 @@ final class Conversation: ObservableObject {
     /// the assistant and is available to the UI. Route-derived, not session.
     @Published var drivingMode = false
 
+    /// Live input meter: RMS of the audio actually captured from the selected
+    /// input/channel (post-gain, pre-send), mapped to 0…1 and smoothed. Updated
+    /// every buffer regardless of mic-mute or echo gating, so a flat meter is
+    /// ground truth that this input is delivering silence. Also mirrored to
+    /// `MicSettings.shared.level` for the Settings sheet, which doesn't hold a
+    /// reference to this live instance.
+    @Published var inputLevel: Float = 0
+
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
@@ -55,6 +63,14 @@ final class Conversation: ObservableObject {
     private var converter: AVAudioConverter?
     private var playFormat: AVAudioFormat?
     private var audioReady = false
+
+    // Live-tunable capture settings, mirrored from MicSettings and read on the
+    // audio thread the same way `converter` is. Channel/gain changes take
+    // effect on the next buffer; a device change needs a fresh audio start.
+    private var capChannel = 0
+    private var capGainLinear: Float = 1
+    /// Meter smoothing state — only ever touched on the main actor.
+    private var levelSmoothed: Float = 0
 
     // How many of her audio buffers are scheduled-but-unfinished. This is the
     // ONLY truthful "is she audibly speaking" signal: the server streams her
@@ -401,7 +417,38 @@ final class Conversation: ObservableObject {
         try s.setCategory(.playAndRecord, mode: .voiceChat,
                           options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
         try s.setActive(true)
+        applyPreferredInput()
         routeToSpeakerIfReceiver()
+    }
+
+    /// Apply the user's saved input choice (RME/USB interface, headset, …)
+    /// BEFORE the engine reads the input format, so a multichannel device's
+    /// real format is what the tap/converter see. No saved choice → system
+    /// default (nil preferred input). Also refreshes the list the Settings
+    /// picker shows and records what we actually resolved to. Never throws:
+    /// a stale/absent device just falls back to the default.
+    private func applyPreferredInput() {
+        let s = AVAudioSession.sharedInstance()
+        let m = MicSettings.shared
+        let inputs = s.availableInputs ?? []
+        m.availableInputs = inputs
+        if let uid = m.preferredInputUID,
+           let match = inputs.first(where: { $0.uid == uid })
+                    ?? inputs.first(where: { $0.portName == m.preferredInputName }) {
+            try? s.setPreferredInput(match)
+            m.activeInputName = match.portName
+        } else {
+            try? s.setPreferredInput(nil)
+            m.activeInputName = s.currentRoute.inputs.first?.portName
+        }
+    }
+
+    /// Mirror the live-tunable capture settings (channel, gain) into the plain
+    /// fields the audio-thread tap reads.
+    private func applyMicSettings() {
+        let m = MicSettings.shared
+        capChannel = max(0, m.channel)
+        capGainLinear = pow(10, max(0, m.gainDB) / 20)
     }
 
     /// Voice-chat sessions love falling back to the phone-call earpiece, which
@@ -430,6 +477,14 @@ final class Conversation: ObservableObject {
                                    channels: 1, interleaved: true)!
         converter = AVAudioConverter(from: inFormat, to: target)
 
+        // Channel count decides the capture path: >1 (a multichannel USB/RME
+        // interface, esp. iOS-app-on-Mac) means we pull one selected channel
+        // out ourselves; ==1 keeps the proven converter downmix. Surfaced to
+        // the Settings picker via MicSettings.
+        let channelCount = Int(inFormat.channelCount)
+        MicSettings.shared.channelCount = channelCount
+        applyMicSettings()
+
         engine.attach(player)
         // Player speaks standard Float32 — mixer connections in exotic formats
         // are exactly the kind of thing AVAudioEngine throws exceptions over.
@@ -438,21 +493,97 @@ final class Conversation: ObservableObject {
 
         input.removeTap(onBus: 0)   // never stack taps — a second install crashes
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
-            guard let self, let converter = self.converter else { return }
-            let ratio = 16000.0 / inFormat.sampleRate
-            let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
-            guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCap) else { return }
-            var fed = false
-            var err: NSError?
-            converter.convert(to: out, error: &err) { _, status in
-                if fed { status.pointee = .noDataNow; return nil }
-                fed = true; status.pointee = .haveData; return buffer
+            guard let self else { return }
+
+            var outData: Data?
+            var instRMS: Float = 0
+            let gain = self.capGainLinear
+
+            if channelCount > 1, let fdata = buffer.floatChannelData {
+                // Multichannel device (e.g. an RME/USB interface on the Mac):
+                // pull the ONE selected channel out directly and resample it to
+                // 16k mono ourselves, instead of letting the converter average
+                // every channel together — which would bury a single live mic
+                // under the silent channels. The channel index is CLAMPED, so
+                // an out-of-range value can never crash: it falls back to 0.
+                let frames = Int(buffer.frameLength)
+                if frames > 0 {
+                    let interleaved = inFormat.isInterleaved
+                    let stride = interleaved ? channelCount : 1
+                    let chIndex = max(0, min(self.capChannel, channelCount - 1))
+                    let base = interleaved ? fdata[0].advanced(by: chIndex) : fdata[chIndex]
+
+                    let ratio = inFormat.sampleRate / 16000.0
+                    let outCount = max(0, Int(Double(frames) / ratio))
+                    var pcm = [Int16](); pcm.reserveCapacity(outCount)
+                    var i = 0
+                    while i < outCount {
+                        let pos = Double(i) * ratio
+                        let i0 = Int(pos)
+                        let i1 = min(i0 + 1, frames - 1)
+                        let frac = Float(pos - Double(i0))
+                        let s0 = base[i0 * stride]
+                        let s1 = base[i1 * stride]
+                        var v = (s0 + (s1 - s0) * frac) * gain   // linear resample
+                        if v > 1 { v = 1 } else if v < -1 { v = -1 }   // hard limit
+                        pcm.append(Int16(v * 32767))
+                        i += 1
+                    }
+                    var sumSq: Float = 0
+                    var j = 0
+                    while j < frames { let g = base[j * stride] * gain; sumSq += g * g; j += 1 }
+                    instRMS = sqrt(sumSq / Float(frames))
+                    outData = pcm.withUnsafeBytes { Data($0) }
+                }
+            } else if let converter = self.converter {
+                // Single-channel input: keep the proven AVAudioConverter downmix.
+                let ratio = 16000.0 / inFormat.sampleRate
+                let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
+                if let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCap) {
+                    var fed = false
+                    var err: NSError?
+                    converter.convert(to: out, error: &err) { _, status in
+                        if fed { status.pointee = .noDataNow; return nil }
+                        fed = true; status.pointee = .haveData; return buffer
+                    }
+                    if err == nil, out.frameLength > 0, let ch = out.int16ChannelData {
+                        if gain != 1 {
+                            let n = Int(out.frameLength)
+                            var i = 0
+                            while i < n {
+                                var v = Float(ch[0][i]) * gain
+                                if v > 32767 { v = 32767 } else if v < -32767 { v = -32767 }
+                                ch[0][i] = Int16(v)
+                                i += 1
+                            }
+                        }
+                        outData = Data(bytes: ch[0], count: Int(out.frameLength) * 2)
+                        if let fdata = buffer.floatChannelData {
+                            let frames = Int(buffer.frameLength)
+                            if frames > 0 {
+                                var sumSq: Float = 0
+                                var j = 0
+                                while j < frames { let g = fdata[0][j] * gain; sumSq += g * g; j += 1 }
+                                instRMS = sqrt(sumSq / Float(frames))
+                            }
+                        }
+                    }
+                }
             }
-            guard err == nil, out.frameLength > 0,
-                  let ch = out.int16ChannelData else { return }
-            let bytes = Int(out.frameLength) * 2
-            let data = Data(bytes: ch[0], count: bytes)
+
+            guard let data = outData else { return }
+            // Map RMS → dB → 0…1 (-60 dB floor). Silence stays at 0; speech
+            // fills the meter; raising the gain visibly raises it.
+            let db = 20 * log10(max(instRMS, 1e-7))
+            let norm = max(0, min(1, (db + 60) / 60))
             Task { @MainActor in
+                // Meter FIRST — it reflects the real captured signal regardless
+                // of mic-mute/echo gating, so a flat meter is ground truth.
+                let prev = self.levelSmoothed
+                let next = norm > prev ? norm : prev * 0.82 + norm * 0.18   // fast attack, slow release
+                self.levelSmoothed = next
+                self.inputLevel = next
+                MicSettings.shared.level = next
                 // Half-duplex: her ears open only when her voice isn't in the
                 // room. Kills echo barge-in AND echo phantom turns at the root.
                 guard self.micOn, !self.echoRisk else { return }
@@ -574,6 +705,13 @@ final class Conversation: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.endBackgroundAssertion() }
+        }
+        // Live-tunable mic settings (channel, gain) changed in Settings: re-read
+        // them so the running tap picks them up on its next buffer. A device
+        // change is also broadcast here but only takes effect on the next start.
+        NotificationCenter.default.addObserver(
+            forName: .scarletMicChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.applyMicSettings() }
         }
     }
 }
