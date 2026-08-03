@@ -44,7 +44,11 @@ struct UnlockView: View {
 
     private func unlock() {
         busy = true; error = ""
-        Task {
+        // @MainActor Task: `error`, `busy` (in defer), and `session.setToken` all
+        // run after a network `await`, so the whole body must stay on main — not
+        // just the one setToken call. This removes the earlier inconsistency where
+        // only setToken hopped while the error/busy writes raced.
+        Task { @MainActor in
             defer { busy = false }
             do {
                 var req = URLRequest(url: AppConfig.unlockURL)
@@ -56,7 +60,7 @@ struct UnlockView: View {
                 guard let token = obj?["token"] as? String else {
                     error = "That's not it — try again."; return
                 }
-                await MainActor.run { session.setToken(token) }
+                session.setToken(token)
             } catch {
                 self.error = "Couldn't reach Scarlet — check your connection."
             }

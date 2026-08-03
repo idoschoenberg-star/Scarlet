@@ -945,6 +945,7 @@ struct CalEventDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            topBar
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack(alignment: .top, spacing: 10) {
@@ -956,18 +957,6 @@ struct CalEventDetailView: View {
                             .font(.title2.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        // Delete is a rare, destructive action — a quiet icon in
-                        // the corner, not a co-primary button. Confirmation-guarded.
-                        Menu {
-                            Button("Delete event", systemImage: "trash",
-                                   role: .destructive) { confirmDelete = true }
-                        } label: {
-                            Image(systemName: deleting ? "hourglass" : "ellipsis.circle")
-                                .font(.system(size: 18))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 34, height: 34)
-                        }
-                        .disabled(deleting)
                     }
                     infoBlock
                     joinButton
@@ -1227,8 +1216,35 @@ struct CalEventDetailView: View {
         }
     }
 
+    // MARK: top bar — always-present, obvious way out (Done) plus a quiet
+    // overflow for the rare destructive action. A sheet must never be a room
+    // with no door: on Mac Catalyst the drag indicator isn't a reliable exit.
+
+    private var topBar: some View {
+        HStack {
+            Button { dismiss() } label: {
+                Text("Done").font(.body.weight(.semibold))
+                    .foregroundStyle(CalStyle.rose)
+            }
+            Spacer()
+            Menu {
+                Button("Delete event", systemImage: "trash",
+                       role: .destructive) { confirmDelete = true }
+            } label: {
+                Image(systemName: deleting ? "hourglass" : "ellipsis.circle")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, height: 34)
+            }
+            .disabled(deleting)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 4)
+    }
+
     // MARK: footer (Ask Scarlet — the one primary action; Delete lives in the
-    // header overflow menu so it isn't a co-equal destructive button)
+    // top-bar overflow menu so it isn't a co-equal destructive button)
 
     private var footer: some View {
         footerButton("Ask Scarlet", icon: "sparkles", tint: CalStyle.rose) {

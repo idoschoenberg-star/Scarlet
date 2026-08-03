@@ -224,6 +224,10 @@ struct RootView: View {
     /// "draft" — the server keeps them), reopen the drafting table over
     /// whatever screen we're on. Once per draft per process: a fresh launch
     /// after a crash offers again; dismissing it doesn't nag within a run.
+    // @MainActor: after the `await` below the continuation can resume off-main,
+    // and everything past it mutates SwiftUI @State (recoveredDraftIds,
+    // voiceDraftPresented) and touches `convo`. Pin the whole method to main.
+    @MainActor
     private func recoverActiveDraft() async {
         guard !voiceDraftPresented, !draftSheetOpen else { return }
         var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!

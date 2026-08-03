@@ -75,6 +75,11 @@ final class SettingsModel: ObservableObject {
 }
 
 struct SettingsView: View {
+    /// True when presented as a sheet (a Done button dismisses it). False when
+    /// rendered as a split-view detail column — there `dismiss()` is a no-op, so
+    /// showing "Done" would be a dead control. Default true for sheet call sites.
+    var presentedAsSheet: Bool = true
+
     @StateObject private var m = SettingsModel()
     @Environment(\.dismiss) private var dismiss
 
@@ -127,7 +132,9 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+                if presentedAsSheet {
+                    ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } }
+                }
             }
             .task { await m.load() }
         }

@@ -122,6 +122,12 @@ final class DraftModel: ObservableObject {
     private var tickCount = 0
     private var writingSince: Date?
     private var timer: Timer?
+    /// True when a writing/revising body has stopped growing for a long window —
+    /// a stalled server stream. Purely a UI hint (the ✕ always closes); it never
+    /// changes the phase or interferes with streaming.
+    @Published var writingStalled = false
+    private var writingProgressAt: Date?
+    private var lastBodyLen = -1
     /// The in-flight (debouncing or fetching) contact search, cancelled by
     /// every keystroke so only the latest query lands.
     private var searchTask: Task<Void, Never>?
@@ -413,8 +419,30 @@ final class DraftModel: ObservableObject {
     }
 
     private func pollTick() async {
-        guard phase == .writing || phase == .ready || phase == .revising else { writingSince = nil; return }
+        guard phase == .writing || phase == .ready || phase == .revising else {
+            writingSince = nil; writingProgressAt = nil; lastBodyLen = -1
+            if writingStalled { writingStalled = false }
+            return
+        }
         tickCount += 1
+        // Stall hint: while writing/revising, watch the body grow. If it stops
+        // growing for ~40s the stream is stuck — surface a gentle note so Ido
+        // knows to close and retry rather than staring at a spinner. Additive
+        // only: never touches `phase`.
+        if (phase == .writing || phase == .revising), let body = draft?.body {
+            if body.count != lastBodyLen {
+                lastBodyLen = body.count
+                writingProgressAt = Date()
+                if writingStalled { writingStalled = false }
+            } else if writingProgressAt == nil {
+                writingProgressAt = Date()
+            } else if Date().timeIntervalSince(writingProgressAt!) > 40 {
+                if !writingStalled { writingStalled = true }
+            }
+        } else {
+            writingProgressAt = nil; lastBodyLen = -1
+            if writingStalled { writingStalled = false }
+        }
         // Once a draft is on screen and Ido is reviewing (.ready), the only
         // thing polling catches is a VOICE revision — back the 1.5s heartbeat
         // off to ~6s to stop hammering draft_active ~80x while he reads.
@@ -824,7 +852,10 @@ struct DraftView: View {
         case .writing:
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small).tint(scarletRose)
-                Text("Scarlet is writing…").font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Text(model.writingStalled
+                     ? "Taking longer than usual — you can close (✕) and try again."
+                     : "Scarlet is writing…")
+                    .font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .revising:
             HStack(spacing: 7) {

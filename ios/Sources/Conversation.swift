@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 import UIKit   // background-task assertion so the car session survives a locked screen
+import os      // os_unfair_lock — guards the state the audio-render thread reads
 
 /// Native ElevenLabs conversational client. Same protocol the web app speaks,
 /// but over a real AVAudioSession so the conversation never stalls: it keeps
@@ -50,6 +51,11 @@ final class Conversation: ObservableObject {
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
     private var reconnecting = false
+    /// Consecutive failed reconnects — drives exponential backoff and the
+    /// eventual give-up, so a dead network can't hammer the mint endpoint at a
+    /// fixed 0.9s forever with the orb frozen on "Reconnecting…".
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 6
     /// The in-flight reconnect sleep — cancellable so End (or a fresh Start)
     /// during the reconnect window can't resurrect the session or spawn a
     /// second socket.
@@ -86,6 +92,27 @@ final class Conversation: ObservableObject {
     // effect on the next buffer; a device change needs a fresh audio start.
     private var capChannel = 0
     private var capGainLinear: Float = 1
+
+    // `converter`, `capChannel`, and `capGainLinear` are WRITTEN on the main
+    // actor (ensureAudio / applyMicSettings / stopAudio) and READ on the
+    // real-time audio thread inside the input tap. A device/format change
+    // reassigns `converter` while a tap callback may be mid-read → a torn
+    // pointer / use-after-free, the residual "quit unexpectedly". This lock makes
+    // every read a consistent snapshot and keeps the old converter alive (via the
+    // snapshot's strong ref) for the duration of a convert() already in flight.
+    // Heap-allocated so the lock has a stable address (never copied by inout).
+    private let audioStateLock: os_unfair_lock_t = {
+        let l = os_unfair_lock_t.allocate(capacity: 1)
+        l.initialize(to: os_unfair_lock_s())
+        return l
+    }()
+
+    /// Atomically snapshot the three fields the audio thread needs.
+    private func audioStateSnapshot() -> (AVAudioConverter?, Int, Float) {
+        os_unfair_lock_lock(audioStateLock)
+        defer { os_unfair_lock_unlock(audioStateLock) }
+        return (converter, capChannel, capGainLinear)
+    }
     /// Meter smoothing state — only ever touched on the main actor.
     private var levelSmoothed: Float = 0
 
@@ -113,6 +140,7 @@ final class Conversation: ObservableObject {
         // Kill any pending reconnect from a prior session so it can't wake a
         // second socket alongside this fresh one.
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+        reconnectAttempts = 0   // fresh session — start the backoff ladder over
         self.token = token
         wantLive = true
         state = .connecting
@@ -124,6 +152,7 @@ final class Conversation: ObservableObject {
     func end() {
         wantLive = false
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+        reconnectAttempts = 0
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
@@ -336,6 +365,16 @@ final class Conversation: ObservableObject {
     // MARK: signed URL + socket
 
     private func connect() async {
+        // Mic gate: without record permission the engine can never start, so
+        // reconnecting would loop forever. Ask once; if denied, stop cleanly with
+        // a message that points at Settings instead of spinning "Reconnecting…".
+        guard await ensureMicPermission() else {
+            status = "Microphone access is off — turn it on in Settings to talk."
+            state = .idle; wantLive = false
+            reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+            pendingOutbound.removeAll()
+            return
+        }
         do {
             var req = URLRequest(url: AppConfig.elevenURL)
             req.httpMethod = "POST"
@@ -350,7 +389,19 @@ final class Conversation: ObservableObject {
             // The user may have tapped End while we were fetching the URL — do
             // NOT resurrect a session he explicitly hung up on.
             guard wantLive else { return }
-            try ensureAudio()
+            // Audio-start failure is NOT a transport drop — reconnecting can't fix
+            // a dead mic/engine, it just loops. Surface it and stop.
+            do {
+                try ensureAudio()
+            } catch {
+                status = "Can't reach the microphone right now. Check it's free (not held by another app) and try again."
+                state = .idle; wantLive = false
+                reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+                pendingOutbound.removeAll()
+                return
+            }
+            // Connected: a real socket is up. Clear the backoff counter.
+            reconnectAttempts = 0
             let task = wsSession.webSocketTask(with: url)
             ws = task
             task.resume()
@@ -406,6 +457,15 @@ final class Conversation: ObservableObject {
     /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
     private func scheduleReconnect() {
         guard wantLive, !reconnecting else { return }
+        // Give up after a bounded number of tries so a truly dead network ends in
+        // an actionable state, not an eternal spinner.
+        if reconnectAttempts >= maxReconnectAttempts {
+            status = "Couldn't reconnect — tap Start to try again."
+            state = .idle; wantLive = false
+            reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+            reconnectAttempts = 0
+            return
+        }
         reconnecting = true
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
@@ -418,10 +478,30 @@ final class Conversation: ObservableObject {
         status = "Reconnecting…"
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
+        // Exponential backoff: 0.9s, 1.8s, 3.6s … capped at 30s.
+        let attempt = reconnectAttempts
+        reconnectAttempts += 1
+        let delay = min(30.0, 0.9 * pow(2.0, Double(attempt)))
         reconnectTask = Task {
-            try? await Task.sleep(nanoseconds: 900_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             if wantLive, !Task.isCancelled { await connect() }
             reconnecting = false
+        }
+    }
+
+    /// Record-permission gate. Returns true only if the mic is authorized.
+    /// Requests once on first use; returns the standing decision thereafter.
+    private func ensureMicPermission() async -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        switch session.recordPermission {
+        case .granted: return true
+        case .denied:  return false
+        case .undetermined:
+            return await withCheckedContinuation { cont in
+                session.requestRecordPermission { ok in cont.resume(returning: ok) }
+            }
+        @unknown default:
+            return false
         }
     }
 
@@ -556,8 +636,12 @@ final class Conversation: ObservableObject {
     /// fields the audio-thread tap reads.
     private func applyMicSettings() {
         let m = MicSettings.shared
-        capChannel = max(0, m.channel)
-        capGainLinear = pow(10, max(0, m.gainDB) / 20)
+        let ch = max(0, m.channel)
+        let gain: Float = pow(10, max(0, m.gainDB) / 20)
+        os_unfair_lock_lock(audioStateLock)
+        capChannel = ch
+        capGainLinear = gain
+        os_unfair_lock_unlock(audioStateLock)
     }
 
     /// Voice-chat sessions love falling back to the phone-call earpiece, which
@@ -584,7 +668,10 @@ final class Conversation: ObservableObject {
         let inFormat = input.outputFormat(forBus: 0)
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
                                    channels: 1, interleaved: true)!
-        converter = AVAudioConverter(from: inFormat, to: target)
+        let newConverter = AVAudioConverter(from: inFormat, to: target)
+        os_unfair_lock_lock(audioStateLock)
+        converter = newConverter
+        os_unfair_lock_unlock(audioStateLock)
 
         // Channel count decides the capture path: >1 (a multichannel USB/RME
         // interface, esp. iOS-app-on-Mac) means we pull one selected channel
@@ -609,7 +696,9 @@ final class Conversation: ObservableObject {
 
             var outData: Data?
             var instRMS: Float = 0
-            let gain = self.capGainLinear
+            // One consistent snapshot for this callback — never read the live
+            // properties field-by-field while main may be swapping the converter.
+            let (snapConverter, snapChannel, gain) = self.audioStateSnapshot()
 
             // Read the layout from the BUFFER ITSELF on every callback, never
             // from the format captured when the tap was installed. On a Mac the
@@ -629,7 +718,7 @@ final class Conversation: ObservableObject {
                 if frames > 0 {
                     let interleaved = buffer.format.isInterleaved
                     let stride = interleaved ? bufCh : 1
-                    let chIndex = max(0, min(self.capChannel, bufCh - 1))
+                    let chIndex = max(0, min(snapChannel, bufCh - 1))
                     // Planar with a bad index would be out of bounds — guard it.
                     guard interleaved || chIndex < bufCh else { return }
                     let base = interleaved ? fdata[0].advanced(by: chIndex) : fdata[chIndex]
@@ -657,8 +746,10 @@ final class Conversation: ObservableObject {
                     instRMS = sqrt(sumSq / Float(frames))
                     outData = pcm.withUnsafeBytes { Data($0) }
                 }
-            } else if let converter = self.converter {
+            } else if let converter = snapConverter {
                 // Single-channel input: keep the proven AVAudioConverter downmix.
+                // `converter` is the snapshot's strong ref — it stays alive for
+                // this convert() even if main reassigns the property meanwhile.
                 let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
                 let ratio = 16000.0 / inRate
                 let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
@@ -743,6 +834,12 @@ final class Conversation: ObservableObject {
     private func rebuildPlayback() {
         guard audioReady else { return }
         player.stop()
+        // player.stop() discards scheduled buffers WITHOUT firing their
+        // completion handlers, so pendingBuffers would stay > 0 forever →
+        // echoRisk stuck true → the mic never streams again ("frozen"). Reset the
+        // playback bookkeeping the same way flushPlayback()/stopAudio() do.
+        pendingBuffers = 0
+        speechTailUntil = Date.distantPast
         engine.disconnectNodeOutput(player)
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
         engine.connect(player, to: engine.mainMixerNode, format: playFormat)
@@ -794,6 +891,12 @@ final class Conversation: ObservableObject {
     private func stopAudio() {
         guard audioReady else { return }
         engine.inputNode.removeTap(onBus: 0)
+        // Clear the converter under the lock: the tap is removed, but a callback
+        // already dispatched can still be running: snapshotting nil (or the still-
+        // live old converter it captured) is safe; a torn read is not.
+        os_unfair_lock_lock(audioStateLock)
+        converter = nil
+        os_unfair_lock_unlock(audioStateLock)
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast

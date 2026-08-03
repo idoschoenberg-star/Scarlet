@@ -18,6 +18,10 @@ final class CarPlayController {
     private let interfaceController: CPInterfaceController
     private var cancellables = Set<AnyCancellable>()
     private var rootIsVoice = false
+    /// True only when CarPlay itself started the shared conversation (it was idle
+    /// when we connected). If the phone already had a session going, the car must
+    /// NOT end it on disconnect — leaving the car would cut off the phone.
+    private var startedSession = false
 
     // Exactly five voice-control states (Apple caps at 5). Identifiers are
     // stable strings we activate from Conversation.state / micOn.
@@ -49,7 +53,10 @@ final class CarPlayController {
             guard let self else { return }
             self.rootIsVoice = true
             let convo = Conversation.shared
-            if convo.state == .idle { convo.start(token: TokenStore.token ?? "") }
+            if convo.state == .idle {
+                convo.start(token: TokenStore.token ?? "")
+                self.startedSession = true   // the car owns this session
+            }
             convo.carPlayDidConnect()
             self.applyState()
         }
@@ -59,7 +66,14 @@ final class CarPlayController {
     func stop() {
         cancellables.removeAll()
         clearNowPlaying()
-        Conversation.shared.end()   // end() already stops audio + setActive(false, notifyOthers)
+        // Only end the shared conversation if the car started it AND the phone
+        // UI isn't in the foreground continuing it. Otherwise just relinquish the
+        // CarPlay surface and leave the conversation running on the phone.
+        let phoneActive = UIApplication.shared.applicationState == .active
+        if startedSession && !phoneActive {
+            Conversation.shared.end()   // end() stops audio + setActive(false, notifyOthers)
+        }
+        startedSession = false
     }
 
     // MARK: state bridge

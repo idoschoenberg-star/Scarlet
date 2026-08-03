@@ -1298,6 +1298,20 @@ struct MailDetailView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // Explicit, always-present way back to the list. The reader is a
+            // NavigationLink push, but Mac Catalyst has no edge-swipe-back and the
+            // list root hides the system nav bar — so the only reliable exit is one
+            // we draw ourselves. A reader you can act in but not leave is the bug
+            // we're killing app-wide.
+            Button { dismiss() } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Inbox").font(.subheadline.weight(.semibold))
+                }
+                .foregroundStyle(OutlookStyle.accentBlue)
+            }
+            .padding(.bottom, 2)
             Text(subjectText)
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(.white)

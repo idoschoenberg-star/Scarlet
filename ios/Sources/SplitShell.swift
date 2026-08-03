@@ -242,8 +242,9 @@ struct SplitShell: View {
             DeskView()
                 .environmentObject(convo)
         case .settings:
-            // Has its own NavigationStack and title bar.
-            SettingsView()
+            // Has its own NavigationStack and title bar. As a detail column there
+            // is nothing to dismiss, so suppress the (otherwise dead) Done button.
+            SettingsView(presentedAsSheet: false)
                 .background(ScarletBackground().ignoresSafeArea())
         }
     }

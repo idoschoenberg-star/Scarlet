@@ -1472,7 +1472,11 @@ private struct WorkoutDetailSheet: View {
     private var coordinates: [CLLocationCoordinate2D] {
         workout.route.compactMap { pair in
             guard pair.count >= 2 else { return nil }
-            return CLLocationCoordinate2D(latitude: pair[0], longitude: pair[1])
+            let c = CLLocationCoordinate2D(latitude: pair[0], longitude: pair[1])
+            // A bad server row (e.g. lat 999) fed to MapPolyline/MKCoordinateRegion
+            // makes MapKit assert and take the app down — drop invalid pairs.
+            guard CLLocationCoordinate2DIsValid(c) else { return nil }
+            return c
         }
     }
 
