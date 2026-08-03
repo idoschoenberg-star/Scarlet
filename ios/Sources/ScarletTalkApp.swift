@@ -25,7 +25,9 @@ struct ScarletTalkApp: App {
 /// lives HERE, above the tabs, so switching pages never tears down a live
 /// call — only the explicit End button (or the OS) ends it.
 struct RootView: View {
-    @StateObject private var convo = Conversation()
+    // The one process-wide conversation — shared with the CarPlay scene so the
+    // car continues the same session instead of racing a second audio graph.
+    @StateObject private var convo = Conversation.shared
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
     /// Draft ids already offered for recovery THIS process — a fresh launch

@@ -106,6 +106,9 @@ final class DraftModel: ObservableObject {
     /// Set when the sheet closed before compose returned a draft_id — the
     /// in-flight compose reads it and dismisses the draft it just created.
     private var dismissRequested = false
+    /// Poll pacing + a watchdog so "Scarlet is writing…" can never spin forever.
+    private var tickCount = 0
+    private var writingSince: Date?
     private var timer: Timer?
     /// The in-flight (debouncing or fetching) contact search, cancelled by
     /// every keystroke so only the latest query lands.
@@ -367,7 +370,26 @@ final class DraftModel: ObservableObject {
     }
 
     private func pollTick() async {
-        guard phase == .writing || phase == .ready else { return }
+        guard phase == .writing || phase == .ready else { writingSince = nil; return }
+        tickCount += 1
+        // Once a draft is on screen and Ido is reviewing (.ready), the only
+        // thing polling catches is a VOICE revision — back the 1.5s heartbeat
+        // off to ~6s to stop hammering draft_active ~80x while he reads.
+        if phase == .ready {
+            writingSince = nil
+            if tickCount % 4 != 0 { return }
+        } else {
+            // Writing watchdog: if no draft is adopted within ~20s, surface an
+            // error instead of a permanent spinner (a failed voice compose, or
+            // a compose whose draft never resolves, used to hang here forever).
+            if writingSince == nil { writingSince = Date() }
+            else if Date().timeIntervalSince(writingSince!) > 20 {
+                writingSince = nil
+                errorText = "Scarlet didn't get this draft started — close and try again."
+                phase = .idle
+                return
+            }
+        }
         if adoptActive {
             // Adopt whatever the server calls active — the voice flow may
             // replace the draft entirely. Active-nil (approved or dismissed

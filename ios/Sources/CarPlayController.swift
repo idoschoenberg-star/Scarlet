@@ -1,0 +1,117 @@
+import CarPlay
+import Combine
+import MediaPlayer
+import UIKit
+
+/// Drives the CarPlay surface for Scarlet's voice-based conversational category
+/// (iOS 26.4). One compliant, distraction-minimal template: a `CPVoiceControl
+/// Template` that only shows listening / thinking / speaking state — no text of
+/// answers, no lists, no maps. Everything substantive is SPOKEN by the existing
+/// voice engine, one item at a time, so the driver's eyes stay on the road.
+///
+/// It reuses `Conversation.shared`, so connecting to the car continues the same
+/// session (and the engine's route-driven driving-mode announcement fires on
+/// its own). Category rules honored: voice is primary on launch, ≤ 5 states,
+/// depth 1, audio session deactivated on disconnect, manual launch only.
+@MainActor
+final class CarPlayController {
+    private let interfaceController: CPInterfaceController
+    private var cancellables = Set<AnyCancellable>()
+    private var rootIsVoice = false
+
+    // Exactly five voice-control states (Apple caps at 5). Identifiers are
+    // stable strings we activate from Conversation.state / micOn.
+    private enum VState: String { case connecting, listening, thinking, speaking, muted }
+
+    private lazy var voiceTemplate: CPVoiceControlTemplate = {
+        let states: [CPVoiceControlState] = [
+            state(.connecting, "Connecting…",       "hourglass"),
+            state(.listening,  "Listening…",        "waveform"),
+            state(.thinking,   "Thinking…",         "ellipsis"),
+            state(.speaking,   "Scarlet",           "speaker.wave.2.fill"),
+            state(.muted,      "Mic off — say \"unmute\"", "mic.slash.fill"),
+        ]
+        return CPVoiceControlTemplate(voiceControlStates: states)
+    }()
+
+    init(interfaceController: CPInterfaceController) {
+        self.interfaceController = interfaceController
+    }
+
+    // MARK: lifecycle
+
+    func start() {
+        guard TokenStore.token != nil else {
+            showSignInNotice()
+            return
+        }
+        interfaceController.setRootTemplate(voiceTemplate, animated: false) { [weak self] _, _ in
+            guard let self else { return }
+            self.rootIsVoice = true
+            let convo = Conversation.shared
+            if convo.state == .idle { convo.start(token: TokenStore.token ?? "") }
+            convo.carPlayDidConnect()
+            self.applyState()
+        }
+        observe()
+    }
+
+    func stop() {
+        cancellables.removeAll()
+        clearNowPlaying()
+        Conversation.shared.end()   // end() already stops audio + setActive(false, notifyOthers)
+    }
+
+    // MARK: state bridge
+
+    private func observe() {
+        let convo = Conversation.shared
+        convo.$state.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
+        convo.$micOn.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
+    }
+
+    /// Map the engine state to a voice-control state + the head unit's now-playing.
+    private func applyState() {
+        guard rootIsVoice else { return }
+        let convo = Conversation.shared
+        let v: VState
+        switch convo.state {
+        case .idle:       v = .connecting   // brief; the session auto-restarts in the car
+        case .connecting: v = .connecting
+        case .listening:  v = convo.micOn ? .listening : .muted
+        case .speaking:   v = .speaking
+        }
+        voiceTemplate.activateVoiceControlState(withIdentifier: v.rawValue)
+        if convo.state == .speaking { setNowPlaying() } else { clearNowPlaying() }
+    }
+
+    // MARK: helpers
+
+    private func state(_ s: VState, _ title: String, _ symbol: String) -> CPVoiceControlState {
+        CPVoiceControlState(identifier: s.rawValue,
+                            titleVariants: [title],
+                            image: UIImage(systemName: symbol),
+                            repeats: true)
+    }
+
+    private func showSignInNotice() {
+        let item = CPInformationItem(title: "Sign in on your phone",
+                                     detail: "Open Scarlet on your iPhone to sign in, then reconnect.")
+        let info = CPInformationTemplate(title: "Scarlet",
+                                         layout: .leading,
+                                         items: [item],
+                                         actions: [])
+        interfaceController.setRootTemplate(info, animated: false, completion: nil)
+    }
+
+    private func setNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "Scarlet",
+            MPMediaItemPropertyArtist: "Speaking",
+        ]
+    }
+
+    private func clearNowPlaying() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+}

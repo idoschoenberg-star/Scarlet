@@ -1052,6 +1052,10 @@ struct ChatThreadView: View {
     @EnvironmentObject private var convo: Conversation
     @State private var composeText = ""
     @FocusState private var composeFocused: Bool
+    /// Guards the auto-scroll so a 20s reconcile that returns identical content
+    /// doesn't yank the reader back to the bottom mid-scroll — only a genuinely
+    /// new/last message scrolls.
+    @State private var lastScrollKey = ""
     /// WhatsApp photo bubbles: tapped image → full-screen viewer sheet.
     @State private var photoItem: WAPhotoItem?
     /// WhatsApp video bubbles: tapped card → full-screen player sheet.
@@ -1177,6 +1181,11 @@ struct ChatThreadView: View {
                     }
                 }
                 .onChange(of: model.loadStamp) { _, _ in
+                    // Only scroll when the newest message actually changed (a new
+                    // send or a new incoming), not on every idle reconcile.
+                    let key = "\(model.messages.count)|\(model.messages.last?.text ?? "")"
+                    guard key != lastScrollKey else { return }
+                    lastScrollKey = key
                     if let last = items.last {
                         withAnimation(.snappy) {
                             proxy.scrollTo(last.id, anchor: .bottom)

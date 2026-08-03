@@ -63,6 +63,19 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UIBackgroundModes: [audio]
+        # CarPlay scene (voice-based conversational category, iOS 26.4). Declares
+        # ONLY the CarPlay role — leaving the window role undeclared lets SwiftUI's
+        # WindowGroup keep managing the phone/iPad/Mac window. Ships DORMANT: with
+        # no CarPlay entitlement granted, iOS never connects this scene, so the
+        # rest of the app is unaffected. The entitlement (below, commented) is
+        # added only after Apple grants it and the CI profile carries it.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+          UISceneConfigurations:
+            CPTemplateApplicationSceneSessionRoleApplication:
+              - UISceneConfigurationName: CarPlay
+                UISceneClassName: CPTemplateApplicationScene
+                UISceneDelegateClassName: "$(PRODUCT_MODULE_NAME).CarPlaySceneDelegate"
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
         # Hands-free launch via the "Talk to Scarlet" App Intent. Pure AppIntents
         # need NO com.apple.developer.siri entitlement (that would require the
@@ -89,3 +102,10 @@ targets:
         # Real-time HealthKit observer wake-ups while backgrounded — the
         # data-doctrine path (enableBackgroundDelivery .immediate).
         com.apple.developer.healthkit.background-delivery: true
+        # CarPlay — voice-based conversational category (iOS 26.4). Kept OUT of
+        # the build until Apple grants it (request at developer.apple.com/contact/
+        # carplay/) AND the CI "ScarletTalk AppStore" profile is regenerated to
+        # carry it — otherwise codesign fails "profile doesn't include the
+        # entitlement". Same discipline as the deliberately-absent Siri
+        # entitlement above. Uncomment only after the grant + profile refresh:
+        # com.apple.developer.carplay-voice-based-conversation: true

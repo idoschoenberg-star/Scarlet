@@ -8,6 +8,12 @@ import UIKit   // background-task assertion so the car session survives a locked
 /// running with the screen locked, and pauses/resumes cleanly on interruptions.
 @MainActor
 final class Conversation: ObservableObject {
+    /// ONE conversation for the whole process. The CarPlay scene is a separate
+    /// UIScene and can't reach RootView's instance; two instances would both
+    /// grab the global AVAudioSession and both installTap (the second tap is an
+    /// instant crash), so the phone UI and CarPlay share exactly this one.
+    static let shared = Conversation()
+
     enum State { case idle, connecting, listening, speaking }
 
     struct Line: Identifiable { let id = UUID(); let text: String; let fromHer: Bool }
@@ -316,6 +322,15 @@ final class Conversation: ObservableObject {
         guard state == .listening || state == .speaking else { return }
         send(["type": "contextual_update",
               "text": "[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action."])
+    }
+
+    /// CarPlay scene connected — treat as authoritative eyes-free driving even
+    /// if the audio route hasn't reported `.carAudio` yet (the scene can connect
+    /// a beat before the route flips). Idempotent; the announce is a no-op until
+    /// the socket is live, and `connect()`'s forceAnnounce covers a cold start.
+    func carPlayDidConnect() {
+        if !drivingMode { drivingMode = true }
+        announceDrivingMode()
     }
 
     // MARK: signed URL + socket
