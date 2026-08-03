@@ -494,7 +494,9 @@ final class Conversation: ObservableObject {
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let draftId = obj["draft_id"] as? String, !draftId.isEmpty {
                 Task { @MainActor in
-                    NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: nil)
+                    // Carry the id so the shell records it and the backstop poll
+                    // won't re-open the same draft after it's dismissed.
+                    NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
                 }
             }
         }

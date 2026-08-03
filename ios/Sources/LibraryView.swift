@@ -251,14 +251,21 @@ struct LibraryView: View {
     @StateObject private var model = LibraryModel()
     @EnvironmentObject private var convo: Conversation
 
-    /// image rows → full-screen photo sheet (ChatsView's viewer).
-    @State private var photoItem: WAPhotoItem?
-    /// video/audio rows → full-screen player sheet (ChatsView's player).
-    @State private var videoItem: WAVideoItem?
-    /// pdf/file rows, after the temp download → QuickLook sheet.
-    @State private var previewFile: PreviewFile?
-    /// html/link rows → in-app web sheet (never bounce out to Safari).
-    @State private var webItem: LibraryWebItem?
+    /// ONE sheet driver for every viewer (photo, video/audio, QuickLook doc,
+    /// web). SwiftUI/Mac Catalyst supports only one sheet per view; four stacked
+    /// `.sheet(item:)` modifiers crash the Mac on tapping an item. Enum-driven.
+    enum LibrarySheet: Identifiable {
+        case photo(WAPhotoItem), video(WAVideoItem), file(PreviewFile), web(LibraryWebItem)
+        var id: String {
+            switch self {
+            case .photo(let i): return "photo-\(i.id)"
+            case .video(let i): return "video-\(i.id)"
+            case .file(let f): return "file-\(f.id)"
+            case .web(let w): return "web-\(w.id)"
+            }
+        }
+    }
+    @State private var activeSheet: LibrarySheet?
     /// Row currently downloading (its chevron swaps to a spinner).
     @State private var downloadingID: String?
     /// The exact focus line last claimed for an open artifact; the sheets'
@@ -295,23 +302,20 @@ struct LibraryView: View {
             .onChange(of: model.shelf) { _, _ in
                 convo.setFocus(browsingFocus)
             }
-            // image → the house full-screen photo viewer.
-            .sheet(item: $photoItem, onDismiss: { restoreBrowsingFocus() }) { item in
-                WAPhotoView(item: item)
-            }
-            // video / audio → the house full-screen player.
-            .sheet(item: $videoItem, onDismiss: { restoreBrowsingFocus() }) { item in
-                WAVideoView(item: item)
-            }
-            // pdf / file → system QuickLook over the downloaded temp file.
-            .sheet(item: $previewFile, onDismiss: { restoreBrowsingFocus() }) { file in
-                QuickLookPreview(url: file.url)
-                    .ignoresSafeArea()
-            }
-            // html / link → in-app web sheet with Done + Share.
-            .sheet(item: $webItem, onDismiss: { restoreBrowsingFocus() }) { item in
-                LibraryWebSheet(item: item)
-                    .preferredColorScheme(.dark)
+            // ONE sheet for every viewer kind (see LibrarySheet).
+            .sheet(item: $activeSheet, onDismiss: { restoreBrowsingFocus() }) { sheet in
+                switch sheet {
+                case .photo(let item):
+                    WAPhotoView(item: item)
+                case .video(let item):
+                    WAVideoView(item: item)
+                case .file(let file):
+                    QuickLookPreview(url: file.url)
+                        .ignoresSafeArea()
+                case .web(let item):
+                    LibraryWebSheet(item: item)
+                        .preferredColorScheme(.dark)
+                }
             }
             .confirmationDialog(
                 "Delete permanently?",
@@ -529,16 +533,16 @@ struct LibraryView: View {
         switch item.kind {
         case .image:
             claimFocus(item)
-            photoItem = WAPhotoItem(url: url)
+            activeSheet = .photo(WAPhotoItem(url: url))
         case .video, .audio:
             claimFocus(item)
-            videoItem = WAVideoItem(url: url)
+            activeSheet = .video(WAVideoItem(url: url))
         case .html, .link:
             claimFocus(item)
             // For an HTML artifact, FORCE text/html rendering — object storage
             // often serves uploaded .html as text/plain (raw source shows) or
             // octet-stream (blank/download). A plain link keeps normal loading.
-            webItem = LibraryWebItem(url: url, title: item.title, forceHTML: item.kind == .html)
+            activeSheet = .web(LibraryWebItem(url: url, title: item.title, forceHTML: item.kind == .html))
         case .pdf, .file:
             openDocument(item, url: url)
         }
@@ -564,7 +568,7 @@ struct LibraryView: View {
                 let dest = Self.tempFileURL(for: item)
                 try data.write(to: dest, options: .atomic)
                 claimFocus(item)
-                previewFile = PreviewFile(url: dest)
+                activeSheet = .file(PreviewFile(url: dest))
             } catch {
                 model.errorText = "Couldn't download \"\(item.title)\" — try again."
             }

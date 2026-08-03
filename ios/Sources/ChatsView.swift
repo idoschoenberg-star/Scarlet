@@ -1056,18 +1056,27 @@ struct ChatThreadView: View {
     /// doesn't yank the reader back to the bottom mid-scroll — only a genuinely
     /// new/last message scrolls.
     @State private var lastScrollKey = ""
-    /// WhatsApp photo bubbles: tapped image → full-screen viewer sheet.
-    @State private var photoItem: WAPhotoItem?
-    /// WhatsApp video bubbles: tapped card → full-screen player sheet.
-    /// (Parallel to photoItem on purpose — keeps the photo path untouched.)
-    @State private var videoItem: WAVideoItem?
+    /// ONE sheet driver for the whole thread — photo viewer, video player, and
+    /// the Scarlet drafting studio. SwiftUI (and especially Mac Catalyst)
+    /// supports only ONE sheet presentation per view; three stacked
+    /// `.sheet(item:)` modifiers raced the single presenting controller and
+    /// crashed the Mac ("Talk quit unexpectedly") on tapping a photo/video/pill.
+    /// A single enum-driven sheet fixes it.
+    enum ThreadSheet: Identifiable {
+        case photo(WAPhotoItem), video(WAVideoItem), draft(ChannelDraftSeed)
+        var id: String {
+            switch self {
+            case .photo(let i): return "photo-\(i.id)"
+            case .video(let i): return "video-\(i.id)"
+            case .draft(let s): return "draft-\(s.id)"
+            }
+        }
+    }
+    @State private var activeSheet: ThreadSheet?
     /// WhatsApp voice notes: inline playback, one at a time. playingVoiceID
     /// is the ChatMessage.id currently playing (nil when idle/paused).
     @State private var voicePlayer: AVPlayer?
     @State private var playingVoiceID: Int?
-    /// "Draft with Scarlet": non-nil presents the drafting studio seeded with
-    /// this chat, its recent lines, and whatever was typed in the compose bar.
-    @State private var scarletDraft: ChannelDraftSeed?
 
     init(channel: ChatChannel, chat: ChatSummary) {
         self.channel = channel
@@ -1121,23 +1130,23 @@ struct ChatThreadView: View {
         .onChange(of: composeFocused) { _, focused in
             if focused { convo.beginTyping() } else { convo.endTyping() }
         }
-        // WhatsApp photo bubbles: tap → full-screen viewer.
-        .sheet(item: $photoItem) { item in
-            WAPhotoView(item: item)
-        }
-        // WhatsApp video bubbles: tap → full-screen player.
-        .sheet(item: $videoItem) { item in
-            WAVideoView(item: item)
-        }
-        // "Draft with Scarlet" (compose-bar pill): the drafting studio,
-        // seeded with this chat. On dismiss, reload once — an approved send
-        // appears via the mirror shortly.
-        .sheet(item: $scarletDraft, onDismiss: {
+        // ONE sheet for the whole thread (see ThreadSheet) — photo viewer,
+        // video player, or the Scarlet drafting studio. On dismiss, reload once
+        // (an approved send appears via the mirror shortly; harmless for the
+        // media cases).
+        .sheet(item: $activeSheet, onDismiss: {
             Task { await model.load() }
-        }) { seed in
-            DraftView(seed: nil, channelSeed: seed)
-                .environmentObject(convo)
-                .preferredColorScheme(.dark)
+        }) { sheet in
+            switch sheet {
+            case .photo(let item):
+                WAPhotoView(item: item)
+            case .video(let item):
+                WAVideoView(item: item)
+            case .draft(let seed):
+                DraftView(seed: nil, channelSeed: seed)
+                    .environmentObject(convo)
+                    .preferredColorScheme(.dark)
+            }
         }
     }
 
@@ -1240,8 +1249,8 @@ struct ChatThreadView: View {
             WhatsAppBubble(message: m,
                            showSender: item.showSender && chat.isGroup,
                            isVoicePlaying: playingVoiceID == m.id,
-                           onImageTap: { url in photoItem = WAPhotoItem(url: url) },
-                           onVideoTap: { url in videoItem = WAVideoItem(url: url) },
+                           onImageTap: { url in activeSheet = .photo(WAPhotoItem(url: url)) },
+                           onVideoTap: { url in activeSheet = .video(WAVideoItem(url: url)) },
                            onVoiceTap: { url in toggleVoice(url, messageID: m.id) })
         case .imessage:
             IMessageBubble(message: m, showDelivered: m.id == lastSentID)
@@ -1410,12 +1419,12 @@ struct ChatThreadView: View {
     /// loses its context.
     private var scarletDraftButton: some View {
         Button {
-            scarletDraft = ChannelDraftSeed(
+            activeSheet = .draft(ChannelDraftSeed(
                 channel: channel.rawValue,
                 recipient: chat.name,
                 contextLines: recentLines.joined(separator: "\n"),
                 instruction: composeText.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
+            ))
             composeText = ""
         } label: {
             HStack(spacing: 5) {
@@ -1528,7 +1537,9 @@ struct TeamsMessageCell: View {
                 Text(message.text)
                     .font(.system(size: 15))
                     .foregroundStyle(ChatPalette.teamsText)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(message.text.readingAlignment)
+                    .environment(\.layoutDirection, message.text.layoutDir)
+                    .frame(maxWidth: .infinity, alignment: message.text.readingFrameAlignment)
             }
         }
         .padding(10)
@@ -1646,6 +1657,8 @@ struct WhatsAppBubble: View {
             Text(message.text)
                 .font(.system(size: 16))
                 .foregroundStyle(ChatPalette.waText)
+                .multilineTextAlignment(message.text.readingAlignment)
+                .environment(\.layoutDirection, message.text.layoutDir)
             timeLine
         }
         .padding(.horizontal, 10)
@@ -1676,6 +1689,8 @@ struct WhatsAppBubble: View {
                 Text(message.text)
                     .font(.system(size: 16))
                     .foregroundStyle(ChatPalette.waText)
+                    .multilineTextAlignment(message.text.readingAlignment)
+                    .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.top, 2)
                     .padding(.horizontal, 4)
             }
@@ -1726,6 +1741,8 @@ struct WhatsAppBubble: View {
                 Text(message.text)
                     .font(.system(size: 16))
                     .foregroundStyle(ChatPalette.waText)
+                    .multilineTextAlignment(message.text.readingAlignment)
+                    .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.top, 2)
                     .padding(.horizontal, 4)
             }
@@ -1941,6 +1958,8 @@ struct IMessageBubble: View {
                 Text(message.text)
                     .font(.system(size: 17))
                     .foregroundStyle(.white)
+                    .multilineTextAlignment(message.text.readingAlignment)
+                    .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
                     .background(

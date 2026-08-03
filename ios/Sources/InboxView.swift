@@ -969,14 +969,24 @@ struct MailDetailView: View {
 
     @State private var detail: MailDetail?
     @State private var failed = false
-    @State private var showDraft = false
     @State private var showRecipients = false
     /// Attachment currently downloading (its chip swaps icon → spinner).
     @State private var downloadingAttachmentId: String?
     /// Small red footnote under the chips; cleared on the next tap.
     @State private var attachmentError = ""
-    /// Non-nil drives the QuickLook sheet.
-    @State private var previewFile: PreviewFile?
+    /// ONE sheet for the reader — the Reply drafting window OR a QuickLook
+    /// attachment preview. Two stacked `.sheet` modifiers on one view crash Mac
+    /// Catalyst; a single enum-driven sheet is safe.
+    enum ReaderSheet: Identifiable {
+        case draft, preview(PreviewFile)
+        var id: String {
+            switch self {
+            case .draft: return "draft"
+            case .preview(let f): return "preview-\(f.id)"
+            }
+        }
+    }
+    @State private var activeSheet: ReaderSheet?
     /// Display name of the attachment being previewed — feeds the viewer's
     /// [FOCUS] line so Scarlet knows exactly which file is on screen.
     @State private var previewName = ""
@@ -1009,29 +1019,35 @@ struct MailDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         // (No overflow menu — "Ask Scarlet" already lives in the action bar; a
         // single-item ellipsis menu was pure duplication.)
-        .sheet(isPresented: $showDraft) {
-            // The loaded detail carries the original's To/Cc; Reply is only
-            // reachable once it's up, but fall back to empty gracefully.
-            DraftView(seed: DraftSeed(
-                messageId: message.id,
-                fromName: message.fromName,
-                fromEmail: message.fromEmail,
-                subject: message.subject,
-                preview: message.preview,
-                toLine: detail?.to ?? "",
-                ccLine: detail?.cc ?? ""
-            ))
-            .environmentObject(convo)   // DraftView hard-requires it; match every other call site
-            .preferredColorScheme(.dark)
-        }
-        // QuickLook: pinch-zoom, paging, share — the Outlook attachment
-        // experience, straight from the system viewer. Full-height dark
-        // sheet with a floating ✕ (a bare QLPreviewController draws no Done
-        // button, and its zoom/scroll gestures can eat the swipe-down, so
-        // the ✕ is the guaranteed way out). `onDismiss` covers both paths —
-        // ✕ tap and swipe — and hands focus back to the email reader.
-        .sheet(item: $previewFile, onDismiss: attachmentViewerClosed) { file in
-            attachmentViewer(file)
+        // ONE sheet drives BOTH the Reply drafting window and the QuickLook
+        // attachment viewer. Two stacked `.sheet` modifiers on one view crash
+        // Mac Catalyst; the enum keeps a single presentation surface.
+        // `onDismiss` runs the attachment-focus restore for every case — it's a
+        // no-op when the draft closes (no attachment focus was set).
+        .sheet(item: $activeSheet, onDismiss: attachmentViewerClosed) { sheet in
+            switch sheet {
+            case .draft:
+                // The loaded detail carries the original's To/Cc; Reply is only
+                // reachable once it's up, but fall back to empty gracefully.
+                DraftView(seed: DraftSeed(
+                    messageId: message.id,
+                    fromName: message.fromName,
+                    fromEmail: message.fromEmail,
+                    subject: message.subject,
+                    preview: message.preview,
+                    toLine: detail?.to ?? "",
+                    ccLine: detail?.cc ?? ""
+                ))
+                .environmentObject(convo)   // DraftView hard-requires it; match every other call site
+                .preferredColorScheme(.dark)
+            case .preview(let file):
+                // QuickLook: pinch-zoom, paging, share — the Outlook attachment
+                // experience, straight from the system viewer. Full-height dark
+                // sheet with a floating ✕ (a bare QLPreviewController draws no
+                // Done button, and its zoom/scroll gestures can eat the
+                // swipe-down, so the ✕ is the guaranteed way out).
+                attachmentViewer(file)
+            }
         }
         .task {
             model.markRead(message.id)
@@ -1133,7 +1149,7 @@ struct MailDetailView: View {
                     let url = Self.tempFileURL(for: att.name)
                     try data.write(to: url, options: .atomic)
                     previewName = att.name
-                    previewFile = PreviewFile(url: url)
+                    activeSheet = .preview(PreviewFile(url: url))
                 case .link(let url):
                     UIApplication.shared.open(url, options: [:], completionHandler: nil)
                 case .failure(let text):
@@ -1155,7 +1171,7 @@ struct MailDetailView: View {
             QuickLookPreview(url: file.url)
                 .ignoresSafeArea()
             Button {
-                previewFile = nil
+                activeSheet = nil
             } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 13, weight: .bold))
@@ -1344,7 +1360,7 @@ struct MailDetailView: View {
             // original recipient), so the button says exactly that.
             actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
                          tint: OutlookStyle.primaryBlue, filled: true) {
-                showDraft = true
+                activeSheet = .draft
             }
             // Archive is GREEN here too, matching the list swipe — one color per
             // concept.

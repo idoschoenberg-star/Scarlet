@@ -813,41 +813,31 @@ struct DraftView: View {
         }
     }
 
-    /// True when the text is dominated by Hebrew — the draft then lays out
-    /// right-to-left exactly as it will read in Outlook/WhatsApp.
-    private func isHebrew(_ s: String) -> Bool {
-        var heb = 0, lat = 0
-        for u in s.unicodeScalars.prefix(400) {
-            if (0x0590...0x05FF).contains(u.value) { heb += 1 }
-            else if (0x41...0x7A).contains(u.value) { lat += 1 }
-        }
-        return heb > lat
-    }
-
-    /// The draft itself: an elegant dark card, readable serif-feel body,
-    /// scrollable and selectable. Hebrew drafts read right-to-left.
+    /// The draft itself: an elegant dark card, readable, scrollable, selectable.
+    /// Ido writes Hebrew AND English together, so direction is decided PER
+    /// PARAGRAPH — a Hebrew line reads right-to-left and hugs the right edge, an
+    /// English line reads left-to-right and hugs the left, in the same draft. No
+    /// window-wide flip; each paragraph keeps its own natural direction.
     private func draftCard(_ draft: DraftModel.ActiveDraft) -> some View {
-        let rtl = isHebrew(draft.body)
         return ScrollView {
-            VStack(alignment: rtl ? .trailing : .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
                 if !draft.subject.isEmpty {
-                    Text(draft.subject)
-                        .font(.headline)
-                        .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
-                        .multilineTextAlignment(rtl ? .trailing : .leading)
-                        .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
+                    paragraphLine(draft.subject, size: 17, weight: .semibold,
+                                  color: Color(red: 0.98, green: 0.92, blue: 0.92))
+                        .padding(.bottom, 6)
                 }
-                Text(draft.body)
-                    .font(.system(size: 17))
-                    .lineSpacing(4)
-                    .foregroundStyle(paper)
-                    .textSelection(.enabled)
-                    .multilineTextAlignment(rtl ? .trailing : .leading)
-                    .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
-                    .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
+                // Render the body paragraph-by-paragraph; blank lines stay as gaps.
+                ForEach(Array(draft.body.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
+                    if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Color.clear.frame(height: 10)
+                    } else {
+                        paragraphLine(line, size: 17, weight: .regular, color: paper)
+                    }
+                }
             }
             .padding(18)
             .padding(.top, 4)
+            .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 20))
@@ -864,6 +854,21 @@ struct DraftView: View {
         }
         .opacity(model.phase == .revising ? 0.55 : 1)
         .animation(.easeInOut(duration: 0.2), value: model.phase)
+    }
+
+    /// One paragraph in ITS OWN direction — Hebrew right-aligned RTL, English
+    /// left-aligned LTR — so a mixed draft stays harmonious. Intra-line mixing
+    /// (an English name inside a Hebrew sentence) is handled by SwiftUI's bidi.
+    private func paragraphLine(_ text: String, size: CGFloat, weight: Font.Weight, color: Color) -> some View {
+        let rtl = text.isRTLDominant
+        return Text(text)
+            .font(.system(size: size, weight: weight))
+            .lineSpacing(4)
+            .foregroundStyle(color)
+            .textSelection(.enabled)
+            .multilineTextAlignment(rtl ? .trailing : .leading)
+            .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
+            .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
     }
 
     /// Placeholder while the first draft composes.

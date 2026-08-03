@@ -679,12 +679,22 @@ struct DeskView: View {
     /// Non-nil presents the standard drafting window (DraftView) seeded for
     /// a Desk channel: "apple_note" from the Notes compose button,
     /// "reminder" from the dictate button beside the quick-add bar.
-    @State private var deskDraftSeed: ChannelDraftSeed?
+    /// ONE sheet driver — the note reader OR the drafting window. Two stacked
+    /// `.sheet(item:)` modifiers crash Mac Catalyst; a single enum-driven sheet
+    /// is safe.
+    enum DeskSheet: Identifiable {
+        case note(DeskNote), draft(ChannelDraftSeed)
+        var id: String {
+            switch self {
+            case .note(let n): return "note-\(n.id)"
+            case .draft(let s): return "draft-\(s.id)"
+            }
+        }
+    }
+    @State private var activeSheet: DeskSheet?
     /// Drag handles for the reminders list — flipped by the small Reorder
     /// toggle in the header (no EditButton needed).
     @State private var remindersEditMode: EditMode = .inactive
-    /// Tapped note → the reading sheet.
-    @State private var openNote: DeskNote?
     /// The exact focus line last claimed for an open note; the sheet's
     /// dismissal restores the browsing focus only if this still owns it
     /// (InboxView's stale-guard pattern).
@@ -728,20 +738,22 @@ struct DeskView: View {
             .onChange(of: addFocused) { _, focused in
                 if focused { convo.beginTyping() } else { convo.endTyping() }
             }
-            .sheet(item: $openNote, onDismiss: { restoreBrowsingFocus() }) { note in
-                DeskNoteSheet(note: note)
-                    .preferredColorScheme(.dark)
-            }
-            // The standard drafting window (look → amend → commit) for the
-            // Desk's two channels. On dismiss, refresh the visible leaf so
-            // an approved note/reminder shows up right away. DraftView
-            // manages its own focus claim + restore.
-            .sheet(item: $deskDraftSeed, onDismiss: {
+            // ONE sheet (see DeskSheet): the note reader or the drafting window.
+            // On dismiss, restore focus and refresh so an approved note/reminder
+            // shows right away.
+            .sheet(item: $activeSheet, onDismiss: {
+                restoreBrowsingFocus()
                 Task { await model.load() }
-            }) { seed in
-                DraftView(seed: nil, channelSeed: seed)
-                    .environmentObject(convo)
-                    .preferredColorScheme(.dark)
+            }) { sheet in
+                switch sheet {
+                case .note(let note):
+                    DeskNoteSheet(note: note)
+                        .preferredColorScheme(.dark)
+                case .draft(let seed):
+                    DraftView(seed: nil, channelSeed: seed)
+                        .environmentObject(convo)
+                        .preferredColorScheme(.dark)
+                }
             }
         }
         // .task re-runs every time this tab is selected → refresh on appear;
@@ -812,8 +824,8 @@ struct DeskView: View {
     /// Apple Notes.
     private var newNoteButton: some View {
         Button {
-            deskDraftSeed = ChannelDraftSeed(channel: "apple_note",
-                                             recipient: "Notes")
+            activeSheet = .draft(ChannelDraftSeed(channel: "apple_note",
+                                                  recipient: "Notes"))
         } label: {
             Image(systemName: "square.and.pencil")
                 .font(.system(size: 20, weight: .medium))
@@ -1022,8 +1034,8 @@ struct DeskView: View {
     /// glyph (not a mic) so it reads as "draft with Scarlet", not inline STT.
     private var dictateReminderButton: some View {
         Button {
-            deskDraftSeed = ChannelDraftSeed(channel: "reminder",
-                                             recipient: "Reminders")
+            activeSheet = .draft(ChannelDraftSeed(channel: "reminder",
+                                                  recipient: "Reminders"))
         } label: {
             Image(systemName: "sparkles")
                 .font(.system(size: 17, weight: .medium))
@@ -1196,7 +1208,7 @@ struct DeskView: View {
         let f = noteFocus(note)
         openedFocus = f
         convo.setFocus(f)
-        openNote = note
+        activeSheet = .note(note)
     }
 
     /// Stale-guard (InboxView's MailDetailView pattern): restore the Desk

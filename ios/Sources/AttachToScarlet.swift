@@ -19,8 +19,13 @@ struct AttachToScarletButton: View {
 
     @State private var showChooser = false
     @State private var showCamera = false
-    @State private var showPhotos = false
-    @State private var showFiles = false
+    /// Photo-library and Files pickers share ONE sheet — two `.sheet(isPresented:)`
+    /// on one view crash Mac Catalyst. Camera stays a separate fullScreenCover.
+    enum AttachPick: Identifiable {
+        case photos, files
+        var id: String { self == .photos ? "photos" : "files" }
+    }
+    @State private var attachPick: AttachPick?
     @State private var uploading = false
     @State private var alertMessage = ""
     @State private var showAlert = false
@@ -57,11 +62,11 @@ struct AttachToScarletButton: View {
                 if UIImagePickerController.isSourceTypeAvailable(.camera) {
                     showCamera = true
                 } else {
-                    showPhotos = true
+                    attachPick = .photos
                 }
             }
-            Button("Photo Library") { showPhotos = true }
-            Button("Files") { showFiles = true }
+            Button("Photo Library") { attachPick = .photos }
+            Button("Files") { attachPick = .files }
             Button("Cancel", role: .cancel) {}
         }
         .fullScreenCover(isPresented: $showCamera) {
@@ -71,19 +76,21 @@ struct AttachToScarletButton: View {
             }
             .ignoresSafeArea()
         }
-        .sheet(isPresented: $showPhotos) {
-            AttachPhotoPicker { image in
-                showPhotos = false
-                handlePickedImage(image, source: "photos")
+        .sheet(item: $attachPick) { pick in
+            switch pick {
+            case .photos:
+                AttachPhotoPicker { image in
+                    attachPick = nil
+                    handlePickedImage(image, source: "photos")
+                }
+                .ignoresSafeArea()
+            case .files:
+                AttachDocumentPicker { url in
+                    attachPick = nil
+                    handlePickedFile(url)
+                }
+                .ignoresSafeArea()
             }
-            .ignoresSafeArea()
-        }
-        .sheet(isPresented: $showFiles) {
-            AttachDocumentPicker { url in
-                showFiles = false
-                handlePickedFile(url)
-            }
-            .ignoresSafeArea()
         }
         .alert("Couldn't share", isPresented: $showAlert) {
             Button("OK", role: .cancel) {}

@@ -33,6 +33,10 @@ struct RootView: View {
     /// Draft ids already offered for recovery THIS process — a fresh launch
     /// (i.e. after a crash) offers again; within one run we don't nag.
     @State private var recoveredDraftIds: Set<String> = []
+    /// True while ANY draft sheet is on screen (RootView's or Inbox/Chats/Desk's,
+    /// via the shared scarletDraftSheetVisible signal) — the backstop poll must
+    /// not open a second window over one already up.
+    @State private var draftSheetOpen = false
     @Environment(\.scenePhase) private var scenePhase
     /// iPhone keeps the TabView; iPad/Mac (regular width) get the
     /// three-pane SplitShell — one codebase, presentation by surface.
@@ -91,8 +95,25 @@ struct RootView: View {
         // Scarlet started a draft by voice (compose_draft tool): open the
         // drafting table over whatever screen Ido is on. The sheet attaches
         // to the active server-side draft instead of composing its own.
-        .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { _ in
-            voiceDraftPresented = true
+        .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { note in
+            if let id = note.object as? String { recoveredDraftIds.insert(id) }
+            if !draftSheetOpen { voiceDraftPresented = true }
+        }
+        // Track any draft sheet's visibility (from every DraftView) so the
+        // backstop poll never double-opens.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
+            draftSheetOpen = (note.userInfo?["visible"] as? Bool) ?? false
+        }
+        // Reliability backstop: a voice-composed draft reaches the window even if
+        // the compose_draft tool-result notification is missed. Every ~2s, if no
+        // draft sheet is open, check for a fresh server-side draft and open it.
+        // recoverActiveDraft() only opens ids not already seen, so a dismissed
+        // draft is never reopened.
+        .task {
+            while !Task.isCancelled {
+                if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
         }
         .sheet(isPresented: $voiceDraftPresented) {
             DraftView(seed: nil, attachToActive: true)
@@ -193,7 +214,7 @@ struct RootView: View {
     /// whatever screen we're on. Once per draft per process: a fresh launch
     /// after a crash offers again; dismissing it doesn't nag within a run.
     private func recoverActiveDraft() async {
-        guard !voiceDraftPresented else { return }
+        guard !voiceDraftPresented, !draftSheetOpen else { return }
         var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
         var items = comps.queryItems ?? []
         items.append(URLQueryItem(name: "op", value: "draft_active"))
