@@ -837,7 +837,7 @@ final class Conversation: ObservableObject {
         // capture graph on the NEW format — the single most important guard
         // against the continuous Mac "quit unexpectedly" crashes.
         NotificationCenter.default.addObserver(
-            forName: AVAudioEngine.configurationChangeNotification, object: engine, queue: .main) { [weak self] _ in
+            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.rebuildAudioGraph() }
         }
         NotificationCenter.default.addObserver(
