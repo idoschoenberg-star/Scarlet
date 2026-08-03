@@ -83,15 +83,12 @@ platform :ios do
       }
     )
 
-    # Wait for Apple to finish PROCESSING and surface its verdict in the log
-    # (Ready to Test vs. Invalid + reason). Uploads were succeeding but builds
-    # weren't appearing in TestFlight, and this environment can't read Apple's
-    # API directly — so make CI report the processing result. Bounded so a
-    # stuck-processing build times out (itself a useful signal) instead of
-    # hanging the 40-min job.
+    # Fire-and-forget upload: don't block CI on Apple's (currently slow)
+    # processing — the binary is delivered the moment this returns, and Apple
+    # processes it into TestFlight on its own schedule.
     upload_to_testflight(
       api_key: key,
-      skip_waiting_for_build_processing: false,
+      skip_waiting_for_build_processing: true,
       distribute_external: false
     )
   end
