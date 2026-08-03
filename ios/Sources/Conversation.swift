@@ -594,7 +594,10 @@ final class Conversation: ObservableObject {
         MicSettings.shared.channelCount = channelCount
         applyMicSettings()
 
-        engine.attach(player)
+        // Guard the attach so the graph can be torn down and rebuilt (on an
+        // audio device/format change) without re-attaching an already-attached
+        // node — which AVAudioEngine traps on.
+        if player.engine == nil { engine.attach(player) }
         // Player speaks standard Float32 — mixer connections in exotic formats
         // are exactly the kind of thing AVAudioEngine throws exceptions over.
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
@@ -608,21 +611,31 @@ final class Conversation: ObservableObject {
             var instRMS: Float = 0
             let gain = self.capGainLinear
 
-            if channelCount > 1, let fdata = buffer.floatChannelData {
+            // Read the layout from the BUFFER ITSELF on every callback, never
+            // from the format captured when the tap was installed. On a Mac the
+            // input device/format changes under a live session (Teams grabs the
+            // mic, headphones, an interface, an alert sound) and stale channel/
+            // stride math would read out of bounds → a hard crash. `bufCh` and
+            // `bufInterleaved` always match the samples actually delivered.
+            let bufCh = Int(buffer.format.channelCount)
+            if bufCh > 1, let fdata = buffer.floatChannelData {
                 // Multichannel device (e.g. an RME/USB interface on the Mac):
                 // pull the ONE selected channel out directly and resample it to
                 // 16k mono ourselves, instead of letting the converter average
                 // every channel together — which would bury a single live mic
-                // under the silent channels. The channel index is CLAMPED, so
-                // an out-of-range value can never crash: it falls back to 0.
+                // under the silent channels. The channel index is CLAMPED to the
+                // BUFFER's real channel count, so it can never read out of range.
                 let frames = Int(buffer.frameLength)
                 if frames > 0 {
-                    let interleaved = inFormat.isInterleaved
-                    let stride = interleaved ? channelCount : 1
-                    let chIndex = max(0, min(self.capChannel, channelCount - 1))
+                    let interleaved = buffer.format.isInterleaved
+                    let stride = interleaved ? bufCh : 1
+                    let chIndex = max(0, min(self.capChannel, bufCh - 1))
+                    // Planar with a bad index would be out of bounds — guard it.
+                    guard interleaved || chIndex < bufCh else { return }
                     let base = interleaved ? fdata[0].advanced(by: chIndex) : fdata[chIndex]
 
-                    let ratio = inFormat.sampleRate / 16000.0
+                    let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
+                    let ratio = inRate / 16000.0
                     let outCount = max(0, Int(Double(frames) / ratio))
                     var pcm = [Int16](); pcm.reserveCapacity(outCount)
                     var i = 0
@@ -646,7 +659,8 @@ final class Conversation: ObservableObject {
                 }
             } else if let converter = self.converter {
                 // Single-channel input: keep the proven AVAudioConverter downmix.
-                let ratio = 16000.0 / inFormat.sampleRate
+                let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
+                let ratio = 16000.0 / inRate
                 let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
                 if let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCap) {
                     var fed = false
@@ -703,6 +717,26 @@ final class Conversation: ObservableObject {
         try engine.start()
         engine.mainMixerNode.outputVolume = 1.0
         audioReady = true
+    }
+
+    /// Single-flight guard so a burst of configuration-change notifications
+    /// can't re-enter the rebuild.
+    private var audioRebuilding = false
+
+    /// The audio hardware/format changed under a live session — a device swap,
+    /// a sample-rate renegotiation, or a phone/Teams call taking then releasing
+    /// the mic. Rebuild the capture graph against the NEW format instead of
+    /// leaving the old tap/converter running against mismatched buffers, which
+    /// is a hard native crash (`try?` can't catch it). This is THE fix for the
+    /// "quit unexpectedly" crashes that fire continuously on the Mac next to
+    /// Outlook, where audio devices churn constantly.
+    @MainActor
+    private func rebuildAudioGraph() {
+        guard wantLive, audioReady, !audioRebuilding else { return }
+        audioRebuilding = true
+        defer { audioRebuilding = false }
+        stopAudio()
+        try? ensureAudio()
     }
 
     /// Server announced a different output rate — rewire only the player leg.
@@ -789,11 +823,22 @@ final class Conversation: ObservableObject {
                     // the gate and return to listening so she recovers on .ended.
                     self.flushPlayback()
                 case .ended:
+                    // A call (Teams/phone) that grabbed the mic likely changed
+                    // the input device/format; rebuild rather than restart the
+                    // stale graph (a restart with a mismatched format crashes).
                     try? self.startAudioSession()
-                    if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
+                    if self.wantLive { self.rebuildAudioGraph() }
                 default: break
                 }
             }
+        }
+        // The audio engine's I/O format changed (device swap, sample-rate
+        // renegotiation, an interface or headphones coming/going). Rebuild the
+        // capture graph on the NEW format — the single most important guard
+        // against the continuous Mac "quit unexpectedly" crashes.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioEngine.configurationChangeNotification, object: engine, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.rebuildAudioGraph() }
         }
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in

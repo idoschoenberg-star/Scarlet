@@ -599,6 +599,7 @@ struct InboxView: View {
             // The Outlook-style header row replaces the system bar on the
             // list screen; pushed screens (reader) keep theirs for Back.
             .toolbar(.hidden, for: .navigationBar)
+            .reportsModalPresence(showCompose)
             .sheet(isPresented: $showCompose) {
                 DraftView(seed: nil)
                     .environmentObject(convo)   // DraftView hard-requires it; match every other call site
@@ -1060,6 +1061,9 @@ struct MailDetailView: View {
             }
         }
         .task {
+            // Crash breadcrumb: if the app dies while an email is open, the next
+            // launch reports last_screen="email-reader" so we can locate it.
+            FlightRecorder.note(screen: "email-reader")
             model.markRead(message.id)
             await fetch()
         }
