@@ -83,9 +83,12 @@ targets:
         # plist string, plus an alternate app name so Siri hears "Scarlet" even
         # though the app's display name is "Talk".
         NSSiriUsageDescription: 'Scarlet uses Siri so you can start a hands-free conversation by voice — just say "Talk to Scarlet".'
-        INAlternativeAppNames:
-          - INAlternativeAppNameKey: Scarlet
-            INAlternativeAppNamePronunciationHintKey: Scarlet
+        # NOTE: INAlternativeAppNames was REMOVED — it generated an empty Siri
+        # name synonym that made App Store processing SILENTLY reject every
+        # build from 131 on (ITMS-90626: "Name synonym '' is too short"), so
+        # nothing past 130 ever appeared in TestFlight. The "Talk to Scarlet"
+        # App Shortcut still works via the app name; bare-"Scarlet" Siri
+        # recognition can be re-added later with a valid, non-empty synonym.
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
         NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."
