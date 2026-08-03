@@ -278,7 +278,7 @@ final class DraftModel: ObservableObject {
                     // message actually reaches Teams instead of dead-ending.
                     if let s = (obj?["link"] as? String), let u = URL(string: s) {
                         teamsLink = u
-                        UIApplication.shared.open(u)
+                        UIApplication.shared.open(u, options: [:], completionHandler: nil)
                     }
                     phase = .saved
                 } else {
