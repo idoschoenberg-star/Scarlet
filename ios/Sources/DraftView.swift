@@ -66,6 +66,9 @@ final class DraftModel: ObservableObject {
         let revision: Int
         let status: String
         let outcome: String
+        /// Teams approval carries a deep link that opens Teams with the message
+        /// pre-typed; nil for every other channel.
+        var link: String? = nil
     }
 
     /// One autocomplete row, as `op=contactsearch` returns it — the server
@@ -90,6 +93,9 @@ final class DraftModel: ObservableObject {
     @Published var draft: ActiveDraft?
     @Published var phase: Phase = .idle
     @Published var errorText = ""
+    /// Teams deep link from the last approval — opened automatically, and
+    /// offered as an "Open in Teams" button in case the auto-open was blocked.
+    @Published var teamsLink: URL?
     /// To-field autocomplete rows for the new-mail form. Never blocks
     /// "Start the draft" — free-typed text stays valid (the server resolves
     /// names at approval).
@@ -266,6 +272,14 @@ final class DraftModel: ObservableObject {
                                                   body: ["id": id, "action": "approve"])
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 if (obj?["ok"] as? Bool) == true {
+                    // Teams: approval returns a deep link that OPENS Teams with
+                    // the message already typed (Teams never auto-sends). Open it
+                    // now and keep it for the "Open in Teams" button, so the
+                    // message actually reaches Teams instead of dead-ending.
+                    if let s = (obj?["link"] as? String), let u = URL(string: s) {
+                        teamsLink = u
+                        UIApplication.shared.open(u)
+                    }
                     phase = .saved
                 } else {
                     errorText = (obj?["error"] as? String) ?? "Couldn't save to Outlook — the draft is still here."
@@ -395,7 +409,8 @@ final class DraftModel: ObservableObject {
             body: (d["body"] as? String) ?? "",
             revision: (d["revision"] as? Int) ?? 0,
             status: (d["status"] as? String) ?? "",
-            outcome: (d["outcome"] as? String) ?? ""
+            outcome: (d["outcome"] as? String) ?? "",
+            link: (d["link"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         )
     }
 
@@ -521,7 +536,7 @@ struct DraftView: View {
                     case "email_outlook":
                         outcome = "saved to his Outlook Drafts (corporate mail is never auto-sent)"
                     case "teams":
-                        outcome = "staged in Teams for his one-tap send"
+                        outcome = "opened in Teams with the message ready — he just taps Send there"
                     case "apple_note":
                         outcome = "saved to his Apple Notes"
                     case "reminder":

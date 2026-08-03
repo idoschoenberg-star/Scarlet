@@ -682,7 +682,10 @@ final class ChatThreadModel: ObservableObject {
                 errorText = (obj["error"] as? String) ?? "Couldn't stage that in Teams."
                 return false
             }
-            if let link = (obj["url"] as? String) ?? (obj["link"] as? String),
+            // The staging op returns the Teams link as `deep_link` — read that
+            // first (a stale `url`/`link` lookup left the tap-to-open card empty,
+            // so the message never reached Teams).
+            if let link = (obj["deep_link"] as? String) ?? (obj["url"] as? String) ?? (obj["link"] as? String),
                let url = URL(string: link) {
                 stagedURL = url
             }
