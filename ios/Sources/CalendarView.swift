@@ -956,6 +956,18 @@ struct CalEventDetailView: View {
                             .font(.title2.weight(.semibold))
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                        // Delete is a rare, destructive action — a quiet icon in
+                        // the corner, not a co-primary button. Confirmation-guarded.
+                        Menu {
+                            Button("Delete event", systemImage: "trash",
+                                   role: .destructive) { confirmDelete = true }
+                        } label: {
+                            Image(systemName: deleting ? "hourglass" : "ellipsis.circle")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 34, height: 34)
+                        }
+                        .disabled(deleting)
                     }
                     infoBlock
                     joinButton
@@ -1215,18 +1227,12 @@ struct CalEventDetailView: View {
         }
     }
 
-    // MARK: footer (Ask Scarlet + Delete, like the mail reader)
+    // MARK: footer (Ask Scarlet — the one primary action; Delete lives in the
+    // header overflow menu so it isn't a co-equal destructive button)
 
     private var footer: some View {
-        HStack(spacing: 10) {
-            footerButton("Ask Scarlet", icon: "sparkles", tint: CalStyle.rose) {
-                askScarlet()
-            }
-            footerButton(deleting ? "Deleting…" : "Delete", icon: "trash.fill",
-                         tint: CalStyle.declineRed) {
-                confirmDelete = true
-            }
-            .disabled(deleting)
+        footerButton("Ask Scarlet", icon: "sparkles", tint: CalStyle.rose) {
+            askScarlet()
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

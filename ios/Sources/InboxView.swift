@@ -1503,7 +1503,18 @@ struct MailBodyView: UIViewRepresentable {
     let html: String
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        var loadedHTML: String?
+        var loadedHTML: String?      // change-detection key (the raw source html)
+        var renderedPage: String?    // exactly what was loaded (capped + framed)
+
+        // If the web content process is jetsam-killed under memory pressure, the
+        // view goes blank rather than taking the whole app down. Reload the same
+        // capped page into the fresh process so the reader recovers on its own —
+        // never the full uncapped source, which could re-trigger the kill.
+        func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+            if let page = renderedPage {
+                webView.loadHTMLString(page, baseURL: nil)
+            }
+        }
 
         func webView(_ webView: WKWebView,
                      decidePolicyFor navigationAction: WKNavigationAction,
@@ -1535,11 +1546,10 @@ struct MailBodyView: UIViewRepresentable {
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = context.coordinator
         web.isOpaque = true
-        // Outlook's near-black behind the page and in the overscroll.
-        let outlookDark = UIColor(red: 27.0 / 255.0, green: 26.0 / 255.0,
-                                  blue: 25.0 / 255.0, alpha: 1.0)
-        web.backgroundColor = outlookDark
-        web.scrollView.backgroundColor = outlookDark
+        // The message body renders on a clean light page (see page(for:)), so the
+        // frame and overscroll match it — a white ground, not the old dark frame.
+        web.backgroundColor = .white
+        web.scrollView.backgroundColor = .white
         web.scrollView.bounces = true
         return web
     }
@@ -1565,7 +1575,9 @@ struct MailBodyView: UIViewRepresentable {
             }
             safe += "\n<p style=\"opacity:.6;font-style:italic\">… message truncated for display — open in Outlook to see the rest.</p>"
         }
-        web.loadHTMLString(Self.page(for: safe), baseURL: nil)
+        let page = Self.page(for: safe)
+        context.coordinator.renderedPage = page
+        web.loadHTMLString(page, baseURL: nil)
     }
 
     /// Outlook-style dark reading frame: responsive viewport, fluid images
@@ -1579,8 +1591,11 @@ struct MailBodyView: UIViewRepresentable {
         <!DOCTYPE html><html><head>\
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">\
         <style>\
-        html{background:#fff;filter:invert(0.94) hue-rotate(180deg)}\
-        img,video,picture{filter:invert(1) hue-rotate(180deg)}\
+        /* NO whole-page CSS filter: a page-wide filter forces the entire
+           message into one large composited layer, which on Mac Catalyst
+           spikes memory on heavy corporate mail and gets the app jetsam-killed
+           ("quit unexpectedly"). Render the message on a clean light page —
+           stability first; a dark re-theme can return once verified safe. */
         html,body{margin:0;padding:12px;background:#fff;color:#111;\
         font:16px -apple-system,system-ui,sans-serif;\
         -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
