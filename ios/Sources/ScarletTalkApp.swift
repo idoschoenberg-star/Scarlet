@@ -30,6 +30,10 @@ struct RootView: View {
     @StateObject private var convo = Conversation.shared
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
+    /// The compose_draft tool arguments (recipient, instruction, channel) posted
+    /// the instant Scarlet calls the tool — handed to the DraftView so the
+    /// writing card paints his request before the server row exists.
+    @State private var voiceDraftIntent: [String: String]? = nil
     /// Draft ids already offered for recovery THIS process — a fresh launch
     /// (i.e. after a crash) offers again; within one run we don't nag.
     @State private var recoveredDraftIds: Set<String> = []
@@ -99,6 +103,13 @@ struct RootView: View {
             if let id = note.object as? String { recoveredDraftIds.insert(id) }
             if !draftSheetOpen { voiceDraftPresented = true }
         }
+        // The INSTANT Scarlet calls compose_draft (before the network round-trip):
+        // capture his request and open the window immediately so it reacts the
+        // moment he finishes speaking, with the body streaming in a beat later.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftIntent)) { note in
+            if let intent = note.object as? [String: String] { voiceDraftIntent = intent }
+            if !draftSheetOpen { voiceDraftPresented = true }
+        }
         // Track any draft sheet's visibility (from every DraftView) so the
         // backstop poll never double-opens.
         .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
@@ -115,8 +126,8 @@ struct RootView: View {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
-        .sheet(isPresented: $voiceDraftPresented) {
-            DraftView(seed: nil, attachToActive: true)
+        .sheet(isPresented: $voiceDraftPresented, onDismiss: { voiceDraftIntent = nil }) {
+            DraftView(seed: nil, attachToActive: true, voiceIntent: voiceDraftIntent)
                 .environmentObject(convo)
                 .preferredColorScheme(.dark)
         }

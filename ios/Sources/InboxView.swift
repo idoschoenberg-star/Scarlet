@@ -21,6 +21,12 @@ extension Notification.Name {
     /// Posted by Conversation when the compose_draft voice tool starts a
     /// draft; RootView presents the drafting sheet in attach mode.
     static let scarletVoiceDraftStarted = Notification.Name("scarletVoiceDraftStarted")
+    /// Posted by Conversation the INSTANT a compose_draft tool call arrives —
+    /// before the network round-trip — carrying [channel, recipient,
+    /// instruction, subject]. RootView opens the drafting sheet immediately and
+    /// seeds the writing card with his request so the window reacts the moment
+    /// he finishes speaking, ahead of the composed body.
+    static let scarletVoiceDraftIntent = Notification.Name("scarletVoiceDraftIntent")
 }
 
 /// The list-level ambient-focus line, shared by the list's own appearance

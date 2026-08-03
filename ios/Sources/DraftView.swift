@@ -69,6 +69,11 @@ final class DraftModel: ObservableObject {
         /// Teams approval carries a deep link that opens Teams with the message
         /// pre-typed; nil for every other channel.
         var link: String? = nil
+        /// The instruction Scarlet heard — shown on the writing card while the
+        /// body streams in, so the window echoes his request immediately.
+        var instruction: String = ""
+        /// When generation began — drives the on-card processing timer.
+        var writingStartedAt: Date? = nil
     }
 
     /// One autocomplete row, as `op=contactsearch` returns it — the server
@@ -102,6 +107,13 @@ final class DraftModel: ObservableObject {
     @Published var suggestions: [Contact] = []
 
     private var draftId: String?
+    /// Optimistic request context painted on the writing card BEFORE any server
+    /// row exists — so the window echoes his request the instant it opens.
+    @Published var pendingRecipient = ""
+    @Published var pendingInstruction = ""
+    @Published var pendingChannel = ""
+    /// Client-side moment the window started writing — drives the on-card timer.
+    @Published var writingStartedAt: Date?
     private var pendingCompose: [String: Any]?
     /// Set when the sheet closed before compose returned a draft_id — the
     /// in-flight compose reads it and dismisses the draft it just created.
@@ -209,11 +221,20 @@ final class DraftModel: ObservableObject {
     }
 
     /// Attach mode: the compose is already in flight on the server (started
-    /// by voice) — find the active draft and follow it.
-    func attachToActive() {
+    /// by voice) — find the active draft and follow it. `intent` carries the
+    /// tool-call arguments (recipient, instruction, channel) known locally the
+    /// instant Scarlet called compose_draft, so the window paints his request
+    /// immediately, before the server row exists.
+    func attachToActive(intent: [String: String]? = nil) {
         guard draftId == nil else { return }
         adoptActive = true
         phase = .writing
+        writingStartedAt = Date()
+        if let intent {
+            pendingRecipient = intent["recipient"] ?? ""
+            pendingInstruction = intent["instruction"] ?? ""
+            pendingChannel = intent["channel"] ?? ""
+        }
         startPolling()
         Task {
             if let d = try? await Self.fetchActive() { adopt(d) }
@@ -230,10 +251,18 @@ final class DraftModel: ObservableObject {
     private func adopt(_ d: ActiveDraft) {
         draftId = d.id
         draft = d
-        if phase == .writing && d.status == "draft" { phase = .ready }
+        // 'writing' means a (re)compose is in flight server-side — a voice
+        // revision flips the live row back to 'writing', so mirror that as the
+        // writing phase (spinner + fast poll) instead of leaving a stale
+        // "Ready" while the text is actually changing under him.
+        if d.status == "writing" {
+            if phase == .ready || phase == .revising { phase = .writing }
+        } else if d.status == "draft" {
+            if phase == .writing || phase == .revising { phase = .ready }
+        }
         // Approved by voice while this window is open: show the same green
         // "sent" state the button shows, then the sheet auto-dismisses.
-        if d.status == "approved" && (phase == .ready || phase == .writing) {
+        if d.status == "approved" && (phase == .ready || phase == .writing || phase == .revising) {
             phase = .saved
         }
     }
@@ -248,6 +277,8 @@ final class DraftModel: ObservableObject {
         let text = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let id = draftId, phase == .ready, !text.isEmpty else { return }
         phase = .revising
+        writingStartedAt = Date()
+        pendingInstruction = text
         errorText = ""
         Task {
             do {
@@ -255,8 +286,13 @@ final class DraftModel: ObservableObject {
                                                   body: ["id": id, "action": "revise", "instruction": text])
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
-                if let d = try? await Self.fetchActive(), d.id == id { draft = d }
-                phase = .ready
+                // The revised body streams server-side — pull the first partial
+                // now and let the heartbeat flip to .ready when it completes,
+                // so the new text visibly writes instead of snapping in.
+                if let d = try? await Self.fetchActive(), d.id == id {
+                    draft = d
+                    if d.status == "draft" { phase = .ready }
+                }
             } catch {
                 errorText = "That revision didn't go through — try again."
                 phase = .ready
@@ -329,6 +365,10 @@ final class DraftModel: ObservableObject {
         pendingCompose = body
         errorText = ""
         phase = .writing
+        writingStartedAt = Date()
+        pendingRecipient = (body["recipient"] as? String) ?? ""
+        pendingInstruction = (body["instruction"] as? String) ?? ""
+        pendingChannel = (body["channel"] as? String) ?? ""
         startPolling()
         Task {
             do {
@@ -339,11 +379,14 @@ final class DraftModel: ObservableObject {
                 // The sheet was closed while this compose was in flight — dismiss
                 // the just-created draft so it doesn't linger as active.
                 if dismissRequested { dismissRequested = false; discard(); return }
+                // The row exists in the 'writing' state within ~1s (body streams
+                // in after). Adopt it so the card shows his request + timer now;
+                // only flip to .ready once the body is actually done.
                 if let d = try? await Self.fetchActive(), d.id == id {
                     draft = d
-                    phase = .ready
+                    if d.status == "draft" { phase = .ready }
                 }
-                // If that fetch missed, the poll flips to .ready on its next tick.
+                // The poll flips to .ready when the streamed body completes.
             } catch {
                 errorText = "Scarlet couldn't start this draft."
                 phase = .idle
@@ -370,7 +413,7 @@ final class DraftModel: ObservableObject {
     }
 
     private func pollTick() async {
-        guard phase == .writing || phase == .ready else { writingSince = nil; return }
+        guard phase == .writing || phase == .ready || phase == .revising else { writingSince = nil; return }
         tickCount += 1
         // Once a draft is on screen and Ido is reviewing (.ready), the only
         // thing polling catches is a VOICE revision — back the 1.5s heartbeat
@@ -379,11 +422,15 @@ final class DraftModel: ObservableObject {
             writingSince = nil
             if tickCount % 4 != 0 { return }
         } else {
-            // Writing watchdog: if no draft is adopted within ~20s, surface an
-            // error instead of a permanent spinner (a failed voice compose, or
-            // a compose whose draft never resolves, used to hang here forever).
-            if writingSince == nil { writingSince = Date() }
-            else if Date().timeIntervalSince(writingSince!) > 20 {
+            // Writing watchdog: only fires while NOTHING has landed yet (no row
+            // adopted). Once a 'writing' row is on screen the body is visibly
+            // streaming in, so a longer draft must never trip this. A compose
+            // that never even creates a row is the real failure.
+            if draft != nil {
+                writingSince = nil
+            } else if writingSince == nil {
+                writingSince = Date()
+            } else if Date().timeIntervalSince(writingSince!) > 20 {
                 writingSince = nil
                 errorText = "Scarlet didn't get this draft started — close and try again."
                 phase = .idle
@@ -402,17 +449,20 @@ final class DraftModel: ObservableObject {
         guard let d = try? await Self.fetchActive() else { return }
         if d.id == want {
             draft = d
-            if phase == .writing && d.status == "draft" { phase = .ready }
+            // Streamed body finished → review; a revision put it back to
+            // 'writing' → show the writing indicator again.
+            if (phase == .writing || phase == .revising) && d.status == "draft" { phase = .ready }
+            if phase == .ready && d.status == "writing" { phase = .writing }
             // Voice approval (her approve_draft tool) — mirror it here so the
             // button, the green check, and her voice stay one single story.
             if d.status == "approved" && phase == .ready { phase = .saved }
-        } else if d.status == "draft" {
+        } else if d.status == "draft" || d.status == "writing" {
             // The active draft IS the window's truth. If voice work replaced
             // it under a different id (Scarlet revised or re-composed), follow
             // it instead of showing a stale copy forever.
             draftId = d.id
             draft = d
-            if phase == .writing { phase = .ready }
+            if d.status == "draft", phase == .writing || phase == .revising { phase = .ready }
         }
     }
 
@@ -432,7 +482,11 @@ final class DraftModel: ObservableObject {
             revision: (d["revision"] as? Int) ?? 0,
             status: (d["status"] as? String) ?? "",
             outcome: (d["outcome"] as? String) ?? "",
-            link: (d["link"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            link: (d["link"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            instruction: (d["instruction"] as? String) ?? ""
+            // writingStartedAt is left client-side (the moment the window
+            // opened) — more reliable than reparsing the server timestamp, and
+            // it's only used to drive the on-card timer.
         )
     }
 
@@ -465,6 +519,10 @@ struct DraftView: View {
     /// Voice-attach mode: skip composing and adopt the active server draft
     /// (Scarlet's compose_draft tool already started it).
     var attachToActive: Bool = false
+    /// The compose_draft tool arguments known locally the instant Scarlet made
+    /// the call (recipient, instruction, channel) — used to paint the writing
+    /// card immediately, before the server row lands.
+    var voiceIntent: [String: String]? = nil
     /// Channel-draft mode: opened from a chat thread (WhatsApp/iMessage/
     /// Teams). With a pre-typed instruction Scarlet composes immediately;
     /// without one the sheet asks first (recipient is fixed — the chat).
@@ -511,7 +569,7 @@ struct DraftView: View {
                                             object: nil,
                                             userInfo: ["visible": true])
             if attachToActive {
-                model.attachToActive()
+                model.attachToActive(intent: voiceIntent)
             } else if let channelSeed {
                 let instr = channelSeed.instruction
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -796,7 +854,12 @@ struct DraftView: View {
 
     @ViewBuilder
     private var content: some View {
-        if let draft = model.draft {
+        // While writing with no body yet → the enriched writing card (his
+        // request + timer). The moment streamed text exists, the draft card
+        // takes over and fills in live.
+        if model.phase == .writing, (model.draft?.body ?? "").isEmpty {
+            writingCard
+        } else if let draft = model.draft {
             draftCard(draft)
         } else if model.phase == .writing {
             writingCard
@@ -871,17 +934,72 @@ struct DraftView: View {
             .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
     }
 
-    /// Placeholder while the first draft composes.
+    /// The writing card echoes his request the instant the window opens —
+    /// recipient headline, the instruction Scarlet heard, and a live timer —
+    /// so it never feels like a blank spinner while the body composes.
     private var writingCard: some View {
-        VStack(spacing: 12) {
-            ProgressView().tint(scarletRose)
-            Text("Composing in your voice…")
-                .font(.callout)
-                .foregroundStyle(.secondary)
+        let recipient = !(model.draft?.recipient ?? "").isEmpty
+            ? model.draft!.recipient : model.pendingRecipient
+        let instruction = !(model.draft?.instruction ?? "").isEmpty
+            ? model.draft!.instruction : model.pendingInstruction
+        let channel = !model.pendingChannel.isEmpty
+            ? model.pendingChannel : (model.draft?.channel ?? "")
+        let since = model.writingStartedAt ?? Date()
+        return VStack(alignment: .leading, spacing: 14) {
+            if !recipient.isEmpty {
+                HStack(spacing: 9) {
+                    Image(systemName: channelGlyph(channel))
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(scarletRose)
+                    Text("To \(recipient)")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.98, green: 0.92, blue: 0.92))
+                        .lineLimit(2)
+                }
+            }
+            if !instruction.isEmpty {
+                paragraphLine(instruction, size: 16, weight: .regular,
+                              color: paper.opacity(0.92))
+                    .padding(.leading, 2)
+            }
+            Spacer(minLength: 8)
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small).tint(scarletRose)
+                Text("Scarlet is writing…")
+                    .font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Spacer()
+                // A quiet processing clock — proof she's on it.
+                TimelineView(.periodic(from: since, by: 1)) { ctx in
+                    Text(elapsedString(ctx.date.timeIntervalSince(since)))
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
+                        .monospacedDigit()
+                }
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 20))
-        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.08), lineWidth: 1))
+        .padding(18)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.09), lineWidth: 1))
+    }
+
+    /// SF Symbol for the channel badge on the writing card.
+    private func channelGlyph(_ channel: String) -> String {
+        switch channel {
+        case "whatsapp": return "message.fill"
+        case "imessage": return "bubble.left.fill"
+        case "teams": return "person.2.fill"
+        case "email_gmail", "email_outlook": return "envelope.fill"
+        case "apple_note": return "note.text"
+        case "reminder": return "checklist"
+        default: return "square.and.pencil"
+        }
+    }
+
+    /// "0:03" processing-timer string from an elapsed interval.
+    private func elapsedString(_ t: TimeInterval) -> String {
+        let s = Int(max(0, t))
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 
     private var errorRetry: some View {

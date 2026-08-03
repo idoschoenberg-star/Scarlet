@@ -470,6 +470,23 @@ final class Conversation: ObservableObject {
         let name = c["tool_name"] as? String ?? ""
         let callId = c["tool_call_id"] as? String ?? ""
         let params = c["parameters"] as? [String: Any] ?? [:]
+        // INSTANT WINDOW: the tool arguments are already here, before any
+        // network round-trip. For a compose, open the drafting window NOW with
+        // his request painted in — recipient, channel, and the instruction she
+        // heard — so he sees it react the moment he finishes speaking, with the
+        // body streaming in a beat later. (The post-result notification below
+        // still fires as the reliability net + to record the real draft id.)
+        if name == "compose_draft" {
+            let intent: [String: String] = [
+                "channel": params["channel"] as? String ?? "",
+                "recipient": params["recipient"] as? String ?? "",
+                "instruction": params["instruction"] as? String ?? "",
+                "subject": params["subject"] as? String ?? "",
+            ]
+            Task { @MainActor in
+                NotificationCenter.default.post(name: .scarletVoiceDraftIntent, object: intent)
+            }
+        }
         Task {
             var out = "{}"
             do {
