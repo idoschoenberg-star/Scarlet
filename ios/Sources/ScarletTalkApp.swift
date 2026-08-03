@@ -6,6 +6,12 @@ import UIKit
 struct ScarletTalkApp: App {
     @StateObject private var session = AppSession()
 
+    init() {
+        // Install the crash black-box before anything else can die, so the
+        // faulting stack is captured and reported on the next launch.
+        FlightRecorder.installCrashHandlers()
+    }
+
     var body: some Scene {
         WindowGroup {
             ZStack {
@@ -298,6 +304,11 @@ struct RootView: View {
 enum FlightRecorder {
     private static let stateKey = "scarlet.flight.state"
     private static let aliveKey = "scarlet.flight.alive"
+    private static let crashKey = "scarlet.flight.crash"
+    /// One capture per process — the first fault wins (an NSException that
+    /// aborts would otherwise be overwritten by the ensuing SIGABRT's thinner
+    /// stack).
+    private static var didCapture = false
 
     static func note(screen: String) {
         let d = UserDefaults.standard
@@ -306,10 +317,71 @@ enum FlightRecorder {
         d.set(true, forKey: aliveKey)
     }
 
+    /// Install once at launch. Captures BOTH uncaught Obj-C/Swift exceptions and
+    /// fatal POSIX signals (EXC_BAD_ACCESS→SIGSEGV/SIGBUS, SIGABRT, SIGILL,
+    /// SIGTRAP, SIGFPE), persisting the backtrace so the next launch reports
+    /// exactly where it died. A pragmatic in-house reporter — enough to pinpoint
+    /// the faulting frame without a third-party SDK. The handler closures capture
+    /// no context, so they convert cleanly to the C function pointers both APIs
+    /// require.
+    static func installCrashHandlers() {
+        NSSetUncaughtExceptionHandler { exc in
+            FlightRecorder.capture(
+                type: "exception",
+                name: exc.name.rawValue,
+                reason: exc.reason ?? "",
+                stack: exc.callStackSymbols.joined(separator: "\n"))
+        }
+        for sig in [SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE] {
+            signal(sig) { s in
+                if !FlightRecorder.didCapture {
+                    FlightRecorder.capture(
+                        type: "signal",
+                        name: "signal_\(s)",
+                        reason: "fatal signal \(s)",
+                        stack: Thread.callStackSymbols.joined(separator: "\n"))
+                }
+                // Re-raise through the default handler so the OS still records it.
+                signal(s, SIG_DFL)
+                raise(s)
+            }
+        }
+    }
+
+    private static func capture(type: String, name: String, reason: String, stack: String) {
+        if didCapture { return }
+        didCapture = true
+        let d = UserDefaults.standard
+        let last = d.dictionary(forKey: stateKey) ?? [:]
+        d.set([
+            "type": type, "name": name, "reason": reason,
+            // callStackSymbols runs top-first (the faulting frame leads), so a
+            // prefix still names the culprit; cap keeps the JSON body sane.
+            "stack": String(stack.prefix(9000)),
+            "last_screen": last["screen"] ?? "unknown",
+            "last_ts": last["ts"] ?? "",
+            "ts": ISO8601DateFormatter().string(from: Date()),
+        ], forKey: crashKey)
+        d.synchronize() // we are about to die — force it to disk
+    }
+
     static func reportUncleanExitIfAny() {
         let d = UserDefaults.standard
+        // A caught crash from the previous run — the richest signal there is.
+        if let crash = d.dictionary(forKey: crashKey) {
+            d.removeObject(forKey: crashKey)
+            d.set(true, forKey: aliveKey) // handled — don't also fire unclean_exit
+            post(kind: "crash", detail: crash)
+            return
+        }
+        // Otherwise: the pre-existing heuristic (freeze/jetsam kill no handler caught).
         guard d.bool(forKey: aliveKey) else { d.set(true, forKey: aliveKey); return }
         let last = d.dictionary(forKey: stateKey) ?? [:]
+        post(kind: "unclean_exit",
+             detail: ["last_screen": last["screen"] ?? "unknown", "last_ts": last["ts"] ?? ""])
+    }
+
+    private static func post(kind: String, detail: [String: Any]) {
         Task {
             var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
             var items = comps.queryItems ?? []
@@ -320,11 +392,7 @@ enum FlightRecorder {
             req.httpMethod = "POST"
             req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.httpBody = try? JSONSerialization.data(withJSONObject: [
-                "kind": "unclean_exit",
-                "detail": ["last_screen": last["screen"] ?? "unknown",
-                           "last_ts": last["ts"] ?? ""],
-            ])
+            req.httpBody = try? JSONSerialization.data(withJSONObject: ["kind": kind, "detail": detail])
             _ = try? await URLSession.shared.data(for: req)
         }
     }
