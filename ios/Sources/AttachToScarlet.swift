@@ -69,6 +69,7 @@ struct AttachToScarletButton: View {
             Button("Files") { attachPick = .files }
             Button("Cancel", role: .cancel) {}
         }
+        .reportsModalPresence(showCamera || attachPick != nil)
         .fullScreenCover(isPresented: $showCamera) {
             AttachCameraPicker { image in
                 showCamera = false

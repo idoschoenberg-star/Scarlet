@@ -741,6 +741,7 @@ struct DeskView: View {
             // ONE sheet (see DeskSheet): the note reader or the drafting window.
             // On dismiss, restore focus and refresh so an approved note/reminder
             // shows right away.
+            .reportsModalPresence(activeSheet != nil)
             .sheet(item: $activeSheet, onDismiss: {
                 restoreBrowsingFocus()
                 Task { await model.load() }

@@ -125,6 +125,7 @@ struct TalkView: View {
             }
         }
         .padding(.horizontal, 24)
+        .reportsModalPresence(showSettings)
         .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
         // Auto-connect ONCE per app session: one press → talking. Coming back
         // from the Inbox tab must not restart (or end) a conversation — the

@@ -996,6 +996,9 @@ struct MailDetailView: View {
     /// Display name of the attachment being previewed — feeds the viewer's
     /// [FOCUS] line so Scarlet knows exactly which file is on screen.
     @State private var previewName = ""
+    /// The per-open temp folder holding the downloaded attachment; deleted when
+    /// the viewer closes so temp bytes don't accumulate across a session.
+    @State private var lastAttachmentDir: URL?
     /// The focus line that was active before the attachment viewer opened
     /// (normally this email's own emailFocus); restored on dismiss.
     @State private var focusBeforeAttachment: String?
@@ -1030,6 +1033,7 @@ struct MailDetailView: View {
         // Mac Catalyst; the enum keeps a single presentation surface.
         // `onDismiss` runs the attachment-focus restore for every case — it's a
         // no-op when the draft closes (no attachment focus was set).
+        .reportsModalPresence(activeSheet != nil)
         .sheet(item: $activeSheet, onDismiss: attachmentViewerClosed) { sheet in
             switch sheet {
             case .draft:
@@ -1155,6 +1159,7 @@ struct MailDetailView: View {
                     let url = Self.tempFileURL(for: att.name)
                     try data.write(to: url, options: .atomic)
                     previewName = att.name
+                    lastAttachmentDir = url.deletingLastPathComponent()
                     activeSheet = .preview(PreviewFile(url: url))
                 case .link(let url):
                     UIApplication.shared.open(url, options: [:], completionHandler: nil)
@@ -1216,6 +1221,12 @@ struct MailDetailView: View {
         attachmentFocusLine = nil
         focusBeforeAttachment = nil
         previewName = ""
+        // Remove this open's temp folder (best-effort) so downloaded bytes
+        // don't pile up in the temp directory over a long session.
+        if let dir = lastAttachmentDir {
+            try? FileManager.default.removeItem(at: dir)
+            lastAttachmentDir = nil
+        }
     }
 
     /// The ambient-focus line while an attachment is full-screen: names the
@@ -1235,7 +1246,11 @@ struct MailDetailView: View {
 
     /// Temp destination that keeps the real filename (extension included —
     /// that's what makes QuickLook pick the right renderer) but strips path
-    /// separators so a hostile name can't escape the temp directory.
+    /// separators so a hostile name can't escape the temp directory. Each open
+    /// gets its OWN unique subfolder: corporate mail routinely reuses display
+    /// names ("image001.png", "ATT00001"), and writing over a file QuickLook is
+    /// still previewing hands it a swapped item. The subfolder isolates every
+    /// preview while preserving the real name+extension for type detection.
     private static func tempFileURL(for name: String) -> URL {
         var clean = name
             .replacingOccurrences(of: "/", with: "_")
@@ -1243,7 +1258,10 @@ struct MailDetailView: View {
             .replacingOccurrences(of: ":", with: "_")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if clean.isEmpty || clean == "." || clean == ".." { clean = "attachment" }
-        return FileManager.default.temporaryDirectory.appendingPathComponent(clean)
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("att-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(clean)
     }
 
     /// Outlook's file-type iconography, decided by extension with a
@@ -1525,7 +1543,25 @@ struct MailBodyView: UIViewRepresentable {
     func updateUIView(_ web: WKWebView, context: Context) {
         guard context.coordinator.loadedHTML != html else { return }
         context.coordinator.loadedHTML = html
-        web.loadHTMLString(Self.page(for: html), baseURL: nil)
+        // Corporate/Amwell mail can be hundreds of KB of nested tables and
+        // inline base64 images. Combined with the full-page invert filter (a
+        // single large composited layer), a huge message can spike memory hard
+        // on Mac Catalyst and get the app jetsam-killed ("quit unexpectedly").
+        // Cap the body so an enormous message still renders its top without the
+        // memory blow-up. Cut on a tag boundary when possible so we don't slice
+        // mid-element.
+        let cap = 700_000
+        var safe = html
+        if safe.count > cap {
+            let head = String(safe.prefix(cap))
+            if let lt = head.range(of: "<", options: .backwards) {
+                safe = String(head[..<lt.lowerBound])
+            } else {
+                safe = head
+            }
+            safe += "\n<p style=\"opacity:.6;font-style:italic\">… message truncated for display — open in Outlook to see the rest.</p>"
+        }
+        web.loadHTMLString(Self.page(for: safe), baseURL: nil)
     }
 
     /// Outlook-style dark reading frame: responsive viewport, fluid images

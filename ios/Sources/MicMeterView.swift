@@ -171,7 +171,7 @@ struct MicrophoneSettingsSection: View {
                     Picker("Channel", selection: Binding(
                         get: { min(max(mic.channel, 0), mic.channelCount - 1) },
                         set: { mic.channel = $0 })) {
-                        ForEach(0..<mic.channelCount, id: \.self) { i in
+                        ForEach(Array(0..<mic.channelCount), id: \.self) { i in
                             Text("Channel \(i + 1)").tag(i)
                         }
                     }

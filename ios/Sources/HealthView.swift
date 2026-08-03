@@ -241,6 +241,7 @@ struct HealthView: View {
             .toolbar(.hidden, for: .navigationBar)
             .onAppear { convo.setFocus(pageFocus()) }
             .onChange(of: period) { _, _ in convo.setFocus(pageFocus()) }
+            .reportsModalPresence(selectedWorkout != nil)
             .sheet(item: $selectedWorkout, onDismiss: { restoreBrowsingFocus() }) { w in
                 WorkoutDetailSheet(workout: w)
                     .preferredColorScheme(.dark)

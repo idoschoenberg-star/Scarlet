@@ -11,6 +11,21 @@ extension Notification.Name {
     static let scarletGoToTalk = Notification.Name("scarletGoToTalk")
 }
 
+extension View {
+    /// Report to RootView that a modal (sheet / fullScreenCover) is on screen,
+    /// so its voice-draft sheet never tries to present a SECOND modal over this
+    /// one — on Mac Catalyst that throws "already presenting" and the app quits.
+    /// Every modal-driving view attaches this; it mirrors what DraftView already
+    /// posts for itself, extended to attachment/photo/file/event/note viewers.
+    /// Pass `item != nil` for `.sheet(item:)` or the Bool for `.sheet(isPresented:)`.
+    func reportsModalPresence(_ isPresented: Bool) -> some View {
+        onChange(of: isPresented) { _, visible in
+            NotificationCenter.default.post(name: .scarletDraftSheetVisible,
+                                            object: nil, userInfo: ["visible": visible])
+        }
+    }
+}
+
 /// The "Scarlet Presence": a capsule EMBEDDED (via safeAreaInset) at the
 /// bottom of each LIST screen — Inbox list, Calendar agenda, Chats list.
 /// It is part of those screens' layout, not a floating overlay, so a pushed

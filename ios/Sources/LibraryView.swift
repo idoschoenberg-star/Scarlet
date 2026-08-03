@@ -303,6 +303,7 @@ struct LibraryView: View {
                 convo.setFocus(browsingFocus)
             }
             // ONE sheet for every viewer kind (see LibrarySheet).
+            .reportsModalPresence(activeSheet != nil)
             .sheet(item: $activeSheet, onDismiss: { restoreBrowsingFocus() }) { sheet in
                 switch sheet {
                 case .photo(let item):

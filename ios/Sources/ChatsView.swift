@@ -1134,6 +1134,7 @@ struct ChatThreadView: View {
         // video player, or the Scarlet drafting studio. On dismiss, reload once
         // (an approved send appears via the mirror shortly; harmless for the
         // media cases).
+        .reportsModalPresence(activeSheet != nil)
         .sheet(item: $activeSheet, onDismiss: {
             Task { await model.load() }
         }) { sheet in

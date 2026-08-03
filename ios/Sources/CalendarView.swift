@@ -525,6 +525,7 @@ struct CalendarView: View {
             didInitialJump = false
             convo.setFocus(calendarAgendaFocus)
         }
+        .reportsModalPresence(sheetEvent != nil)
         .sheet(item: $sheetEvent) { event in
             CalEventDetailView(event: event, model: model)
                 .preferredColorScheme(.dark)
