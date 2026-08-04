@@ -106,8 +106,14 @@ struct RootView: View {
         // drafting table over whatever screen Ido is on. The sheet attaches
         // to the active server-side draft instead of composing its own.
         .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { note in
-            if let id = note.object as? String { recoveredDraftIds.insert(id) }
-            if !draftSheetOpen { voiceDraftPresented = true }
+            // Mark the id "seen" ONLY when we actually present it. Marking it
+            // unconditionally (the old bug) permanently blinded the backstop
+            // poll for that draft whenever draftSheetOpen was momentarily true,
+            // so the window then never opened at all.
+            if !draftSheetOpen {
+                if let id = note.object as? String { recoveredDraftIds.insert(id) }
+                voiceDraftPresented = true
+            }
         }
         // The INSTANT Scarlet calls compose_draft (before the network round-trip):
         // capture his request and open the window immediately so it reacts the
@@ -248,7 +254,11 @@ struct RootView: View {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let draft = obj["draft"] as? [String: Any],
               let id = draft["id"] as? String, !id.isEmpty,
-              (draft["status"] as? String) == "draft" else { return }
+              // Open on "writing" too, not only "draft": a voice-composed draft
+              // sits in "writing" for the seconds the body streams in, and the
+              // window is meant to open immediately and show it filling. Gating
+              // on "draft" alone meant the window often never opened.
+              ["writing", "draft"].contains(draft["status"] as? String ?? "") else { return }
         // Only resurrect reasonably recent work (48h) — not archaeology.
         if let ts = draft["updated_at"] as? String,
            let when = MailDates.parse(ts),
