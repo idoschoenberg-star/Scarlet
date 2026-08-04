@@ -761,6 +761,12 @@ struct InboxView: View {
                         ZStack {
                             NavigationLink {
                                 MailDetailView(message: message, model: model)
+                                    // Mac Catalyst drops @EnvironmentObject across
+                                    // the NavigationLink→destination boundary, so
+                                    // MailDetailView's `convo` traps
+                                    // (EnvironmentObject.error → SIGTRAP) on open.
+                                    // Re-inject like every DraftView call site.
+                                    .environmentObject(convo)
                             } label: {
                                 EmptyView()
                             }

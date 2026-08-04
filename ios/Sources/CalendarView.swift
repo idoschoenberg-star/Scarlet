@@ -528,6 +528,10 @@ struct CalendarView: View {
         .reportsModalPresence(sheetEvent != nil)
         .sheet(item: $sheetEvent) { event in
             CalEventDetailView(event: event, model: model)
+                // Mac Catalyst drops @EnvironmentObject across the sheet
+                // boundary; CalEventDetailView reads `convo`, so without this
+                // it traps on open (same crash class as the mail reader).
+                .environmentObject(convo)
                 .preferredColorScheme(.dark)
         }
     }

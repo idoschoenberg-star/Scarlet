@@ -43,6 +43,92 @@ else
   ok "Conversation is a single shared instance"
 fi
 
+# 5) Mac-Catalyst @EnvironmentObject drop — the class of crash that hit builds
+#    147/148/149: Catalyst does NOT propagate an injected @EnvironmentObject
+#    across a NavigationLink→destination OR a .sheet boundary. A detail view that
+#    reads `@EnvironmentObject var convo: Conversation` therefore traps
+#    (EnvironmentObject.error → SIGTRAP) on open unless it is RE-injected with
+#    .environmentObject(convo) at the construction site. This guard fails the
+#    build if any convo-reading view is constructed without a nearby re-inject.
+py=$(command -v python3 || command -v python)
+if [ -n "$py" ]; then
+  missing=$("$py" - "$SRC" <<'PY'
+import sys, glob, os, re
+root = sys.argv[1]
+files = sorted(glob.glob(os.path.join(root, "*.swift")))
+
+# (1) Which struct types read `@EnvironmentObject ... convo: Conversation`?
+readers = set()
+for f in files:
+    cur = None
+    for line in open(f, encoding="utf-8", errors="ignore"):
+        m = re.match(r"\s*struct\s+([A-Za-z_]\w*)", line)
+        if m:
+            cur = m.group(1)
+        if cur and re.search(r"@EnvironmentObject\b.*\bconvo\s*:\s*Conversation", line):
+            readers.add(cur)
+
+# (2) Every construction site of a reader type must re-inject convo. Scan the
+#     WHOLE expression — the constructor's parenthesized args (which can be a
+#     long multi-line literal) plus the trailing `.`-modifier chain — not a
+#     fixed line window, so long seeds don't cause false positives.
+def code_of(s):
+    return s.split("//", 1)[0]
+
+problems = []
+for f in files:
+    lines = open(f, encoding="utf-8", errors="ignore").read().splitlines()
+    for i, line in enumerate(lines):
+        for name in readers:
+            if re.search(r"\bstruct\s+" + re.escape(name) + r"\b", code_of(line)):
+                continue
+            m = re.search(r"\b" + re.escape(name) + r"\s*\(", code_of(line))
+            if not m:
+                continue
+            # Walk from the opening paren: accumulate until paren depth returns
+            # to 0 (end of args), then keep consuming blank lines and lines whose
+            # stripped code starts with '.' (the modifier chain).
+            block = []
+            depth = 0
+            started = False
+            j = i
+            col = m.end() - 1  # index of '('
+            while j < len(lines):
+                seg = code_of(lines[j])
+                scan = seg[col+1:] if j == i else seg
+                for ch in scan:
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                block.append(lines[j])
+                if not started:
+                    started = True
+                # args closed?
+                if started and depth <= 0 and j >= i:
+                    # consume trailing modifier chain
+                    k = j + 1
+                    while k < len(lines):
+                        st = code_of(lines[k]).strip()
+                        if st == "" or st.startswith(".") or st.startswith(")") or st.startswith("]"):
+                            block.append(lines[k]); k += 1
+                        else:
+                            break
+                    break
+                j += 1
+            if ".environmentObject(" not in "\n".join(block):
+                problems.append(f"{os.path.basename(f)}:{i+1}  {name}(...) never re-injects .environmentObject(convo)")
+print("\n".join(problems))
+PY
+)
+  if [ -n "$missing" ]; then
+    fatal "Conversation @EnvironmentObject not re-injected at a presented/pushed view — Mac Catalyst will SIGTRAP on open:"
+    echo "$missing" | sed 's/^/         /'
+  else
+    ok "every Conversation-reading view re-injects convo at its call sites (Catalyst-safe)"
+  fi
+fi
+
 # 4) Advisory: bracket balance per file (a real error still fails the compile;
 #    this just surfaces a likely bad merge earlier, and ignores false positives).
 py=$(command -v python3 || command -v python)

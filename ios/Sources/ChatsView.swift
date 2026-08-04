@@ -953,6 +953,11 @@ struct ChatsView: View {
             ForEach(model.chats) { chat in
                 NavigationLink {
                     ChatThreadView(channel: model.channel, chat: chat)
+                        // Mac Catalyst drops @EnvironmentObject across the
+                        // NavigationLink→destination boundary; without this,
+                        // ChatThreadView's `convo` traps on open (same crash
+                        // class as the mail reader). Re-inject explicitly.
+                        .environmentObject(convo)
                 } label: {
                     ChatListRow(chat: chat, channel: model.channel)
                 }
