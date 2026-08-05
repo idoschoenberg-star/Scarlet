@@ -474,6 +474,7 @@ struct CalendarView: View {
     @State private var didInitialJump = false
 
     var body: some View {
+        NavigationStack {
         ScrollViewReader { proxy in
             VStack(spacing: 0) {
                 headerBar(proxy)
@@ -526,13 +527,24 @@ struct CalendarView: View {
             convo.setFocus(calendarAgendaFocus)
         }
         .reportsModalPresence(sheetEvent != nil)
-        .sheet(item: $sheetEvent) { event in
-            CalEventDetailView(event: event, model: model)
-                // Mac Catalyst drops @EnvironmentObject across the sheet
-                // boundary; CalEventDetailView reads `convo`, so without this
-                // it traps on open (same crash class as the mail reader).
-                .environmentObject(convo)
-                .preferredColorScheme(.dark)
+        // Item detail PUSHES into the detail column (not a window-covering
+        // sheet) so the scarlet sidebar stays reachable while a meeting is
+        // open — fixes the "sidebar does nothing inside a meeting" dead-end.
+        // Same list→reader pattern Inbox/Chats already use. isPresented (not
+        // item:) because CalEvent isn't Hashable and this stays iOS-16-safe.
+        .navigationDestination(isPresented: Binding(
+            get: { sheetEvent != nil },
+            set: { if !$0 { sheetEvent = nil } }
+        )) {
+            if let event = sheetEvent {
+                CalEventDetailView(event: event, model: model)
+                    // Mac Catalyst drops @EnvironmentObject across the
+                    // navigation boundary; re-inject so CalEventDetailView's
+                    // `convo` read doesn't trap on open.
+                    .environmentObject(convo)
+                    .preferredColorScheme(.dark)
+            }
+        }
         }
     }
 
@@ -974,8 +986,6 @@ struct CalEventDetailView: View {
             footer
         }
         .background(CalStyle.bg.ignoresSafeArea())
-        .presentationDetents([.large])
-        .presentationDragIndicator(.visible)
         .task { await fetch() }
         // Ambient focus: this event while the sheet is up; back to the agenda
         // on the way out — unless another screen already claimed focus.
