@@ -172,16 +172,23 @@ final class DraftModel: ObservableObject {
 
     /// New-mail mode: no original message — the backend composes fresh and
     /// approval resolves the free-form recipient to a real address.
-    func startNewMail(recipient: String, instruction: String) {
+    func startNewMail(recipient: String, instruction: String,
+                      channel: String = "email_outlook",
+                      attachmentIDs: [String] = []) {
         guard phase == .idle, draftId == nil else { return }
         let to = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !to.isEmpty else { return }
-        compose([
-            "channel": "email_outlook",
+        var body: [String: Any] = [
+            "channel": channel,
             "recipient": to,
-            "instruction": instr.isEmpty ? "Draft this email." : instr,
-        ])
+            "instruction": instr.isEmpty
+                ? (attachmentIDs.isEmpty ? "Draft this email."
+                   : "Write a brief, warm cover note from Ido; the photo(s) are attached.")
+                : instr,
+        ]
+        if !attachmentIDs.isEmpty { body["attachment_upload_ids"] = attachmentIDs }
+        compose(body)
     }
 
     /// Outlook-style To-field autocomplete: debounce ~350ms, then ask the
@@ -555,6 +562,12 @@ struct DraftView: View {
     /// Teams). With a pre-typed instruction Scarlet composes immediately;
     /// without one the sheet asks first (recipient is fixed — the chat).
     var channelSeed: ChannelDraftSeed? = nil
+    /// Photo-forward mode: a new outbound email (Outlook or Gmail) that carries
+    /// already-uploaded photos as real attachments. Behaves like new-mail (the
+    /// To field collects the recipient) but on the chosen channel, and every
+    /// approved send attaches these `uploads` ids server-side.
+    var forwardChannel: String? = nil
+    var attachmentUploadIDs: [String] = []
 
     @StateObject private var model = DraftModel()
     @Environment(\.dismiss) private var dismiss
@@ -730,6 +743,18 @@ struct DraftView: View {
                     .padding(.vertical, 4)
                     .background(badgeColor.opacity(0.16), in: Capsule())
                     .overlay(Capsule().stroke(badgeColor.opacity(0.4), lineWidth: 1))
+                if !attachmentUploadIDs.isEmpty {
+                    HStack(spacing: 3) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("\(attachmentUploadIDs.count) photo\(attachmentUploadIDs.count == 1 ? "" : "s")")
+                            .font(.system(size: 10, weight: .bold))
+                    }
+                    .foregroundStyle(scarletRose)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(scarletRose.opacity(0.16), in: Capsule())
+                    .overlay(Capsule().stroke(scarletRose.opacity(0.4), lineWidth: 1))
+                }
                 Spacer()
                 Button {
                     model.discard()
@@ -780,7 +805,7 @@ struct DraftView: View {
     // attach mode) — the badge and approve wording follow the draft itself.
 
     private var channel: String {
-        model.draft?.channel ?? channelSeed?.channel ?? "email_outlook"
+        model.draft?.channel ?? channelSeed?.channel ?? forwardChannel ?? "email_outlook"
     }
 
     private var badgeText: String {
@@ -1054,6 +1079,19 @@ struct DraftView: View {
     /// arrives through the unified input row below.
     private var newMailForm: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if !attachmentUploadIDs.isEmpty {
+                HStack(spacing: 8) {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("\(attachmentUploadIDs.count) photo\(attachmentUploadIDs.count == 1 ? "" : "s") will be attached — add a recipient, then speak or type an optional note below.")
+                        .font(.footnote)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .foregroundStyle(scarletRose)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(scarletRose.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
+            }
             TextField("To — a name or an email address…", text: $newTo)
                 .textInputAutocapitalization(.words)
                 .autocorrectionDisabled()
@@ -1188,7 +1226,12 @@ struct DraftView: View {
 
     private var canSendInput: Bool {
         let text = revisionText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
+        // Photo forward with a recipient but no typed note is valid — the server
+        // writes a short cover note and attaches the photo(s). Everything else
+        // needs some text to act on.
+        let forwardReady = !attachmentUploadIDs.isEmpty && model.draft == nil
+            && !newTo.trimmingCharacters(in: .whitespaces).isEmpty && model.phase == .idle
+        guard !text.isEmpty || forwardReady else { return false }
         if model.draft != nil { return model.phase == .ready }
         // Pre-draft: only channel / new-mail mode can start a compose here
         // (email replies and voice-attach are already in flight on appear).
@@ -1208,7 +1251,9 @@ struct DraftView: View {
         } else if let cs = channelSeed {
             model.startChannelDraft(seed: cs, instruction: text)
         } else {
-            model.startNewMail(recipient: newTo, instruction: text)
+            model.startNewMail(recipient: newTo, instruction: text,
+                               channel: forwardChannel ?? "email_outlook",
+                               attachmentIDs: attachmentUploadIDs)
         }
         revisionText = ""
         revisionFocused = false
