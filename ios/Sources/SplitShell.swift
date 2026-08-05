@@ -36,6 +36,7 @@ struct SplitShell: View {
         case calendar
         case chats
         case library
+        case photos
         case health
         case desk
         case settings
@@ -49,6 +50,7 @@ struct SplitShell: View {
             case .calendar: return "Calendar"
             case .chats: return "Chats"
             case .library: return "Library"
+            case .photos: return "Photos"
             case .health: return "Health"
             case .desk: return "Desk"
             case .settings: return "Settings"
@@ -63,6 +65,7 @@ struct SplitShell: View {
             case .calendar: return "calendar"
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .library: return "books.vertical.fill"
+            case .photos: return "photo.on.rectangle.angled"
             case .health: return "heart.fill"
             case .desk: return "checklist"
             case .settings: return "gearshape.fill"
@@ -77,9 +80,10 @@ struct SplitShell: View {
             case .calendar: return "3"
             case .chats: return "4"
             case .library: return "5"
-            case .health: return "6"
-            case .desk: return "7"
-            case .settings: return "8"
+            case .photos: return "6"
+            case .health: return "7"
+            case .desk: return "8"
+            case .settings: return "9"
             }
         }
     }
@@ -97,7 +101,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .library, .health, .desk]
+        [.talk, .inbox, .calendar, .chats, .library, .photos, .health, .desk]
     }
 
     var body: some View {
@@ -233,6 +237,10 @@ struct SplitShell: View {
         case .library:
             // Self-contained NavigationStack (shelves + viewers).
             LibraryView()
+                .environmentObject(convo)
+        case .photos:
+            // Self-contained NavigationStack (grid + in-column full-screen viewer).
+            PhotosView()
                 .environmentObject(convo)
         case .health:
             HealthView()

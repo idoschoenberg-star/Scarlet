@@ -251,9 +251,12 @@ struct LibraryView: View {
     @StateObject private var model = LibraryModel()
     @EnvironmentObject private var convo: Conversation
 
-    /// ONE sheet driver for every viewer (photo, video/audio, QuickLook doc,
-    /// web). SwiftUI/Mac Catalyst supports only one sheet per view; four stacked
-    /// `.sheet(item:)` modifiers crash the Mac on tapping an item. Enum-driven.
+    /// ONE presentation driver for every viewer. The photo, video/audio, and
+    /// web viewers now PUSH into the detail column (navigationDestination) so
+    /// the Scarlet sidebar stays reachable; QuickLook (`.file`) is inherently
+    /// modal and stays the SINGLE `.sheet`. SwiftUI/Mac Catalyst supports only
+    /// one sheet per view — stacking sheets crashes the Mac — so exactly one
+    /// case stays a sheet and the rest become pushes. Enum-driven.
     enum LibrarySheet: Identifiable {
         case photo(WAPhotoItem), video(WAVideoItem), file(PreviewFile), web(LibraryWebItem)
         var id: String {
@@ -302,20 +305,50 @@ struct LibraryView: View {
             .onChange(of: model.shelf) { _, _ in
                 convo.setFocus(browsingFocus)
             }
-            // ONE sheet for every viewer kind (see LibrarySheet).
+            // Photo / video / web viewers PUSH into the detail column (not
+            // window-covering sheets) so the Scarlet sidebar stays reachable
+            // while a deliverable is open — the CalendarView fix, applied here.
+            // On pop, restore the browsing focus. isPresented (not item:)
+            // because the viewer items aren't Hashable and this stays
+            // iOS-16-safe.
             .reportsModalPresence(activeSheet != nil)
-            .sheet(item: $activeSheet, onDismiss: { restoreBrowsingFocus() }) { sheet in
-                switch sheet {
+            .navigationDestination(isPresented: Binding(
+                get: {
+                    switch activeSheet {
+                    case .photo, .video, .web: return true
+                    default: return false
+                    }
+                },
+                set: { if !$0 {
+                    restoreBrowsingFocus()
+                    activeSheet = nil
+                } }
+            )) {
+                switch activeSheet {
                 case .photo(let item):
                     WAPhotoView(item: item)
                 case .video(let item):
                     WAVideoView(item: item)
-                case .file(let file):
-                    QuickLookPreview(url: file.url)
-                        .ignoresSafeArea()
                 case .web(let item):
                     LibraryWebSheet(item: item)
                         .preferredColorScheme(.dark)
+                default:
+                    EmptyView()
+                }
+            }
+            // QuickLook is inherently modal — it stays the SINGLE `.sheet` on
+            // this view (Mac Catalyst allows only one). A derived binding
+            // surfaces only the `.file` case; every other case drives the push
+            // above instead of ever reaching this sheet.
+            .sheet(item: Binding<LibrarySheet?>(
+                get: { if case .file = activeSheet { return activeSheet } else { return nil } },
+                set: { newValue in
+                    if newValue == nil, case .file = activeSheet { activeSheet = nil }
+                }
+            ), onDismiss: { restoreBrowsingFocus() }) { sheet in
+                if case .file(let file) = sheet {
+                    QuickLookPreview(url: file.url)
+                        .ignoresSafeArea()
                 }
             }
             .confirmationDialog(
@@ -735,30 +768,50 @@ struct LibraryWebItem: Identifiable {
     var id: String { url.absoluteString }
 }
 
-/// The in-app browser sheet: WKWebView inside a NavigationStack with a Done
-/// button and a Share link — html pages and external links stay in the app
-/// instead of bouncing out to Safari.
+/// The in-app browser: a WKWebView pushed into the Library's NavigationStack
+/// with a drawn Back button and a Share link — html pages and external links
+/// stay in the app instead of bouncing out to Safari.
 struct LibraryWebSheet: View {
     let item: LibraryWebItem
     @Environment(\.dismiss) private var dismiss
 
+    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
+
     var body: some View {
-        NavigationStack {
+        // Pushed into the Library's NavigationStack (not a sheet): the list
+        // root hides the system nav bar app-wide and Mac Catalyst has no
+        // edge-swipe-back, so we draw the way back (and the Share action)
+        // ourselves — the app-wide reader pattern.
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button { dismiss() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("Library").font(.subheadline.weight(.semibold))
+                    }
+                    .foregroundStyle(scarletRose)
+                }
+                Spacer(minLength: 8)
+                Text(item.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 8)
+                ShareLink(item: item.url) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(scarletRose)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
             LibraryWebView(url: item.url, forceHTML: item.forceHTML)
                 .ignoresSafeArea(edges: .bottom)
-                .navigationTitle(item.title)
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") { dismiss() }
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        ShareLink(item: item.url) {
-                            Image(systemName: "square.and.arrow.up")
-                        }
-                    }
-                }
         }
+        .background(Color.black.ignoresSafeArea())
     }
 }
 

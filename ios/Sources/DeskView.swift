@@ -679,9 +679,11 @@ struct DeskView: View {
     /// Non-nil presents the standard drafting window (DraftView) seeded for
     /// a Desk channel: "apple_note" from the Notes compose button,
     /// "reminder" from the dictate button beside the quick-add bar.
-    /// ONE sheet driver — the note reader OR the drafting window. Two stacked
-    /// `.sheet(item:)` modifiers crash Mac Catalyst; a single enum-driven sheet
-    /// is safe.
+    /// ONE presentation driver. The `.note` case now PUSHES a reader into the
+    /// detail column (navigationDestination) so the Scarlet sidebar stays
+    /// reachable; the `.draft` case is the SINGLE `.sheet` on this view. Two
+    /// stacked `.sheet(item:)` modifiers crash Mac Catalyst, so exactly one
+    /// stays a sheet and the note reader becomes a push.
     enum DeskSheet: Identifiable {
         case note(DeskNote), draft(ChannelDraftSeed)
         var id: String {
@@ -738,19 +740,45 @@ struct DeskView: View {
             .onChange(of: addFocused) { _, focused in
                 if focused { convo.beginTyping() } else { convo.endTyping() }
             }
-            // ONE sheet (see DeskSheet): the note reader or the drafting window.
-            // On dismiss, restore focus and refresh so an approved note/reminder
-            // shows right away.
+            // The note reader now PUSHES into the detail column (not a
+            // window-covering sheet) so the Scarlet sidebar stays reachable
+            // while a note is open — the CalendarView fix, applied here. On
+            // pop, restore focus and refresh so an approved note shows right
+            // away. isPresented (not item:) because DeskNote isn't Hashable
+            // and this stays iOS-16-safe.
             .reportsModalPresence(activeSheet != nil)
-            .sheet(item: $activeSheet, onDismiss: {
+            .navigationDestination(isPresented: Binding(
+                get: { if case .note = activeSheet { return true } else { return false } },
+                set: { if !$0 {
+                    restoreBrowsingFocus()
+                    activeSheet = nil
+                    Task { await model.load() }
+                } }
+            )) {
+                if case .note(let note) = activeSheet {
+                    DeskNoteSheet(note: note)
+                        // Mac Catalyst drops @EnvironmentObject across the
+                        // navigation boundary; re-inject to match the app-wide
+                        // push pattern (harmless even though the reader is
+                        // self-contained today).
+                        .environmentObject(convo)
+                        .preferredColorScheme(.dark)
+                }
+            }
+            // The drafting window stays a sheet — the SINGLE remaining `.sheet`
+            // on this view (Mac Catalyst allows only one). A derived binding
+            // surfaces only the `.draft` case, so the `.note` case drives the
+            // push above instead of ever reaching this sheet.
+            .sheet(item: Binding<DeskSheet?>(
+                get: { if case .draft = activeSheet { return activeSheet } else { return nil } },
+                set: { newValue in
+                    if newValue == nil, case .draft = activeSheet { activeSheet = nil }
+                }
+            ), onDismiss: {
                 restoreBrowsingFocus()
                 Task { await model.load() }
             }) { sheet in
-                switch sheet {
-                case .note(let note):
-                    DeskNoteSheet(note: note)
-                        .preferredColorScheme(.dark)
-                case .draft(let seed):
+                if case .draft(let seed) = sheet {
                     DraftView(seed: nil, channelSeed: seed)
                         .environmentObject(convo)
                         .preferredColorScheme(.dark)
@@ -1341,7 +1369,25 @@ struct DeskNoteSheet: View {
     @State private var errorText = ""
 
     var body: some View {
-        NavigationStack {
+        // Pushed into the Desk's NavigationStack (not a sheet), so it draws
+        // its own way back: the list root hides the system nav bar app-wide
+        // and Mac Catalyst has no edge-swipe-back, so the only reliable exit is
+        // one we draw ourselves — the app-wide reader pattern (Inbox/Calendar).
+        VStack(spacing: 0) {
+            HStack {
+                Button { dismiss() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("Desk").font(.subheadline.weight(.semibold))
+                    }
+                    .foregroundStyle(DeskUI.yellow)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 4)
             Group {
                 if loading {
                     VStack(spacing: 10) {
@@ -1359,15 +1405,9 @@ struct DeskNoteSheet: View {
                     reader
                 }
             }
-            .background(DeskUI.background.ignoresSafeArea())
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
-                        .tint(DeskUI.yellow)
-                }
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(DeskUI.background.ignoresSafeArea())
         .task { await load() }
     }
 
