@@ -366,12 +366,34 @@ final class InboxModel: ObservableObject {
         }
     }
 
+    /// A message the reader couldn't open, with the server's specific reason —
+    /// `moved` marks the common case (the Graph id rotated when the mail was
+    /// archived/filed elsewhere), which the reader answers by refreshing the list.
+    struct MailReadError: LocalizedError {
+        let userMessage: String
+        let moved: Bool
+        var errorDescription: String? { userMessage }
+    }
+
     /// Opens a message. Graph ids carry `+ / =` and friends, so the id is
     /// percent-encoded down to alphanumerics before it rides the query string.
     func read(id: String) async throws -> MailDetail {
         let encoded = id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id
-        let data = try await Self.request("op=mailread&id=\(encoded)", method: "GET")
-        let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+        // Do the request inline (not via `request()`) so a non-2xx body can be
+        // read — the server returns a SPECIFIC reason ("message_moved" when the
+        // Graph id rotated) that the reader shows instead of a blanket error.
+        guard let url = URL(string: "\(AppConfig.apiBase)/app-api?op=mailread&id=\(encoded)") else {
+            throw URLError(.badURL)
+        }
+        var req = URLRequest(url: url)
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            throw MailReadError(
+                userMessage: (obj["message"] as? String) ?? "Couldn't open this message.",
+                moved: (obj["error"] as? String) == "message_moved")
+        }
         let attachments: [MailAttachment] = ((obj["attachments"] as? [[String: Any]]) ?? [])
             .compactMap { a in
                 guard let aid = a["id"] as? String, !aid.isEmpty else { return nil }
@@ -982,6 +1004,9 @@ struct MailDetailView: View {
 
     @State private var detail: MailDetail?
     @State private var failed = false
+    /// The specific reason the message wouldn't open (from the server), shown in
+    /// place of the old blanket line. Empty → fall back to the generic message.
+    @State private var failureText = ""
     @State private var showRecipients = false
     /// Attachment currently downloading (its chip swaps icon → spinner).
     @State private var downloadingAttachmentId: String?
@@ -1090,7 +1115,14 @@ struct MailDetailView: View {
     private func fetch() async {
         do {
             detail = try await model.read(id: message.id)
+        } catch let e as InboxModel.MailReadError {
+            failureText = e.userMessage
+            failed = true
+            // The id rotated because the mail moved/was archived elsewhere —
+            // refresh the list so the stale row (and its dead id) disappears.
+            if e.moved { await model.load() }
         } catch {
+            failureText = ""
             failed = true
         }
     }
@@ -1382,10 +1414,13 @@ struct MailDetailView: View {
             MailBodyView(html: detail.html)
         } else if failed {
             VStack(spacing: 12) {
-                Text("Couldn't open this message.")
+                Text(failureText.isEmpty ? "Couldn't open this message." : failureText)
                     .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
                 Button("Try again") {
                     failed = false
+                    failureText = ""
                     Task { await fetch() }
                 }
                 .buttonStyle(.bordered)
