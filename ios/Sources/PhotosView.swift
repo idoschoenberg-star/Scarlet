@@ -263,13 +263,13 @@ struct PhotosView: View {
             // Channel picker for a multi-select forward.
             .confirmationDialog("Forward \(selection.count) photo\(selection.count == 1 ? "" : "s")",
                                 isPresented: $showChannelDialog, titleVisibility: .visible) {
+                Button("WhatsApp") { beginForward(channel: "whatsapp") }
+                Button("iMessage") { beginForward(channel: "imessage") }
                 Button("Amwell email") { beginForward(channel: "email_outlook") }
                 Button("Gmail") { beginForward(channel: "email_gmail") }
-                Button("WhatsApp — not yet", role: .none) {}
-                    .disabled(true)
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("WhatsApp photo send isn't wired through the Mac bridge yet — use email for now.")
+                Text("The draft opens next — add a note or just send with no text.")
             }
             .sheet(item: $forwardRequest) { req in
                 DraftView(seed: nil, forwardChannel: req.channel,
@@ -815,12 +815,13 @@ struct PhotoPagerView: View {
         }
         .confirmationDialog("Forward this photo", isPresented: $showChannelDialog,
                             titleVisibility: .visible) {
+            Button("WhatsApp") { beginForward(channel: "whatsapp") }
+            Button("iMessage") { beginForward(channel: "imessage") }
             Button("Amwell email") { beginForward(channel: "email_outlook") }
             Button("Gmail") { beginForward(channel: "email_gmail") }
-            Button("WhatsApp — not yet", role: .none) {}.disabled(true)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("WhatsApp photo send isn't wired through the Mac bridge yet — use email for now.")
+            Text("The draft opens next — add a note or just send with no text.")
         }
         .sheet(item: $forwardRequest) { req in
             DraftView(seed: nil, forwardChannel: req.channel,
@@ -1069,6 +1070,8 @@ func handleSendPhotos(_ params: [String: Any]) async -> String {
     var channel = (params["channel"] as? String ?? "email_outlook").lowercased()
     if ["email", "outlook", "amwell"].contains(channel) { channel = "email_outlook" }
     if channel == "gmail" { channel = "email_gmail" }
+    if ["whatsapp", "wa", "whats app"].contains(channel) { channel = "whatsapp" }
+    if ["imessage", "message", "messages", "text", "sms"].contains(channel) { channel = "imessage" }
     let place = (params["place"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let limitRaw = (params["limit"] as? Int) ?? Int((params["limit"] as? String) ?? "") ?? 20
     let limit = min(max(limitRaw, 1), 30)
@@ -1090,10 +1093,12 @@ func handleSendPhotos(_ params: [String: Any]) async -> String {
         return j(["ok": false, "reason": "no_matches", "found": 0,
                   "note": "No photos matched that place/time. Tell Ido nothing was found."])
     }
-    if channel == "whatsapp" || channel == "imessage" {
-        let ch = channel == "whatsapp" ? "WhatsApp" : "iMessage"
-        return j(["ok": false, "reason": "channel_media_unsupported", "found": assets.count, "channel": channel,
-                  "note": "Found \(assets.count) photos, but \(ch) photo sending isn't wired yet. Offer to EMAIL them to \(recipient) — call send_photos again with channel email_outlook or email_gmail."])
+    // Email, WhatsApp, and iMessage all carry photos now. Teams can't yet —
+    // refuse honestly and offer another channel.
+    let supported = ["email_outlook", "email_gmail", "whatsapp", "imessage"]
+    if !supported.contains(channel) {
+        return j(["ok": false, "reason": "channel_unsupported", "found": assets.count, "channel": channel,
+                  "note": "Found \(assets.count) photos, but \(channel) photo sending isn't available yet. Offer WhatsApp, iMessage, or email to \(recipient)."])
     }
 
     var ids: [String] = []
