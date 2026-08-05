@@ -526,7 +526,10 @@ struct PhotosView: View {
         let chosen = model.assets.filter { selection.contains($0.localIdentifier) }
         guard !chosen.isEmpty else { return }
         busy = true
-        Task {
+        // @MainActor: this Task mutates @State and drives .sheet presentation
+        // after its awaits — those MUST land on the main thread (the heavy JPEG
+        // encode still runs off-main inside the nonisolated PhotoUploader.upload).
+        Task { @MainActor in
             var ids: [String] = []
             var firstError: String?
             for asset in chosen {
@@ -615,7 +618,9 @@ struct PhotoThumbnail: View {
         requestID = imageManager.requestImage(
             for: asset, targetSize: target, contentMode: .aspectFill, options: options
         ) { result, _ in
-            if let result { self.image = result }
+            // PHImageManager doesn't guarantee a main-thread callback — hop before
+            // touching @State.
+            if let result { DispatchQueue.main.async { self.image = result } }
         }
     }
 }
@@ -696,9 +701,12 @@ struct PhotoPage: View {
         fast.resizeMode = .fast
         imageManager.requestImage(for: asset, targetSize: target,
                                   contentMode: .aspectFit, options: fast) { result, info in
-            if let result, self.image == nil {
-                self.image = result
-                self.degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? true
+            // PHImageManager may call back off-main — hop before touching @State.
+            DispatchQueue.main.async {
+                if let result, self.image == nil {
+                    self.image = result
+                    self.degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? true
+                }
             }
         }
 
@@ -710,14 +718,17 @@ struct PhotoPage: View {
         imageManager.requestImage(for: asset, targetSize: target,
                                   contentMode: .aspectFit, options: hi) { result, info in
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-            if let result {
-                self.image = result
-                if !isDegraded { self.degraded = false; self.hiResUnavailable = false }
-            } else if info?[PHImageErrorKey] != nil {
-                // The original couldn't be reached. If we have the fast copy,
-                // keep showing it and say so; otherwise it's a hard failure.
-                if self.image == nil { self.failed = true }
-                else { self.hiResUnavailable = true }
+            // PHImageManager may call back off-main — hop before touching @State.
+            DispatchQueue.main.async {
+                if let result {
+                    self.image = result
+                    if !isDegraded { self.degraded = false; self.hiResUnavailable = false }
+                } else if info?[PHImageErrorKey] != nil {
+                    // The original couldn't be reached. If we have the fast copy,
+                    // keep showing it and say so; otherwise it's a hard failure.
+                    if self.image == nil { self.failed = true }
+                    else { self.hiResUnavailable = true }
+                }
             }
         }
     }
@@ -877,7 +888,8 @@ struct PhotoPagerView: View {
     private func beginForward(channel: String) {
         let asset = currentAsset
         busy = true; busyLabel = "Uploading…"
-        Task {
+        // @MainActor: mutates @State + drives .sheet after awaits — must be main.
+        Task { @MainActor in
             guard let img = await PhotosModel.fullImage(for: asset, manager: imageManager) else {
                 busy = false
                 errorText = "That photo's original couldn't be downloaded (it may be in iCloud and offline)."
@@ -901,7 +913,8 @@ struct PhotoPagerView: View {
     private func askScarlet() {
         let asset = currentAsset
         busy = true; busyLabel = "Sharing with Scarlet…"
-        Task {
+        // @MainActor: mutates @State + calls convo (main-actor) after awaits.
+        Task { @MainActor in
             guard let img = await PhotosModel.fullImage(for: asset, manager: imageManager) else {
                 busy = false
                 errorText = "That photo's original couldn't be downloaded (it may be in iCloud and offline)."
