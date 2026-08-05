@@ -39,6 +39,16 @@ final class Conversation: ObservableObject {
     /// reference to this live instance.
     @Published var inputLevel: Float = 0
 
+    /// She has heard him and is composing a reply — the beat between his words
+    /// ending and her voice starting. Drives the orb's "thinking" shimmer. Set
+    /// when a user turn lands, cleared the instant her audio begins.
+    @Published var thinking = false
+
+    /// Manual barge-in latch: true from the moment he taps the orb to cut her
+    /// off until his NEXT turn lands. While set, her already-in-flight audio is
+    /// dropped so a half-sent response can't keep talking over him.
+    private var barged = false
+
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
@@ -143,6 +153,7 @@ final class Conversation: ObservableObject {
         reconnectAttempts = 0   // fresh session — start the backoff ladder over
         self.token = token
         wantLive = true
+        barged = false; thinking = false
         state = .connecting
         status = "Waking her up…"   // don't leave the stale "Ended." line up during connect
         Task { await connect() }
@@ -158,8 +169,24 @@ final class Conversation: ObservableObject {
         ws = nil
         stopAudio()
         endBackgroundAssertion()
+        barged = false; thinking = false
         state = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
+    }
+
+    /// Barge-in: cut her off mid-sentence. Tapping the orb while she's speaking
+    /// silences her instantly (flushPlayback stops the player AND clears the echo
+    /// gate, so the mic reopens right away), latches `barged` so any audio still
+    /// arriving for the killed turn is dropped until he speaks again, and pings
+    /// the agent that the user is taking the floor. No-op unless she's audibly
+    /// talking, so an accidental tap in silence does nothing.
+    func interrupt() {
+        guard state == .speaking else { return }
+        barged = true
+        thinking = false
+        flushPlayback()                     // instant silence + echo gate cleared + → listening
+        send(["type": "user_activity"])     // ElevenLabs: the user is active now
+        if micOn { status = "Go ahead — I'm listening…" }
     }
 
     // MARK: background survival (locked screen in the car)
@@ -288,6 +315,10 @@ final class Conversation: ObservableObject {
     /// once from `connect()`. Confined to the main actor, so enqueue and flush
     /// can't race, and an already-live send is never also queued (no double-send).
     private func deliverUserMessage(_ text: String) {
+        // A user/system turn is going out — she'll be composing a reply. Release
+        // any barge-in latch so her answer can play, and light "thinking".
+        barged = false
+        thinking = true
         switch state {
         case .listening, .speaking:
             send(["type": "user_message", "text": text])
@@ -407,6 +438,11 @@ final class Conversation: ObservableObject {
             task.resume()
             send(["type": "conversation_initiation_client_data"])
             listen()
+            // A reconnect is a brand-new socket: never carry a barge-in latch or
+            // a "thinking" flag across it, or her resumed speech would be dropped
+            // by playPCM's `barged` gate (silent, until he happens to speak) and
+            // the orb could shimmer forever. Same reset start() does.
+            barged = false; thinking = false
             state = .listening
             status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
             // A fresh socket knows nothing about the screen — replay the
@@ -534,13 +570,24 @@ final class Conversation: ObservableObject {
         case "user_transcript":
             if let x = ev["user_transcription_event"] as? [String: Any],
                let t = (x["user_transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !t.isEmpty { transcript.append(.init(text: t, fromHer: false)) }
+               !t.isEmpty {
+                transcript.append(.init(text: t, fromHer: false))
+                // His turn has landed: release any barge-in latch (her NEW reply
+                // may now play) and light the "thinking" state until she speaks.
+                barged = false
+                thinking = true
+            }
         case "interruption":
             flushPlayback()
+            thinking = false
         case "ping":
             let id = (ev["ping_event"] as? [String: Any])?["event_id"]
             send(["type": "pong", "event_id": id as Any])
         case "client_tool_call":
+            // A tool turn is an observable response — the "thinking" beat is over.
+            // Clearing it here also stops the orb shimmering forever on a silent
+            // tool action that never produces audio (e.g. opening a draft window).
+            thinking = false
             if let c = ev["client_tool_call"] as? [String: Any] { runTool(c) }
         default: break
         }
@@ -846,8 +893,13 @@ final class Conversation: ObservableObject {
     }
 
     private func playPCM(base64: String) {
+        // He just barged in — drop the tail of the killed turn so her voice
+        // can't crawl back over him. Cleared when his next turn lands.
+        if barged { return }
         guard let data = Data(base64Encoded: base64),
               let fmt = playFormat else { return }
+        // Her audio has begun — she's no longer "thinking".
+        thinking = false
         let frames = AVAudioFrameCount(data.count / 2)
         guard frames > 0, let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames),
               let ch = buf.floatChannelData else { return }
@@ -884,6 +936,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        thinking = false
         state = .listening
         if micOn { status = "Listening…" }
     }

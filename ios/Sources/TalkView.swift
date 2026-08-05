@@ -12,6 +12,21 @@ struct TalkView: View {
     /// The orb yields space to the transcript while he's typing/dictating.
     private var orbSize: CGFloat { typeFocused ? 110 : 200 }
 
+    /// The orb's visual state, derived from the conversation. `youTalk` fires
+    /// when his mic level crosses a small threshold while she's not speaking, so
+    /// the orb visibly answers his voice; `thinking` is the beat after his words
+    /// land, before hers begin.
+    private var orbMode: OrbMode {
+        switch convo.state {
+        case .idle:       return .asleep
+        case .connecting: return .connecting
+        case .speaking:   return .sheTalk
+        case .listening:
+            if convo.thinking { return .thinking }
+            return convo.inputLevel > 0.12 ? .youTalk : .listening
+        }
+    }
+
     var body: some View {
         VStack(spacing: 20) {
             ZStack {
@@ -38,19 +53,34 @@ struct TalkView: View {
 
             // The orb shrinks the moment the keyboard is up, so her written
             // reply always has room — the whole point of "answering silently".
-            Orb(active: convo.state == .speaking)
+            // It is also a live state machine: asleep → listening → (his voice
+            // moves it) → thinking → she speaks — and while she speaks it's the
+            // barge-in button.
+            Orb(mode: orbMode, level: CGFloat(min(max(convo.inputLevel, 0), 1)))
                 .frame(width: orbSize, height: orbSize)
                 .animation(.easeInOut(duration: 0.25), value: typeFocused)
-                // The orb IS the Scarlet button: tapping it while idle wakes her.
+                // The orb IS the Scarlet button: tap wakes her when asleep, and
+                // cuts her off when she's mid-sentence (barge-in).
                 .onTapGesture {
-                    if convo.state == .idle {
+                    switch convo.state {
+                    case .idle:
                         convo.hasAutoStarted = true
                         convo.start(token: TokenStore.token ?? "")
+                    case .speaking:
+                        convo.interrupt()
+                    default:
+                        break
                     }
                 }
 
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
+            // Discoverability for barge-in — only while she's actually talking.
+            if convo.state == .speaking {
+                Text("tap the orb to interrupt")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.4))
+            }
 
             // Her reply lives here — always a real, readable, scrollable area
             // (never squeezed to nothing), and it takes any spare height so a
@@ -141,20 +171,89 @@ struct TalkView: View {
 
 // MARK: - Small building blocks
 
+/// The orb's five living states. Kept out of Conversation so the view owns its
+/// own presentation; TalkView maps conversation state → this.
+enum OrbMode: Equatable { case asleep, connecting, thinking, listening, youTalk, sheTalk }
+
+/// A breathing, voice-reactive orb. In any given mode exactly one scale input
+/// varies — the slow breathe (most modes) OR his live mic level (`youTalk`) —
+/// so the two never fight and the repeatForever animation stays smooth. Colors,
+/// glow and breathing tempo all shift with the state; a soft rotating sheen
+/// marks "thinking". Everything stays in the scarlet family.
 struct Orb: View {
-    var active: Bool
+    var mode: OrbMode
+    var level: CGFloat            // 0…1 live mic level
     @State private var breathe = false
+    @State private var spin = false
+
+    private var core: Color {
+        switch mode {
+        case .asleep:     return Color(red: 0.45, green: 0.12, blue: 0.18)
+        case .connecting: return Color(red: 0.85, green: 0.28, blue: 0.38)
+        case .thinking:   return Color(red: 0.90, green: 0.30, blue: 0.42)
+        case .listening:  return Color(red: 1.00, green: 0.32, blue: 0.42)
+        case .youTalk:    return Color(red: 1.00, green: 0.44, blue: 0.54)
+        case .sheTalk:    return Color(red: 1.00, green: 0.28, blue: 0.40)
+        }
+    }
+    private var glow: CGFloat {
+        switch mode {
+        case .asleep:                 return 14
+        case .connecting, .thinking:  return 26
+        case .listening:              return 24
+        case .youTalk:                return 28 + level * 34   // his voice brightens it
+        case .sheTalk:                return 44
+        }
+    }
+    /// The breathing amplitude. youTalk stays flat (1.0) because his mic level
+    /// drives the motion there instead — so only one factor is ever animated.
+    private var breatheScale: CGFloat {
+        switch mode {
+        case .asleep:  return 1.03
+        case .sheTalk: return 1.09
+        case .youTalk: return 1.0
+        default:       return 1.05
+        }
+    }
+    private var breatheDuration: Double {
+        switch mode {
+        case .asleep:                            return 3.2
+        case .connecting, .thinking, .listening: return 2.0
+        case .youTalk:                           return 0.8
+        case .sheTalk:                           return 0.5
+        }
+    }
+    /// His voice visibly moves the orb (youTalk only; 1.0 everywhere else).
+    private var reactiveScale: CGFloat { mode == .youTalk ? 1.0 + level * 0.35 : 1.0 }
+
     var body: some View {
-        Circle()
-            .fill(RadialGradient(colors: [Color(red: 1, green: 0.3, blue: 0.41),
-                                          Color(red: 0.27, green: 0.03, blue: 0.10)],
-                                 center: .init(x: 0.35, y: 0.3), startRadius: 8, endRadius: 160))
-            .shadow(color: Color(red: 1, green: 0.3, blue: 0.41).opacity(active ? 0.6 : 0.3),
-                    radius: active ? 40 : 22)
-            .scaleEffect(breathe ? 1.05 : 1.0)
-            .animation(.easeInOut(duration: active ? 0.6 : 2.2).repeatForever(autoreverses: true),
-                       value: breathe)
-            .onAppear { breathe = true }
+        ZStack {
+            // Outer halo — always breathing, brightens with the state.
+            Circle()
+                .fill(RadialGradient(colors: [core.opacity(0.34), .clear],
+                                     center: .center, startRadius: 2, endRadius: 150))
+                .scaleEffect(breathe ? 1.14 : 0.96)
+            // The orb body.
+            Circle()
+                .fill(RadialGradient(colors: [core, Color(red: 0.20, green: 0.02, blue: 0.07)],
+                                     center: .init(x: 0.35, y: 0.3), startRadius: 8, endRadius: 160))
+                .overlay(
+                    // Thinking sheen: a faint rotating highlight while she composes.
+                    Circle()
+                        .fill(AngularGradient(
+                            colors: [.clear, .white.opacity(mode == .thinking ? 0.20 : 0), .clear],
+                            center: .center))
+                        .rotationEffect(.degrees(spin ? 360 : 0))
+                        .blendMode(.plusLighter)
+                )
+                .shadow(color: core.opacity(0.6), radius: glow)
+                .scaleEffect((breathe ? breatheScale : 1.0) * reactiveScale)
+        }
+        .animation(.easeInOut(duration: breatheDuration).repeatForever(autoreverses: true), value: breathe)
+        .animation(.easeOut(duration: 0.12), value: level)
+        .animation(.easeInOut(duration: 0.4), value: mode)
+        .animation(.linear(duration: 3).repeatForever(autoreverses: false), value: spin)
+        .onAppear { breathe = true; spin = true }
     }
 }
 
