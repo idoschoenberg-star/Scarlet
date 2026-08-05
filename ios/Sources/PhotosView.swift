@@ -689,7 +689,7 @@ struct PhotoPage: View {
         let s = UIScreen.main.scale
         let target = CGSize(width: bound.width * s, height: bound.height * s)
 
-        // 1) Instant local copy (no network) — may be degraded or absent.
+        // Step 1 — instant local copy, no network — may be degraded or absent.
         let fast = PHImageRequestOptions()
         fast.deliveryMode = .fastFormat
         fast.isNetworkAccessAllowed = false
@@ -702,7 +702,7 @@ struct PhotoPage: View {
             }
         }
 
-        // 2) Full quality, network allowed — replaces the fast copy when it lands.
+        // Step 2 — full quality, network allowed — replaces the fast copy when it lands.
         let hi = PHImageRequestOptions()
         hi.deliveryMode = .highQualityFormat
         hi.isNetworkAccessAllowed = true

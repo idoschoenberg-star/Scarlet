@@ -95,7 +95,12 @@ for f in files:
             col = m.end() - 1  # index of '('
             while j < len(lines):
                 seg = code_of(lines[j])
-                scan = seg[col+1:] if j == i else seg
+                # Include the opening '(' on the first line so it's COUNTED —
+                # otherwise a multi-line constructor whose first line has no
+                # other paren reads depth 0, the walker thinks the args already
+                # closed, and it misses a `.environmentObject` on a later line
+                # (a false FATAL). Start at col, not col+1.
+                scan = seg[col:] if j == i else seg
                 for ch in scan:
                     if ch == "(":
                         depth += 1
