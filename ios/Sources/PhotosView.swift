@@ -1,3 +1,4 @@
+import CoreLocation
 import Photos
 import SwiftUI
 import UIKit
@@ -999,4 +1000,148 @@ struct FullScreenPager: View {
             .padding(.top, 12)
         }
     }
+}
+
+// MARK: - Natural-language photo dispatch
+// "send the photos from Jerusalem this week to Phyllis" — from any screen, by
+// voice or chat. The voice agent resolves the phrase into {place, since, until,
+// recipient, channel} and calls the send_photos client tool; Conversation.runTool
+// routes it here. Selection runs ON-DEVICE (that's where the library is), the
+// matches upload, and they ride the same photo-attachment draft pipeline the
+// Photos "Forward" button uses. Email works today; WhatsApp/iMessage media is
+// still blocked at the Mac bridge and is refused honestly (never faked).
+
+enum PhotoDispatch {
+    struct Query { var since: Date?; var until: Date?; var place: String?; var limit: Int }
+
+    /// Select images by date range + optional place. One forward-geocode of the
+    /// place → a radius filter over each asset's GPS. Newest first, capped.
+    /// Returns `placeResolved=false` when a place was given but couldn't be
+    /// geocoded (so the caller refuses rather than sending the wrong photos).
+    static func select(_ q: Query) async -> (assets: [PHAsset], placeResolved: Bool) {
+        if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .notDetermined {
+            _ = await withCheckedContinuation { (c: CheckedContinuation<PHAuthorizationStatus, Never>) in
+                PHPhotoLibrary.requestAuthorization(for: .readWrite) { c.resume(returning: $0) }
+            }
+        }
+        let opts = PHFetchOptions()
+        var preds: [NSPredicate] = [NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)]
+        if let s = q.since { preds.append(NSPredicate(format: "creationDate >= %@", s as NSDate)) }
+        if let u = q.until { preds.append(NSPredicate(format: "creationDate <= %@", u as NSDate)) }
+        opts.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: preds)
+        opts.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        let result = PHAsset.fetchAssets(with: opts)
+        var assets: [PHAsset] = []
+        result.enumerateObjects { a, _, _ in assets.append(a) }
+
+        var placeResolved = true
+        if let place = q.place, !place.trimmingCharacters(in: .whitespaces).isEmpty {
+            if let center = await geocode(place) {
+                let radius: CLLocationDistance = 30_000   // ~30 km around the place
+                assets = assets.filter { $0.location.map { $0.distance(from: center) <= radius } ?? false }
+            } else {
+                placeResolved = false
+                assets = []   // can't honor a place we couldn't resolve — empty beats wrong
+            }
+        }
+        return (Array(assets.prefix(max(1, q.limit))), placeResolved)
+    }
+
+    static func geocode(_ place: String) async -> CLLocation? {
+        await withCheckedContinuation { (c: CheckedContinuation<CLLocation?, Never>) in
+            CLGeocoder().geocodeAddressString(place) { marks, _ in
+                c.resume(returning: marks?.first?.location)
+            }
+        }
+    }
+}
+
+/// Execute the send_photos tool on-device and return a compact JSON result the
+/// voice agent reads back. Never sends anything itself — it opens a draft
+/// (email) with the photos attached; Ido approves it like any other draft.
+@MainActor
+func handleSendPhotos(_ params: [String: Any]) async -> String {
+    func j(_ o: [String: Any]) -> String {
+        guard let d = try? JSONSerialization.data(withJSONObject: o) else { return "{}" }
+        return String(data: d, encoding: .utf8) ?? "{}"
+    }
+    let recipient = (params["recipient"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    var channel = (params["channel"] as? String ?? "email_outlook").lowercased()
+    if ["email", "outlook", "amwell"].contains(channel) { channel = "email_outlook" }
+    if channel == "gmail" { channel = "email_gmail" }
+    let place = (params["place"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let limitRaw = (params["limit"] as? Int) ?? Int((params["limit"] as? String) ?? "") ?? 20
+    let limit = min(max(limitRaw, 1), 30)
+    let iso = ISO8601DateFormatter()
+    func parse(_ v: Any?) -> Date? { (v as? String).flatMap { iso.date(from: $0) } }
+    let since = parse(params["since"]); let until = parse(params["until"])
+
+    guard !recipient.isEmpty else {
+        return j(["ok": false, "reason": "no_recipient", "note": "Ask Ido who to send them to."])
+    }
+
+    let (assets, placeResolved) = await PhotoDispatch.select(
+        .init(since: since, until: until, place: place, limit: limit))
+    if let place, !place.isEmpty, !placeResolved {
+        return j(["ok": false, "reason": "place_unresolved",
+                  "note": "Couldn't locate '\(place)'. Ask Ido to name the place differently, or drop it."])
+    }
+    if assets.isEmpty {
+        return j(["ok": false, "reason": "no_matches", "found": 0,
+                  "note": "No photos matched that place/time. Tell Ido nothing was found."])
+    }
+    if channel == "whatsapp" || channel == "imessage" {
+        let ch = channel == "whatsapp" ? "WhatsApp" : "iMessage"
+        return j(["ok": false, "reason": "channel_media_unsupported", "found": assets.count, "channel": channel,
+                  "note": "Found \(assets.count) photos, but \(ch) photo sending isn't wired yet. Offer to EMAIL them to \(recipient) — call send_photos again with channel email_outlook or email_gmail."])
+    }
+
+    var ids: [String] = []
+    for a in assets {
+        if let img = await PhotosModel.fullImage(for: a, manager: PHImageManager.default()),
+           let up = try? await PhotoUploader.upload(image: img) {
+            ids.append(up.id)
+        }
+    }
+    if ids.isEmpty {
+        return j(["ok": false, "reason": "upload_failed",
+                  "note": "Couldn't upload the photos — check the connection and try again."])
+    }
+
+    guard let draftId = await composePhotoDraft(channel: channel, recipient: recipient, uploadIDs: ids) else {
+        return j(["ok": false, "reason": "compose_failed", "note": "Couldn't open the draft — try again."])
+    }
+    // Open the draft window now (the app's backstop poll is the fallback).
+    NotificationCenter.default.post(name: .scarletVoiceDraftIntent,
+        object: ["channel": channel, "recipient": recipient, "instruction": ""])
+    NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
+
+    let n = ids.count
+    let tail = channel == "email_outlook"
+        ? "Amwell is drafts-only — he taps Send in the window."
+        : "He says 'send it' or taps Send."
+    return j(["ok": true, "found": n, "channel": channel, "recipient": recipient,
+              "note": "Drafted \(n) photo\(n == 1 ? "" : "s") to \(recipient) with them attached; the window is open. \(tail)"])
+}
+
+/// POST op=draft_compose with the uploaded photos as attachments → draft id.
+private func composePhotoDraft(channel: String, recipient: String, uploadIDs: [String]) async -> String? {
+    var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+    var q = comps.queryItems ?? []
+    q.append(URLQueryItem(name: "op", value: "draft_compose"))
+    comps.queryItems = q
+    var req = URLRequest(url: comps.url ?? AppConfig.appAPIURL)
+    req.httpMethod = "POST"
+    req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    let body: [String: Any] = [
+        "channel": channel, "recipient": recipient,
+        "instruction": "Write a brief, warm cover note from Ido to accompany the attached photos.",
+        "attachment_upload_ids": uploadIDs,
+    ]
+    req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+    guard let (data, _) = try? await URLSession.shared.data(for: req),
+          let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+          let id = obj["draft_id"] as? String, !id.isEmpty else { return nil }
+    return id
 }

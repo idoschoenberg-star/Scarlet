@@ -597,6 +597,18 @@ final class Conversation: ObservableObject {
         let name = c["tool_name"] as? String ?? ""
         let callId = c["tool_call_id"] as? String ?? ""
         let params = c["parameters"] as? [String: Any] ?? [:]
+        // send_photos runs ENTIRELY on-device (the photo library lives here): it
+        // selects by place/time, uploads the matches, and opens a draft with them
+        // attached — no server tool handler exists or should. Handle it locally
+        // and return the result to the agent; skip the default server POST.
+        if name == "send_photos" {
+            Task { @MainActor in
+                let out = await handleSendPhotos(params)
+                send(["type": "client_tool_result", "tool_call_id": callId,
+                      "result": String(out.prefix(4000)), "is_error": false])
+            }
+            return
+        }
         // INSTANT WINDOW: the tool arguments are already here, before any
         // network round-trip. For a compose, open the drafting window NOW with
         // his request painted in — recipient, channel, and the instruction she
