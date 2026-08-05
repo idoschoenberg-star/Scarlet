@@ -905,6 +905,14 @@ final class Conversation: ObservableObject {
     }
 
     private func playPCM(base64: String) {
+        // Teardown guard: audio-frame events are dispatched as @MainActor Tasks
+        // from the socket receive loop, so one can still run AFTER end() tore the
+        // session down. Without this, a late frame would restart a just-stopped
+        // engine — player.play() on a non-running engine throws the "IsRunning()"
+        // exception (hard crash), and even when it doesn't it resurrects an ended
+        // session into a phantom "listening" state. end()/stopAudio() clear both
+        // flags synchronously, so any post-teardown frame is dropped here.
+        guard wantLive, audioReady else { return }
         // He just barged in — drop the tail of the killed turn so her voice
         // can't crawl back over him. Cleared when his next turn lands.
         if barged { return }

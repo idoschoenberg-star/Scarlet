@@ -641,6 +641,11 @@ struct PhotoPage: View {
     @State private var failed = false
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
+    // Track in-flight image requests so a recycled page (TabView reuses the view
+    // for a new asset) cancels the previous asset's requests — otherwise a late
+    // callback can paint the OLD photo onto the NEW page.
+    @State private var fastRequestID: PHImageRequestID?
+    @State private var hiRequestID: PHImageRequestID?
 
     var body: some View {
         ZStack {
@@ -689,7 +694,13 @@ struct PhotoPage: View {
     }
 
     private func load() async {
-        // Reset for a recycled page.
+        // Reset for a recycled page. Cancel any in-flight requests from the
+        // page's PREVIOUS asset and clear the stale image, so a late callback
+        // can't paint the old photo here and the fast-path (guarded on image==nil)
+        // actually applies to the new asset.
+        if let fastRequestID { imageManager.cancelImageRequest(fastRequestID) }
+        if let hiRequestID { imageManager.cancelImageRequest(hiRequestID) }
+        image = nil
         scale = 1; lastScale = 1; degraded = false; hiResUnavailable = false; failed = false
         let bound = UIScreen.main.bounds
         let s = UIScreen.main.scale
@@ -700,7 +711,7 @@ struct PhotoPage: View {
         fast.deliveryMode = .fastFormat
         fast.isNetworkAccessAllowed = false
         fast.resizeMode = .fast
-        imageManager.requestImage(for: asset, targetSize: target,
+        fastRequestID = imageManager.requestImage(for: asset, targetSize: target,
                                   contentMode: .aspectFit, options: fast) { result, info in
             // PHImageManager may call back off-main — hop before touching @State.
             DispatchQueue.main.async {
@@ -716,7 +727,7 @@ struct PhotoPage: View {
         hi.deliveryMode = .highQualityFormat
         hi.isNetworkAccessAllowed = true
         hi.resizeMode = .exact
-        imageManager.requestImage(for: asset, targetSize: target,
+        hiRequestID = imageManager.requestImage(for: asset, targetSize: target,
                                   contentMode: .aspectFit, options: hi) { result, info in
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             // PHImageManager may call back off-main — hop before touching @State.
@@ -765,8 +776,15 @@ struct PhotoPagerView: View {
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
+    // Safe anchor index — clamps into range and never yields -1 on an empty
+    // array (assets[min(startIndex, count-1)] would be assets[-1] → crash if this
+    // pager were ever pushed with no assets).
+    private var anchorIndex: Int { assets.isEmpty ? 0 : min(max(startIndex, 0), assets.count - 1) }
+
     private var currentAsset: PHAsset {
-        assets.first { $0.localIdentifier == currentID } ?? assets[min(startIndex, assets.count - 1)]
+        if let hit = assets.first(where: { $0.localIdentifier == currentID }) { return hit }
+        guard !assets.isEmpty else { return PHAsset() }
+        return assets[anchorIndex]
     }
 
     var body: some View {
@@ -788,7 +806,7 @@ struct PhotoPagerView: View {
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
-            if currentID.isEmpty { currentID = assets[min(startIndex, assets.count - 1)].localIdentifier }
+            if currentID.isEmpty, !assets.isEmpty { currentID = assets[anchorIndex].localIdentifier }
             convo.setFocus(photoFocus(currentAsset))
         }
         .onChange(of: currentID) { _, _ in
