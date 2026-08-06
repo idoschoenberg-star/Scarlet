@@ -56,7 +56,9 @@
     display:flex; justify-content:center; gap:8px;
     padding:8px 18px calc(8px + env(safe-area-inset-bottom));
     background:rgba(10,4,6,.72); border-top:1px solid rgba(255,150,160,.12);
-    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px); }
+    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    overflow-x:auto; scrollbar-width:none; }
+  .tabbar::-webkit-scrollbar { display:none; }
   .tab { flex:1; max-width:180px; padding:9px 0 7px; border-radius:14px; border:none; cursor:pointer;
     background:transparent; color:#9b787c; font-family:inherit; font-size:11px; letter-spacing:.1em;
     text-transform:uppercase; font-weight:500; display:flex; flex-direction:column; align-items:center; gap:3px;
@@ -772,6 +774,131 @@
     .sigwrap:hover .rowarch { opacity:1; }
     .chrow, .sig, .fchip, .tab, .calbtn { cursor:pointer; }
   }
+
+  /* ---------- MUSIC view ---------- */
+  #viewMusic { padding-top:0; }
+  .mfeed { flex:1; width:100%; max-width:680px; overflow-y:auto; overscroll-behavior:contain;
+    padding:6px 14px 26px; scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent;
+    -webkit-overflow-scrolling:touch; }
+  .mlabel { font-size:11.5px; letter-spacing:.16em; text-transform:uppercase; color:var(--i1-faint,#9b8285);
+    font-weight:600; margin:20px 4px 10px; }
+  .mlabel:first-child { margin-top:6px; }
+  /* Now-Playing card */
+  .npcard { display:flex; gap:14px; align-items:center; padding:14px; border-radius:20px;
+    background:linear-gradient(135deg, rgba(60,20,30,.6), rgba(30,12,18,.75));
+    border:1px solid rgba(255,150,160,.16); box-shadow:0 8px 30px rgba(0,0,0,.4); }
+  .npart { width:72px; height:72px; min-width:72px; border-radius:14px; object-fit:cover;
+    background:#1a0a0e; box-shadow:0 4px 16px rgba(0,0,0,.5); cursor:pointer; }
+  .npmeta { flex:1; min-width:0; }
+  .nptitle { font-size:16px; font-weight:650; color:#fdeff0; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; }
+  .npartist { font-size:13px; color:#c9a2a4; margin-top:2px; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .npctrls { display:flex; align-items:center; gap:6px; margin-top:9px; }
+  .mctl { width:38px; height:38px; min-width:38px; border-radius:50%; border:1px solid rgba(255,150,160,.2);
+    background:rgba(255,255,255,.06); color:#fdeff0; font-size:16px; display:flex; align-items:center;
+    justify-content:center; cursor:pointer; transition:all .15s; }
+  .mctl:active { transform:scale(.9); }
+  .mctl.play { background:linear-gradient(135deg,#d92446,#8c1130); border-color:transparent;
+    width:44px; height:44px; min-width:44px; font-size:18px; box-shadow:0 5px 18px rgba(210,35,70,.4); }
+  .mvol { flex:1; min-width:60px; margin-left:6px; accent-color:#ff6a86; height:4px; }
+  .npnote { font-size:11px; color:#9c797c; margin-top:9px; line-height:1.5; }
+  /* horizontal playlist rail */
+  .mrail { display:flex; gap:12px; overflow-x:auto; padding:2px 2px 8px; scrollbar-width:none;
+    scroll-snap-type:x mandatory; }
+  .mrail::-webkit-scrollbar { display:none; }
+  .mcard { flex:0 0 auto; width:132px; scroll-snap-align:start; cursor:pointer; }
+  .mcard img { width:132px; height:132px; border-radius:14px; object-fit:cover; background:#1a0a0e;
+    box-shadow:0 5px 18px rgba(0,0,0,.4); display:block; }
+  .mcard .mct { font-size:13px; color:#f4e2e4; margin-top:7px; font-weight:500; unicode-bidi:plaintext;
+    line-height:1.3; overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  .mcard .mcs { font-size:11.5px; color:#a68184; margin-top:1px; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* track rows (library, playlist, search, recent) */
+  .trow { display:flex; align-items:center; gap:11px; padding:9px 8px; border-radius:12px;
+    cursor:pointer; transition:background .12s; }
+  .trow:hover, .trow:active { background:rgba(255,255,255,.05); }
+  .trow img { width:46px; height:46px; min-width:46px; border-radius:9px; object-fit:cover; background:#1a0a0e; }
+  .tmeta { flex:1; min-width:0; }
+  .ttitle { font-size:14.5px; color:#f4e2e4; unicode-bidi:plaintext; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .tsub { font-size:12px; color:#a68184; margin-top:2px; unicode-bidi:plaintext; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .tdur { font-size:12px; color:#8f6f72; flex:none; }
+  .tfwd { flex:none; width:34px; height:34px; border-radius:50%; border:1px solid rgba(255,150,160,.2);
+    background:rgba(255,255,255,.05); color:#c9a2a4; font-size:14px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; }
+  .tfwd:active { transform:scale(.9); }
+  .mchips { display:flex; gap:8px; padding:2px 2px 6px; overflow-x:auto; scrollbar-width:none; }
+  .mchips::-webkit-scrollbar { display:none; }
+  /* track detail overlay */
+  #trackDetail .tdinner { flex:1; overflow-y:auto; padding:10px 20px 40px; max-width:520px;
+    width:100%; margin:0 auto; text-align:center; }
+  #trackDetail .tdart { width:min(74vw,320px); height:min(74vw,320px); border-radius:20px;
+    object-fit:cover; background:#1a0a0e; box-shadow:0 12px 40px rgba(0,0,0,.6); margin:8px auto 18px; }
+  #trackDetail .tdt { font-size:22px; font-weight:700; color:#fdeff0; unicode-bidi:plaintext; line-height:1.25; }
+  #trackDetail .tda { font-size:15px; color:#c9a2a4; margin-top:6px; unicode-bidi:plaintext; }
+  #trackDetail .tdrow { display:flex; gap:10px; justify-content:center; margin:18px 0 6px; flex-wrap:wrap; }
+  #trackDetail .tdbtn { border:1px solid rgba(255,150,160,.25); background:rgba(255,255,255,.06);
+    color:#fdeff0; border-radius:13px; padding:12px 20px; font:inherit; font-size:15px; font-weight:600; cursor:pointer; }
+  #trackDetail .tdbtn.prim { background:linear-gradient(135deg,#d92446,#8c1130); border-color:transparent; }
+  #trackDetail .tdstat { display:flex; gap:18px; justify-content:center; margin-top:16px; flex-wrap:wrap; }
+  #trackDetail .tdstat div { font-size:12.5px; color:#a68184; }
+  #trackDetail .tdstat b { display:block; font-size:16px; color:#f4e2e4; font-weight:650; margin-bottom:2px; }
+
+  /* ---------- reMARKABLE view ---------- */
+  #viewRemarkable { padding-top:0; }
+  .rmfeed { flex:1; width:100%; max-width:640px; overflow-y:auto; overscroll-behavior:contain;
+    padding:6px 14px 26px; scrollbar-width:thin; scrollbar-color:rgba(255,150,160,.25) transparent;
+    -webkit-overflow-scrolling:touch; }
+  .rmcrumb { display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:4px 4px 10px;
+    font-size:13px; color:#c9a2a4; }
+  .rmcrumb button { border:none; background:none; color:#ffc7ce; font:inherit; font-size:13px;
+    cursor:pointer; padding:2px 0; }
+  .rmcrumb .sep { color:#8f6f72; }
+  .rmrow { display:flex; align-items:center; gap:12px; padding:12px 12px; border-radius:14px;
+    background:rgba(255,255,255,.045); border:1px solid rgba(255,255,255,.07); margin-bottom:9px;
+    cursor:pointer; animation:fadein .25s ease; transition:background .12s; }
+  .rmrow:hover, .rmrow:active { background:rgba(255,255,255,.075); }
+  .rmicon { font-size:24px; width:34px; text-align:center; flex:none; }
+  .rmname { flex:1; min-width:0; font-size:15px; color:#f4e2e4; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rmkind { font-size:11px; color:#a68184; flex:none; }
+  .rmfwd { flex:none; width:34px; height:34px; border-radius:50%; border:1px solid rgba(255,150,160,.2);
+    background:rgba(255,255,255,.05); color:#c9a2a4; font-size:14px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; }
+  .rmfwd:active { transform:scale(.9); }
+  /* rm page viewer overlay */
+  #rmView .rmpages { flex:1; overflow-y:auto; padding:4px 10px 34px; text-align:center; }
+  #rmView .rmpages svg, #rmView .rmpages img { width:100%; max-width:820px; border-radius:10px;
+    margin:6px auto; display:block; box-shadow:0 8px 30px rgba(0,0,0,.6); background:#fff; }
+  #rmView .rmpagenum { font-size:11px; color:#8f6f72; letter-spacing:.12em; margin:2px 0 10px; text-transform:uppercase; }
+
+  /* ---------- FORWARD chooser overlay ---------- */
+  #fwdWin { z-index:70; align-items:center; justify-content:flex-end; }
+  #fwdWin .fwdcard { width:100%; max-width:560px; margin:0 auto; background:#1d1216;
+    border:1px solid #5a3a42; border-top-left-radius:22px; border-top-right-radius:22px;
+    box-shadow:0 -12px 40px rgba(0,0,0,.55); padding:16px 18px calc(20px + env(safe-area-inset-bottom));
+    max-height:82vh; overflow-y:auto; animation:fwdup .22s ease; }
+  @keyframes fwdup { from { transform:translateY(30px); opacity:.3; } to { transform:translateY(0); opacity:1; } }
+  #fwdWin .fwdhead { display:flex; align-items:center; gap:10px; margin-bottom:6px; }
+  #fwdWin .fwdtitle { flex:1; font-size:16px; font-weight:700; color:#fdeff0; }
+  #fwdWin .fwdsub { font-size:12.5px; color:#a68184; margin-bottom:14px; unicode-bidi:plaintext;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #fwdWin .fwdchips { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+  #fwdWin .fwdchip { display:flex; align-items:center; gap:7px; padding:9px 14px; border-radius:999px;
+    border:1px solid rgba(255,150,160,.2); background:rgba(255,255,255,.04); color:#e8cdcf;
+    font-size:13.5px; cursor:pointer; transition:all .15s; }
+  #fwdWin .fwdchip .fdot { width:9px; height:9px; border-radius:50%; }
+  #fwdWin .fwdchip.active { background:rgba(255,199,206,.18); border-color:rgba(255,199,206,.55); color:#ffd9dd; }
+  #fwdWin input, #fwdWin textarea { width:100%; box-sizing:border-box; border-radius:12px;
+    border:1px solid #5a3a42; background:#140c0f; color:#fdf3f4; padding:12px 14px; font:inherit;
+    font-size:15px; margin-bottom:12px; }
+  #fwdWin textarea { resize:none; min-height:60px; }
+  #fwdWin .fwdgo { width:100%; font-size:16px; font-weight:700; padding:14px; border:none;
+    border-radius:14px; background:#2ea86b; color:#fff; cursor:pointer; }
+  #fwdWin .fwdgo:disabled { opacity:.5; }
+  #fwdWin .fwdnote { font-size:11.5px; color:#9c7a80; text-align:center; margin-top:10px; line-height:1.5; }
 </style>
 </head>
 <body>
@@ -913,6 +1040,24 @@
     <div class="sigfeed" id="notesFeed"><div class="ovnote" style="margin-top:30px">Loading…</div></div>
   </section>
 
+  <!-- ================= MUSIC ================= -->
+  <section class="view" id="viewMusic">
+    <div class="chathead">
+      <div class="name">Music</div>
+      <div class="sub" id="musicSub">Your Spotify — play, browse, forward</div>
+    </div>
+    <div class="mfeed" id="mfeed"><div class="ovnote" style="margin-top:30px">Loading your music…</div></div>
+  </section>
+
+  <!-- ================= reMARKABLE ================= -->
+  <section class="view" id="viewRemarkable">
+    <div class="chathead">
+      <div class="name">Paper</div>
+      <div class="sub" id="rmSub">Your reMarkable — notebooks &amp; documents</div>
+    </div>
+    <div class="rmfeed" id="rmfeed"><div class="ovnote" style="margin-top:30px">Loading your paper…</div></div>
+  </section>
+
   <!-- lock screen -->
   <div class="overlay" id="lock">
     <div class="lockbox">
@@ -936,6 +1081,8 @@
     <button class="tab" id="tabNotes"><span class="ic">📝</span>Notes<span class="dot"></span></button>
     <button class="tab" id="tabChat"><span class="ic">💬</span>Chat<span class="dot"></span></button>
     <button class="tab" id="tabGallery"><span class="ic">🖼</span>Gallery<span class="dot"></span></button>
+    <button class="tab" id="tabMusic"><span class="ic">🎵</span>Music<span class="dot"></span></button>
+    <button class="tab" id="tabRemarkable"><span class="ic">🖊</span>Paper<span class="dot"></span></button>
   </nav>
 
   <!-- alarm ringing -->
@@ -1047,6 +1194,7 @@
   <!-- image lightbox -->
   <div class="overlay" id="lightbox">
     <div class="ovhead"><div class="ovtitle" id="lbTitle"></div>
+      <button class="ovbtn" id="lbFwd" title="Forward">↗</button>
       <button class="ovbtn" id="lbClose">✕</button></div>
     <img id="lightboxImg" alt="">
   </div>
@@ -1056,6 +1204,44 @@
     <div class="ovhead"><div class="ovtitle" id="pdfTitle">Document</div>
       <button class="ovbtn" id="pdfClose">✕</button></div>
     <div id="pdfPages"><div class="ovnote">Loading…</div></div>
+  </div>
+
+  <!-- music track detail -->
+  <div class="overlay" id="trackDetail">
+    <div class="ovhead"><div class="ovtitle" id="tdHead">Track</div>
+      <button class="ovbtn" id="tdClose">✕</button></div>
+    <div class="tdinner" id="tdInner"><div class="ovnote">Loading…</div></div>
+  </div>
+
+  <!-- reMarkable page viewer (mirrors the pdf/lightbox pattern) -->
+  <div class="overlay" id="rmView">
+    <div class="ovhead"><div class="ovtitle" id="rmvTitle">Notebook</div>
+      <button class="ovbtn" id="rmvFwd" title="Forward">↗</button>
+      <button class="ovbtn" id="rmvClose">✕</button></div>
+    <div class="rmpages" id="rmvPages"><div class="ovnote">Opening…</div></div>
+  </div>
+
+  <!-- Forward chooser: shared by Music, Photos & reMarkable. Picks a channel +
+       recipient, then hands off to the existing drafting studio — nothing sends
+       until Ido approves in the draft window. -->
+  <div class="overlay" id="fwdWin">
+    <div class="fwdcard">
+      <div class="fwdhead">
+        <div class="fwdtitle" id="fwdTitle">Forward</div>
+        <button class="ovbtn" id="fwdClose">✕</button>
+      </div>
+      <div class="fwdsub" id="fwdSub" dir="auto"></div>
+      <div class="fwdchips" id="fwdChips">
+        <button class="fwdchip" data-ch="email_gmail"><span class="fdot" style="background:#ea4335"></span>Email</button>
+        <button class="fwdchip" data-ch="whatsapp"><span class="fdot" style="background:#25d366"></span>WhatsApp</button>
+        <button class="fwdchip" data-ch="teams"><span class="fdot" style="background:#7b83eb"></span>Teams</button>
+        <button class="fwdchip" data-ch="imessage"><span class="fdot" style="background:#0b93f6"></span>iMessage</button>
+      </div>
+      <input id="fwdTo" dir="auto" placeholder="To — name, email or number">
+      <textarea id="fwdNote" dir="auto" placeholder="Add a note (optional)…"></textarea>
+      <button class="fwdgo" id="fwdGo" disabled>Forward</button>
+      <div class="fwdnote">Scarlet drafts it first — you review and approve before anything sends.</div>
+    </div>
   </div>
 
 <script>
@@ -1146,11 +1332,13 @@
   const views = { live: document.getElementById("viewLive"), today: document.getElementById("viewToday"),
     inbox: document.getElementById("viewInbox"),
     signals: document.getElementById("viewSignals"), notes: document.getElementById("viewNotes"),
-    chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery") };
+    chat: document.getElementById("viewChat"), gallery: document.getElementById("viewGallery"),
+    music: document.getElementById("viewMusic"), remarkable: document.getElementById("viewRemarkable") };
   const tabs = { live: document.getElementById("tabLive"), today: document.getElementById("tabToday"),
     inbox: document.getElementById("tabInbox"),
     signals: document.getElementById("tabSignals"), notes: document.getElementById("tabNotes"),
-    chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery") };
+    chat: document.getElementById("tabChat"), gallery: document.getElementById("tabGallery"),
+    music: document.getElementById("tabMusic"), remarkable: document.getElementById("tabRemarkable") };
   let activeTab = "live";
   function switchTab(name) {
     activeTab = name;
@@ -1161,7 +1349,7 @@
     document.documentElement.dataset.ox = name === "inbox" ? "1" : "0";
     if (name !== "inbox") { try { closeMail(); } catch (e) {} }
     document.documentElement.dataset.sig = name === "signals" ? "1" : "0";
-    for (const k of ["live", "today", "inbox", "signals", "notes", "chat", "gallery"]) {
+    for (const k of ["live", "today", "inbox", "signals", "notes", "chat", "gallery", "music", "remarkable"]) {
       views[k].classList.toggle("active", k === name);
       tabs[k].classList.toggle("active", k === name);
     }
@@ -1175,6 +1363,8 @@
     if (name === "signals") { tabs.signals.classList.remove("unread"); loadSignals(); }
     if (name === "notes") loadNotesTab();
     if (name === "gallery") { if (galSub === "clips") loadClips(); else loadGallery(true); }
+    if (name === "music") loadMusic();
+    if (name === "remarkable") loadRemarkable();
   }
   tabs.live.addEventListener("click", () => switchTab("live"));
   tabs.today.addEventListener("click", () => switchTab("today"));
@@ -1183,6 +1373,8 @@
   tabs.notes.addEventListener("click", () => switchTab("notes"));
   tabs.chat.addEventListener("click", () => switchTab("chat"));
   tabs.gallery.addEventListener("click", () => switchTab("gallery"));
+  tabs.music.addEventListener("click", () => switchTab("music"));
+  tabs.remarkable.addEventListener("click", () => switchTab("remarkable"));
 
   /* ============================================================
      GALLERY — large cards, endless scroll
@@ -1502,23 +1694,61 @@
   /* ---------- lightbox + pdf ---------- */
   const lightbox = document.getElementById("lightbox");
   const lightboxImg = document.getElementById("lightboxImg");
+  let lbCur = null; // { src, title } of the photo currently shown — drives Forward
+  function closeLightbox() { lightbox.classList.remove("on"); }
   function openLightbox(src, title) {
+    lbCur = { src, title: title || "" };
     lightboxImg.src = src;
     document.getElementById("lbTitle").textContent = title || "";
     lightbox.classList.add("on");
   }
-  document.getElementById("lbClose").addEventListener("click", () => lightbox.classList.remove("on"));
-  lightbox.addEventListener("click", (e) => { if (e.target === lightbox || e.target === lightboxImg) lightbox.classList.remove("on"); });
+  document.getElementById("lbClose").addEventListener("click", closeLightbox);
+  lightbox.addEventListener("click", (e) => { if (e.target === lightbox || e.target === lightboxImg) closeLightbox(); });
+  // Forward a photo → the shared chooser → the existing drafting/approve loop.
+  document.getElementById("lbFwd").addEventListener("click", () => {
+    if (!lbCur) return;
+    const cap = (lbCur.title || "").replace(/^📷\s*/, "").trim();
+    openForwardChooser({
+      title: "Forward photo",
+      sub: cap || "Photo",
+      onSubmit: (channel, recipient, note) => draftComposeForward({
+        channel, recipient,
+        original: (cap ? cap + "\n" : "") + lbCur.src,
+        instruction: "Forward this photo to " + recipient + "." +
+          (note ? " Note from Ido: " + note : "") + " Include the image link: " + lbCur.src,
+      }),
+    });
+  });
+  // Never a dead end: swipe down (or up) on the image closes back to the grid,
+  // and Esc closes on any device with a keyboard.
+  (() => {
+    let sy = 0, sx = 0;
+    lightboxImg.addEventListener("touchstart", (e) => {
+      if (!e.touches[0]) return; sy = e.touches[0].clientY; sx = e.touches[0].clientX;
+    }, { passive: true });
+    lightboxImg.addEventListener("touchend", (e) => {
+      const t = e.changedTouches[0]; if (!t) return;
+      if (Math.abs(t.clientY - sy) > 70 && Math.abs(t.clientY - sy) > Math.abs(t.clientX - sx)) closeLightbox();
+    }, { passive: true });
+  })();
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    if (lightbox.classList.contains("on")) { closeLightbox(); return; }
+    const td = document.getElementById("trackDetail"); if (td.classList.contains("on")) { td.classList.remove("on"); return; }
+    const rv = document.getElementById("rmView"); if (rv.classList.contains("on")) { rv.classList.remove("on"); return; }
+    const fw = document.getElementById("fwdWin"); if (fw.classList.contains("on")) { fw.classList.remove("on"); return; }
+  });
 
   const pdfview = document.getElementById("pdfview");
   const pdfPages = document.getElementById("pdfPages");
   document.getElementById("pdfClose").addEventListener("click", () => {
     pdfview.classList.remove("on"); pdfPages.innerHTML = "";
   });
-  async function openPdf(url) {
+  async function openPdf(url, title) {
     pdfview.classList.add("on");
     pdfPages.innerHTML = '<div class="ovnote">Loading document…</div>';
-    document.getElementById("pdfTitle").textContent = decodeURIComponent(url.split("/").pop().split("?")[0]);
+    document.getElementById("pdfTitle").textContent = title ||
+      decodeURIComponent(url.split("/").pop().split("?")[0]);
     try {
       const pdfjs = await import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/legacy/build/pdf.min.mjs");
       pdfjs.GlobalWorkerOptions.workerSrc =
@@ -4412,6 +4642,472 @@
     chatBtn.classList.toggle("on", document.body.classList.contains("showchat"));
     chat.scrollTop = chat.scrollHeight;
   });
+
+  /* ============================================================
+     FORWARD CHOOSER — shared by Music, Photos & reMarkable.
+     Picks channel + recipient, then hands off to the drafting studio.
+     Nothing sends until Ido approves in the existing draft window.
+  ============================================================ */
+  const fwdWin = document.getElementById("fwdWin");
+  let fwdState = null; // { onSubmit(channel, recipient, note) -> Promise }
+  function openForwardChooser(opts) {
+    fwdState = opts;
+    document.getElementById("fwdTitle").textContent = opts.title || "Forward";
+    document.getElementById("fwdSub").textContent = opts.sub || "";
+    document.getElementById("fwdTo").value = "";
+    document.getElementById("fwdNote").value = "";
+    document.querySelectorAll("#fwdChips .fwdchip").forEach((c) => c.classList.remove("active"));
+    const go = document.getElementById("fwdGo");
+    go.disabled = true; go.textContent = "Forward";
+    fwdWin.classList.add("on");
+    setTimeout(() => document.getElementById("fwdTo").focus(), 60);
+  }
+  function fwdSelectedChannel() {
+    const c = document.querySelector("#fwdChips .fwdchip.active");
+    return c ? c.dataset.ch : "";
+  }
+  function fwdRefreshGo() {
+    document.getElementById("fwdGo").disabled =
+      !(fwdSelectedChannel() && document.getElementById("fwdTo").value.trim());
+  }
+  document.querySelectorAll("#fwdChips .fwdchip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      document.querySelectorAll("#fwdChips .fwdchip").forEach((c) => c.classList.toggle("active", c === chip));
+      fwdRefreshGo();
+    });
+  });
+  document.getElementById("fwdTo").addEventListener("input", fwdRefreshGo);
+  document.getElementById("fwdClose").addEventListener("click", () => fwdWin.classList.remove("on"));
+  fwdWin.addEventListener("click", (e) => { if (e.target === fwdWin) fwdWin.classList.remove("on"); });
+  document.getElementById("fwdGo").addEventListener("click", async () => {
+    if (!fwdState) return;
+    const channel = fwdSelectedChannel();
+    const recipient = document.getElementById("fwdTo").value.trim();
+    const note = document.getElementById("fwdNote").value.trim();
+    if (!channel || !recipient) return;
+    const go = document.getElementById("fwdGo");
+    go.disabled = true; go.textContent = "Drafting…";
+    try {
+      await fwdState.onSubmit(channel, recipient, note);
+      fwdWin.classList.remove("on");
+      pollDraft(); // surface the draft window immediately for approve/revise
+    } catch (e) {
+      go.textContent = "Couldn't draft — try again"; go.disabled = false;
+      setTimeout(() => { go.textContent = "Forward"; }, 2600);
+    }
+  });
+  // Generic draft start (Photos & reMarkable forwards reuse the studio primitive).
+  async function draftComposeForward(body) {
+    const r = await fetch(APP_URL + "&op=draft_compose", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error("draft failed");
+    return r.json().catch(() => ({}));
+  }
+
+  /* ============================================================
+     MUSIC — as much Spotify as fits: now-playing, playlists, library,
+     recently played, For-You, search, track detail, and forward.
+  ============================================================ */
+  const mfeed = document.getElementById("mfeed");
+  const musicSub = document.getElementById("musicSub");
+  let musicData = null, musicRecs = null, musicView = "home", musicPlaylist = null;
+  const fmtMs = (ms) => { const s = Math.round((Number(ms) || 0) / 1000); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+  function musicNote(t) { musicSub.textContent = t; }
+
+  async function loadMusic() {
+    musicView = "home";
+    if (!APP_URL) return;
+    if (!musicData) mfeed.innerHTML = '<div class="ovnote" style="margin-top:30px">Loading your music…</div>';
+    try {
+      const r = await fetch(APP_URL + "&op=music_library");
+      musicData = await r.json();
+      renderMusicHome();
+      musicNote("Your Spotify — play, browse, forward");
+      loadMusicRecs();
+    } catch (e) {
+      musicNote("reconnecting…");
+      if (!musicData) mfeed.innerHTML = '<div class="ovnote" style="margin-top:30px">Couldn\'t reach your music.<br><span class="doclink" id="mRetry" style="margin-top:12px">Retry</span></div>';
+      const rb = document.getElementById("mRetry"); if (rb) rb.addEventListener("click", loadMusic);
+    }
+  }
+  async function loadMusicRecs() {
+    try {
+      const r = await fetch(APP_URL + "&op=music_recommend&limit=20");
+      musicRecs = await r.json();
+      if (musicView === "home") renderMusicHome();
+    } catch (e) {}
+  }
+  async function refreshNowPlaying() {
+    try {
+      const r = await fetch(APP_URL + "&op=music_library");
+      const d = await r.json();
+      if (musicData) { musicData.nowPlaying = d.nowPlaying; musicData.recentlyPlayed = d.recentlyPlayed || musicData.recentlyPlayed; }
+      if (musicView === "home") { const slot = document.getElementById("npSlot"); if (slot) renderNowPlaying(slot); }
+    } catch (e) {}
+  }
+
+  function trackRow(t, opts) {
+    opts = opts || {};
+    const row = document.createElement("div");
+    row.className = "trow";
+    const img = document.createElement("img");
+    img.loading = "lazy"; img.src = t.image || ""; img.alt = "";
+    const meta = document.createElement("div");
+    meta.className = "tmeta";
+    const ti = document.createElement("div"); ti.className = "ttitle"; ti.dir = "auto"; ti.textContent = t.title || "";
+    const ts = document.createElement("div"); ts.className = "tsub"; ts.dir = "auto"; ts.textContent = t.artist || (t.artists ? t.artists.join(", ") : "");
+    meta.appendChild(ti); meta.appendChild(ts);
+    row.appendChild(img); row.appendChild(meta);
+    if (t.durationMs) { const du = document.createElement("div"); du.className = "tdur"; du.textContent = fmtMs(t.durationMs); row.appendChild(du); }
+    const fwd = document.createElement("button");
+    fwd.className = "tfwd"; fwd.textContent = "↗"; fwd.title = "Forward";
+    fwd.addEventListener("click", (e) => { e.stopPropagation(); forwardTrack(t); });
+    row.appendChild(fwd);
+    row.addEventListener("click", () => { if (opts.play) playTrack(t); else openTrack(t.uri || t.id); });
+    return row;
+  }
+
+  function renderNowPlaying(slot) {
+    const np = musicData && musicData.nowPlaying;
+    slot.innerHTML = "";
+    if (!np) {
+      const empty = document.createElement("div");
+      empty.className = "ovnote"; empty.style.padding = "14px";
+      empty.textContent = "Nothing playing. Pick a track below — playback needs Spotify open on a device.";
+      slot.appendChild(empty); return;
+    }
+    const card = document.createElement("div"); card.className = "npcard";
+    const art = document.createElement("img"); art.className = "npart"; art.src = np.image || ""; art.alt = "";
+    art.addEventListener("click", () => openTrack(np.uri));
+    const meta = document.createElement("div"); meta.className = "npmeta";
+    const tt = document.createElement("div"); tt.className = "nptitle"; tt.dir = "auto"; tt.textContent = np.title || "";
+    tt.addEventListener("click", () => openTrack(np.uri));
+    const ar = document.createElement("div"); ar.className = "npartist"; ar.dir = "auto"; ar.textContent = np.artist || "";
+    const ctr = document.createElement("div"); ctr.className = "npctrls";
+    const prev = mkCtl("⏮", () => musicControl("previous"));
+    const playing = np.isPlaying;
+    const play = mkCtl(playing ? "⏸" : "▶︎", () => musicControl(playing ? "pause" : "resume"), true);
+    const next = mkCtl("⏭", () => musicControl("next"));
+    const fwd = mkCtl("↗", () => forwardTrack(np));
+    const vol = document.createElement("input");
+    vol.type = "range"; vol.min = "0"; vol.max = "100"; vol.value = String(np.volume != null ? np.volume : 60);
+    vol.className = "mvol"; vol.title = "Volume";
+    vol.addEventListener("change", () => musicControl("volume", { volume: Number(vol.value) }));
+    ctr.appendChild(prev); ctr.appendChild(play); ctr.appendChild(next); ctr.appendChild(fwd); ctr.appendChild(vol);
+    meta.appendChild(tt); meta.appendChild(ar); meta.appendChild(ctr);
+    card.appendChild(art); card.appendChild(meta);
+    slot.appendChild(card);
+    if (np.note) { const n = document.createElement("div"); n.className = "npnote"; n.textContent = np.note; slot.appendChild(n); }
+  }
+  function mkCtl(label, fn, primary) {
+    const b = document.createElement("button");
+    b.className = "mctl" + (primary ? " play" : "");
+    b.textContent = label;
+    b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+    return b;
+  }
+
+  function renderMusicHome() {
+    musicView = "home";
+    mfeed.innerHTML = "";
+    // Search
+    const comp = document.createElement("div"); comp.className = "compose";
+    comp.innerHTML = '<input id="mSearch" placeholder="Search songs, artists, albums, playlists…" dir="auto">';
+    mfeed.appendChild(comp);
+    const si = comp.querySelector("#mSearch");
+    let stimer = null;
+    si.addEventListener("input", () => { clearTimeout(stimer); const q = si.value.trim();
+      stimer = setTimeout(() => { if (q) runMusicSearch(q); else renderMusicHome(); }, 350); });
+    si.addEventListener("keydown", (e) => { if (e.key === "Enter") { const q = si.value.trim(); if (q) runMusicSearch(q); } });
+
+    // Now playing
+    const npSlot = document.createElement("div"); npSlot.id = "npSlot"; mfeed.appendChild(npSlot);
+    renderNowPlaying(npSlot);
+
+    const d = musicData || {};
+    // Playlists rail
+    if ((d.playlists || []).length) {
+      addLabel("Your Playlists");
+      const rail = document.createElement("div"); rail.className = "mrail";
+      for (const p of d.playlists) rail.appendChild(playlistCard(p));
+      mfeed.appendChild(rail);
+    }
+    // For You
+    if (musicRecs && (musicRecs.tracks || []).length) {
+      addLabel("For You" + (musicRecs.note ? " · " + musicRecs.note : ""));
+      for (const t of musicRecs.tracks.slice(0, 12)) mfeed.appendChild(trackRow(t, { play: true }));
+    }
+    // Liked / saved
+    if ((d.saved || []).length) {
+      addLabel("Liked Songs");
+      for (const t of d.saved.slice(0, 30)) mfeed.appendChild(trackRow(t, { play: true }));
+    }
+    // Recently played
+    if ((d.recentlyPlayed || []).length) {
+      addLabel("Recently Played");
+      for (const t of d.recentlyPlayed.slice(0, 30)) mfeed.appendChild(trackRow(t, { play: true }));
+    }
+    if (!(d.playlists || []).length && !(d.saved || []).length && !(d.recentlyPlayed || []).length && !(d.nowPlaying)) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "16px";
+      e.textContent = "Your Spotify library is empty here, or Spotify isn't connected yet.";
+      mfeed.appendChild(e);
+    }
+  }
+  function addLabel(txt) { const l = document.createElement("div"); l.className = "mlabel"; l.textContent = txt; mfeed.appendChild(l); }
+  function playlistCard(p) {
+    const c = document.createElement("div"); c.className = "mcard";
+    const img = document.createElement("img"); img.loading = "lazy"; img.src = p.image || ""; img.alt = "";
+    const t = document.createElement("div"); t.className = "mct"; t.dir = "auto"; t.textContent = p.name || "";
+    const s = document.createElement("div"); s.className = "mcs"; s.textContent = (p.count != null ? p.count + " tracks" : "");
+    c.appendChild(img); c.appendChild(t); c.appendChild(s);
+    c.addEventListener("click", () => openPlaylist(p));
+    return c;
+  }
+
+  async function openPlaylist(p) {
+    musicView = "playlist"; musicPlaylist = p;
+    mfeed.innerHTML = "";
+    const back = document.createElement("div"); back.className = "rmcrumb";
+    back.innerHTML = '<button id="mBack">‹ Music</button>';
+    back.querySelector("#mBack").addEventListener("click", () => { renderMusicHome(); });
+    mfeed.appendChild(back);
+    const head = document.createElement("div"); head.className = "npcard"; head.style.marginBottom = "6px";
+    head.innerHTML = '<img class="npart" src="' + esc(p.image || "") + '" alt=""><div class="npmeta">' +
+      '<div class="nptitle" dir="auto">' + esc(p.name || "Playlist") + '</div>' +
+      '<div class="npartist">' + (p.count != null ? p.count + " tracks" : "") + '</div>' +
+      '<div class="npctrls"><button class="mctl play" id="plPlay">▶︎</button>' +
+      '<button class="mctl" id="plFwd">↗</button></div></div>';
+    mfeed.appendChild(head);
+    head.querySelector("#plPlay").addEventListener("click", () => musicPlay({ uri: p.uri }));
+    head.querySelector("#plFwd").addEventListener("click", () => forwardPlaylist(p));
+    const loading = document.createElement("div"); loading.className = "ovnote"; loading.textContent = "Loading tracks…";
+    mfeed.appendChild(loading);
+    try {
+      const r = await fetch(APP_URL + "&op=music_playlist&id=" + encodeURIComponent(p.id) + "&limit=100&offset=0");
+      const d = await r.json();
+      loading.remove();
+      const tracks = (d.playlist && d.tracks) ? d.tracks : (d.tracks || []);
+      if (!tracks.length) { const e = document.createElement("div"); e.className = "ovnote"; e.textContent = "No tracks."; mfeed.appendChild(e); return; }
+      for (const t of tracks) mfeed.appendChild(trackRow(t, { play: true }));
+    } catch (e) { loading.textContent = "Couldn't load this playlist."; }
+  }
+
+  async function runMusicSearch(q) {
+    musicView = "search";
+    // Keep the search box; replace everything below it.
+    let comp = mfeed.querySelector(".compose");
+    mfeed.innerHTML = "";
+    if (comp) mfeed.appendChild(comp); else { renderMusicHome(); comp = mfeed.querySelector(".compose"); mfeed.querySelectorAll(".mlabel,.trow,.mrail,.npcard,#npSlot,.ovnote").forEach(n=>n.remove()); }
+    const status = document.createElement("div"); status.className = "ovnote"; status.textContent = "Searching…"; mfeed.appendChild(status);
+    try {
+      const r = await fetch(APP_URL + "&op=music_search&q=" + encodeURIComponent(q) + "&type=track,artist,album,playlist&limit=10");
+      const d = await r.json();
+      status.remove();
+      let any = false;
+      if ((d.tracks || []).length) { any = true; addLabel("Songs"); for (const t of d.tracks) mfeed.appendChild(trackRow(t, { play: true })); }
+      if ((d.playlists || []).length) { any = true; addLabel("Playlists"); const rail = document.createElement("div"); rail.className = "mrail"; for (const p of d.playlists) rail.appendChild(playlistCard(p)); mfeed.appendChild(rail); }
+      if ((d.albums || []).length) { any = true; addLabel("Albums"); const rail = document.createElement("div"); rail.className = "mrail"; for (const a of d.albums) { const c = playlistCard({ image: a.image, name: a.name, count: null, uri: a.uri, id: a.id }); c.onclick = () => musicPlay({ uri: a.uri }); rail.appendChild(c); } mfeed.appendChild(rail); }
+      if ((d.artists || []).length) { any = true; addLabel("Artists"); for (const a of d.artists) { const row = trackRow({ image: a.image, title: a.name, artist: "Artist", uri: a.uri }, { play: true }); mfeed.appendChild(row); } }
+      if (!any) { const e = document.createElement("div"); e.className = "ovnote"; e.textContent = "No results for “" + q + "”."; mfeed.appendChild(e); }
+    } catch (e) { status.textContent = "Search failed — try again."; }
+  }
+
+  async function playTrack(t) {
+    musicNote("Playing… (needs Spotify open on a device)");
+    await musicPlay(t.uri ? { uri: t.uri } : { query: t.title + " " + (t.artist || ""), kind: "track" });
+  }
+  async function musicPlay(body) {
+    try {
+      const r = await fetch(APP_URL + "&op=music_play", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const d = await r.json().catch(() => ({}));
+      if (d && d.note) musicNote(d.note);
+    } catch (e) { musicNote("Couldn't start playback — is Spotify open?"); }
+    setTimeout(refreshNowPlaying, 900);
+  }
+  async function musicControl(action, extra) {
+    try {
+      const r = await fetch(APP_URL + "&op=music_control", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ action }, extra || {})) });
+      const d = await r.json().catch(() => ({}));
+      if (d && d.note) musicNote(d.note);
+    } catch (e) { musicNote("Playback control needs Spotify open on a device."); }
+    setTimeout(refreshNowPlaying, 700);
+  }
+
+  // Track detail overlay
+  const trackDetail = document.getElementById("trackDetail");
+  document.getElementById("tdClose").addEventListener("click", () => trackDetail.classList.remove("on"));
+  trackDetail.addEventListener("click", (e) => { if (e.target === trackDetail) trackDetail.classList.remove("on"); });
+  async function openTrack(uriOrId) {
+    if (!uriOrId) return;
+    trackDetail.classList.add("on");
+    const inner = document.getElementById("tdInner");
+    inner.innerHTML = '<div class="ovnote">Loading…</div>';
+    const key = String(uriOrId).startsWith("spotify:") ? "uri" : "uri";
+    try {
+      const r = await fetch(APP_URL + "&op=music_track&" + key + "=" + encodeURIComponent(uriOrId));
+      const d = await r.json();
+      const t = d.track || d;
+      const artists = (t.artists && t.artists.length) ? t.artists.join(", ") : (t.artist || "");
+      inner.innerHTML =
+        '<img class="tdart" src="' + esc(t.image || "") + '" alt="">' +
+        '<div class="tdt" dir="auto">' + esc(t.title || "") + '</div>' +
+        '<div class="tda" dir="auto">' + esc(artists) + (t.album ? " · " + esc(t.album) : "") + '</div>' +
+        '<div class="tdrow">' +
+          '<button class="tdbtn prim" id="tdPlay">▶︎ Play</button>' +
+          '<button class="tdbtn" id="tdFwd">↗ Forward</button>' +
+        '</div>' +
+        '<div class="tdstat">' +
+          (t.durationMs ? '<div><b>' + fmtMs(t.durationMs) + '</b>Length</div>' : '') +
+          (t.popularity != null ? '<div><b>' + t.popularity + '</b>Popularity</div>' : '') +
+        '</div>';
+      inner.querySelector("#tdPlay").addEventListener("click", () => playTrack(t));
+      inner.querySelector("#tdFwd").addEventListener("click", () => forwardTrack(t));
+    } catch (e) { inner.innerHTML = '<div class="ovnote">Couldn\'t load this track.</div>'; }
+  }
+
+  // Music forwards use the dedicated backend op (attaches the share link),
+  // then the existing draft window drives review → approve.
+  function forwardTrack(t) {
+    openForwardChooser({
+      title: "Forward song", sub: (t.title || "") + (t.artist ? " · " + t.artist : ""),
+      onSubmit: (channel, recipient, note) => musicForward({ channel, recipient, uri: t.uri, id: t.id, kind: "track", note }),
+    });
+  }
+  function forwardPlaylist(p) {
+    openForwardChooser({
+      title: "Forward playlist", sub: p.name || "Playlist",
+      onSubmit: (channel, recipient, note) => musicForward({ channel, recipient, uri: p.uri, id: p.id, kind: "playlist", note }),
+    });
+  }
+  async function musicForward(body) {
+    const r = await fetch(APP_URL + "&op=music_forward", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error("forward failed");
+    return r.json().catch(() => ({}));
+  }
+
+  /* ============================================================
+     reMARKABLE — folder/notebook browser + paged viewer + forward.
+  ============================================================ */
+  const rmfeed = document.getElementById("rmfeed");
+  const rmSub = document.getElementById("rmSub");
+  let rmStack = [{ id: null, name: "Paper" }]; // breadcrumb path
+
+  async function loadRemarkable() {
+    if (!APP_URL) return;
+    rmStack = [{ id: null, name: "Paper" }];
+    await rmOpenFolder(null, "Paper", true);
+  }
+  async function rmOpenFolder(folderId, name, isRoot) {
+    if (!isRoot) rmStack.push({ id: folderId, name });
+    rmfeed.innerHTML = '<div class="ovnote" style="margin-top:20px">Loading…</div>';
+    renderRmCrumb();
+    try {
+      const u = APP_URL + "&op=rm_list" + (folderId ? "&folderId=" + encodeURIComponent(folderId) : "");
+      const r = await fetch(u);
+      const d = await r.json();
+      renderRmList(d.items || []);
+      rmSub.textContent = "Your reMarkable — notebooks & documents";
+    } catch (e) {
+      rmfeed.innerHTML = "";
+      renderRmCrumb();
+      const err = document.createElement("div"); err.className = "ovnote"; err.style.marginTop = "20px";
+      err.innerHTML = "Couldn't reach your reMarkable.<br><span class=\"doclink\" id=\"rmRetry\" style=\"margin-top:12px\">Retry</span>";
+      rmfeed.appendChild(err);
+      const rb = document.getElementById("rmRetry"); if (rb) rb.addEventListener("click", () => rmOpenFolder(folderId, name, true));
+    }
+  }
+  function renderRmCrumb() {
+    const bar = document.createElement("div"); bar.className = "rmcrumb";
+    rmStack.forEach((node, i) => {
+      if (i) { const sep = document.createElement("span"); sep.className = "sep"; sep.textContent = "›"; bar.appendChild(sep); }
+      const b = document.createElement("button"); b.textContent = node.name;
+      b.addEventListener("click", () => {
+        if (i === rmStack.length - 1) return;
+        rmStack = rmStack.slice(0, i + 1);
+        rmOpenFolder(node.id, node.name, true);
+      });
+      bar.appendChild(b);
+    });
+    // Prepend the crumb (it lives above the list)
+    const existing = rmfeed.querySelector(".rmcrumb"); if (existing) existing.remove();
+    rmfeed.insertBefore(bar, rmfeed.firstChild);
+  }
+  function renderRmList(items) {
+    // Clear list rows but keep the crumb
+    rmfeed.querySelectorAll(".rmrow, .ovnote").forEach((n) => n.remove());
+    if (!items.length) {
+      const e = document.createElement("div"); e.className = "ovnote"; e.style.marginTop = "20px";
+      e.textContent = "Empty here."; rmfeed.appendChild(e); return;
+    }
+    // Folders first, then documents
+    const sorted = items.slice().sort((a, b) => (a.type === "folder" ? -1 : 1) - (b.type === "folder" ? -1 : 1));
+    for (const it of sorted) {
+      const row = document.createElement("div"); row.className = "rmrow";
+      const ic = document.createElement("div"); ic.className = "rmicon";
+      ic.textContent = it.type === "folder" ? "📁" : (it.kind === "pdf" ? "📄" : it.kind === "epub" ? "📗" : "📓");
+      const nm = document.createElement("div"); nm.className = "rmname"; nm.dir = "auto"; nm.textContent = it.name || "Untitled";
+      row.appendChild(ic); row.appendChild(nm);
+      if (it.type === "folder") {
+        const k = document.createElement("div"); k.className = "rmkind"; k.textContent = "›"; row.appendChild(k);
+        row.addEventListener("click", () => rmOpenFolder(it.id, it.name || "Folder"));
+      } else {
+        const k = document.createElement("div"); k.className = "rmkind"; k.textContent = it.kind || "notebook"; row.appendChild(k);
+        const fwd = document.createElement("button"); fwd.className = "rmfwd"; fwd.textContent = "↗"; fwd.title = "Forward";
+        fwd.addEventListener("click", (e) => { e.stopPropagation(); forwardRm(it); });
+        row.appendChild(fwd);
+        row.addEventListener("click", () => openRmDoc(it));
+      }
+      rmfeed.appendChild(row);
+    }
+  }
+
+  // rm viewer overlay
+  const rmView = document.getElementById("rmView");
+  let rmCurDoc = null;
+  document.getElementById("rmvClose").addEventListener("click", () => rmView.classList.remove("on"));
+  rmView.addEventListener("click", (e) => { if (e.target === rmView) rmView.classList.remove("on"); });
+  document.getElementById("rmvFwd").addEventListener("click", () => { if (rmCurDoc) forwardRm(rmCurDoc); });
+  async function openRmDoc(it) {
+    rmCurDoc = it;
+    const pages = document.getElementById("rmvPages");
+    document.getElementById("rmvTitle").textContent = it.name || "Notebook";
+    rmView.classList.add("on");
+    pages.innerHTML = '<div class="ovnote">Opening…</div>';
+    try {
+      const r = await fetch(APP_URL + "&op=rm_pages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: it.id }) });
+      const d = await r.json();
+      if (d.pdfBase64) {
+        rmView.classList.remove("on");
+        openPdf("data:application/pdf;base64," + d.pdfBase64, d.name || it.name || "Document");
+        return;
+      }
+      if (d.error) { pages.innerHTML = '<div class="ovnote" style="margin-top:24px">' + esc(d.error) + '</div>'; return; }
+      const svgs = d.pages || [];
+      if (!svgs.length) { pages.innerHTML = '<div class="ovnote" style="margin-top:24px">This notebook has no rendered pages yet.</div>'; return; }
+      pages.innerHTML = "";
+      svgs.forEach((svg, i) => {
+        const num = document.createElement("div"); num.className = "rmpagenum"; num.textContent = "Page " + (i + 1) + " / " + svgs.length; pages.appendChild(num);
+        const holder = document.createElement("div");
+        // Backend SVG strings are trusted content from our own function.
+        holder.innerHTML = svg;
+        pages.appendChild(holder);
+      });
+    } catch (e) {
+      pages.innerHTML = '<div class="ovnote" style="margin-top:24px">Couldn\'t open this notebook here.</div>';
+    }
+  }
+
+  function forwardRm(it) {
+    openForwardChooser({
+      title: "Forward from Paper", sub: it.name || "Notebook",
+      onSubmit: (channel, recipient, note) => draftComposeForward({
+        channel, recipient,
+        original: "reMarkable " + (it.kind || "notebook") + ": " + (it.name || "Untitled"),
+        instruction: "Forward this reMarkable " + (it.kind || "notebook") + " (\"" + (it.name || "Untitled") +
+          "\") to " + recipient + "." + (note ? " Note from Ido: " + note : ""),
+      }),
+    });
+  }
 </script>
 </body>
 </html>
