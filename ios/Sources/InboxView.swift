@@ -632,7 +632,12 @@ struct InboxView: View {
             // Ambient focus: the list reports itself whenever it's the
             // visible screen (tab selected, reader popped) and again when
             // the Focused|Other pill flips.
-            .onAppear { convo.setFocus(inboxBrowsingFocus(model.tab)) }
+            .onAppear {
+                convo.setFocus(inboxBrowsingFocus(model.tab))
+                // Crash breadcrumb: a kill on the LIST (scrolling heavy rows)
+                // must not report as whatever screen came before it.
+                FlightRecorder.note(screen: "inbox")
+            }
             .onChange(of: model.tab) { _, newTab in
                 convo.setFocus(inboxBrowsingFocus(newTab))
             }
@@ -1006,6 +1011,7 @@ struct MailDetailView: View {
     @ObservedObject var model: InboxModel
     @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var detail: MailDetail?
     @State private var failed = false
@@ -1117,6 +1123,25 @@ struct MailDetailView: View {
         .onDisappear {
             if convo.currentFocus == emailFocus {
                 convo.setFocus(inboxBrowsingFocus(model.tab))
+            }
+        }
+        // A backgrounded app holding a fully rendered mail body is the fattest
+        // possible jetsam target — release the detail (html body, attachment
+        // list, the webview it feeds) on the way to background, and re-fetch on
+        // return. Guarded so it can't fight the .task fetch: the background
+        // branch only clears, and the .active branch only loads when nothing is
+        // loaded and no error screen is up (an inactive↔active flicker — control
+        // center, a call banner — leaves a loaded detail untouched).
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                detail = nil
+            case .active:
+                if detail == nil && !failed {
+                    Task { await fetch() }
+                }
+            default:
+                break
             }
         }
     }
@@ -1569,8 +1594,19 @@ struct MailBodyView: UIViewRepresentable {
     let html: String
 
     final class Coordinator: NSObject, WKNavigationDelegate {
-        var loadedHTML: String?      // change-detection key (the raw source html)
+        /// Change-detection key. A cheap FINGERPRINT of the source html — never
+        /// the html itself: `detail.html` already holds the full body, and a
+        /// second uncapped copy here doubled the footprint of a heavy Amwell
+        /// mail (~13 MB of inlined base64 images × 2) — prime jetsam bait.
+        var loadedFingerprint: String?
         var renderedPage: String?    // exactly what was loaded (capped + framed)
+
+        /// The cheap identity for change detection: length + hash. Collisions
+        /// would need same-length same-hash different bodies — not a real risk
+        /// for "did this message change under me".
+        static func fingerprint(of html: String) -> String {
+            "\(html.count)|\(html.hashValue)"
+        }
 
         // If the web content process is jetsam-killed under memory pressure, the
         // view goes blank rather than taking the whole app down. Reload the same
@@ -1622,9 +1658,22 @@ struct MailBodyView: UIViewRepresentable {
         return web
     }
 
+    // SwiftUI is done with this webview (reader popped, detail released):
+    // tear the web content down NOW instead of waiting for ARC — the web
+    // process's DOM (megabytes of nested tables + base64 images) and the
+    // retained page copy are the reader's whole memory profile, and jetsam
+    // doesn't wait for deallocation to "get around to it".
+    static func dismantleUIView(_ web: WKWebView, coordinator: Coordinator) {
+        web.stopLoading()
+        web.loadHTMLString("", baseURL: nil)   // drop the web process's DOM now
+        coordinator.loadedFingerprint = nil
+        coordinator.renderedPage = nil         // release the retained page copy
+    }
+
     func updateUIView(_ web: WKWebView, context: Context) {
-        guard context.coordinator.loadedHTML != html else { return }
-        context.coordinator.loadedHTML = html
+        let fingerprint = Coordinator.fingerprint(of: html)
+        guard context.coordinator.loadedFingerprint != fingerprint else { return }
+        context.coordinator.loadedFingerprint = fingerprint
         // Corporate/Amwell mail can be hundreds of KB of nested tables and
         // inline base64 images. Combined with the full-page invert filter (a
         // single large composited layer), a huge message can spike memory hard

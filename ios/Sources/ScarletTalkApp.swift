@@ -204,6 +204,10 @@ struct RootView: View {
                 Task { await sections.refresh() }
             }
             FlightRecorder.phase("\(phase)")
+            // AFTER phase() (which re-arms the unclean-exit flag): background
+            // is a clean stopping point, so disarm the detector there. Keyed
+            // on the enum, not the interpolated string, so it can't drift.
+            if phase == .background { FlightRecorder.markBackgrounded() }
         }
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
@@ -398,6 +402,9 @@ enum FlightRecorder {
 
     /// A lifecycle PHASE transition (active/inactive/background) — recorded under
     /// its own key so it complements, never overwrites, the content screen.
+    /// Every phase re-arms the unclean-exit flag (the app is demonstrably
+    /// alive); the caller then disarms via markBackgrounded() when the new
+    /// phase is .background — see that method for why.
     static func phase(_ phase: String) {
         let d = UserDefaults.standard
         d.set(["phase": phase, "ts": ISO8601DateFormatter().string(from: Date()),
@@ -405,6 +412,20 @@ enum FlightRecorder {
               forKey: phaseKey)
         d.set(true, forKey: aliveKey)
         trackPeakMemory()
+    }
+
+    /// Disarm the unclean-exit detector: reaching .background is a legitimate
+    /// stopping point — iOS may reclaim the app from there at any time and
+    /// that reclaim is normal lifecycle, NOT a crash. Before this, aliveKey
+    /// was set true and never cleared, so EVERY relaunch after a routine
+    /// background eviction reported "unclean_exit" — the detector cried wolf
+    /// and buried real kills. note()/phase() re-arm the flag the moment the
+    /// app does anything again, so a death while active/inactive (the kills
+    /// worth catching, like the Amwell-inbox jetsam) still reports. A jetsam
+    /// of a BACKGROUNDED app now reads as clean — intended: it IS a normal
+    /// iOS reclaim.
+    static func markBackgrounded() {
+        UserDefaults.standard.set(false, forKey: aliveKey)
     }
 
     /// Persist the high-water mark of resident memory so a jetsam kill (which
