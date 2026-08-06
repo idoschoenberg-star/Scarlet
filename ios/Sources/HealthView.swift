@@ -276,7 +276,7 @@ struct HealthView: View {
             // whole story: cached data, this old, never a blank screen.
             if let updated = sync.lastUpdated {
                 (Text("updated ") + Text(updated, style: .relative) + Text(" ago"))
-                    .font(.system(size: 11))
+                    .font(.scarletCaption)
                     .foregroundStyle(.white.opacity(0.4))
             }
             Button {
@@ -424,7 +424,7 @@ struct HealthView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(tint)
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.scarletCaptionEmph)
                     .foregroundStyle(.white.opacity(0.6))
                     .textCase(.uppercase)
                     .kerning(0.8)
@@ -702,12 +702,12 @@ struct HealthView: View {
                             .foregroundStyle(.white)
                             .contentTransition(.numericText())
                         Text("last night · \(latest.source)")
-                            .font(.system(size: 13))
+                            .font(.scarletCaption)
                             .foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         if latest.score > 0 {
                             Text("score \(latest.score)")
-                                .font(.system(size: 12, weight: .bold, design: .rounded))
+                                .font(.system(size: 13, weight: .bold, design: .rounded))
                                 .foregroundStyle(HealthStyle.sleepREM)
                                 .padding(.horizontal, 9)
                                 .padding(.vertical, 4)
@@ -716,7 +716,7 @@ struct HealthView: View {
                     }
                     if latest.hr > 0 {
                         Text("night heart rate \(latest.hr) bpm")
-                            .font(.system(size: 12))
+                            .font(.scarletCaption)
                             .foregroundStyle(.white.opacity(0.55))
                     }
                     SleepStageBar(deep: latest.deep, rem: latest.rem,
@@ -756,7 +756,7 @@ struct HealthView: View {
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                     .annotation(position: .topTrailing) {
                         Text("avg \(HealthFmt.minutes(Int(avg * 60)))")
-                            .font(.system(size: 9))
+                            .font(.scarletCaption)
                             .foregroundStyle(.white.opacity(0.5))
                     }
             }
@@ -776,7 +776,7 @@ struct HealthView: View {
     private func nightHRChart(_ points: [MetricPoint]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Night heart rate · Withings")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.scarletCaptionEmph)
                 .foregroundStyle(.white.opacity(0.45))
                 .textCase(.uppercase)
                 .kerning(0.6)
@@ -878,10 +878,10 @@ struct HealthView: View {
                                 .foregroundStyle(.white)
                                 .contentTransition(.numericText())
                             Text("kg")
-                                .font(.system(size: 13))
+                                .font(.scarletCaption)
                                 .foregroundStyle(.secondary)
                             Text(weightDeltaText)
-                                .font(.system(size: 12))
+                                .font(.scarletCaption)
                                 .foregroundStyle(.white.opacity(0.55))
                             Spacer(minLength: 0)
                         }
@@ -956,7 +956,7 @@ struct HealthView: View {
     private func bodyStat(_ label: String, _ value: String?, trend: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.scarletCaptionEmph)
                 .foregroundStyle(.white.opacity(0.45))
                 .textCase(.uppercase)
                 .kerning(0.6)
@@ -980,7 +980,7 @@ struct HealthView: View {
     private func fatChart(_ points: [MetricPoint]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Body fat %")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.scarletCaptionEmph)
                 .foregroundStyle(.white.opacity(0.45))
                 .textCase(.uppercase)
                 .kerning(0.6)
@@ -1022,7 +1022,7 @@ struct HealthView: View {
                                     .foregroundStyle(.white)
                                     .contentTransition(.numericText())
                                 Text("resting bpm")
-                                    .font(.system(size: 13)).foregroundStyle(.secondary)
+                                    .font(.scarletCaption).foregroundStyle(.secondary)
                             }
                         }
                         if let latest = hrv.last {
@@ -1032,7 +1032,7 @@ struct HealthView: View {
                                     .foregroundStyle(.white)
                                     .contentTransition(.numericText())
                                 Text("ms HRV")
-                                    .font(.system(size: 13)).foregroundStyle(.secondary)
+                                    .font(.scarletCaption).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -1072,7 +1072,7 @@ struct HealthView: View {
     private func hrvChart(_ days: [HealthDay]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("HRV · ms")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.scarletCaptionEmph)
                 .foregroundStyle(.white.opacity(0.45))
                 .textCase(.uppercase)
                 .kerning(0.6)
@@ -1129,7 +1129,7 @@ struct HealthView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(groupedWorkouts, id: \.day) { group in
                         Text(HealthFmt.dayHeaderText(group.day))
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.scarletCaptionEmph)
                             .foregroundStyle(.white.opacity(0.45))
                             .textCase(.uppercase)
                             .kerning(0.8)
@@ -1206,7 +1206,7 @@ private struct PeriodPicker: View {
                     withAnimation(.snappy(duration: 0.3)) { period = p }
                 } label: {
                     Text(p.rawValue)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.scarletCaptionEmph)
                         .foregroundStyle(period == p ? .white : .white.opacity(0.55))
                         .padding(.vertical, 7)
                         .frame(maxWidth: .infinity)
@@ -1257,14 +1257,14 @@ private struct StatRing: View {
                         .lineLimit(1)
                         .contentTransition(.numericText())
                     Text("\(Int((progress * 100).rounded()))%")
-                        .font(.system(size: 9, weight: .semibold))
+                        .font(.scarletCaptionEmph)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.horizontal, 6)
             }
             .frame(width: 72, height: 72)
             Text(label)
-                .font(.system(size: 11))
+                .font(.scarletCaption)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
@@ -1291,7 +1291,7 @@ private struct GlancePill: View {
                     .foregroundStyle(.white)
                     .contentTransition(.numericText())
                 Text(sub)
-                    .font(.system(size: 10))
+                    .font(.scarletCaption)
                     .foregroundStyle(.white.opacity(0.55))
                     .lineLimit(1)
             }
@@ -1317,7 +1317,7 @@ private struct HeroStat: View {
                 .foregroundStyle(.white)
                 .contentTransition(.numericText())
             Text(label)
-                .font(.system(size: 11))
+                .font(.scarletCaption)
                 .foregroundStyle(tint)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1333,7 +1333,7 @@ private struct LegendChip: View {
         HStack(spacing: 4) {
             Circle().fill(color).frame(width: 7, height: 7)
             Text(text)
-                .font(.system(size: 10))
+                .font(.scarletCaption)
                 .foregroundStyle(.white.opacity(0.55))
         }
     }
@@ -1416,10 +1416,10 @@ private struct HealthWorkoutRow: View {
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(.white)
                 Text(HealthFmt.workoutDay.string(from: workout.start))
-                    .font(.system(size: 12))
+                    .font(.scarletCaption)
                     .foregroundStyle(.secondary)
                 Text(statsLine)
-                    .font(.system(size: 12))
+                    .font(.scarletCaption)
                     .foregroundStyle(.white.opacity(0.55))
             }
             Spacer(minLength: 8)
@@ -1568,7 +1568,7 @@ private struct WorkoutDetailSheet: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(HealthStyle.rose)
                 Text(label)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.scarletCaptionEmph)
                     .foregroundStyle(.white.opacity(0.55))
                     .textCase(.uppercase)
                     .kerning(0.6)

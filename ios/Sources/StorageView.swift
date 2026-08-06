@@ -101,6 +101,19 @@ final class StorageModel: ObservableObject {
         var videoCount = 0
     }
 
+    /// Best-effort byte size of a single PHAssetResource. `fileSize` is a
+    /// KVC-only key with no public accessor; on an OS where it isn't
+    /// KVC-accessible, `value(forKey:)` throws an uncatchable
+    /// NSUnknownKeyException rather than returning nil. Guard with
+    /// `responds(to:)` so an unavailable key contributes 0 instead of crashing.
+    nonisolated static func resourceFileSize(_ res: PHAssetResource) -> Int64 {
+        guard res.responds(to: NSSelectorFromString("fileSize")) else { return 0 }
+        if let n = res.value(forKey: "fileSize") as? NSNumber {
+            return n.int64Value
+        }
+        return 0
+    }
+
     /// Sum PHAssetResource file sizes for images and videos. Runs OFF the main
     /// actor (nonisolated static) — the enumeration can touch thousands of assets.
     nonisolated static func sumLibrary() -> LibrarySums {
@@ -113,11 +126,13 @@ final class StorageModel: ObservableObject {
             result.enumerateObjects { asset, _, _ in
                 count += 1
                 for res in PHAssetResource.assetResources(for: asset) {
-                    // `fileSize` is exposed via KVC on PHAssetResource; read it
-                    // defensively as NSNumber so a missing value is just skipped.
-                    if let n = res.value(forKey: "fileSize") as? NSNumber {
-                        bytes += n.int64Value
-                    }
+                    // `fileSize` is a PRIVATE, KVC-only key on PHAssetResource —
+                    // it has no public property. Calling value(forKey:) blindly
+                    // raises an uncatchable NSUnknownKeyException on any OS where
+                    // the key isn't KVC-accessible (it does NOT return nil), which
+                    // would crash the whole size sweep. Probe responds(to:) first
+                    // and treat the size as best-effort (contribute 0 on failure).
+                    bytes += resourceFileSize(res)
                 }
             }
             return (bytes, count)
@@ -170,7 +185,12 @@ struct StorageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scarletScreen()   // shared near-black ink ground; category accents stay as chrome
-        .toolbar(.hidden, for: .navigationBar)
+        // NOTE: do NOT hide the navigation bar here. Storage is PUSHED onto
+        // Settings' NavigationStack and has no stack of its own, so the automatic
+        // "‹ Settings" back button is the only way out — hiding the bar would
+        // strip it and leave a hard dead-end. The .scarletScreen() ink ground
+        // already supplies the dark surface; the sibling PreferencesView keeps
+        // its bar for the same reason.
         .task { model.compute() }
         // Destructive clip deletion — confirmed.
         .confirmationDialog("Delete downloaded clips?",
@@ -259,7 +279,7 @@ struct StorageView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(paper)
                     Text(subtitle)
-                        .font(.system(size: 12))
+                        .font(.scarletCaption)
                         .foregroundStyle(.white.opacity(0.5))
                         .lineLimit(1)
                 }
@@ -320,7 +340,7 @@ struct StorageView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(disabled ? Color.white.opacity(0.4) : paper)
                     Text(detail)
-                        .font(.system(size: 12))
+                        .font(.scarletDetail)
                         .foregroundStyle(.white.opacity(0.5))
                         .multilineTextAlignment(.leading)
                         .fixedSize(horizontal: false, vertical: true)
