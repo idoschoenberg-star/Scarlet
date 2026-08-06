@@ -305,6 +305,41 @@ private struct FoodWeek {
     }
 }
 
+/// One further-reading link under the dietitian tips (a video or an article).
+private struct FoodTipLink: Identifiable {
+    let id = UUID()
+    let title: String
+    let url: URL?
+    let kind: String   // "video" | "article"
+    let source: String
+
+    var isVideo: Bool { kind == "video" }
+
+    init(dict: [String: Any]) {
+        title = (dict["title"] as? String) ?? "Read more"
+        url = (dict["url"] as? String).flatMap { URL(string: $0) }
+        kind = (dict["kind"] as? String) ?? "article"
+        source = (dict["source"] as? String) ?? ""
+    }
+}
+
+/// Scarlet's dietitian tips: personalized advice, a few focus topics, and links.
+private struct FoodTips {
+    let advice: String
+    let focus: [String]
+    let links: [FoodTipLink]
+
+    init(advice: String, focus: [String], links: [FoodTipLink]) {
+        self.advice = advice; self.focus = focus; self.links = links
+    }
+
+    init(dict: [String: Any]) {
+        advice = (dict["advice"] as? String) ?? ""
+        focus = ((dict["focus"] as? [Any]) ?? []).compactMap { $0 as? String }
+        links = ((dict["links"] as? [[String: Any]]) ?? []).map { FoodTipLink(dict: $0) }
+    }
+}
+
 /// An in-flight meal log — the optimistic "analyzing…" card.
 private struct FoodPending: Identifiable {
     let id: String
@@ -320,9 +355,12 @@ final class FoodModel: ObservableObject {
     @Published fileprivate var day: FoodDay?
     @Published fileprivate var week: FoodWeek?
     @Published fileprivate var pending: [FoodPending] = []
+    @Published fileprivate var tips: FoodTips?
     @Published var dayError = ""
     @Published var weekError = ""
     @Published var logError = ""
+    @Published var tipsError = ""
+    @Published var tipsLoading = false
     @Published var refreshing = false
     @Published var updatedAt: Date?
 
@@ -337,7 +375,9 @@ final class FoodModel: ObservableObject {
         refreshing = true
         async let d: Void = refreshDay()
         async let w: Void = refreshWeek()
-        _ = await (d, w)
+        // Tips load lazily (only if not yet loaded this session) — cheap here.
+        async let tp: Void = refreshTips()
+        _ = await (d, w, tp)
         refreshing = false
     }
 
@@ -373,6 +413,29 @@ final class FoodModel: ObservableObject {
             saveCache()
         } catch {
             if week == nil { weekError = "Couldn't load your week — check your connection." }
+        }
+    }
+
+    /// Scarlet-as-dietitian tips (advice + focus topics + further-reading links).
+    /// Lazy: loads once per session unless `force` (the card's Refresh button).
+    /// Never spins forever — always resolves to tips, an error, or empty.
+    func refreshTips(force: Bool = false) async {
+        guard TokenStore.token != nil else {
+            if tips == nil { tipsError = "Locked — unlock Scarlet for your tips." }
+            return
+        }
+        if tipsLoading { return }
+        if tips != nil && !force { return }
+        tipsLoading = true
+        tipsError = ""
+        defer { tipsLoading = false }
+        do {
+            let data = try await Self.request(op: "nutrition_tips", body: [:])
+            let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            tips = FoodTips(dict: obj)
+            tipsError = ""
+        } catch {
+            if tips == nil { tipsError = "Couldn't load your tips — tap to try again." }
         }
     }
 
@@ -548,7 +611,7 @@ struct FoodView: View {
                 headerBar
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             // Composer + Scarlet presence live at the bottom of the screen, part
             // of its layout — same pattern as Reminders (quick-add + presence).
             .safeAreaInset(edge: .bottom) {
@@ -675,6 +738,7 @@ struct FoodView: View {
                 adviceCard(d.advice, title: "Scarlet's take")
             }
             mealsCard(d)
+            tipsCard
         } else if !model.pending.isEmpty {
             ForEach(model.pending) { p in FoodPendingCard(pending: p) }
         } else if !model.dayError.isEmpty {
@@ -786,6 +850,21 @@ struct FoodView: View {
         foodCard(title, icon: "sparkles", tint: FoodStyle.rose) {
             FoodAdviceText(text: text)
         }
+    }
+
+    // MARK: dietitian tips (advice grounded in the numbers + further reading)
+
+    private var tipsCard: some View {
+        foodCard("Dietitian tips", icon: "leaf.fill", tint: FoodStyle.good) {
+            FoodTipsView(
+                tips: model.tips,
+                loading: model.tipsLoading,
+                error: model.tipsError,
+                onRefresh: { Task { await model.refreshTips(force: true) } }
+            )
+        }
+        // Load lazily the first time the card scrolls into view.
+        .onAppear { Task { await model.refreshTips() } }
     }
 
     // MARK: shared card shell (matches HealthView's 20pt card)
@@ -1200,6 +1279,154 @@ private struct FoodAdviceText: View {
     }
 }
 
+// MARK: - Dietitian tips (advice + focus chips + further-reading links)
+
+private struct FoodTipsView: View {
+    let tips: FoodTips?
+    let loading: Bool
+    let error: String
+    let onRefresh: () -> Void
+
+    var body: some View {
+        if let t = tips, !t.advice.isEmpty {
+            VStack(alignment: .leading, spacing: 14) {
+                FoodAdviceText(text: t.advice)
+                if !t.focus.isEmpty { focusChips(t.focus) }
+                if !t.links.isEmpty { linksBlock(t.links) }
+                Button(action: onRefresh) {
+                    Label("Refresh tips", systemImage: "arrow.clockwise")
+                        .font(.scarletCaption)
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                .buttonStyle(.plain)
+                .disabled(loading)
+            }
+        } else if loading {
+            thinking
+        } else if !error.isEmpty {
+            Button(action: onRefresh) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.clockwise")
+                    Text(error)
+                        .multilineTextAlignment(.leading)
+                }
+                .font(.scarletBody)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+        } else {
+            // Momentary pre-load state before .onAppear kicks the fetch — never a
+            // forever spinner (the parent triggers the load immediately).
+            thinking
+        }
+    }
+
+    private var thinking: some View {
+        HStack(spacing: 12) {
+            ProgressView().tint(FoodStyle.good)
+            Text("Scarlet is thinking about your nutrition…")
+                .font(.scarletBody)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 6)
+    }
+
+    private func focusChips(_ focus: [String]) -> some View {
+        FoodFlowChips(items: focus)
+    }
+
+    @ViewBuilder
+    private func linksBlock(_ links: [FoodTipLink]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Read more")
+                .font(.scarletCaptionEmph)
+                .foregroundStyle(.white.opacity(0.6))
+                .textCase(.uppercase)
+                .kerning(0.8)
+            ForEach(links) { link in
+                Button {
+                    open(link.url)
+                } label: {
+                    FoodTipLinkRow(link: link)
+                }
+                .buttonStyle(.plain)
+                .disabled(link.url == nil)
+            }
+        }
+    }
+
+    private func open(_ url: URL?) {
+        guard let url else { return }
+        UIApplication.shared.open(url)
+    }
+}
+
+/// A row of small focus-topic chips ("protein timing", "fiber", …). Only 2-4
+/// short keywords, so a horizontal scroll row never clips and stays simple.
+private struct FoodFlowChips: View {
+    let items: [String]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(Array(items.enumerated()), id: \.offset) { _, topic in
+                    Text(topic)
+                        .font(.scarletCaptionEmph)
+                        .foregroundStyle(FoodStyle.good)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(Capsule().fill(FoodStyle.good.opacity(0.14)))
+                }
+            }
+            .padding(.vertical, 1)
+        }
+    }
+}
+
+/// One further-reading link — video (▶︎) or article (📄), tappable, source shown.
+/// Video links are visually distinct (rose fill + border).
+private struct FoodTipLinkRow: View {
+    let link: FoodTipLink
+
+    var body: some View {
+        let rtl = link.title.isRTLDominant
+        HStack(spacing: 10) {
+            Image(systemName: link.isVideo ? "play.rectangle.fill" : "doc.text")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(link.isVideo ? FoodStyle.rose : FoodStyle.carbs)
+                .frame(width: 24)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(link.title)
+                    .font(.scarletBodyEmph)
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(rtl ? .trailing : .leading)
+                    .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
+                    .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
+                Text((link.isVideo ? "Video" : "Article")
+                     + (link.source.isEmpty ? "" : " · \(link.source)"))
+                    .font(.scarletCaption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: "arrow.up.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 14)
+            .fill(link.isVideo ? FoodStyle.rose.opacity(0.12) : .white.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 14)
+            .stroke(link.isVideo ? FoodStyle.rose.opacity(0.30) : .white.opacity(0.08), lineWidth: 1))
+        .contentShape(Rectangle())
+    }
+}
+
 // MARK: - Week chart (self-contained SwiftUI bars + dashed target line)
 
 private struct FoodWeekChart: View {
@@ -1266,7 +1493,7 @@ private struct FoodMealDetailSheet: View {
                 }
                 .padding(16)
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             .navigationTitle("Meal")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
