@@ -800,7 +800,7 @@ struct DraftView: View {
             }
             if !recipientText.isEmpty {
                 Text("To: \(recipientText)")
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -809,7 +809,7 @@ struct DraftView: View {
             // Reply-All server-side.
             if let seed, !seed.toLine.isEmpty {
                 Text(replyAllText(seed))
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(.white.opacity(0.45))
                     .lineLimit(2)
             }
@@ -911,28 +911,28 @@ struct DraftView: View {
                 Text(model.writingStalled
                      ? "Taking longer than usual — you can close (✕) and try again."
                      : "Scarlet is writing…")
-                    .font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                    .font(.scarletDetail).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .revising:
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small).tint(scarletRose)
-                Text("Revising…").font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Text("Revising…").font(.scarletDetail).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .approving:
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small).tint(scarletRose)
-                Text(approvingLabel).font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Text(approvingLabel).font(.scarletDetail).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .ready:
-            Text("Ready for your review").font(.footnote).foregroundStyle(.secondary)
+            Text("Ready for your review").font(.scarletDetail).foregroundStyle(.secondary)
         case .saved:
-            Text(savedLabel).font(.footnote)
+            Text(savedLabel).font(.scarletDetail)
                 .foregroundStyle(Color(red: 0.55, green: 0.85, blue: 0.62))
         case .idle:
             if channelSeed != nil && model.draft == nil {
-                Text("Tell Scarlet what to say").font(.footnote).foregroundStyle(.secondary)
+                Text("Tell Scarlet what to say").font(.scarletDetail).foregroundStyle(.secondary)
             } else if seed == nil && !attachToActive && model.draft == nil {
-                Text("A fresh email from your Amwell address").font(.footnote).foregroundStyle(.secondary)
+                Text("A fresh email from your Amwell address").font(.scarletDetail).foregroundStyle(.secondary)
             }
         }
     }
@@ -997,7 +997,7 @@ struct DraftView: View {
             // first draft is meaningless noise.
             if draft.revision > 0 {
                 Text("v\(draft.revision)")
-                    .font(.caption2)
+                    .font(.scarletCaption)
                     .foregroundStyle(.white.opacity(0.35))
                     .padding(10)
             }
@@ -1053,7 +1053,7 @@ struct DraftView: View {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small).tint(scarletRose)
                 Text("Scarlet is writing…")
-                    .font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                    .font(.scarletDetail).foregroundStyle(scarletRose.opacity(0.95))
                 Spacer()
                 // A quiet processing clock — proof she's on it.
                 TimelineView(.periodic(from: since, by: 1)) { ctx in
@@ -1141,7 +1141,7 @@ struct DraftView: View {
                     Image(systemName: "paperclip")
                         .font(.system(size: 13, weight: .semibold))
                     Text(attachHint)
-                        .font(.footnote)
+                        .font(.scarletDetail)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .foregroundStyle(scarletRose)
@@ -1237,7 +1237,7 @@ struct DraftView: View {
         VStack(spacing: 12) {
             if model.draft != nil && !model.errorText.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 1, green: 0.45, blue: 0.45))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

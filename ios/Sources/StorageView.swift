@@ -211,7 +211,7 @@ struct StorageView: View {
                 .font(.system(size: 30, weight: .heavy))
                 .foregroundStyle(.white)
             Text("Manage what Scarlet keeps on this phone.")
-                .font(.footnote)
+                .font(.scarletDetail)
                 .foregroundStyle(.white.opacity(0.55))
         }
     }
@@ -220,7 +220,7 @@ struct StorageView: View {
         HStack(spacing: 10) {
             ProgressView().controlSize(.small).tint(scarletRose)
             Text("Measuring on-device usage…")
-                .font(.footnote).foregroundStyle(.secondary)
+                .font(.scarletDetail).foregroundStyle(.secondary)
         }
     }
 
@@ -344,7 +344,7 @@ struct StorageView: View {
 
     private var footnote: some View {
         Text("Total on-device media: \(Self.human(total)).")
-            .font(.footnote)
+            .font(.scarletDetail)
             .foregroundStyle(.white.opacity(0.45))
             .padding(.top, 4)
     }

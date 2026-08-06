@@ -319,7 +319,7 @@ struct HealthView: View {
             VStack(spacing: 10) {
                 ProgressView()
                 Text(sync.available ? "Reading Apple Health…" : "Loading your health data…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -374,7 +374,7 @@ struct HealthView: View {
             }
             if !sync.errorText.isEmpty {
                 Text(sync.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                     .multilineTextAlignment(.center)
             }
@@ -390,7 +390,7 @@ struct HealthView: View {
             VStack(spacing: 14) {
                 if !sync.errorText.isEmpty {
                     Text(sync.errorText)
-                        .font(.footnote)
+                        .font(.scarletDetail)
                         .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 2)

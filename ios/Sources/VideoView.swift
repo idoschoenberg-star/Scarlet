@@ -450,7 +450,7 @@ struct VideoView: View {
             HStack(spacing: 12) {
                 HStack(spacing: 10) {
                     Text("How many")
-                        .font(.footnote)
+                        .font(.scarletDetail)
                         .foregroundStyle(.secondary)
                     Text("\(count)")
                         .font(.system(size: 16, weight: .bold))
@@ -483,7 +483,7 @@ struct VideoView: View {
                 Image(systemName: "waveform")
                     .font(.system(size: 11, weight: .semibold))
                 Text("Or ask Scarlet to bring you videos about something.")
-                    .font(.footnote)
+                    .font(.scarletDetail)
             }
             .foregroundStyle(scarletRose.opacity(0.9))
         }
@@ -507,7 +507,7 @@ struct VideoView: View {
         HStack(spacing: 10) {
             ProgressView().controlSize(.small).tint(scarletRose)
             Text(model.fetchNote.isEmpty ? "Downloading…" : model.fetchNote)
-                .font(.footnote)
+                .font(.scarletDetail)
                 .foregroundStyle(scarletRose.opacity(0.95))
             Spacer()
         }
@@ -543,7 +543,7 @@ struct VideoView: View {
             VStack(spacing: 10) {
                 ProgressView().tint(scarletRose)
                 Text("Opening your clip library…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 40)
@@ -562,7 +562,7 @@ struct VideoView: View {
         } else {
             if !model.errorText.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 1, green: 0.5, blue: 0.5))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

@@ -446,7 +446,7 @@ struct LibraryView: View {
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Fetching the shelf…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.items.isEmpty && !model.errorText.isEmpty {
@@ -483,7 +483,7 @@ struct LibraryView: View {
         List {
             if !model.errorText.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                     .listRowBackground(Color.clear)
             }
@@ -788,13 +788,13 @@ struct LibraryWebSheet: View {
                     HStack(spacing: 3) {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 15, weight: .semibold))
-                        Text("Library").font(.subheadline.weight(.semibold))
+                        Text("Library").font(.scarletDetailEmph)
                     }
                     .foregroundStyle(scarletRose)
                 }
                 Spacer(minLength: 8)
                 Text(item.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.scarletBodyEmph)
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.tail)

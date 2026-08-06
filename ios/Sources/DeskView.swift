@@ -917,7 +917,7 @@ struct DeskView: View {
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Fetching your reminders…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.reminders.isEmpty && !model.errorText.isEmpty {
@@ -1133,7 +1133,7 @@ struct DeskView: View {
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Asking your Mac…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.notes.isEmpty && model.macAsleep {
@@ -1170,7 +1170,7 @@ struct DeskView: View {
         List {
             if model.macAsleep {
                 Text("Your home Mac is asleep — showing the last snapshot; notes will refresh when it wakes.")
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(DeskUI.yellow)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -1201,7 +1201,7 @@ struct DeskView: View {
 
     private var errorRow: some View {
         Text(model.errorText)
-            .font(.footnote)
+            .font(.scarletDetail)
             .foregroundStyle(DeskUI.red)
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -1379,7 +1379,7 @@ struct DeskNoteSheet: View {
                     HStack(spacing: 3) {
                         Image(systemName: "chevron.left")
                             .font(.system(size: 15, weight: .semibold))
-                        Text("Desk").font(.subheadline.weight(.semibold))
+                        Text("Desk").font(.scarletDetailEmph)
                     }
                     .foregroundStyle(DeskUI.yellow)
                 }
@@ -1393,7 +1393,7 @@ struct DeskNoteSheet: View {
                     VStack(spacing: 10) {
                         ProgressView()
                         Text("Asking your Mac…")
-                            .font(.footnote).foregroundStyle(.secondary)
+                            .font(.scarletDetail).foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if asleep {
