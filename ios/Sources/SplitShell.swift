@@ -27,7 +27,6 @@ struct SplitShell: View {
     @ObservedObject var sections: SectionOrderStore
 
     @State private var section: AppSection = .talk
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -37,14 +36,43 @@ struct SplitShell: View {
         "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
+        // Deterministic two-column layout — NOT a NavigationSplitView.
+        //
+        // ROOT CAUSE of the "focus → dead sidebar" regression: the shell used
+        // to be a `NavigationSplitView(.balanced)` whose *managed sidebar
+        // column* held these custom buttons, while the *detail column* hosted a
+        // section view that owns its OWN `NavigationStack` (InboxView,
+        // ChatsView, LibraryView, …) and pushes a reader via `NavigationLink`.
+        // On iPad/Mac-Catalyst, driving detail navigation from inside a
+        // split view's detail while the sidebar is a fully-custom button list
+        // makes the split view's column management contend with the inner
+        // stack's pushes: after Ido opens an email/chat/item (or a focus action
+        // brings a detail forward), the balanced style collapses / steals
+        // hit-testing from the sidebar column — and because the sidebar's
+        // system navigation bar is hidden (`.toolbar(.hidden)`), there is NO
+        // toggle left to bring it back. The section buttons go dead with no
+        // recovery affordance: a true dead end.
+        //
+        // The sidebar here is 100% custom (brand header + our own selection
+        // pills + manual `section` state) — NavigationSplitView contributed
+        // nothing but that fragile auto-collapse. Laying the two panes out as
+        // plain HStack siblings makes the sidebar a first-class view that can
+        // never be collapsed, covered, or drained of hit-testing by whatever
+        // the detail's inner NavigationStack pushes. The sidebar is ALWAYS
+        // tappable, regardless of what's open on the right. (SplitShell only
+        // ever renders at `horizontalSizeClass == .regular`, so a fixed-width
+        // sidebar + flexible detail is always the correct geometry; narrow
+        // multitasking widths fall back to RootView's phone TabView.)
+        HStack(spacing: 0) {
             sidebar
-                .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 250)
-                .toolbar(.hidden, for: .navigationBar)
-        } detail: {
+                .frame(width: 210)
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(width: 0.5)
+                .ignoresSafeArea()
             detailColumn
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .navigationSplitViewStyle(.balanced)
         .tint(scarletRose)
         // Visual mirrors of RootView's cross-screen wiring. RootView still
         // OWNS the behavior behind these notifications; this shell only brings
