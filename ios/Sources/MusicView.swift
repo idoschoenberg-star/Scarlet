@@ -260,8 +260,12 @@ final class MusicModel: ObservableObject {
                 snapshot = (try? await provider.fetchLibrary()) ?? snapshot
             } catch {
                 // Connect can only play to an already-open Spotify app. Surface a
-                // calm, persistent "Open Spotify" affordance rather than a toast.
+                // calm, persistent "Open Spotify" affordance rather than a toast —
+                // and, because that card sits at the top of the scroll far from a
+                // tapped track, also flash a short message near the action so the
+                // tap never looks silently ignored.
                 needsDevice = true
+                flash = "Open Spotify on a device to play"
             }
         }
     }
@@ -279,9 +283,11 @@ final class MusicModel: ObservableObject {
                 try await provider.setPlaying(want)
                 needsDevice = false
             } catch {
-                // Revert the optimistic flip and surface the same calm recovery.
+                // Revert the optimistic flip and surface the same calm recovery,
+                // plus a short flash near the button so the failed tap is visible.
                 snapshot.nowPlaying = np
                 needsDevice = true
+                flash = "Open Spotify on a device to play"
             }
         }
     }
@@ -317,7 +323,11 @@ struct MusicView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     header
-                    if model.needsDevice {
+                    // Only surface the standalone recovery card when there's no
+                    // now-playing bar. The LAST PLAYED bar already carries an
+                    // Open-Spotify affordance (it routes its tap to openSpotify()),
+                    // so showing both is a redundant double prompt.
+                    if model.needsDevice && model.snapshot.nowPlaying == nil {
                         deviceRecovery
                     }
                     if let np = model.snapshot.nowPlaying {

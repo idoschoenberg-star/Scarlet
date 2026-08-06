@@ -720,8 +720,11 @@ struct PhotoThumbnail: View {
     }
 
     private func load(side: CGFloat) {
-        // Cancel a stale request if the cell got recycled to a new asset.
+        // Cancel a stale request if the cell got recycled to a new asset, and
+        // clear the previous asset's thumbnail immediately so a recycled cell
+        // never keeps painting the old photo during a fast scroll.
         if let requestID { imageManager.cancelImageRequest(requestID) }
+        image = nil
         let scale = UIScreen.main.scale
         let target = CGSize(width: max(1, side) * scale, height: max(1, side) * scale)
         let options = PHImageRequestOptions()
@@ -758,6 +761,9 @@ struct PhotoPage: View {
     var chromeVisible: Bool = true
     /// A single tap on the photo (parent toggles its chrome).
     var onSingleTap: () -> Void = {}
+    /// Fires whenever the zoom state crosses the 1× boundary, so the parent can
+    /// gate its swipe-down-to-dismiss: a zoomed photo must PAN, not close.
+    var onZoomChanged: (Bool) -> Void = { _ in }
 
     @State private var image: UIImage?
     @State private var degraded = false     // showing a fast/low-res copy
@@ -765,6 +771,10 @@ struct PhotoPage: View {
     @State private var failed = false
     @State private var scale: CGFloat = 1
     @State private var lastScale: CGFloat = 1
+    // Pan translation, live ONLY while zoomed in (scale > 1). Reset to zero the
+    // moment the photo returns to fit, so an un-zoomed page is never offset.
+    @State private var offset: CGSize = .zero
+    @State private var lastOffset: CGSize = .zero
     // Track in-flight image requests so a recycled page (TabView reuses the view
     // for a new asset) cancels the previous asset's requests — otherwise a late
     // callback can paint the OLD photo onto the NEW page.
@@ -784,6 +794,7 @@ struct PhotoPage: View {
                     .resizable()
                     .scaledToFit()
                     .scaleEffect(scale)
+                    .offset(offset)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if failed {
                 VStack(spacing: 8) {
@@ -820,14 +831,39 @@ struct PhotoPage: View {
         .contentShape(Rectangle())
         .gesture(
             MagnificationGesture()
-                .onChanged { value in scale = min(max(lastScale * value, 1), 5) }
-                .onEnded { _ in lastScale = scale }
+                .onChanged { value in
+                    scale = min(max(lastScale * value, 1), 5)
+                    if scale <= 1 { offset = .zero; lastOffset = .zero }
+                    onZoomChanged(scale > 1)
+                }
+                .onEnded { _ in
+                    lastScale = scale
+                    if scale <= 1 { offset = .zero; lastOffset = .zero }
+                    onZoomChanged(scale > 1)
+                }
+        )
+        // Pan the zoomed photo. Simultaneous so it never blocks paging or the
+        // parent's dismiss when at rest — it only moves the image while scale > 1
+        // (when scale == 1 the handlers no-op, leaving swipe-to-dismiss intact).
+        .simultaneousGesture(
+            DragGesture()
+                .onChanged { v in
+                    guard scale > 1 else { return }
+                    offset = CGSize(width: lastOffset.width + v.translation.width,
+                                    height: lastOffset.height + v.translation.height)
+                }
+                .onEnded { _ in
+                    guard scale > 1 else { return }
+                    lastOffset = offset
+                }
         )
         .onTapGesture(count: 2) {
             withAnimation(.easeInOut(duration: 0.2)) {
                 scale = scale > 1 ? 1 : 2.5
                 lastScale = scale
+                if scale <= 1 { offset = .zero; lastOffset = .zero }
             }
+            onZoomChanged(scale > 1)
         }
         .onTapGesture { onSingleTap() }
         .animation(.easeInOut(duration: 0.2), value: showQualityPill)
@@ -842,7 +878,9 @@ struct PhotoPage: View {
         if let fastRequestID { imageManager.cancelImageRequest(fastRequestID) }
         if let hiRequestID { imageManager.cancelImageRequest(hiRequestID) }
         image = nil
-        scale = 1; lastScale = 1; degraded = false; hiResUnavailable = false; failed = false
+        scale = 1; lastScale = 1; offset = .zero; lastOffset = .zero
+        degraded = false; hiResUnavailable = false; failed = false
+        onZoomChanged(false)
         let bound = UIScreen.main.bounds
         let s = UIScreen.main.scale
         let target = CGSize(width: bound.width * s, height: bound.height * s)
@@ -909,6 +947,10 @@ struct PhotoPagerView: View {
     /// the Apple-Photos "pull down to close" gesture. 0 when at rest.
     @State private var dragOffset: CGFloat = 0
 
+    /// True while the current page is zoomed in (scale > 1). Gates dismissDrag so
+    /// a zoomed photo pans instead of closing on a downward drag.
+    @State private var pageZoomed = false
+
     /// Auto-hiding chrome (Apple-Photos behavior).
     @StateObject private var chrome = ChromeTimer()
 
@@ -944,7 +986,8 @@ struct PhotoPagerView: View {
                 ForEach(assets, id: \.localIdentifier) { asset in
                     PhotoPage(asset: asset, imageManager: imageManager,
                               chromeVisible: chrome.visible,
-                              onSingleTap: { chrome.toggle() })
+                              onSingleTap: { chrome.toggle() },
+                              onZoomChanged: { pageZoomed = $0 })
                         .tag(asset.localIdentifier)
                         .ignoresSafeArea()
                 }
@@ -979,6 +1022,9 @@ struct PhotoPagerView: View {
         }
         .onChange(of: currentID) { _, _ in
             convo.setFocus(photoFocus(currentAsset))
+            // New page starts un-zoomed; the incoming page's load also re-asserts
+            // this, but reset here so dismiss is immediately re-enabled on swipe.
+            pageZoomed = false
         }
         .onDisappear {
             chrome.cancel()
@@ -1080,12 +1126,15 @@ struct PhotoPagerView: View {
     private var dismissDrag: some Gesture {
         DragGesture(minimumDistance: 20)
             .onChanged { v in
+                // A zoomed photo pans (handled inside PhotoPage); never dismiss.
+                guard !pageZoomed else { return }
                 if v.translation.height > 0,
                    v.translation.height > abs(v.translation.width) {
                     dragOffset = v.translation.height
                 }
             }
             .onEnded { v in
+                guard !pageZoomed else { return }
                 if v.translation.height > 120,
                    v.translation.height > abs(v.translation.width) {
                     dismiss()
@@ -1194,6 +1243,10 @@ struct FullScreenPager: View {
     /// Live vertical offset while swiping the photo down to dismiss. 0 at rest.
     @State private var dragOffset: CGFloat = 0
 
+    /// True while the current page is zoomed in (scale > 1). Gates dismissDrag so
+    /// a zoomed photo pans instead of closing on a downward drag.
+    @State private var pageZoomed = false
+
     /// Auto-hiding chrome (Apple-Photos behavior).
     @StateObject private var chrome = ChromeTimer()
 
@@ -1220,7 +1273,8 @@ struct FullScreenPager: View {
                 ForEach(assets, id: \.localIdentifier) { asset in
                     PhotoPage(asset: asset, imageManager: imageManager,
                               chromeVisible: chrome.visible,
-                              onSingleTap: { chrome.toggle() })
+                              onSingleTap: { chrome.toggle() },
+                              onZoomChanged: { pageZoomed = $0 })
                         .tag(asset.localIdentifier)
                         .ignoresSafeArea()
                 }
@@ -1246,6 +1300,7 @@ struct FullScreenPager: View {
         // Full-screen photos may be viewed in landscape OR portrait (iPhone) —
         // a natural toggle; restore portrait for the rest of the app on close.
         .onAppear { OrientationGate.allow(.allButUpsideDown); chrome.bump() }
+        .onChange(of: currentID) { _, _ in pageZoomed = false }
         .onDisappear { OrientationGate.allow(.portrait); chrome.cancel() }
         .statusBarHidden(true)
         .overlay {
@@ -1297,12 +1352,15 @@ struct FullScreenPager: View {
     private var dismissDrag: some Gesture {
         DragGesture(minimumDistance: 20)
             .onChanged { v in
+                // A zoomed photo pans (handled inside PhotoPage); never dismiss.
+                guard !pageZoomed else { return }
                 if v.translation.height > 0,
                    v.translation.height > abs(v.translation.width) {
                     dragOffset = v.translation.height
                 }
             }
             .onEnded { v in
+                guard !pageZoomed else { return }
                 if v.translation.height > 120,
                    v.translation.height > abs(v.translation.width) {
                     dismiss()
