@@ -1210,7 +1210,8 @@ struct PhotoPagerView: View {
     private func photoFocus(_ asset: PHAsset) -> String {
         let when = Self.dateFormat.string(from: asset.creationDate ?? Date())
         return "[FOCUS] Ido is viewing a single photo full-screen, taken \(when). "
-            + "Any request like 'what's in this', 'describe it', 'תתארי', 'forward it' refers to THIS photo on his screen."
+            + "Any request like 'what's in this', 'describe it', 'תתארי', 'forward it' refers to THIS photo on his screen.\n"
+            + "asset_id: \(asset.localIdentifier)"
     }
 
     private static let dateFormat: DateFormatter = {

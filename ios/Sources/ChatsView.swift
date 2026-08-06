@@ -1522,8 +1522,21 @@ struct ChatThreadView: View {
         "[FOCUS] Ido is viewing his \(channel.displayName) conversation with \(chat.name).\n"
             + "recipient: \(chat.name)\n"
             + "channel: \(channel.rawValue)\n"
+            + "\(channelIDKey): \(chat.id)\n"
             + "recent messages:\n"
             + recentLines.joined(separator: "\n")
+    }
+
+    /// The machine-usable id key for this channel's focus line — the same
+    /// identifier the thread already sends everywhere (see CallBar): WhatsApp
+    /// jid / iMessage handle / Teams chat id. Lets her ACT on the open thread
+    /// without asking which chat he means.
+    private var channelIDKey: String {
+        switch channel {
+        case .whatsapp: return "chat_jid"
+        case .imessage: return "handle"
+        case .teams:    return "chat_id"
+        }
     }
 }
 

@@ -13,7 +13,9 @@ import Charts
 /// Both are optional-safe end to end: any field may be null and any section may
 /// be empty, and the page degrades to skeletons / a "pull to refresh" line
 /// rather than ever crashing or breaking layout. This view deliberately does
-/// NOT read the Conversation @EnvironmentObject, so it needs no re-injection.
+/// NOT read the Conversation @EnvironmentObject, so it needs no re-injection;
+/// ambient focus goes through `Conversation.shared` directly (the same
+/// instance the rest of the app injects).
 
 // MARK: - Palette
 
@@ -337,7 +339,30 @@ struct AmwellView: View {
             .task {
                 if model.quoteState == .idle { await model.load() }
             }
+            // Ambient focus: the page reports itself on appearance and again
+            // as the quote/intel loads land, so the price on her mind matches
+            // the price on his screen. Via Conversation.shared — this view
+            // stays free of @EnvironmentObject (see the header note).
+            .onAppear { Conversation.shared.setFocus(pageFocus()) }
+            .onChange(of: model.quoteState) { _, _ in Conversation.shared.setFocus(pageFocus()) }
+            .onChange(of: model.intelState) { _, _ in Conversation.shared.setFocus(pageFocus()) }
         }
+    }
+
+    /// The page-level ambient-focus line — the AMWL quote and how much intel is
+    /// on screen, with the ticker as the machine-usable key.
+    private func pageFocus() -> String {
+        var line = "[FOCUS] Ido is on his Amwell page — AMWL stock quote and company intel."
+        if let q = model.quote, q.price != nil {
+            line += " Quote on screen: \(AmwellFmt.price(q.price, currency: true))"
+                + " (\(AmwellFmt.signedPct(q.changePct)) today)."
+        }
+        if let i = model.intel {
+            let n = i.press.count + i.competitors.count + i.clients.count + i.analyst.count
+            if n > 0 { line += " \(n) intel items (press, competitors, clients, analyst)." }
+        }
+        line += "\nsymbol: AMWL"
+        return line
     }
 
     // MARK: header

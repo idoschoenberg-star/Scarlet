@@ -675,7 +675,8 @@ struct LibraryView: View {
 
     private func itemFocus(_ item: LibraryItem) -> String {
         "[FOCUS] Ido opened a Library deliverable: \"\(item.title)\" "
-            + "(\(item.kind.rawValue)) — one of the items Scarlet produced for him."
+            + "(\(item.kind.rawValue)) — one of the items Scarlet produced for him.\n"
+            + "artifact_id: \(item.id)"
     }
 
     private func claimFocus(_ item: LibraryItem) {
