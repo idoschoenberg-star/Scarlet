@@ -295,7 +295,7 @@ struct PhotosView: View {
                 headerBar
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             // Scarlet lives at the bottom of the LIST screen only — part of its
             // layout, so the pushed viewer structurally replaces it (same as
             // InboxView / LibraryView / ChatsView). Hidden in select mode, where

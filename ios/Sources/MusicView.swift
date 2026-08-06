@@ -270,7 +270,7 @@ struct MusicView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            ScarletTheme.ink.ignoresSafeArea()   // shared near-black ink ground; green accent stays as chrome
             content
         }
         .task { await model.load() }

@@ -288,7 +288,7 @@ struct LibraryView: View {
                 shelfSwitcher
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             // Scarlet lives at the bottom of the list screen, part of its
             // layout — same pattern as ChatsView / InboxView.
             .safeAreaInset(edge: .bottom) {

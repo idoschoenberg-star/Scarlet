@@ -169,7 +169,7 @@ struct StorageView: View {
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .background(ScarletBackground().ignoresSafeArea())
+        .scarletScreen()   // shared near-black ink ground; category accents stay as chrome
         .toolbar(.hidden, for: .navigationBar)
         .task { model.compute() }
         // Destructive clip deletion — confirmed.

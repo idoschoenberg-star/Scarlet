@@ -330,7 +330,7 @@ struct AmwellView: View {
                 .frame(maxWidth: 760, alignment: .leading)   // iPad/Mac: keep it readable
                 .frame(maxWidth: .infinity, alignment: .center)
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()   // shared near-black ink ground; up/down/teal stay as accents
             .navigationTitle("Amwell")
             .navigationBarTitleDisplayMode(.inline)
             .refreshable { await model.load() }

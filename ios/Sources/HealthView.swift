@@ -231,7 +231,7 @@ struct HealthView: View {
                 headerBar
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             // Scarlet lives at the bottom of the list screen, part of its
             // layout — same pattern as ChatsView / InboxView / LibraryView.
             .safeAreaInset(edge: .bottom) {
@@ -1464,7 +1464,7 @@ private struct WorkoutDetailSheet: View {
                 }
                 .padding(16)
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             .navigationTitle(workout.kind.capitalized)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

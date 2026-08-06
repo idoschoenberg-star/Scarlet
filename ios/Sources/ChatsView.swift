@@ -812,7 +812,7 @@ struct ChatsView: View {
                 channelSwitcher
                 content
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()
             // Scarlet lives at the bottom of the LIST screen only — a pushed
             // thread (with its own compose bar) structurally replaces it.
             .safeAreaInset(edge: .bottom) {

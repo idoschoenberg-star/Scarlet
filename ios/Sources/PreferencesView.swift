@@ -390,7 +390,7 @@ struct PreferencesView: View {
             .listStyle(.insetGrouped)
             .scrollContentBackground(.hidden)
             .environment(\.editMode, $editMode)
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()   // shared near-black ink ground; rose accent stays as chrome
             .navigationTitle("Preferences")
             .toolbar {
                 if presentedAsSheet {

@@ -395,7 +395,7 @@ struct VideoView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 28)
             }
-            .background(ScarletBackground().ignoresSafeArea())
+            .scarletScreen()   // shared near-black ink ground; red accent stays as chrome
             .scrollDismissesKeyboard(.interactively)
             .toolbar(.hidden, for: .navigationBar)
             .safeAreaInset(edge: .bottom) {
