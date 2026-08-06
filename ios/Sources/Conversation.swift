@@ -142,6 +142,30 @@ final class Conversation: ObservableObject {
         defer { os_unfair_lock_unlock(audioStateLock) }
         return (converter, capChannel, capGainLinear)
     }
+
+    /// Set when the tap sees buffers whose format no longer matches the
+    /// converter (a route changed the live rate — Bluetooth HFP ↔ built-in).
+    /// Written/read under audioStateLock (tap thread sets it, main clears it),
+    /// so exactly ONE rebuild is scheduled per mismatch episode instead of a
+    /// storm of Tasks at buffer rate.
+    private var converterRebuildPending = false
+
+    /// Called from the TAP THREAD when a buffer's format disagrees with the
+    /// converter's input format: schedule one main-actor graph rebuild, which
+    /// re-reads the live input format and rebuilds the converter to match.
+    private func requestConverterRebuild() {
+        os_unfair_lock_lock(audioStateLock)
+        let already = converterRebuildPending
+        converterRebuildPending = true
+        os_unfair_lock_unlock(audioStateLock)
+        guard !already else { return }
+        Task { @MainActor in
+            self.rebuildAudioGraph()
+            os_unfair_lock_lock(self.audioStateLock)
+            self.converterRebuildPending = false
+            os_unfair_lock_unlock(self.audioStateLock)
+        }
+    }
     /// Meter smoothing state — only ever touched on the main actor.
     private var levelSmoothed: Float = 0
 
@@ -861,7 +885,17 @@ final class Conversation: ObservableObject {
         engine.connect(player, to: engine.mainMixerNode, format: playFormat)
 
         input.removeTap(onBus: 0)   // never stack taps — a second install crashes
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
+        // format: nil — adopt the bus's LIVE format at install time. Passing the
+        // inFormat read above raises an uncatchable "Failed to create tap due to
+        // format mismatch" NSException (SIGABRT) when the effective input format
+        // shifts between the read and the install — exactly what happens when
+        // the app launches onto a Bluetooth HFP route (AirPods/car, 16 kHz mic)
+        // and the session renegotiates during the graph work in between. This
+        // was the "crash out of the gate" captured three times by the flight
+        // recorder (builds 176 AND 177). The callback below is already fully
+        // buffer-format-driven; the converter-mismatch guard inside it covers a
+        // rate change AFTER install.
+        input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
 
             var outData: Data?
@@ -920,6 +954,17 @@ final class Conversation: ObservableObject {
                 // Single-channel input: keep the proven AVAudioConverter downmix.
                 // `converter` is the snapshot's strong ref — it stays alive for
                 // this convert() even if main reassigns the property meanwhile.
+                // With the tap installed format-nil, a route change can deliver
+                // buffers in a NEW live format while this converter was built
+                // for the old one — convert() would just error and the mic would
+                // go silently dead. Detect the mismatch, drop this frame, and
+                // schedule ONE main-actor rebuild that recreates the converter
+                // from the live format.
+                if converter.inputFormat.sampleRate != buffer.format.sampleRate ||
+                   converter.inputFormat.channelCount != buffer.format.channelCount {
+                    self.requestConverterRebuild()
+                    return
+                }
                 let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
                 let ratio = 16000.0 / inRate
                 let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
