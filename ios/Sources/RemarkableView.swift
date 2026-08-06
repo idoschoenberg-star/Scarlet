@@ -746,24 +746,53 @@ struct RmReaderView: View {
         }
     }
 
-    // MARK: notebook pager (one SVG page per swipeable view)
-
+    // MARK: notebook pager (windowed — one live WKWebView per visible page only)
+    //
+    // A paged TabView is NOT lazy: a plain ForEach over every page builds one
+    // `RmSVGWebView` → one `WKWebView` per page UP FRONT. On a large notebook
+    // that spins up dozens–hundreds of web content processes and the app gets
+    // jetsam-killed ("quit unexpectedly"). Fix: keep ALL page slots in the
+    // TabView — so selection, swipe paging and the "n / N" indicator stay
+    // correct across the whole notebook — but only the pages within a ±1 window
+    // of `currentPage` actually HOST a WKWebView. Every other slot is a cheap
+    // white placeholder (a Color, no web process). As `currentPage` moves, the
+    // window follows: an entering page builds its web view, a leaving page tears
+    // its web view down, so at most ~3 WKWebViews are ever alive at once. The
+    // visible page and its immediate swipe neighbours are always real, so paging
+    // never reveals a placeholder.
     private var notebookPager: some View {
         let pages = doc?.pages ?? []
         return TabView(selection: $currentPage) {
             ForEach(Array(pages.enumerated()), id: \.offset) { idx, svg in
-                RmSVGWebView(svg: svg)
-                    .background(RmTheme.page)
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(ScarletTheme.hairline, lineWidth: 1))
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 14)
+                pageSlot(idx: idx, svg: svg)
                     .tag(idx)
             }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
         .indexViewStyle(.page(backgroundDisplayMode: .never))
+    }
+
+    /// One page slot at a fixed index. Inside the ±1 window it renders the real
+    /// handwriting (`RmSVGWebView` → `WKWebView`); outside it, a lightweight
+    /// white placeholder with identical frame/chrome, so paging geometry and the
+    /// page indicator are byte-identical whether or not the web view is live.
+    @ViewBuilder
+    private func pageSlot(idx: Int, svg: String) -> some View {
+        let inWindow = abs(idx - currentPage) <= 1
+        Group {
+            if inWindow {
+                RmSVGWebView(svg: svg)
+            } else {
+                // Placeholder: just the white page surface — no web process.
+                RmTheme.page
+            }
+        }
+        .background(RmTheme.page)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+            .stroke(ScarletTheme.hairline, lineWidth: 1))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
     }
 
     // MARK: states
@@ -799,7 +828,7 @@ struct RmReaderView: View {
     }
 
     private var emptyReader: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 14) {
             Image(systemName: "doc")
                 .font(.system(size: 32))
                 .foregroundStyle(ScarletTheme.textSecondary)
@@ -807,6 +836,14 @@ struct RmReaderView: View {
                 .font(.scarletBody)
                 .foregroundStyle(ScarletTheme.textSecondary)
                 .multilineTextAlignment(.center)
+            Button { Task { await load() } } label: {
+                Text("Try again")
+                    .font(.scarletBodyEmph)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 22).padding(.vertical, 11)
+                    .background(RmTheme.accent, in: Capsule())
+            }
+            .buttonStyle(.plain)
         }
         .padding(32)
     }
@@ -903,6 +940,14 @@ struct RmReaderView: View {
 struct RmSVGWebView: UIViewRepresentable {
     let svg: String
 
+    /// Remembers the SVG last handed to `loadHTMLString`, so a repeat SwiftUI
+    /// update with the same content is a no-op instead of a full reload.
+    final class Coordinator {
+        var loadedSVG: String?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         let web = WKWebView(frame: .zero, configuration: config)
@@ -916,6 +961,11 @@ struct RmSVGWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ web: WKWebView, context: Context) {
+        // SwiftUI calls updateUIView on every surrounding state change (page
+        // swipes, layout passes). Reloading the same SVG each time causes a
+        // white reload flash and needless churn — only reload when it changes.
+        guard context.coordinator.loadedSVG != svg else { return }
+        context.coordinator.loadedSVG = svg
         web.loadHTMLString(Self.html(for: svg), baseURL: nil)
     }
 

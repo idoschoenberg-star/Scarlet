@@ -450,6 +450,8 @@ struct NoteRow: View {
                 .foregroundStyle(.white)
                 .lineLimit(1)
                 .truncationMode(.tail)
+                .multilineTextAlignment(note.title.readingAlignment)
+                .frame(maxWidth: .infinity, alignment: note.title.readingFrameAlignment)
             if let stamp = note.modifiedText {
                 Text(stamp)
                     .font(.system(size: 15))
@@ -522,12 +524,15 @@ struct NoteReaderView: View {
     }
 
     private var reader: some View {
-        ScrollView {
+        let displayTitle = shownTitle.isEmpty ? note.title : shownTitle
+        return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text(shownTitle.isEmpty ? note.title : shownTitle)
+                Text(displayTitle)
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(.white)
                     .textSelection(.enabled)
+                    .multilineTextAlignment(displayTitle.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: displayTitle.readingFrameAlignment)
                 if !alsoMatched.isEmpty {
                     Text("Also matched: " + alsoMatched.joined(separator: ", "))
                         .font(.system(size: 13))
@@ -538,7 +543,8 @@ struct NoteReaderView: View {
                     .lineSpacing(6)
                     .foregroundStyle(.white)
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(text.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: text.readingFrameAlignment)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
