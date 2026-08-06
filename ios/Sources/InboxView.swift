@@ -148,9 +148,11 @@ private struct InboxCache: Codable {
     var focusedStamp: Date?
     var otherStamp: Date?
 
-    static let url: URL = FileManager.default
-        .urls(for: .documentDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("inbox-cache.json")
+    static var url: URL {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return docs.appendingPathComponent("inbox-cache.json")
+    }
 
     static func loadSync() -> InboxCache {
         guard let data = try? Data(contentsOf: url),
@@ -1061,6 +1063,11 @@ struct MailDetailView: View {
         }
         .background(OutlookStyle.background.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
+        // The list hides its own nav bar, but `.toolbar(.hidden)` does NOT
+        // propagate to this PUSHED reader — without this the iPhone reader shows
+        // the system back chevron ON TOP of our custom "‹ Inbox" button. Hide it
+        // here so ONLY the one custom back affordance shows.
+        .toolbar(.hidden, for: .navigationBar)
         // (No overflow menu — "Ask Scarlet" already lives in the action bar; a
         // single-item ellipsis menu was pure duplication.)
         // ONE sheet drives BOTH the Reply drafting window and the QuickLook
@@ -1605,10 +1612,12 @@ struct MailBodyView: UIViewRepresentable {
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = context.coordinator
         web.isOpaque = true
-        // The message body renders on a clean light page (see page(for:)), so the
-        // frame and overscroll match it — a white ground, not the old dark frame.
-        web.backgroundColor = .white
-        web.scrollView.backgroundColor = .white
+        // The message body renders on a dark reading frame (see page(for:)) that
+        // matches the app's near-black canvas, so the frame and overscroll match
+        // it — no white box in a dark app. Sender inline colors still win inside
+        // the message; only the page ground is themed.
+        web.backgroundColor = UIColor(OutlookStyle.background)
+        web.scrollView.backgroundColor = UIColor(OutlookStyle.background)
         web.scrollView.bounces = true
         return web
     }
@@ -1640,28 +1649,27 @@ struct MailBodyView: UIViewRepresentable {
     }
 
     /// Outlook-style dark reading frame: responsive viewport, fluid images
-    /// and tables, long words wrapped, and the soft-invert dark transform.
-    /// The page is authored light (white ground, #111 text, 16px body) and
-    /// the filter flips it: 0.94 invert keeps blacks off pure-white glare,
-    /// hue-rotate(180deg) puts brand colors back near their real hue, and
-    /// media elements get the same filter again to cancel it out.
+    /// and tables, long words wrapped, and a dark page ground that matches the
+    /// app canvas — no white box in a dark app.
     static func page(for html: String) -> String {
         """
         <!DOCTYPE html><html><head>\
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=3">\
         <style>\
-        /* NO whole-page CSS filter: a page-wide filter forces the entire
-           message into one large composited layer, which on Mac Catalyst
-           spikes memory on heavy corporate mail and gets the app jetsam-killed
-           ("quit unexpectedly"). Render the message on a clean light page —
-           stability first; a dark re-theme can return once verified safe. */
-        html,body{margin:0;padding:12px;background:#fff;color:#111;\
+        /* Theme only the FRAME dark — NO whole-page CSS invert filter: a
+           page-wide filter forces the entire message into one large composited
+           layer, which on Mac Catalyst spikes memory on heavy corporate mail
+           and gets the app jetsam-killed ("quit unexpectedly"). We just paint
+           the page ground/default text dark and declare color-scheme:dark; any
+           sender inline colors still win inside the message. */
+        html,body{margin:0;padding:12px;background:#1B1A19;color:#EDEDED;\
+        color-scheme:dark;\
         font:16px -apple-system,system-ui,sans-serif;\
         -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
         img{max-width:100%!important;height:auto!important}\
         table{max-width:100%!important;table-layout:auto}\
         td,th{word-break:break-word}\
-        a{color:#0f6cbd}\
+        a{color:#479EF5}\
         </style>\
         </head><body>\(html)</body></html>
         """
