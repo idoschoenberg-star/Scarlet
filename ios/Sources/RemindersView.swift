@@ -627,6 +627,10 @@ struct RemindersView: View {
                     .focused($addFocused)
                     .onSubmit { submitQuickAdd() }
             }
+            // Embedded dictation: tap and speak the reminder — no keyboard.
+            DictationMicButton(onText: { words in
+                quickAdd = DictationField.merge(existing: quickAdd, adding: words)
+            }, tint: RemUI.blue, size: 32)
             Button { submitQuickAdd() } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 26))

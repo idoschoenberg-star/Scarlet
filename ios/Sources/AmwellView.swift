@@ -493,33 +493,57 @@ struct AmwellView: View {
 
     // MARK: stats
 
-    private var statsSection: some View {
+    /// One statistic (label + formatted value); a named struct instead of a
+    /// tuple so the SwiftUI type-checker doesn't choke on tuples-of-tuples.
+    private struct AmwellStat: Identifiable {
+        let id = UUID()
+        let label: String
+        let value: String
+    }
+    private struct AmwellStatRow: Identifiable {
+        let id = UUID()
+        let left: AmwellStat
+        let right: AmwellStat?
+    }
+
+    /// Precomputed OUTSIDE the ViewBuilder (explicitly typed) — the inline
+    /// stride/map/tuple version blew past the compiler's type-check budget.
+    private var statRows: [AmwellStatRow] {
         let q = model.quote
-        let rows: [(String, String)] = [
-            ("Open", AmwellFmt.price(q?.open)),
-            ("Prev Close", AmwellFmt.price(q?.prevClose)),
-            ("High", AmwellFmt.price(q?.dayHigh)),
-            ("Low", AmwellFmt.price(q?.dayLow)),
-            ("52W High", AmwellFmt.price(q?.week52High)),
-            ("52W Low", AmwellFmt.price(q?.week52Low)),
-            ("Mkt Cap", AmwellFmt.cap(q?.marketCap)),
-            ("Currency", q?.currency ?? "USD"),
+        let stats: [AmwellStat] = [
+            AmwellStat(label: "Open", value: AmwellFmt.price(q?.open)),
+            AmwellStat(label: "Prev Close", value: AmwellFmt.price(q?.prevClose)),
+            AmwellStat(label: "High", value: AmwellFmt.price(q?.dayHigh)),
+            AmwellStat(label: "Low", value: AmwellFmt.price(q?.dayLow)),
+            AmwellStat(label: "52W High", value: AmwellFmt.price(q?.week52High)),
+            AmwellStat(label: "52W Low", value: AmwellFmt.price(q?.week52Low)),
+            AmwellStat(label: "Mkt Cap", value: AmwellFmt.cap(q?.marketCap)),
+            AmwellStat(label: "Currency", value: q?.currency ?? "USD"),
         ]
+        var rows: [AmwellStatRow] = []
+        var i = 0
+        while i < stats.count {
+            rows.append(AmwellStatRow(left: stats[i],
+                                      right: i + 1 < stats.count ? stats[i + 1] : nil))
+            i += 2
+        }
+        return rows
+    }
+
+    private var statsSection: some View {
+        let rows = statRows
         return VStack(spacing: 0) {
-            let pairs = stride(from: 0, to: rows.count, by: 2).map {
-                (rows[$0], $0 + 1 < rows.count ? rows[$0 + 1] : nil)
-            }
-            ForEach(Array(pairs.enumerated()), id: \.offset) { idx, pair in
+            ForEach(Array(rows.enumerated()), id: \.element.id) { idx, pair in
                 HStack(spacing: 0) {
-                    statCell(pair.0.0, pair.0.1)
+                    statCell(pair.left.label, pair.left.value)
                     Rectangle().fill(AmwellStyle.hair).frame(width: 1, height: 34)
-                    if let right = pair.1 {
-                        statCell(right.0, right.1)
+                    if let right = pair.right {
+                        statCell(right.label, right.value)
                     } else {
                         Spacer()
                     }
                 }
-                if idx < pairs.count - 1 {
+                if idx < rows.count - 1 {
                     Rectangle().fill(AmwellStyle.hair).frame(height: 1)
                 }
             }

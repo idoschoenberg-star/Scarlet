@@ -492,6 +492,10 @@ struct PreferencesView: View {
                         .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                         .focused($instructFocused)
                         .disabled(m.applying)
+                    // Embedded dictation: tap and speak the tuning instruction.
+                    DictationMicButton(onText: { words in
+                        instructionText = DictationField.merge(existing: instructionText, adding: words)
+                    }, tint: scarletRose, size: 40)
                     Button {
                         send()
                     } label: {

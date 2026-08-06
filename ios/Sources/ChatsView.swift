@@ -1102,6 +1102,25 @@ struct ChatThreadView: View {
         .toolbarBackground(channel.barSurface, for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
         .toolbarColorScheme(.dark, for: .navigationBar)
+        // Tap-to-call: a phone icon + a channel-appropriate video icon at the
+        // top-right of the open conversation. CallBar shows only the buttons
+        // that make sense for this channel and this device (see CallLauncher);
+        // it uses no sheets, so it never collides with the thread's one .sheet.
+        // The counterpart's number/UPN comes straight from the same identifier
+        // the thread already sends everywhere: WhatsApp jid / iMessage handle /
+        // Teams chat id (chat.id) — the WhatsApp number is the digits of the jid.
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                CallBar(channel: channel,
+                        counterpartID: chat.id,
+                        isGroup: chat.isGroup,
+                        tint: channel.accent,
+                        displayName: chat.name)
+            }
+        }
+        // Brief toast if a call can't be launched (rare — buttons are already
+        // gated by canOpenURL, so unavailable ones don't appear).
+        .callFailureToast()
         // Refresh on appear, then the 20s heartbeat — only while visible.
         // Cached messages are already on screen; this reconciles silently.
         .task {

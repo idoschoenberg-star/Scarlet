@@ -887,6 +887,11 @@ struct FoodView: View {
                 .padding(.horizontal, 10)
                 .background(RoundedRectangle(cornerRadius: 16).fill(.white.opacity(0.07)))
 
+                // Embedded dictation: tap and speak the meal — no keyboard.
+                DictationMicButton(onText: { words in
+                    mealText = DictationField.merge(existing: mealText, adding: words)
+                }, tint: FoodStyle.rose, size: 44)
+
                 Button {
                     submitText()
                 } label: {

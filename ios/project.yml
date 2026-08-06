@@ -103,6 +103,14 @@ targets:
         # Required by App Store validation whenever HealthKit is linked,
         # even though Scarlet never writes health data.
         NSHealthUpdateUsageDescription: "Scarlet does not write to your health data; this permission is declared only because Apple requires it for apps that connect to Health."
+        # Tap-to-call (CallLauncher): schemes canOpenURL must be allowed to
+        # probe so the thread header can show only the call buttons that will
+        # actually work (tel/facetime hide on Mac; whatsapp falls back to wa.me).
+        LSApplicationQueriesSchemes:
+          - tel
+          - whatsapp
+          - facetime
+          - facetime-audio
         ITSAppUsesNonExemptEncryption: false
     # XcodeGen GENERATES the entitlements file at this path from these
     # properties, same as Info.plist above.
