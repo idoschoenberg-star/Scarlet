@@ -869,6 +869,15 @@ struct RmReaderView: View {
             let pdfB64 = obj["pdfBase64"] as? String
             doc = RmDoc(name: name, kind: kind, pages: pages, pdfBase64: pdfB64)
 
+            // Open where he left off, not at page 1: the server reports the last
+            // page with actual handwriting (last_page); if it's absent, the very
+            // last page. Only on the initial open (currentPage still 0) — a
+            // retry/refresh must never yank the page from under his fingers.
+            if currentPage == 0, !pages.isEmpty {
+                let last = (obj["last_page"] as? Int) ?? (pages.count - 1)
+                currentPage = min(max(last, 0), pages.count - 1)
+            }
+
             // Decode a PDF/ePub source up front (guarded — never force-unwrap).
             if let pdfB64, !pdfB64.isEmpty {
                 if let decoded = Data(base64Encoded: pdfB64, options: .ignoreUnknownCharacters) {
