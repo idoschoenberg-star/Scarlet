@@ -59,16 +59,55 @@ enum NewsStyle {
     static let cardGap: CGFloat = 18
     static let sectionGap: CGFloat = 26
 
-    // -- Type scale: READABLE — nothing tiny. Balanced, editorial.
-    //    display  → the lead headline            (30–34, heavy)
-    //    title    → feature-card headlines        (22, semibold)
-    //    rowTitle → compact-row headlines         (18, semibold)
-    //    body     → summaries / detail body       (16.5, regular)
-    //    kicker   → source name, uppercase label  (12.5, bold, tracked)
-    //    meta     → relative time, byline          (13.5, regular)
-    static func display(_ size: CGFloat = 30) -> Font { .system(size: size, weight: .bold, design: .serif) }
+    // -- Type scale: READABLE, and DIRECTION-AWARE (the crux of the Hebrew fix).
+    //
+    //    English reads in an editorial serif (New York) — that's the magazine
+    //    voice. Hebrew must NOT: the system serif face carries NO Hebrew glyphs,
+    //    so Hebrew fell back to a mismatched face and rendered thin, cramped and
+    //    hard to read — the #1 legibility bug Ido reported. Hebrew now renders in
+    //    the system SANS (SF Hebrew is excellent), a hair LARGER and a shade
+    //    HEAVIER so it holds its weight beside the Latin serif, with a touch more
+    //    line spacing (Hebrew reads better with air). One ramp, resolved per
+    //    string by its own direction.
+    //
+    //    display  → the lead / detail headline
+    //    title    → feature-card headlines
+    //    rowTitle → compact-row headlines
+    //    body     → summaries / detail body
+    enum Role { case display(CGFloat), title, rowTitle, body }
+
+    static func font(_ role: Role, rtl: Bool) -> Font {
+        switch role {
+        case .display(let s):
+            return rtl ? .system(size: s + 2, weight: .heavy)
+                       : .system(size: s,     weight: .bold,     design: .serif)
+        case .title:
+            return rtl ? .system(size: 23,   weight: .bold)
+                       : .system(size: 22,   weight: .semibold, design: .serif)
+        case .rowTitle:
+            return rtl ? .system(size: 19.5, weight: .semibold)
+                       : .system(size: 18,   weight: .semibold, design: .serif)
+        case .body:
+            return rtl ? .system(size: 17.5, weight: .regular)
+                       : .system(size: 16.5, weight: .regular)
+        }
+    }
+
+    /// Line spacing per role; Hebrew gets a little more air so tall glyphs and
+    /// nikud don't crowd the line above.
+    static func lineSpacing(_ role: Role, rtl: Bool) -> CGFloat {
+        let base: CGFloat
+        switch role {
+        case .display:  base = 5
+        case .title:    base = 3.5
+        case .rowTitle: base = 3
+        case .body:     base = 5
+        }
+        return rtl ? base + 1.5 : base
+    }
+
+    // -- Chrome / state-screen fonts (short English UI labels).
     static let title    = Font.system(size: 22, weight: .semibold, design: .serif)
-    static let rowTitle = Font.system(size: 18, weight: .semibold, design: .serif)
     static let body     = Font.system(size: 16.5, weight: .regular)
     static let kicker   = Font.system(size: 12.5, weight: .bold)
     static let meta     = Font.system(size: 13.5, weight: .regular)
@@ -315,24 +354,31 @@ final class NewsModel: ObservableObject {
 /// Hebrew headline) is handled by SwiftUI's own bidi.
 struct NewsText: View {
     let text: String
-    var font: Font
+    var role: NewsStyle.Role
     var color: Color = NewsStyle.ink
     var lineLimit: Int? = nil
-    var lineSpacing: CGFloat = 3
     /// Force a light color when the text sits over an image scrim.
     var overImage: Bool = false
 
     var body: some View {
         let rtl = text.isRTLDominant
         Text(text)
-            .font(font)
+            .font(NewsStyle.font(role, rtl: rtl))
             .foregroundStyle(color)
-            .lineSpacing(lineSpacing)
+            .lineSpacing(NewsStyle.lineSpacing(role, rtl: rtl))
             .lineLimit(lineLimit)
-            .multilineTextAlignment(rtl ? .trailing : .leading)
-            .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
+            // Reading-START alignment: `.leading` resolves against the text's OWN
+            // layout direction (set just below) — LEFT for English, RIGHT for
+            // Hebrew — so every string hugs the edge it reads from. The old code
+            // forced `.trailing` AND `.rightToLeft`, which cancel to `.leading`
+            // and shoved Hebrew to the LEFT. This was the core RTL bug.
+            .multilineTextAlignment(.leading)
+            // Never let a parent (grid row, HStack) vertically compress or clip
+            // the wrapped lines — the block always takes the height it needs.
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
-            .shadow(color: overImage ? .black.opacity(0.35) : .clear,
+            .shadow(color: overImage ? .black.opacity(0.38) : .clear,
                     radius: overImage ? 8 : 0, x: 0, y: 1)
     }
 }
@@ -471,23 +517,26 @@ struct NewsHeroCard: View {
                 startPoint: .top, endPoint: .bottom)
                 .frame(height: height)
 
-            // Headline block, pinned to the bottom reading edge.
-            VStack(alignment: rtl ? .trailing : .leading, spacing: 10) {
+            // Headline block, pinned to the bottom reading edge. The block runs
+            // in the headline's own direction, so for a Hebrew lead the badge and
+            // time hug the right edge too — the whole card reads as one language.
+            VStack(alignment: .leading, spacing: 10) {
                 leadBadge
                 NewsText(text: story.title,
-                         font: NewsStyle.display(hSize == .regular ? 34 : 29),
+                         role: .display(hSize == .regular ? 34 : 29),
                          color: .white,
                          lineLimit: 4,
-                         lineSpacing: 4,
                          overImage: true)
                 if let time = story.relativeTime {
                     Text(time)
                         .font(NewsStyle.meta)
                         .foregroundStyle(.white.opacity(0.82))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .shadow(color: .black.opacity(0.4), radius: 6, y: 1)
                 }
             }
             .padding(22)
+            .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
 
             if story.hasVideo {
                 NewsPlayBadge(size: 62)
@@ -527,6 +576,9 @@ struct NewsFeatureCard: View {
     @Environment(\.horizontalSizeClass) private var hSize
 
     private var imageHeight: CGFloat { hSize == .regular ? 200 : 208 }
+    /// The card's chrome follows the HEADLINE's direction, so a Hebrew story's
+    /// byline and text hug the right edge as one block.
+    private var rtl: Bool { story.title.isRTLDominant }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -541,16 +593,21 @@ struct NewsFeatureCard: View {
                     }
                 }
             }
+            // Text block laid out in the headline's direction. `.leading` here is
+            // reading-start, so under the RTL environment it hugs the right — and
+            // the kicker's trailing spacer pushes SOURCE·TIME to the right too.
             VStack(alignment: .leading, spacing: 9) {
                 NewsKicker(source: story.primarySource, time: story.relativeTime)
-                NewsText(text: story.title, font: NewsStyle.title,
-                         color: NewsStyle.ink, lineLimit: 3, lineSpacing: 3)
+                NewsText(text: story.title, role: .title,
+                         color: NewsStyle.ink, lineLimit: 3)
                 if let summary = story.summary {
-                    NewsText(text: summary, font: NewsStyle.body,
-                             color: NewsStyle.inkSecondary, lineLimit: 3, lineSpacing: 3.5)
+                    NewsText(text: summary, role: .body,
+                             color: NewsStyle.inkSecondary, lineLimit: 3)
                 }
             }
             .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .newsCardSurface()
@@ -564,12 +621,18 @@ struct NewsFeatureCard: View {
 struct NewsCompactRow: View {
     let story: NewsStory
 
+    /// Row direction follows the headline. For a Hebrew story the whole row
+    /// mirrors — text on the right, thumbnail on the LEFT — the way an Israeli
+    /// news app lays it out, instead of a right-aligned headline crammed against
+    /// a left-pinned thumbnail.
+    private var rtl: Bool { story.title.isRTLDominant }
+
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .leading, spacing: 7) {
                 NewsKicker(source: story.primarySource, time: story.relativeTime)
-                NewsText(text: story.title, font: NewsStyle.rowTitle,
-                         color: NewsStyle.ink, lineLimit: 4, lineSpacing: 2.5)
+                NewsText(text: story.title, role: .rowTitle,
+                         color: NewsStyle.ink, lineLimit: 4)
                 Spacer(minLength: 0)
             }
             if story.imageURL != nil {
@@ -585,6 +648,7 @@ struct NewsCompactRow: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
         .newsCardSurface(radius: 18)
     }
 }
@@ -890,16 +954,22 @@ struct NewsDetailView: View {
                     VStack(alignment: .leading, spacing: 18) {
                         heroImage
                         VStack(alignment: .leading, spacing: 14) {
-                            NewsKicker(source: story.primarySource, time: story.relativeTime)
-                            NewsText(text: story.title,
-                                     font: NewsStyle.display(hSize == .regular ? 34 : 29),
-                                     color: NewsStyle.ink, lineLimit: nil, lineSpacing: 5)
-                            if let summary = story.summary {
-                                NewsText(text: summary, font: NewsStyle.body,
-                                         color: NewsStyle.ink.opacity(0.88),
-                                         lineLimit: nil, lineSpacing: 6)
-                                    .padding(.top, 2)
+                            // Byline + headline + standfirst read in the article's
+                            // own direction (Hebrew → right, English → left); the
+                            // action chrome below stays in the app's LTR frame.
+                            VStack(alignment: .leading, spacing: 12) {
+                                NewsKicker(source: story.primarySource, time: story.relativeTime)
+                                NewsText(text: story.title,
+                                         role: .display(hSize == .regular ? 34 : 29),
+                                         color: NewsStyle.ink, lineLimit: nil)
+                                if let summary = story.summary {
+                                    NewsText(text: summary, role: .body,
+                                             color: NewsStyle.ink.opacity(0.88),
+                                             lineLimit: nil)
+                                }
                             }
+                            .environment(\.layoutDirection,
+                                         story.title.isRTLDominant ? .rightToLeft : .leftToRight)
                             openButton
                             alternates
                             sourcesFootnote
