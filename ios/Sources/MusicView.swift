@@ -53,6 +53,13 @@ struct MusicLibrarySnapshot: Equatable {
     /// A gentle provider note ("Connect Spotify", "Nothing saved yet") — shown
     /// only when there's nothing else to render.
     var note: String? = nil
+    /// True only when a live Spotify Connect device exists right now. When false,
+    /// nothing can actually play — any `nowPlaying` is a stale "ghost" track from
+    /// a past session, so the page must not fake live audio.
+    var hasActiveDevice: Bool = false
+    /// How many Spotify apps are currently open to play to (0 → prompt "Open
+    /// Spotify"). Informational alongside `hasActiveDevice`.
+    var availableDevices: Int = 0
 }
 
 // MARK: - Provider seam (Spotify today, Tidal later)
@@ -84,7 +91,9 @@ struct SpotifyMusicProvider: MusicProvider {
             playlists: Self.parsePlaylists(obj["playlists"]),
             saved: Self.parseTracks(obj["saved"]),
             nowPlaying: Self.parseNowPlaying(obj["nowPlaying"]),
-            note: (obj["note"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            note: (obj["note"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+            hasActiveDevice: (obj["hasActiveDevice"] as? Bool) ?? false,
+            availableDevices: (obj["availableDevices"] as? Int) ?? Int((obj["availableDevices"] as? Double) ?? 0)
         )
     }
 
@@ -224,6 +233,11 @@ final class MusicModel: ObservableObject {
         defer { loading = false }
         do {
             snapshot = try await provider.fetchLibrary()
+            // Proactively surface the calm "Open Spotify" card whenever nothing
+            // can actually play — but only when the library otherwise loaded
+            // (connected, has content). Don't trip it on an empty/not-connected
+            // page, whose own empty state already guides him.
+            needsDevice = !isEmpty && !snapshot.hasActiveDevice
         } catch {
             errorText = "Couldn't reach \(provider.displayName) — check your connection."
         }
@@ -352,10 +366,15 @@ struct MusicView: View {
     // -- Now-playing bar
 
     private func nowPlayingBar(_ np: MusicNowPlaying) -> some View {
-        HStack(spacing: 14) {
+        // With no active Connect device, `np` is a stale "ghost" from a past
+        // session — not live audio. Be honest: label it "LAST PLAYED", show a
+        // play (▶) affordance (never a pause implying live sound), and route the
+        // tap to openSpotify() since there's nothing to actually resume.
+        let live = model.snapshot.hasActiveDevice
+        return HStack(spacing: 14) {
             artwork(np.imageURL, size: 58, corner: 10)
             VStack(alignment: .leading, spacing: 3) {
-                Text("NOW PLAYING")
+                Text(live ? "NOW PLAYING" : "LAST PLAYED")
                     .font(.system(size: 10, weight: .bold))
                     .tracking(1.2)
                     .foregroundStyle(scarletRose)
@@ -372,14 +391,18 @@ struct MusicView: View {
             }
             Spacer(minLength: 8)
             Button {
-                model.togglePlayPause()
+                if live {
+                    model.togglePlayPause()
+                } else {
+                    openSpotify()
+                }
             } label: {
-                Image(systemName: np.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                Image(systemName: (live && np.isPlaying) ? "pause.circle.fill" : "play.circle.fill")
                     .font(.system(size: 42))
                     .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(np.isPlaying ? "Pause" : "Play")
+            .accessibilityLabel(live ? (np.isPlaying ? "Pause" : "Play") : "Open \(model.provider.displayName)")
         }
         .padding(14)
         .background(
