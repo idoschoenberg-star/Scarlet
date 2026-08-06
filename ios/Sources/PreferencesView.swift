@@ -385,37 +385,48 @@ struct PreferencesView: View {
     private let rowFill = Color.white.opacity(0.05)
 
     var body: some View {
-        NavigationStack {
-            List {
-                summarySection
-                instructSection
-                newsSection
-                orderSection
-                talkHintSection
-            }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden)
-            .environment(\.editMode, $editMode)
-            .scarletScreen()   // shared near-black ink ground; rose accent stays as chrome
-            .navigationTitle("Preferences")
-            .toolbar {
-                if presentedAsSheet {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("Done") { dismiss() }
-                    }
-                }
-                // One reorder toggle drives edit mode for BOTH drag lists (news
-                // + section order) — iOS shows the drag handles when active.
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button(editMode == .active ? "Finish" : "Reorder") {
-                        withAnimation { editMode = editMode == .active ? .inactive : .active }
-                    }
-                    .disabled(m.newsSources.isEmpty && m.order.isEmpty)
-                }
-            }
-            .refreshable { await m.refresh() }
-            .task { await m.refresh() }
+        // When PUSHED from Settings (presentedAsSheet == false) we must inherit
+        // Settings' NavigationStack — wrapping our own here would nest two stacks
+        // (doubled bar, fragile back). Only the sheet path needs its own stack
+        // and its Done button. The toolbar items surface on the inherited bar
+        // when pushed, so Reorder still works either way.
+        if presentedAsSheet {
+            NavigationStack { content }
+        } else {
+            content
         }
+    }
+
+    @ViewBuilder private var content: some View {
+        List {
+            summarySection
+            instructSection
+            newsSection
+            orderSection
+            talkHintSection
+        }
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        .environment(\.editMode, $editMode)
+        .scarletScreen()   // shared near-black ink ground; rose accent stays as chrome
+        .navigationTitle("Preferences")
+        .toolbar {
+            if presentedAsSheet {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            // One reorder toggle drives edit mode for BOTH drag lists (news
+            // + section order) — iOS shows the drag handles when active.
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(editMode == .active ? "Finish" : "Reorder") {
+                    withAnimation { editMode = editMode == .active ? .inactive : .active }
+                }
+                .disabled(m.newsSources.isEmpty && m.order.isEmpty)
+            }
+        }
+        .refreshable { await m.refresh() }
+        .task { await m.refresh() }
     }
 
     // MARK: 1) live summary card
