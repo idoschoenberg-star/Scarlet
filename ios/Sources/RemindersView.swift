@@ -432,6 +432,9 @@ struct RemindersView: View {
                 case .addWithDate(let title):
                     RemAddSheet(initialTitle: title) { t, due in
                         model.add(t, due: due)
+                        // Clear the quick-add bar too — the date-sheet path
+                        // consumes the typed text just like submitQuickAdd().
+                        quickAdd = ""
                     }
                     .preferredColorScheme(.dark)
                 case .edit(let reminder):
@@ -714,12 +717,16 @@ struct RemRow: View {
                     .font(.system(size: 18, weight: .regular))
                     .lineLimit(2)
                     .truncationMode(.tail)
+                    .multilineTextAlignment(reminder.title.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: reminder.title.readingFrameAlignment)
                 if !reminder.notes.isEmpty {
                     Text(reminder.notes)
                         .font(.system(size: 15))
                         .foregroundStyle(RemUI.gray)
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .multilineTextAlignment(reminder.notes.readingAlignment)
+                        .frame(maxWidth: .infinity, alignment: reminder.notes.readingFrameAlignment)
                 }
                 if let due = reminder.dueAt {
                     Text(RemDates.dueChip(due))

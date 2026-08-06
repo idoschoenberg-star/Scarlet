@@ -520,6 +520,10 @@ struct CalendarView: View {
                 Task { await model.load() }
             }
         }
+        // Hide this section's own system nav bar, exactly like every sibling
+        // (Notes/Reminders/reMarkable). Without it Calendar was the one screen
+        // showing a stray system bar on iPhone.
+        .toolbar(.hidden, for: .navigationBar)
         // Ambient focus: the agenda reports itself whenever it's on screen —
         // and each re-entry re-arms the jump-to-today.
         .onAppear {
@@ -885,6 +889,8 @@ struct CalEventRow: View {
                         ? Color(calHex: 0x8A8886) : Color.white)
                     .lineLimit(2)
                     .truncationMode(.tail)
+                    .multilineTextAlignment(event.subject.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: event.subject.readingFrameAlignment)
                 Text(event.timeRange)
                     .font(.scarletDetail.monospacedDigit())
                     .foregroundStyle(isUpNext
@@ -972,7 +978,8 @@ struct CalEventDetailView: View {
                         Text(event.subject)
                             .font(.scarletSection)
                             .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .multilineTextAlignment(event.subject.readingAlignment)
+                            .frame(maxWidth: .infinity, alignment: event.subject.readingFrameAlignment)
                     }
                     infoBlock
                     joinButton
@@ -986,6 +993,10 @@ struct CalEventDetailView: View {
             footer
         }
         .background(CalStyle.bg.ignoresSafeArea())
+        // The pushed detail draws its own top bar (Done + overflow); hide the
+        // system nav bar so it doesn't stack a duplicate system Back on top —
+        // the same discipline sibling readers (RmReaderView) already follow.
+        .toolbar(.hidden, for: .navigationBar)
         .task { await fetch() }
         // Ambient focus: this event while the sheet is up; back to the agenda
         // on the way out — unless another screen already claimed focus.
@@ -1225,7 +1236,8 @@ struct CalEventDetailView: View {
                     .scarletReadingLineSpacing()
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(d.preview.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: d.preview.readingFrameAlignment)
             }
         }
     }
