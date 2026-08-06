@@ -685,17 +685,22 @@ private struct IntelCard: View {
     private var card: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(item.title.isEmpty ? "(untitled)" : item.title)
-                .font(.system(size: 15.5, weight: .semibold))
+                // Reading prose → shared ScarletType scale (legible, not the old
+                // hardcoded 15.5pt), and per-item RTL so a Hebrew source headline
+                // hugs the right edge while English stays left.
+                .font(.scarletBodyEmph)
                 .foregroundStyle(.white)
-                .multilineTextAlignment(.leading)
+                .multilineTextAlignment(item.title.readingAlignment)
+                .frame(maxWidth: .infinity, alignment: item.title.readingFrameAlignment)
                 .fixedSize(horizontal: false, vertical: true)
 
             if !item.snippet.isEmpty {
                 Text(item.snippet)
-                    .font(.system(size: 13.5))
+                    .font(.scarletDetail)
                     .foregroundStyle(.white.opacity(0.72))
                     .lineLimit(3)
-                    .multilineTextAlignment(.leading)
+                    .multilineTextAlignment(item.snippet.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: item.snippet.readingFrameAlignment)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
