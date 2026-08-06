@@ -343,7 +343,13 @@ struct RemarkableView: View {
         }
         .tint(RmTheme.accent)
         .task {
-            if model.items.isEmpty && model.phase != .notConnected { await model.load() }
+            // Cache-first, refresh-behind. loadCache() paints the last-known root
+            // instantly in init; we then ALWAYS refresh from the reMarkable cloud
+            // so a stale on-disk cache can never keep showing old notebooks while
+            // hiding the actual current ones (the "only old notebooks" bug).
+            // load() keeps the cached items if the refresh fails and only shows a
+            // spinner when nothing is cached yet, so this never blanks or flickers.
+            if model.phase != .notConnected { await model.load() }
         }
     }
 
