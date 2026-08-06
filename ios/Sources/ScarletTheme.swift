@@ -48,6 +48,7 @@ enum ScarletTheme {
         case .chats:     return Color(red: 0.30, green: 0.80, blue: 0.52)  // green
         case .reminders: return Color(red: 0.42, green: 0.66, blue: 1.0)   // blue
         case .notes:     return Color(red: 1.0, green: 0.78, blue: 0.36)   // amber
+        case .remarkable: return Color(red: 0.52, green: 0.64, blue: 0.82) // graphite blue
         case .news:      return Color(red: 1.0, green: 0.44, blue: 0.40)   // warm red
         case .amwell:    return Color(red: 0.30, green: 0.82, blue: 0.74)  // teal
         case .music:     return Color(red: 0.40, green: 0.85, blue: 0.55)  // spotify-ish green

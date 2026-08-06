@@ -16,6 +16,7 @@ enum AppSection: String, CaseIterable, Identifiable {
     case chats
     case reminders
     case notes
+    case remarkable
     case news
     case amwell
     case music
@@ -39,6 +40,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chats: return "Chats"
         case .reminders: return "Reminders"
         case .notes: return "Notes"
+        case .remarkable: return "reMarkable"
         case .news: return "News"
         case .amwell: return "Amwell"
         case .music: return "Music"
@@ -59,6 +61,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chats: return "bubble.left.and.bubble.right.fill"
         case .reminders: return "checklist"
         case .notes: return "note.text"
+        case .remarkable: return "pencil.and.outline"
         case .news: return "newspaper.fill"
         case .amwell: return "chart.line.uptrend.xyaxis"
         case .music: return "music.note"
@@ -87,6 +90,7 @@ enum AppSection: String, CaseIterable, Identifiable {
         case .chats:     ChatsView().environmentObject(convo)
         case .reminders: RemindersView().environmentObject(convo)
         case .notes:     NotesView().environmentObject(convo)
+        case .remarkable: RemarkableView().environmentObject(convo)
         case .news:      NewsView().environmentObject(convo)
         case .amwell:    AmwellView().environmentObject(convo)
         case .music:     MusicView().environmentObject(convo)
@@ -117,7 +121,7 @@ final class SectionOrderStore: ObservableObject {
 
     /// A sensible default: the daily-driver surfaces first.
     static let defaultOrder: [AppSection] = [
-        .talk, .inbox, .calendar, .chats, .reminders, .notes,
+        .talk, .inbox, .calendar, .chats, .reminders, .notes, .remarkable,
         .news, .amwell, .music, .video, .photos, .health, .food, .library,
     ]
 
