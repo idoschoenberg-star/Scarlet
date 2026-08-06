@@ -235,7 +235,38 @@ final class Conversation: ObservableObject {
         bgTask = .invalid
     }
 
-    func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }
+    /// Mute ⇄ unmute — and, crucially, hand the shared speaker back when muted so
+    /// Spotify (a separate app) can play. Muting isn't just a flag: it stops her
+    /// current playback, tears the capture graph down, and DEACTIVATES the audio
+    /// session (`.notifyOthersOnDeactivation`, inside stopAudio) so other apps get
+    /// the loudspeaker immediately. Unmuting cleanly re-acquires by rebuilding
+    /// exactly the way `connect()` does. The socket stays live throughout, so
+    /// unmute doesn't re-handshake — she's simply audible again.
+    func toggleMic() {
+        micOn.toggle()
+        if micOn {
+            // UNMUTE → re-acquire. ensureAudio() is idempotent: because mute set
+            // `audioReady` false (via stopAudio), it re-runs startAudioSession()
+            // (setActive(true) on our category) and reinstalls the ONE input tap.
+            // If the graph were still up it would only ensure the engine is
+            // running — so this can never install a second tap.
+            do {
+                try ensureAudio()
+                status = "Listening…"
+            } catch {
+                // Input not free yet (another app may still hold it) — stay muted
+                // in effect and let him retry.
+                micOn = false
+                status = "Can't reach the mic yet — tap Mic to try again."
+            }
+        } else {
+            // MUTE → release the speaker. Silence her, drop the capture path, and
+            // deactivate the session so music can play RIGHT NOW.
+            flushPlayback()   // stop her current audio + clear the echo gate
+            stopAudio()       // removeTap + engine.stop + setActive(false, .notifyOthersOnDeactivation)
+            status = "Muted — music can play. Tap Mic when you want me back."
+        }
+    }
     func toggleSpeaker() { speakerOn.toggle(); player.volume = speakerOn ? 1 : 0 }
 
     /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
@@ -247,11 +278,19 @@ final class Conversation: ObservableObject {
     }
 
     private func applyOutputRoute() {
+        // Muted → the session is intentionally released to other apps (Spotify).
+        // Don't re-grab it just because he flips the loudspeaker/earpiece preference
+        // while muted; the choice is honored on unmute's rebuild.
+        guard micOn else { return }
         let s = AVAudioSession.sharedInstance()
         let phoneIsOutput = s.currentRoute.outputs.allSatisfy {
             $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
         }
-        let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+        // .duckOthers: if music is already playing when she becomes active, it
+        // DUCKS (lowers) rather than hard-stops, and returns to full volume when
+        // she deactivates/mutes. NOT .mixWithOthers — that would bleed her
+        // loudspeaker voice into the mic and defeat Apple's echo cancellation.
+        let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP, .duckOthers]
         // .voiceChat is tuned for the EARPIECE and keeps loudspeaker output
         // quiet-call level; .videoChat is the speakerphone tuning — full
         // loudspeaker loudness with echo control intact. Keep Apple's AEC on
@@ -577,7 +616,7 @@ final class Conversation: ObservableObject {
                 // silent-dead-mic on the very first launch. Prime the session and
                 // yield briefly so the graph is built against a real input format.
                 try? session.setCategory(.playAndRecord, mode: .voiceChat,
-                                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .duckOthers])
                 try? session.setActive(true)
                 try? await Task.sleep(nanoseconds: 150_000_000)
             }
@@ -708,8 +747,10 @@ final class Conversation: ObservableObject {
 
     private func startAudioSession() throws {
         let s = AVAudioSession.sharedInstance()
+        // .duckOthers so already-playing music ducks (not hard-stops) while she's
+        // active and restores when she deactivates. Never .mixWithOthers (echo).
         try s.setCategory(.playAndRecord, mode: .voiceChat,
-                          options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                          options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .duckOthers])
         try s.setActive(true)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
@@ -1090,6 +1131,10 @@ final class Conversation: ObservableObject {
                     // the gate and return to listening so she recovers on .ended.
                     self.flushPlayback()
                 case .ended:
+                    // Muted → the session was intentionally handed to other apps
+                    // (Spotify has the speaker); an interruption ending must NOT
+                    // re-grab it. Unmute is the only thing that reactivates.
+                    guard self.micOn else { break }
                     // A call (Teams/phone) that grabbed the mic likely changed
                     // the input device/format; rebuild rather than restart the
                     // stale graph (a restart with a mismatched format crashes).
@@ -1111,8 +1156,12 @@ final class Conversation: ObservableObject {
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
-                if self.wantLive { self.routeToSpeakerIfReceiver() }
+                // Muted (audioReady == false → graph torn down, session released):
+                // a route change must NOT restart the engine or re-grab the route,
+                // or she'd steal the speaker back from Spotify. `wantLive &&
+                // audioReady` is true only when she's genuinely live and unmuted.
+                if self.wantLive, self.audioReady, !self.engine.isRunning { try? self.engine.start() }
+                if self.wantLive, self.audioReady { self.routeToSpeakerIfReceiver() }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
                 self.evaluateDrivingMode()
