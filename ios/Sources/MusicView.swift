@@ -1,5 +1,8 @@
 import Foundation
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// The Music section: Ido's own streaming library on a dynamic, dark page, plus
 /// one-tap playback onto his active device — and the reminder that he can always
@@ -192,6 +195,11 @@ final class MusicModel: ObservableObject {
     /// A short transient toast shown when a play action fails ("Couldn't start
     /// — open Spotify on a device first"), cleared on the next successful tap.
     @Published var flash = ""
+    /// Set when a play/control action failed because Spotify Connect has no
+    /// active device. Unlike `flash`, this is a *persistent* inline state that
+    /// stays until a play succeeds — it drives the calm "Open Spotify" recovery
+    /// affordance instead of a toast that vanishes and dead-ends him.
+    @Published var needsDevice = false
     /// The uri currently being started, to show a spinner on the tapped tile.
     @Published var startingURI: String?
 
@@ -230,11 +238,16 @@ final class MusicModel: ObservableObject {
             defer { startingURI = nil }
             do {
                 try await provider.play(uri: uri)
+                // Playback started → there's an active device now; clear recovery.
+                needsDevice = false
+                flash = ""
                 // Give the device a beat, then refresh the now-playing card.
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 snapshot = (try? await provider.fetchLibrary()) ?? snapshot
             } catch {
-                flash = "Couldn't start playback — open \(provider.displayName) on a device first."
+                // Connect can only play to an already-open Spotify app. Surface a
+                // calm, persistent "Open Spotify" affordance rather than a toast.
+                needsDevice = true
             }
         }
     }
@@ -250,10 +263,11 @@ final class MusicModel: ObservableObject {
         Task { @MainActor in
             do {
                 try await provider.setPlaying(want)
+                needsDevice = false
             } catch {
-                // Revert on failure.
+                // Revert the optimistic flip and surface the same calm recovery.
                 snapshot.nowPlaying = np
-                flash = "Couldn't \(want ? "resume" : "pause") — open \(provider.displayName) on a device first."
+                needsDevice = true
             }
         }
     }
@@ -289,6 +303,9 @@ struct MusicView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     header
+                    if model.needsDevice {
+                        deviceRecovery
+                    }
                     if let np = model.snapshot.nowPlaying {
                         nowPlayingBar(np)
                     }
@@ -374,6 +391,76 @@ struct MusicView: View {
                     )
                 )
         )
+    }
+
+    // -- No-active-device recovery (one tap back into playback)
+
+    /// Spotify Connect can only start playback on an already-open Spotify app.
+    /// When there's no active device, this calm inline card explains it in one
+    /// line and hands Ido a single "Open Spotify" tap — after which the app
+    /// registers as a device and his next play tap just works. It clears itself
+    /// the moment a play succeeds (`model.needsDevice`), so it never dead-ends.
+    private var deviceRecovery: some View {
+        let accent = ScarletTheme.accent(for: .music)
+        return HStack(spacing: 12) {
+            Image(systemName: "hifispeaker.2.fill")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("No active \(model.provider.displayName) device")
+                    .font(.scarletBodyEmph)
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text("Open \(model.provider.displayName) once so Scarlet can play to it.")
+                    .font(.scarletDetail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Button {
+                openSpotify()
+            } label: {
+                Text("Open \(model.provider.displayName)")
+                    .font(.scarletDetailEmph)
+                    .foregroundStyle(ScarletTheme.ink)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(Capsule().fill(accent))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open \(model.provider.displayName)")
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(cardBG)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(accent.opacity(0.45), lineWidth: 1)
+                )
+        )
+    }
+
+    /// Deep-link into the Spotify app so it registers as an active Connect
+    /// device. Tries the `spotify:` scheme first (opens straight into the app),
+    /// then the `https://open.spotify.com` universal link as a fallback. We just
+    /// attempt `open(_:)` — it succeeds without an `LSApplicationQueriesSchemes`
+    /// entry even when `canOpenURL` would return false. If neither opens, the
+    /// honest inline text above simply stays put.
+    private func openSpotify() {
+        #if canImport(UIKit)
+        let app = UIApplication.shared
+        let scheme = URL(string: "spotify://")
+        let web = URL(string: "https://open.spotify.com")
+        if let scheme {
+            app.open(scheme, options: [:]) { ok in
+                if !ok, let web { app.open(web, options: [:], completionHandler: nil) }
+            }
+        } else if let web {
+            app.open(web, options: [:], completionHandler: nil)
+        }
+        #endif
     }
 
     // -- Voice hint
