@@ -657,7 +657,7 @@ struct InboxView: View {
             }
             .frame(width: 36, height: 36)
             Text("Inbox")
-                .font(.system(size: 28, weight: .bold))
+                .font(.scarletHero)
                 .foregroundStyle(.white)
             Spacer()
             // New mail: Scarlet drafts it in the native studio.
@@ -687,7 +687,7 @@ struct InboxView: View {
                         model.setTab(t)
                     } label: {
                         Text(t.title)
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(.scarletDetailEmph)
                             .foregroundStyle(model.tab == t
                                 ? Color.white : OutlookStyle.textSecondary)
                             .padding(.horizontal, 16)
@@ -707,7 +707,7 @@ struct InboxView: View {
                 // (nothing else drives a re-render) — matches the calendar.
                 TimelineView(.everyMinute) { _ in
                     Text(Self.updatedLabel(stamp))
-                        .font(.system(size: 11))
+                        .font(.scarletCaption)
                         .foregroundStyle(OutlookStyle.textSecondary)
                 }
             }
@@ -735,7 +735,7 @@ struct InboxView: View {
             // could not exist yet, so the one spinner in the flow is here.
             VStack(spacing: 10) {
                 ProgressView()
-                Text("Checking the mail…").font(.footnote).foregroundStyle(.secondary)
+                Text("Checking the mail…").font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.messages.isEmpty && !model.errorText.isEmpty {
@@ -743,7 +743,7 @@ struct InboxView: View {
                 Image(systemName: "wifi.exclamationmark")
                     .font(.title2).foregroundStyle(.secondary)
                 Text(model.errorText)
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.scarletBody).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Button("Try again") { Task { await model.load() } }
                     .buttonStyle(.bordered)
@@ -756,21 +756,21 @@ struct InboxView: View {
                 Image(systemName: "envelope.open")
                     .font(.title2).foregroundStyle(.secondary)
                 Text("Inbox is quiet.")
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.scarletBody).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             List {
                 if !model.errorText.isEmpty {
                     Text(model.errorText)
-                        .font(.footnote)
+                        .font(.scarletDetail)
                         .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                         .listRowBackground(Color.clear)
                 }
                 ForEach(groups) { group in
                     // Per-day headers, Outlook style: small caps, quiet gray.
                     Text(group.title.uppercased())
-                        .font(.system(size: 12, weight: .semibold))
+                        .font(.scarletCaptionEmph)
                         .kerning(0.5)
                         .foregroundStyle(OutlookStyle.textSecondary)
                         .padding(.top, 12)
@@ -918,40 +918,43 @@ struct InboxRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(senderName)
-                        .font(.system(size: 15, weight: message.unread ? .bold : .semibold))
+                        .font(.scarletBody)
+                        .fontWeight(message.unread ? .bold : .semibold)
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     if message.importance == "high" {
                         Text("!")
-                            .font(.subheadline.bold())
+                            .font(.scarletBodyEmph)
                             .foregroundStyle(.red)
                     }
                     Spacer(minLength: 8)
                     Text(timeLabel)
-                        .font(.system(size: 12))
+                        .font(.scarletCaption)
                         .foregroundStyle(OutlookStyle.textSecondary)
                 }
                 HStack(spacing: 6) {
                     Text(message.subject)
-                        .font(.system(size: 14, weight: message.unread ? .semibold : .regular))
+                        .font(.scarletDetail)
+                        .fontWeight(message.unread ? .semibold : .regular)
                         .foregroundStyle(Color.white.opacity(message.unread ? 1.0 : 0.9))
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer(minLength: 8)
                     if message.flagged {
                         Image(systemName: "flag.fill")
-                            .font(.system(size: 12))
+                            .font(.scarletCaption)
                             .foregroundStyle(OutlookStyle.flagOrange)
                     }
                     if message.attachments {
                         Image(systemName: "paperclip")
-                            .font(.system(size: 12))
+                            .font(.scarletCaption)
                             .foregroundStyle(OutlookStyle.textSecondary)
                     }
                 }
                 Text(message.preview)
-                    .font(.system(size: 13))
+                    .font(.scarletDetail)
+                    .scarletReadingLineSpacing(2)
                     .foregroundStyle(OutlookStyle.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -1141,7 +1144,7 @@ struct MailDetailView: View {
             }
             if !attachmentError.isEmpty {
                 Text(attachmentError)
-                    .font(.footnote)
+                    .font(.scarletCaption)
                     .foregroundStyle(.red)
                     .padding(.horizontal, 16)
             }
@@ -1165,13 +1168,13 @@ struct MailDetailView: View {
                 }
                 VStack(alignment: .leading, spacing: 1) {
                     Text(att.name)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.scarletDetailEmph)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .frame(maxWidth: 170, alignment: .leading)
+                        .frame(maxWidth: 190, alignment: .leading)
                     Text(Self.sizeFormat.string(fromByteCount: Int64(att.size)))
-                        .font(.system(size: 11))
+                        .font(.scarletCaption)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -1345,13 +1348,13 @@ struct MailDetailView: View {
                 HStack(spacing: 3) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Inbox").font(.subheadline.weight(.semibold))
+                    Text("Inbox").font(.scarletDetailEmph)
                 }
                 .foregroundStyle(OutlookStyle.accentBlue)
             }
             .padding(.bottom, 2)
             Text(subjectText)
-                .font(.system(size: 22, weight: .semibold))
+                .font(.scarletTitle)
                 .foregroundStyle(.white)
                 .lineLimit(3)
                 .truncationMode(.tail)
@@ -1359,18 +1362,18 @@ struct MailDetailView: View {
                 SenderAvatar(name: senderDisplayName, email: senderAddress, size: 40)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(senderDisplayName)
-                        .font(.subheadline.weight(.semibold))
+                        .font(.scarletBodyEmph)
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     if !senderAddress.isEmpty && senderAddress != senderDisplayName {
                         Text(senderAddress)
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.scarletCaption).foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.middle)
                     }
                     if !receivedText.isEmpty {
                         Text(receivedText)
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.scarletCaption).foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 8)
@@ -1379,7 +1382,7 @@ struct MailDetailView: View {
                         withAnimation(.easeInOut(duration: 0.18)) { showRecipients.toggle() }
                     } label: {
                         HStack(spacing: 3) {
-                            Text("Details").font(.caption)
+                            Text("Details").font(.scarletCaption)
                             Image(systemName: "chevron.down")
                                 .font(.system(size: 10, weight: .semibold))
                                 .rotationEffect(.degrees(showRecipients ? 180 : 0))
@@ -1392,11 +1395,11 @@ struct MailDetailView: View {
                 VStack(alignment: .leading, spacing: 3) {
                     if !detail.to.isEmpty {
                         Text("To: \(detail.to)")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                            .font(.scarletCaption).foregroundStyle(.secondary).lineLimit(3)
                     }
                     if !detail.cc.isEmpty {
                         Text("Cc: \(detail.cc)")
-                            .font(.caption).foregroundStyle(.secondary).lineLimit(3)
+                            .font(.scarletCaption).foregroundStyle(.secondary).lineLimit(3)
                     }
                 }
             }
@@ -1415,7 +1418,7 @@ struct MailDetailView: View {
         } else if failed {
             VStack(spacing: 12) {
                 Text(failureText.isEmpty ? "Couldn't open this message." : failureText)
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.scarletBody).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 24)
                 Button("Try again") {
@@ -1466,9 +1469,10 @@ struct MailDetailView: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 13, weight: .semibold))
-                Text(label).font(.footnote.weight(.semibold))
+                Text(label).font(.scarletDetailEmph)
             }
             .lineLimit(1)
+            .minimumScaleFactor(0.85)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
             .background(filled ? tint : OutlookStyle.surface, in: Capsule())

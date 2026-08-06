@@ -247,12 +247,15 @@ struct HealthView: View {
                     .preferredColorScheme(.dark)
             }
         }
-        // .task re-runs every time this tab is selected → sync on appear.
+        // .task re-runs every time this tab is selected → refresh on appear.
         // (The cache already painted; this refreshes deltas in background.)
-        .task { if sync.authorized { await sync.syncNow() } }
+        // `refresh()` routes itself: HealthKit read+push on iPhone/iPad, a
+        // server-only overview load on Mac Catalyst — so the Mac pulls the
+        // freshest iPhone-pushed data the moment the tab appears or foregrounds.
+        .task { await sync.refresh() }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { if sync.authorized { await sync.syncNow() } }
+            Task { await sync.refresh() }
         }
     }
 
@@ -277,13 +280,15 @@ struct HealthView: View {
                     .foregroundStyle(.white.opacity(0.4))
             }
             Button {
-                Task { await sync.syncNow() }
+                Task { await sync.refresh() }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(.white)
             }
-            .disabled(sync.syncing || !sync.authorized)
+            // Not gated on HealthKit authorization: on the Mac (no HealthKit)
+            // this button still pulls the server overview.
+            .disabled(sync.syncing)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
@@ -294,14 +299,9 @@ struct HealthView: View {
 
     @ViewBuilder
     private var content: some View {
-        if !sync.available {
-            explainer(
-                icon: "heart.slash",
-                title: "No Health data here",
-                text: "This device doesn't provide Apple Health data.",
-                showConnect: false
-            )
-        } else if !sync.authorized {
+        if sync.available && !sync.authorized && !sync.hasData {
+            // iPhone/iPad first run: HealthKit is present but not yet granted,
+            // and nothing is cached — offer the connect flow.
             explainer(
                 icon: "heart.text.square.fill",
                 title: "Connect Apple Health",
@@ -311,24 +311,30 @@ struct HealthView: View {
                     + "back to Health.",
                 showConnect: true
             )
-        } else if sync.days.isEmpty && sync.syncing {
+        } else if sync.hasData {
+            // The populated dashboard — whether the data came from HealthKit
+            // (iPhone/iPad) or purely from the server overview (Mac Catalyst).
+            dashboard
+        } else if sync.syncing {
             VStack(spacing: 10) {
                 ProgressView()
-                Text("Reading Apple Health…")
+                Text(sync.available ? "Reading Apple Health…" : "Loading your health data…")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if sync.days.isEmpty {
+        } else {
+            // Authorized (or Mac) but nothing came back yet.
             explainer(
                 icon: "heart.text.square",
                 title: "Nothing yet",
-                text: "No health data came back. If you just connected, check "
-                    + "that Scarlet's categories are on in the Health app, then sync.",
+                text: sync.available
+                    ? "No health data came back. If you just connected, check "
+                        + "that Scarlet's categories are on in the Health app, then sync."
+                    : "No health data has synced from your iPhone or Withings yet. "
+                        + "Open the Health tab on your iPhone to push the latest, then sync here.",
                 showConnect: false,
                 showSyncButton: true
             )
-        } else {
-            dashboard
         }
     }
 
@@ -349,7 +355,7 @@ struct HealthView: View {
                 Button {
                     Task {
                         await sync.requestAccess()
-                        await sync.syncNow()
+                        await sync.refresh()
                     }
                 } label: {
                     Label("Connect Apple Health", systemImage: "heart.fill")
@@ -362,7 +368,7 @@ struct HealthView: View {
                 .padding(.top, 6)
             }
             if showSyncButton {
-                Button("Sync now") { Task { await sync.syncNow() } }
+                Button("Sync now") { Task { await sync.refresh() } }
                     .buttonStyle(.bordered)
                     .tint(HealthStyle.rose)
             }
@@ -406,7 +412,7 @@ struct HealthView: View {
             .animation(.snappy(duration: 0.35), value: period)
         }
         .scrollIndicators(.hidden)
-        .refreshable { await sync.syncNow() }
+        .refreshable { await sync.refresh() }
     }
 
     /// The shared card shell — 20 pt radius, small-caps header, generous air.

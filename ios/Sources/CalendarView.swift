@@ -577,7 +577,7 @@ struct CalendarView: View {
             }
             .frame(width: 38, height: 38)
             Text("Calendar")
-                .font(.system(size: 26, weight: .bold))
+                .font(.scarletHero)
                 .foregroundStyle(.white)
             Spacer()
             // Unambiguous "jump to today" — a bare calendar glyph reads as
@@ -586,7 +586,7 @@ struct CalendarView: View {
                 goToToday(proxy)
             } label: {
                 Text("Today")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.scarletDetailEmph)
                     .foregroundStyle(CalStyle.accent)
             }
         }
@@ -633,7 +633,7 @@ struct CalendarView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(monthTitle)
-                    .font(.system(size: 17, weight: .semibold))
+                    .font(.scarletTitle)
                     .foregroundStyle(.white)
                 Spacer()
                 // Quiet freshness stamp — the cache paints instantly, this
@@ -641,7 +641,7 @@ struct CalendarView: View {
                 if let updated = model.lastUpdated {
                     TimelineView(.everyMinute) { _ in
                         Text(Self.agoStamp(updated))
-                            .font(.system(size: 11))
+                            .font(.scarletCaption)
                             .foregroundStyle(Color(calHex: 0x8A8886))
                     }
                 }
@@ -702,7 +702,7 @@ struct CalendarView: View {
         } label: {
             VStack(spacing: 3) {
                 Text(CalDates.weekdayLetter.string(from: day))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.scarletCaptionEmph)
                     .foregroundStyle(Color(calHex: 0x8A8886))
                 ZStack {
                     if isToday {
@@ -734,7 +734,7 @@ struct CalendarView: View {
             // First run only — once a cache exists this never shows again.
             VStack(spacing: 10) {
                 ProgressView()
-                Text("Checking the calendar…").font(.footnote).foregroundStyle(.secondary)
+                Text("Checking the calendar…").font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.days.isEmpty && !model.errorText.isEmpty {
@@ -742,7 +742,7 @@ struct CalendarView: View {
                 Image(systemName: "wifi.exclamationmark")
                     .font(.title2).foregroundStyle(.secondary)
                 Text(model.errorText)
-                    .font(.callout).foregroundStyle(.secondary)
+                    .font(.scarletBody).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Button("Try again") { Task { await model.load() } }
                     .buttonStyle(.bordered)
@@ -759,7 +759,7 @@ struct CalendarView: View {
         List {
             if !model.errorText.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(calHex: 0xE8B04F))
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
@@ -792,7 +792,7 @@ struct CalendarView: View {
     /// The row carries the day's scroll anchor id.
     private func dayHeader(_ day: CalendarModel.Day) -> some View {
         Text(dayTitle(day.date))
-            .font(.system(size: 13, weight: .semibold).smallCaps())
+            .font(.scarletDetailEmph.smallCaps())
             .kerning(0.4)
             .foregroundStyle(CalDates.cal.isDateInToday(day.date)
                 ? CalStyle.accent : Color(calHex: 0x8A8886))
@@ -813,7 +813,7 @@ struct CalendarView: View {
 
     private var noEventsRow: some View {
         Text("No events")
-            .font(.system(size: 14))
+            .font(.scarletDetail)
             .italic()
             .foregroundStyle(Color(calHex: 0x797774))
             .padding(.leading, 4)
@@ -835,7 +835,7 @@ struct CalendarView: View {
                                 .fill(CalStyle.bar(for: e.showAs))
                                 .frame(width: 7, height: 7)
                             Text(e.subject)
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.scarletDetailEmph)
                                 .strikethrough(e.response == "declined")
                                 .foregroundStyle(e.response == "declined"
                                     ? Color(calHex: 0x8A8886) : Color.white)
@@ -879,22 +879,22 @@ struct CalEventRow: View {
                 .padding(.leading, 10)
             VStack(alignment: .leading, spacing: 3) {
                 Text(event.subject)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.scarletBodyEmph)
                     .strikethrough(event.response == "declined")
                     .foregroundStyle(event.response == "declined"
                         ? Color(calHex: 0x8A8886) : Color.white)
                     .lineLimit(2)
                     .truncationMode(.tail)
                 Text(event.timeRange)
-                    .font(.system(size: 13).monospacedDigit())
+                    .font(.scarletDetail.monospacedDigit())
                     .foregroundStyle(isUpNext
                         ? Color(calHex: 0xA8CEF5) : Color(calHex: 0x9E9C9A))
                 if !event.location.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "mappin.and.ellipse")
-                            .font(.system(size: 10))
+                            .font(.system(size: 12))
                         Text(event.location)
-                            .font(.system(size: 13))
+                            .font(.scarletDetail)
                             .lineLimit(1)
                             .truncationMode(.tail)
                     }
@@ -908,7 +908,7 @@ struct CalEventRow: View {
                     UIApplication.shared.open(joinURL, options: [:], completionHandler: nil)
                 } label: {
                     Text("Join")
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.scarletDetailEmph)
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 7)
@@ -970,7 +970,7 @@ struct CalEventDetailView: View {
                             .frame(width: 4)
                             .padding(.vertical, 3)
                         Text(event.subject)
-                            .font(.title2.weight(.semibold))
+                            .font(.scarletSection)
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -1029,12 +1029,12 @@ struct CalEventDetailView: View {
             }
             if failed {
                 Text("Couldn't load full details.")
-                    .font(.footnote)
+                    .font(.scarletCaption)
                     .foregroundStyle(.secondary)
             } else if detail == nil {
                 HStack(spacing: 7) {
                     ProgressView().controlSize(.small)
-                    Text("Loading details…").font(.footnote).foregroundStyle(.secondary)
+                    Text("Loading details…").font(.scarletCaption).foregroundStyle(.secondary)
                 }
             }
         }
@@ -1056,11 +1056,11 @@ struct CalEventDetailView: View {
     private func infoRow(_ icon: String, _ text: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: icon)
-                .font(.system(size: 13))
+                .font(.system(size: 15))
                 .foregroundStyle(Color(calHex: 0x8A8886))
                 .frame(width: 18)
             Text(text)
-                .font(.system(size: 15))
+                .font(.scarletBody)
                 .foregroundStyle(.white.opacity(0.92))
         }
     }
@@ -1107,7 +1107,7 @@ struct CalEventDetailView: View {
                 }
                 if !actionError.isEmpty {
                     Text(actionError)
-                        .font(.footnote)
+                        .font(.scarletCaption)
                         .foregroundStyle(Color(calHex: 0xF57373))
                 }
             }
@@ -1124,7 +1124,7 @@ struct CalEventDetailView: View {
                 Image(systemName: icon)
                     .font(.system(size: 12, weight: .bold))
                 Text(label)
-                    .font(.footnote.weight(.semibold))
+                    .font(.scarletDetailEmph)
             }
             .lineLimit(1)
             .minimumScaleFactor(0.8)
@@ -1165,7 +1165,7 @@ struct CalEventDetailView: View {
                 } label: {
                     HStack(spacing: 5) {
                         Text("Attendees (\(d.attendees.count))")
-                            .font(.footnote.weight(.semibold))
+                            .font(.scarletDetailEmph)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 10, weight: .semibold))
                             .rotationEffect(.degrees(showAttendees ? 180 : 0))
@@ -1191,13 +1191,13 @@ struct CalEventDetailView: View {
                 .foregroundStyle(responseGlyph(a.response).1)
                 .frame(width: 16)
             Text(a.name.isEmpty ? a.email : a.name)
-                .font(.system(size: 14))
+                .font(.scarletDetail)
                 .foregroundStyle(.white.opacity(0.85))
                 .lineLimit(1)
                 .truncationMode(.middle)
             if !a.required {
                 Text("optional")
-                    .font(.caption2)
+                    .font(.scarletCaption)
                     .foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -1221,8 +1221,8 @@ struct CalEventDetailView: View {
             VStack(alignment: .leading, spacing: 10) {
                 Divider().overlay(CalStyle.separator)
                 Text(d.preview)
-                    .font(.system(size: 15))
-                    .lineSpacing(3)
+                    .font(.scarletBody)
+                    .scarletReadingLineSpacing()
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1273,7 +1273,7 @@ struct CalEventDetailView: View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 13, weight: .semibold))
-                Text(label).font(.footnote.weight(.semibold))
+                Text(label).font(.scarletDetailEmph)
             }
             .lineLimit(1)
             .frame(maxWidth: .infinity)

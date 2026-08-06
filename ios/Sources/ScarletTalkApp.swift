@@ -70,7 +70,10 @@ struct RootView: View {
     // The one process-wide conversation — shared with the CarPlay scene so the
     // car continues the same session instead of racing a second audio graph.
     @StateObject private var convo = Conversation.shared
-    @State private var tab: Tab = .talk
+    /// Ido's chosen section order — cache-first, server-reconciled. Drives both
+    /// the phone tabs and the iPad/Mac sidebar so they stay one app.
+    @StateObject private var sections = SectionOrderStore()
+    @State private var tab: AppSection = .talk
     @State private var voiceDraftPresented = false
     /// The compose_draft tool arguments (recipient, instruction, channel) posted
     /// the instant Scarlet calls the tool — handed to the DraftView so the
@@ -88,8 +91,6 @@ struct RootView: View {
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, library, photos, health, desk }
-
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
     private static let talkFocus =
@@ -98,7 +99,7 @@ struct RootView: View {
     var body: some View {
         Group {
             if hSize == .regular {
-                SplitShell(convo: convo)
+                SplitShell(convo: convo, sections: sections)
             } else {
                 phoneTabs
             }
@@ -185,6 +186,7 @@ struct RootView: View {
             convo.setFocus(Self.talkFocus)
             FlightRecorder.reportUncleanExitIfAny()
             FlightRecorder.note(screen: "talk")
+            Task { await sections.refresh() }
             Task { await recoverActiveDraft() }
             // Cold-launch "Talk to Scarlet": the intent may have fired before
             // the observer above was listening, so drain the pending flag once.
@@ -193,7 +195,10 @@ struct RootView: View {
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await recoverActiveDraft() } }
+            if phase == .active {
+                Task { await recoverActiveDraft() }
+                Task { await sections.refresh() }
+            }
             FlightRecorder.note(screen: "phase:\(phase)")
         }
         .onChange(of: tab) { _, newTab in
@@ -224,42 +229,29 @@ struct RootView: View {
         }
     }
 
-    /// The iPhone presentation: the main tabs (5+ fold into More).
+    /// The iPhone presentation: tabs in Ido's chosen order (6+ fold into the
+    /// system "More" list). One loop over `sections.order` + pinned Settings —
+    /// adding a section anywhere never touches this shell. iOS shows the first
+    /// few as prominent tabs, so his reorder decides which are one tap away.
     private var phoneTabs: some View {
         TabView(selection: $tab) {
-            TalkView(convo: convo)
-                .background(ScarletBackground().ignoresSafeArea())
-                .tabItem { Label("Talk", systemImage: "waveform") }
-                .tag(Tab.talk)
-            InboxView()
-                .environmentObject(convo)
-                .tabItem { Label("Inbox", systemImage: "envelope.fill") }
-                .tag(Tab.inbox)
-            CalendarView()
-                .environmentObject(convo)
-                .tabItem { Label("Calendar", systemImage: "calendar") }
-                .tag(Tab.calendar)
-            ChatsView()
-                .environmentObject(convo)
-                .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
-                .tag(Tab.chats)
-            LibraryView()
-                .environmentObject(convo)
-                .tabItem { Label("Library", systemImage: "books.vertical.fill") }
-                .tag(Tab.library)
-            PhotosView()
-                .environmentObject(convo)
-                .tabItem { Label("Photos", systemImage: "photo.on.rectangle.angled") }
-                .tag(Tab.photos)
-            HealthView()
-                .environmentObject(convo)
-                .tabItem { Label("Health", systemImage: "heart.fill") }
-                .tag(Tab.health)
-            DeskView()
-                .environmentObject(convo)
-                .tabItem { Label("Desk", systemImage: "checklist") }
-                .tag(Tab.desk)
+            ForEach(sections.order + [.settings]) { s in
+                sectionTab(s)
+            }
         }
+    }
+
+    /// One phone tab for a section — its screen, uniform convo injection, the
+    /// scarlet backdrop, and its label/tag. Talk is the only one that needs an
+    /// explicit background (it draws over the gradient); the rest own theirs.
+    @ViewBuilder
+    private func sectionTab(_ s: AppSection) -> some View {
+        s.destination(convo: convo)
+            .environmentObject(convo)
+            .background(s == .talk ? AnyView(ScarletBackground().ignoresSafeArea())
+                                   : AnyView(Color.clear))
+            .tabItem { Label(s.title, systemImage: s.icon) }
+            .tag(s)
     }
 
     /// Wake the conversation from the "Talk to Scarlet" App Intent — switch to

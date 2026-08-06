@@ -7,20 +7,15 @@ import SwiftUI
 /// `horizontalSizeClass == .regular`. One codebase, presentation switches
 /// by size class.
 ///
-/// Column anatomy: a `NavigationSplitView` with a custom sidebar plus a
-/// detail column. Inbox, Chats and Library are ALREADY self-contained
-/// `NavigationStack`s with their own pushed details, so they render
-/// full-width in the detail column — their internal list→reader push IS the
-/// list-pane→reading-pane flow, and at iPad width the pushed reader is the
-/// big pane. Talk gets centered (max ~700pt); Calendar and Settings manage
-/// their own layouts.
+/// Sections and their order come from the shared `AppSection` catalog +
+/// `SectionOrderStore`, the SAME source the phone tabs use — so a reorder in
+/// Settings reflows both surfaces identically. Settings is pinned to the
+/// bottom of the sidebar (Preferences lives inside it).
 ///
 /// IMPORTANT — this view is rendered INSIDE RootView's body, so RootView's
 /// onReceive listeners (ask-about-email delivery, voice-draft sheet, draft
 /// recovery, desk-mode polling) still run above it. This shell must NOT
-/// duplicate that work; it only mirrors the *visual* "go to Talk" switch,
-/// because RootView's `tab` state drives the compact TabView, not this
-/// shell's selection.
+/// duplicate that work; it only mirrors the *visual* "go to Talk" switch.
 struct SplitShell: View {
     /// TalkView reads it from the environment; declared here so the
     /// dependency is explicit (RootView already has it injected app-wide).
@@ -28,67 +23,10 @@ struct SplitShell: View {
     /// Owned by RootView — the live conversation survives pane switches
     /// exactly as it survives tab switches on the phone.
     @ObservedObject var convo: Conversation
+    /// Ido's chosen section order — the same instance the phone tabs use.
+    @ObservedObject var sections: SectionOrderStore
 
-    /// Sidebar sections. Order here is also the ⌘1…⌘6 shortcut order.
-    enum ShellSection: String, CaseIterable, Identifiable {
-        case talk
-        case inbox
-        case calendar
-        case chats
-        case library
-        case photos
-        case health
-        case desk
-        case settings
-
-        var id: String { rawValue }
-
-        var title: String {
-            switch self {
-            case .talk: return "Talk"
-            case .inbox: return "Inbox"
-            case .calendar: return "Calendar"
-            case .chats: return "Chats"
-            case .library: return "Library"
-            case .photos: return "Photos"
-            case .health: return "Health"
-            case .desk: return "Desk"
-            case .settings: return "Settings"
-            }
-        }
-
-        /// Mirrors RootView's tabItem icons so the two shells feel like one app.
-        var icon: String {
-            switch self {
-            case .talk: return "waveform"
-            case .inbox: return "envelope.fill"
-            case .calendar: return "calendar"
-            case .chats: return "bubble.left.and.bubble.right.fill"
-            case .library: return "books.vertical.fill"
-            case .photos: return "photo.on.rectangle.angled"
-            case .health: return "heart.fill"
-            case .desk: return "checklist"
-            case .settings: return "gearshape.fill"
-            }
-        }
-
-        /// Hardware-keyboard shortcut: ⌘1…⌘6 in sidebar order.
-        var shortcutKey: KeyEquivalent {
-            switch self {
-            case .talk: return "1"
-            case .inbox: return "2"
-            case .calendar: return "3"
-            case .chats: return "4"
-            case .library: return "5"
-            case .photos: return "6"
-            case .health: return "7"
-            case .desk: return "8"
-            case .settings: return "9"
-            }
-        }
-    }
-
-    @State private var section: ShellSection = .talk
+    @State private var section: AppSection = .talk
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
@@ -98,18 +36,10 @@ struct SplitShell: View {
     private static let talkFocus =
         "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
-    /// The main (top) sidebar group; Settings renders separately at the
-    /// bottom of the sidebar.
-    private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .library, .photos, .health, .desk]
-    }
-
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar
                 .navigationSplitViewColumnWidth(min: 190, ideal: 210, max: 250)
-                // The sidebar is fully custom (brand header + rows) — no
-                // system bar on top of it.
                 .toolbar(.hidden, for: .navigationBar)
         } detail: {
             detailColumn
@@ -117,21 +47,19 @@ struct SplitShell: View {
         .navigationSplitViewStyle(.balanced)
         .tint(scarletRose)
         // Visual mirrors of RootView's cross-screen wiring. RootView still
-        // OWNS the behavior behind these notifications (waking her,
-        // delivering the question, presenting the draft sheet); this shell
-        // only brings the Talk pane forward, since RootView's `tab` state
-        // doesn't drive this presentation.
+        // OWNS the behavior behind these notifications; this shell only brings
+        // the Talk pane forward, since RootView's `tab` state doesn't drive
+        // this presentation.
         .onReceive(NotificationCenter.default.publisher(for: .scarletGoToTalk)) { _ in
             section = .talk
         }
         .onReceive(NotificationCenter.default.publisher(for: .scarletAskAboutEmail)) { _ in
             section = .talk
         }
-        // Returning to Talk re-reports its ambient focus (the other panes
-        // report their own from their onAppears, exactly as on the phone).
         .onChange(of: section) { _, newSection in
             if newSection == .talk { convo.setFocus(Self.talkFocus) }
         }
+        .task { await sections.refresh() }
     }
 
     // MARK: - Sidebar
@@ -149,8 +77,8 @@ struct SplitShell: View {
 
             ScrollView {
                 VStack(spacing: 4) {
-                    ForEach(mainSections) { s in
-                        sidebarRow(s)
+                    ForEach(Array(sections.order.enumerated()), id: \.element) { idx, s in
+                        sidebarRow(s, index: idx)
                     }
                 }
                 .padding(.horizontal, 10)
@@ -159,13 +87,9 @@ struct SplitShell: View {
             Spacer(minLength: 0)
 
             VStack(spacing: 12) {
-                sidebarRow(.settings)
+                sidebarRow(.settings, index: nil)
                     .padding(.horizontal, 10)
-                // On big screens she lives in the corner, always: the same
-                // self-contained presence capsule the phone embeds per list
-                // screen, pinned here so she's visible from every pane.
-                // (List panes keep their own embedded capsule too — see the
-                // compatibility note in the type doc above.)
+                // On big screens she lives in the corner, always.
                 ScarletPresenceView(convo: convo)
                     .padding(.bottom, 12)
             }
@@ -174,9 +98,10 @@ struct SplitShell: View {
         .background(ScarletBackground().ignoresSafeArea())
     }
 
-    /// One sidebar row: icon + label, rose selection pill, ⌘n shortcut.
-    private func sidebarRow(_ s: ShellSection) -> some View {
-        Button {
+    /// One sidebar row: icon + label, rose selection pill. The first nine
+    /// sections get a ⌘1…⌘9 hardware shortcut, in Ido's chosen order.
+    private func sidebarRow(_ s: AppSection, index: Int?) -> some View {
+        let row = Button {
             section = s
         } label: {
             HStack(spacing: 11) {
@@ -184,7 +109,7 @@ struct SplitShell: View {
                     .font(.system(size: 15))
                     .frame(width: 24)
                 Text(s.title)
-                    .font(.system(size: 15, weight: section == s ? .semibold : .regular))
+                    .font(.system(size: 16, weight: section == s ? .semibold : .regular))
                 Spacer(minLength: 0)
             }
             .foregroundStyle(section == s ? .white : .white.opacity(0.72))
@@ -198,21 +123,29 @@ struct SplitShell: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .keyboardShortcut(s.shortcutKey, modifiers: .command)
+
+        return Group {
+            if let i = index, i < 9, let key = KeyEquivalent(digit: i + 1) {
+                row.keyboardShortcut(key, modifiers: .command)
+            } else {
+                row
+            }
+        }
     }
 
     // MARK: - Detail column
 
     /// Section hosting. A plain switch is deliberate: the section views
-    /// re-`.task` on appear by design (that's their refresh path on the
-    /// phone's TabView too), and the Conversation lives above this shell so
-    /// nothing that matters is torn down by switching.
+    /// re-`.task` on appear by design (their refresh path on the phone too),
+    /// and the Conversation lives above this shell so nothing that matters is
+    /// torn down by switching. Talk, Calendar and Settings get bespoke
+    /// framing; everything else uses the shared `destination` builder.
     @ViewBuilder
     private var detailColumn: some View {
         switch section {
         case .talk:
-            // The one-pager, centered like a sheet of paper on the desk —
-            // full-width Talk on a 13" screen reads as stretched.
+            // Centered like a sheet of paper on the desk — full-width Talk on a
+            // 13" screen reads as stretched.
             ZStack {
                 ScarletBackground().ignoresSafeArea()
                 TalkView(convo: convo)
@@ -220,40 +153,26 @@ struct SplitShell: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .toolbar(.hidden, for: .navigationBar)
-        case .inbox:
-            // Self-contained NavigationStack: list full-width, pushed reader
-            // becomes the big reading pane. Zero rewrites.
-            InboxView()
-                .environmentObject(convo)
         case .calendar:
-            // Manages its own layout (week strip + agenda; detail is a sheet).
             CalendarView()
                 .environmentObject(convo)
                 .toolbar(.hidden, for: .navigationBar)
-        case .chats:
-            // Self-contained NavigationStack (channel lists + pushed threads).
-            ChatsView()
-                .environmentObject(convo)
-        case .library:
-            // Self-contained NavigationStack (shelves + viewers).
-            LibraryView()
-                .environmentObject(convo)
-        case .photos:
-            // Self-contained NavigationStack (grid + in-column full-screen viewer).
-            PhotosView()
-                .environmentObject(convo)
-        case .health:
-            HealthView()
-                .environmentObject(convo)
-        case .desk:
-            // Self-contained (Reminders + Apple Notes; serif reading sheet).
-            DeskView()
-                .environmentObject(convo)
         case .settings:
-            // Has its own NavigationStack and title bar. As a detail column there
-            // is nothing to dismiss, so suppress the (otherwise dead) Done button.
             SettingsView(presentedAsSheet: false)
                 .background(ScarletBackground().ignoresSafeArea())
+        default:
+            // Self-contained sections (their own NavigationStack / layout).
+            // Uniform convo injection matches the phone shell.
+            section.destination(convo: convo)
+                .environmentObject(convo)
         }
+    }
+}
+
+/// ⌘1…⌘9 from a small integer, without force-unwrapping a Character.
+private extension KeyEquivalent {
+    init?(digit: Int) {
+        guard (1...9).contains(digit), let ch = String(digit).first else { return nil }
+        self = KeyEquivalent(ch)
     }
 }

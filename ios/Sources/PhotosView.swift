@@ -8,21 +8,30 @@ import UIKit
 /// and offline-robust rendering.
 ///
 /// NAVIGATION (the shape Ido asked for — no bare-nav-bar middle stage):
-///   • Grid of square thumbnails (this view). Full-width inside SplitShell's
-///     detail column, like InboxView / LibraryView.
+///   • Grid of square thumbnails (this view), full-width inside SplitShell's
+///     detail column, like InboxView / LibraryView. The grid density is
+///     adjustable — three levels (large / medium / small ≈ 2 / 4 / 6 columns),
+///     switched by the header control OR by pinching the grid, exactly like
+///     Apple Photos.
 ///   • Tap a thumbnail → an in-column PAGED slideshow (`PhotoPagerView`): the
-///     photo edge-to-edge, swipe LEFT/RIGHT to the next/previous, its own Back
-///     capsule (nav bar hidden — never a lone toolbar over the picture). Back →
-///     thumbnails. This is close #1 when you came straight from the grid.
+///     photo edge-to-edge on black, swipe LEFT/RIGHT for next/previous. The
+///     chrome (Back · Ask · Forward · Expand) AUTO-HIDES — a single tap toggles
+///     it, and it fades on its own after a moment. The photo itself is CLEAN:
+///     no caption or label baked over it.
 ///   • Expand → a true full-screen cover (`FullScreenPager`) that covers the
-///     sidebar too, for landscape 16:9 viewing; swipe L/R; Close → the in-column
-///     pager. So from full screen: Close (→ pager) then Back (→ thumbnails) is
-///     "close it, then close it again to be in the thumbnails."
+///     sidebar too, rotating NATURALLY with the device (portrait when the phone
+///     is portrait, landscape when turned). Same clean auto-hiding chrome.
+///
+/// CLEAN + NATURAL (Ido's core ask): the full-screen photo fills the page on a
+/// black field, `.scaledToFit` so every ratio (9:16 portrait, 16:9 landscape,
+/// square) is letterboxed and never cropped or stretched; controls auto-hide so
+/// nothing sits over the picture; and orientation is never locked — the app-level
+/// `OrientationGate` is widened to `.allButUpsideDown` while full-screen so the
+/// device rotates the way photos are normally viewed.
 ///
 /// ACTIONS on the focused photo (and on a multi-selection from the grid):
 ///   • Forward → uploads the photo(s) and opens the drafting studio on the
-///     chosen channel (Amwell email / Gmail) with them attached; WhatsApp is
-///     shown but disabled (its Mac bridge can't carry media yet — honest).
+///     chosen channel with them attached.
 ///   • Ask Scarlet → uploads the photo and tells her (focus + spoken nudge) to
 ///     analyze_document, so she can actually see the pixels and talk about it.
 ///
@@ -211,6 +220,45 @@ enum PhotoUploader {
     }
 }
 
+// MARK: - Auto-hiding chrome timer (shared by both slideshow viewers)
+
+/// Drives the show/hide of the on-photo controls so the picture stays clean.
+/// Tap toggles; when shown it schedules its own fade after a few seconds, like
+/// Apple Photos. Main-actor isolated (it only ever mutates from SwiftUI), and
+/// its pending fade is a cancelable work item so a torn-down viewer never fires
+/// a state mutation after it's gone.
+@MainActor
+final class ChromeTimer: ObservableObject {
+    @Published var visible = true
+    /// Monotonic token: every (re)arm bumps it, and the pending fade only fires
+    /// if its captured token still matches — a cancel/re-arm simply invalidates
+    /// any in-flight countdown. All isolated to the main actor, so the
+    /// @Published mutation always lands on the main thread (no purple warnings,
+    /// no cross-actor state race, nothing fires after teardown).
+    private var generation = 0
+
+    /// Show the chrome (if hidden) and (re)arm the auto-hide countdown.
+    func bump(hideAfter seconds: Double = 3.5) {
+        if !visible { visible = true }
+        generation &+= 1
+        let mine = generation
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, mine == self.generation else { return }
+            withAnimation(.easeInOut(duration: 0.25)) { self.visible = false }
+        }
+    }
+
+    /// A tap on the photo: flip visibility. Showing re-arms the fade; hiding
+    /// invalidates any pending fade so it doesn't immediately toggle back.
+    func toggle() {
+        withAnimation(.easeInOut(duration: 0.25)) { visible.toggle() }
+        if visible { bump() } else { generation &+= 1 }
+    }
+
+    func cancel() { generation &+= 1 }
+}
+
 // MARK: - Photos page (grid)
 
 struct PhotosView: View {
@@ -219,9 +267,16 @@ struct PhotosView: View {
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
-    /// Three columns of square thumbnails, a hair of breathing room between —
-    /// the familiar camera-roll density, native on every width.
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
+    /// Grid density — "three levels of thumbnails" Ido asked for. Persisted so it
+    /// stays how he left it. Only ever one of `densityLevels`; clamped on read.
+    @AppStorage("photoGridColumns") private var gridColumns: Int = 4
+    private let densityLevels = [2, 4, 6]   // large · medium · small
+
+    /// Live columns for the LazyVGrid, from the current (clamped) density.
+    private var columns: [GridItem] {
+        let n = max(2, min(gridColumns, 6))
+        return Array(repeating: GridItem(.flexible(), spacing: 2), count: n)
+    }
 
     // Multi-select (grid) state.
     @State private var selecting = false
@@ -305,15 +360,18 @@ struct PhotosView: View {
         }
     }
 
-    // MARK: header (title + Select + refresh)
+    // MARK: header (title + density + Select + refresh)
 
     private var headerBar: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             Text("Photos")
                 .font(.system(size: 34, weight: .heavy))
                 .foregroundStyle(.white)
-            Spacer()
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Spacer(minLength: 8)
             if !model.assets.isEmpty {
+                densityControl
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) {
                         selecting.toggle()
@@ -338,6 +396,49 @@ struct PhotosView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    /// Three-level thumbnail-size control (large / medium / small ≈ 2 / 4 / 6
+    /// columns). The visible, discoverable partner to the grid's pinch gesture.
+    private var densityControl: some View {
+        HStack(spacing: 2) {
+            ForEach(densityLevels, id: \.self) { cols in
+                let active = gridColumns == cols
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { gridColumns = cols }
+                } label: {
+                    Image(systemName: densityIcon(cols))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(active ? scarletRose : .white.opacity(0.5))
+                        .frame(width: 30, height: 28)
+                        .background(active ? scarletRose.opacity(0.16) : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(cols == 2 ? "Large thumbnails"
+                                    : cols == 4 ? "Medium thumbnails" : "Small thumbnails")
+            }
+        }
+        .padding(2)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+    }
+
+    private func densityIcon(_ cols: Int) -> String {
+        switch cols {
+        case 2:  return "square.grid.2x2"
+        case 4:  return "square.grid.3x3"
+        default: return "square.grid.4x3.fill"
+        }
+    }
+
+    /// Step the grid density one level in (larger thumbs / fewer columns) or out.
+    private func stepDensity(zoomIn: Bool) {
+        guard let idx = densityLevels.firstIndex(of: max(2, min(gridColumns, 6))) else {
+            gridColumns = 4; return
+        }
+        let next = zoomIn ? idx - 1 : idx + 1
+        guard densityLevels.indices.contains(next) else { return }
+        withAnimation(.easeInOut(duration: 0.2)) { gridColumns = densityLevels[next] }
     }
 
     // MARK: content states (loading / no-permission / empty / grid)
@@ -462,8 +563,19 @@ struct PhotosView: View {
                 }
             }
             .padding(.horizontal, 2)
+            .animation(.easeInOut(duration: 0.2), value: gridColumns)
         }
         .scrollContentBackground(.hidden)
+        // Pinch the grid to change density — the Apple-Photos gesture. Runs
+        // alongside scrolling (simultaneous), and only commits one step at the
+        // end of the pinch so it never thrashes mid-gesture.
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onEnded { value in
+                    if value > 1.2 { stepDensity(zoomIn: true) }
+                    else if value < 0.8 { stepDensity(zoomIn: false) }
+                }
+        )
     }
 
     /// A grid cell in select mode: the thumbnail with a check overlay.
@@ -628,12 +740,24 @@ struct PhotoThumbnail: View {
 
 // MARK: - Zoomable, offline-robust single photo (used by both pagers)
 
-/// One page in the slideshow: the full photo on black, best-available-first
-/// then upgraded to full quality, pinch/double-tap zoom, and an honest chip when
-/// only a lower-quality (iCloud-unreachable) copy is on hand.
+/// One page in the slideshow: the full photo on black, letterboxed with
+/// `.scaledToFit` so any ratio (portrait 9:16, landscape 16:9, square) shows
+/// whole — never cropped, never stretched. Best-available copy first, then
+/// upgraded to full quality; pinch / double-tap to zoom; a single tap bubbles up
+/// (`onSingleTap`) so the parent can toggle its auto-hiding chrome.
+///
+/// CLEAN: the photo carries NO baked-in text. The only overlay is a small
+/// "lower-quality copy" pill for the iCloud-unreachable case, and it appears
+/// ONLY while the chrome is showing (`chromeVisible`) — so a viewed photo is
+/// otherwise completely bare.
 struct PhotoPage: View {
     let asset: PHAsset
     let imageManager: PHCachingImageManager
+    /// The parent's chrome visibility — gates the (rare) quality pill so nothing
+    /// persists over the picture.
+    var chromeVisible: Bool = true
+    /// A single tap on the photo (parent toggles its chrome).
+    var onSingleTap: () -> Void = {}
 
     @State private var image: UIImage?
     @State private var degraded = false     // showing a fast/low-res copy
@@ -647,37 +771,20 @@ struct PhotoPage: View {
     @State private var fastRequestID: PHImageRequestID?
     @State private var hiRequestID: PHImageRequestID?
 
+    private var showQualityPill: Bool {
+        chromeVisible && image != nil && degraded && hiResUnavailable
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+
             if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
                     .scaleEffect(scale)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { value in scale = min(max(lastScale * value, 1), 5) }
-                            .onEnded { _ in lastScale = scale }
-                    )
-                    .onTapGesture(count: 2) {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            scale = scale > 1 ? 1 : 2.5
-                            lastScale = scale
-                        }
-                    }
-                if degraded && hiResUnavailable {
-                    VStack {
-                        Spacer()
-                        Text("Showing a lower-quality copy — the original is in iCloud")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .padding(.horizontal, 12).padding(.vertical, 7)
-                            .background(.black.opacity(0.5), in: Capsule())
-                            .padding(.bottom, 24)
-                    }
-                }
             } else if failed {
                 VStack(spacing: 8) {
                     Image(systemName: "photo")
@@ -689,7 +796,41 @@ struct PhotoPage: View {
             } else {
                 ProgressView().tint(.white)
             }
+
+            // The one permitted overlay — and only while chrome is up, so the
+            // clean view stays clean.
+            if showQualityPill {
+                VStack {
+                    Spacer()
+                    Label("Lower-quality copy · original in iCloud",
+                          systemImage: "icloud.and.arrow.down")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .padding(.horizontal, 12).padding(.vertical, 7)
+                        .background(.black.opacity(0.5), in: Capsule())
+                        .padding(.bottom, 40)
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)   // never eats a toggle tap
+            }
         }
+        // Taps land anywhere on the page (including the black letterbox bars):
+        // double-tap zooms, single-tap toggles the parent's chrome. count:2 is
+        // attached first so SwiftUI resolves a double-tap before the single.
+        .contentShape(Rectangle())
+        .gesture(
+            MagnificationGesture()
+                .onChanged { value in scale = min(max(lastScale * value, 1), 5) }
+                .onEnded { _ in lastScale = scale }
+        )
+        .onTapGesture(count: 2) {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                scale = scale > 1 ? 1 : 2.5
+                lastScale = scale
+            }
+        }
+        .onTapGesture { onSingleTap() }
+        .animation(.easeInOut(duration: 0.2), value: showQualityPill)
         .task(id: asset.localIdentifier) { await load() }
     }
 
@@ -748,10 +889,11 @@ struct PhotoPage: View {
 
 // MARK: - In-column paged slideshow (level 1 — pushed from the grid)
 
-/// The photo, edge-to-edge, in the detail column. Swipe LEFT/RIGHT to move
-/// through the roll (a real slideshow). Its own Back capsule returns to the
-/// thumbnails (nav bar hidden — never a lone toolbar over the picture). Expand
-/// goes to a true full-screen cover; Forward / Ask act on the current photo.
+/// The photo, edge-to-edge, on black, in the detail column. Swipe LEFT/RIGHT to
+/// move through the roll (a real slideshow); pinch to zoom. The chrome
+/// (Back · Ask · Forward · Expand) AUTO-HIDES — a single tap on the photo toggles
+/// it and it fades on its own — so the picture stays clean. Expand goes to a true
+/// full-screen cover; Forward / Ask act on the current photo.
 struct PhotoPagerView: View {
     let assets: [PHAsset]
     let startIndex: Int
@@ -762,6 +904,9 @@ struct PhotoPagerView: View {
 
     @State private var currentID: String = ""
     @State private var showFullScreen = false
+
+    /// Auto-hiding chrome (Apple-Photos behavior).
+    @StateObject private var chrome = ChromeTimer()
 
     // Forward / ask / progress.
     @State private var showChannelDialog = false
@@ -793,7 +938,9 @@ struct PhotoPagerView: View {
 
             TabView(selection: $currentID) {
                 ForEach(assets, id: \.localIdentifier) { asset in
-                    PhotoPage(asset: asset, imageManager: imageManager)
+                    PhotoPage(asset: asset, imageManager: imageManager,
+                              chromeVisible: chrome.visible,
+                              onSingleTap: { chrome.toggle() })
                         .tag(asset.localIdentifier)
                         .ignoresSafeArea()
                 }
@@ -802,22 +949,30 @@ struct PhotoPagerView: View {
             .ignoresSafeArea()
 
             controlsOverlay
+                .opacity(chrome.visible ? 1 : 0)
+                .allowsHitTesting(chrome.visible)
+                .animation(.easeInOut(duration: 0.25), value: chrome.visible)
         }
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
             if currentID.isEmpty, !assets.isEmpty { currentID = assets[anchorIndex].localIdentifier }
             convo.setFocus(photoFocus(currentAsset))
+            chrome.bump()
         }
         .onChange(of: currentID) { _, _ in
             convo.setFocus(photoFocus(currentAsset))
         }
         .onDisappear {
+            chrome.cancel()
             if convo.currentFocus?.hasPrefix("[FOCUS] Ido is viewing a single photo") == true {
                 convo.setFocus("[FOCUS] Ido is browsing his on-device Photos grid. No single photo is open.")
             }
         }
-        // True full-screen cover (covers the sidebar too, for 16:9 landscape).
+        // True full-screen cover (covers the sidebar too; rotates naturally).
+        // ONE .fullScreenCover + ONE .sheet on this view — the Catalyst-safe
+        // combination (never two .sheet modifiers). convo is re-injected because
+        // FullScreenPager reads it (Ask Scarlet); Catalyst drops it otherwise.
         .fullScreenCover(isPresented: $showFullScreen, onDismiss: {
             if forwardAfterFullScreen {
                 forwardAfterFullScreen = false
@@ -830,6 +985,7 @@ struct PhotoPagerView: View {
                                 forwardAfterFullScreen = true
                                 showFullScreen = false
                             })
+                .environmentObject(convo)
         }
         .confirmationDialog("Forward this photo", isPresented: $showChannelDialog,
                             titleVisibility: .visible) {
@@ -866,7 +1022,7 @@ struct PhotoPagerView: View {
         }
     }
 
-    // MARK: overlay controls (Back · Ask · Forward · Expand)
+    // MARK: overlay controls (Back · Ask · Forward · Expand) — auto-hiding
 
     private var controlsOverlay: some View {
         HStack(spacing: 10) {
@@ -883,9 +1039,9 @@ struct PhotoPagerView: View {
                 .background(Capsule().fill(Color.black.opacity(0.5)))
             }
             Spacer()
-            circleButton("bubble.left.and.text.bubble.right") { askScarlet() }
-            circleButton("arrowshape.turn.up.right") { showChannelDialog = true }
-            circleButton("arrow.up.left.and.arrow.down.right") { showFullScreen = true }
+            circleButton("bubble.left.and.text.bubble.right") { chrome.bump(); askScarlet() }
+            circleButton("arrowshape.turn.up.right") { chrome.bump(); showChannelDialog = true }
+            circleButton("arrow.up.left.and.arrow.down.right") { chrome.bump(); showFullScreen = true }
         }
         .padding(.horizontal, 12)
         .padding(.top, 12)
@@ -970,25 +1126,50 @@ struct PhotoPagerView: View {
 
 // MARK: - True full-screen slideshow (level 2 — cover over the whole window)
 
-/// The immersive slideshow: the photo over the entire window (sidebar included),
-/// swipe LEFT/RIGHT, pinch to zoom. Close returns to the in-column pager — so
-/// from here, Close then Back lands on the thumbnails. Forward hands off to the
-/// parent (which opens the channel picker after this cover closes) rather than
-/// stacking a sheet on a cover — Mac Catalyst can present only one at a time.
+/// The immersive slideshow: the photo over the ENTIRE window (sidebar included),
+/// on black, `.scaledToFit` so every ratio is letterboxed whole. Swipe LEFT/RIGHT
+/// through the roll; pinch to zoom. Orientation is NOT locked — the device
+/// rotates naturally (portrait ⇄ landscape) via the widened OrientationGate. The
+/// chrome (Close · Ask · Forward) AUTO-HIDES — one tap toggles it — so the photo
+/// stays clean. Forward hands off to the parent (which opens the channel picker
+/// after this cover closes) rather than stacking a sheet on a cover: Mac Catalyst
+/// can present only one at a time. Ask Scarlet runs in place (no sheet needed).
 struct FullScreenPager: View {
     let assets: [PHAsset]
     @Binding var currentID: String
     let imageManager: PHCachingImageManager
     var onForward: () -> Void
 
+    @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
+
+    /// Auto-hiding chrome (Apple-Photos behavior).
+    @StateObject private var chrome = ChromeTimer()
+
+    // Ask-in-place progress / error (no sheet — an .alert is Catalyst-safe here).
+    @State private var busy = false
+    @State private var busyLabel = "Sharing with Scarlet…"
+    @State private var errorText: String?
+    @State private var showError = false
+
+    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
+
+    /// Current asset, clamped — never subscripts an empty roll.
+    private var currentAsset: PHAsset {
+        if let hit = assets.first(where: { $0.localIdentifier == currentID }) { return hit }
+        guard let first = assets.first else { return PHAsset() }
+        return first
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
+
             TabView(selection: $currentID) {
                 ForEach(assets, id: \.localIdentifier) { asset in
-                    PhotoPage(asset: asset, imageManager: imageManager)
+                    PhotoPage(asset: asset, imageManager: imageManager,
+                              chromeVisible: chrome.visible,
+                              onSingleTap: { chrome.toggle() })
                         .tag(asset.localIdentifier)
                         .ignoresSafeArea()
                 }
@@ -996,33 +1177,86 @@ struct FullScreenPager: View {
             .tabViewStyle(.page(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            HStack {
-                Button { dismiss() } label: {
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Color.black.opacity(0.5)))
-                }
-                .buttonStyle(.plain)
-                Spacer()
-                Button { onForward() } label: {
-                    Image(systemName: "arrowshape.turn.up.right")
-                        .font(.system(size: 16, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 38, height: 38)
-                        .background(Circle().fill(Color.black.opacity(0.5)))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 12)
+            controlsOverlay
+                .opacity(chrome.visible ? 1 : 0)
+                .allowsHitTesting(chrome.visible)
+                .animation(.easeInOut(duration: 0.25), value: chrome.visible)
         }
-        // Full-screen photos may be viewed in landscape OR portrait (iPhone);
-        // restore portrait for the rest of the app on close.
-        .onAppear { OrientationGate.allow(.allButUpsideDown) }
-        .onDisappear { OrientationGate.allow(.portrait) }
+        // Full-screen photos may be viewed in landscape OR portrait (iPhone) —
+        // a natural toggle; restore portrait for the rest of the app on close.
+        .onAppear { OrientationGate.allow(.allButUpsideDown); chrome.bump() }
+        .onDisappear { OrientationGate.allow(.portrait); chrome.cancel() }
         .statusBarHidden(true)
+        .overlay {
+            if busy {
+                ZStack {
+                    Color.black.opacity(0.4).ignoresSafeArea()
+                    VStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        Text(busyLabel).font(.footnote).foregroundStyle(.white.opacity(0.85))
+                    }
+                    .padding(22)
+                    .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 16))
+                }
+            }
+        }
+        .alert("Something went wrong", isPresented: $showError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(errorText ?? "Try again.")
+        }
+    }
+
+    // MARK: overlay controls (Close · Ask · Forward) — auto-hiding
+
+    private var controlsOverlay: some View {
+        HStack(spacing: 10) {
+            circleButton("chevron.down") { dismiss() }
+            Spacer()
+            circleButton("bubble.left.and.text.bubble.right") { chrome.bump(); askScarlet() }
+            circleButton("arrowshape.turn.up.right") { chrome.bump(); onForward() }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+    }
+
+    private func circleButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 38, height: 38)
+                .background(Circle().fill(Color.black.opacity(0.5)))
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+    }
+
+    /// Ask Scarlet, in place — no sheet, so it's safe inside the cover. Uploads
+    /// the current photo and nudges her to analyze_document, exactly like the
+    /// in-column pager, and keeps Ido in the immersive view while she looks.
+    private func askScarlet() {
+        let asset = currentAsset
+        busy = true; busyLabel = "Sharing with Scarlet…"
+        // @MainActor: mutates @State + calls convo (main-actor) after awaits.
+        Task { @MainActor in
+            guard let img = await PhotosModel.fullImage(for: asset, manager: imageManager) else {
+                busy = false
+                errorText = "That photo's original couldn't be downloaded (it may be in iCloud and offline)."
+                showError = true
+                return
+            }
+            do {
+                let up = try await PhotoUploader.upload(image: img)
+                busy = false
+                convo.setFocus("[FOCUS] Ido opened a photo and shared it with you (uploaded as \(up.title)). Use analyze_document to see it — it is ALREADY uploaded; do not ask him to send it again.")
+                convo.sendSystemNudge("[SYSTEM] Ido shared the photo he's viewing (\(up.title)). Call analyze_document to look at it, then say what you see in a few words and ask what he'd like to do with it.", ensureLive: true)
+            } catch let e as PhotoUploader.UploadError {
+                busy = false; errorText = e.text; showError = true
+            } catch {
+                busy = false; errorText = "Upload failed — check your connection."; showError = true
+            }
+        }
     }
 }
 

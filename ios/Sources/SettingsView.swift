@@ -86,6 +86,29 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
+                // Personalization: the dynamic preferences hub (news, section
+                // order, interests — editable by control, text, or voice) and
+                // the on-device storage manager. Both are self-contained pages
+                // pushed within this stack; neither needs the conversation.
+                Section {
+                    NavigationLink {
+                        PreferencesView(presentedAsSheet: false)
+                    } label: {
+                        Label("Preferences", systemImage: "slider.horizontal.3")
+                            .font(.scarletBody)
+                    }
+                    NavigationLink {
+                        StorageView()
+                    } label: {
+                        Label("Storage", systemImage: "internaldrive")
+                            .font(.scarletBody)
+                    }
+                } header: {
+                    Text("Personalization")
+                } footer: {
+                    Text("Your priorities and preferences live here — change them by tapping, typing, or just telling Scarlet.")
+                }
+
                 Section {
                     if m.loading {
                         HStack { ProgressView(); Text("Loading voices…").foregroundStyle(.secondary) }

@@ -167,6 +167,16 @@ final class HealthSync: ObservableObject {
 
     var available: Bool { HKHealthStore.isHealthDataAvailable() }
 
+    /// True once ANY renderable data exists — Apple days, workouts, or the
+    /// Withings body/sleep series — no matter the source (HealthKit, the
+    /// server overview, or the local cache). The dashboard renders whenever
+    /// this is true, so Mac Catalyst (which has no HealthKit) still shows the
+    /// full server-sourced picture instead of a dead-end explainer.
+    var hasData: Bool {
+        !days.isEmpty || !workouts.isEmpty
+            || !withingsMeasures.isEmpty || !withingsNights.isEmpty
+    }
+
     // MARK: authorization
 
     /// Everything the tab reads. Share (write) nothing.
@@ -263,6 +273,48 @@ final class HealthSync: ObservableObject {
     }
 
     // MARK: sync
+
+    /// The single entry point every Health surface calls (on-appear,
+    /// foreground, manual refresh, pull-to-refresh). It routes by capability:
+    ///
+    /// • iPhone/iPad with HealthKit granted → `syncNow()`: read Apple Health,
+    ///   push it to the server (`op=health_push`, so the server copy — and thus
+    ///   the Mac — gets today's data), then fold in the server overview.
+    /// • Mac Catalyst (no HealthKit) or an iOS device before Apple Health is
+    ///   connected → `syncFromServer()`: skip all HealthKit work and load the
+    ///   same picture straight from the server (`op=health_overview`:
+    ///   iPhone-pushed `health_days` + Withings body & sleep). This is what
+    ///   populates the Health section on the Mac.
+    func refresh() async {
+        if available && authorized {
+            await syncNow()
+        } else {
+            await syncFromServer()
+        }
+    }
+
+    /// Server-only load — no HealthKit read, no push. Reads the merged overview
+    /// (server day history + Withings body & sleep) and folds it into the
+    /// model. On the Mac this is the whole story; on iOS it also backfills
+    /// Withings/server history before Apple Health has been connected.
+    func syncFromServer() async {
+        guard !syncing else { return }
+        // No device token yet → nothing to read; stay quiet (the cache, if any,
+        // is already painted).
+        guard TokenStore.token != nil else { return }
+        syncing = true
+        errorText = ""
+        defer { syncing = false }
+        do {
+            let overview = try await Self.fetchOverview(windowDays: 30)
+            // @MainActor-isolated method: we resume here on the main actor, so
+            // mutating the @Published model in applyMerged is safe.
+            applyMerged(localDays: [], localWorkouts: [], overview: overview)
+            lastSync = Date()
+        } catch {
+            errorText = "Couldn't reach the server — showing the last synced data."
+        }
+    }
 
     func syncNow() async {
         guard available, authorized, !syncing else { return }
