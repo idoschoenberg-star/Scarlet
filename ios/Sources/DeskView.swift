@@ -1230,7 +1230,8 @@ struct DeskView: View {
 
     private func noteFocus(_ note: DeskNote) -> String {
         "[FOCUS] Ido opened an Apple Note from his Mac on his Desk: "
-            + "\"\(note.title)\". He is reading it now."
+            + "\"\(note.title)\". He is reading it now.\n"
+            + "note_id: \(note.id)"
     }
 
     private func open(_ note: DeskNote) {

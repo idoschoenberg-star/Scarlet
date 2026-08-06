@@ -335,6 +335,7 @@ final class MusicModel: ObservableObject {
 
 struct MusicView: View {
     @StateObject private var model = MusicModel()
+    @EnvironmentObject private var convo: Conversation
 
     // House dark-scarlet palette (matches LibraryView / DraftView).
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
@@ -347,6 +348,29 @@ struct MusicView: View {
         }
         .task { await model.load() }
         .refreshable { await model.load() }
+        // Ambient focus: the page reports itself on appearance and again after
+        // each load, so the now-playing line reflects what's actually on screen.
+        .onAppear { convo.setFocus(pageFocus()) }
+        .onChange(of: model.snapshot) { _, _ in convo.setFocus(pageFocus()) }
+    }
+
+    /// The page-level ambient-focus line — what's playing (or last played) and
+    /// what the shelf shows, so "pause it", "add this to a playlist", "play
+    /// something like this" need no explanation.
+    private func pageFocus() -> String {
+        let s = model.snapshot
+        var line = "[FOCUS] Ido is on his Music page (\(model.provider.displayName))."
+        if let np = s.nowPlaying {
+            let byArtist = np.artist.isEmpty ? "" : " by \(np.artist)"
+            if s.hasActiveDevice {
+                line += " \(np.isPlaying ? "Now playing" : "Paused"): \"\(np.title)\"\(byArtist)."
+            } else {
+                line += " Last played: \"\(np.title)\"\(byArtist) — no active Spotify device right now."
+            }
+        }
+        line += " \(s.playlists.count) playlists and \(s.saved.count) saved tracks on the shelf."
+            + " He can ask you to play, queue, or find music (spotify tools)."
+        return line
     }
 
     @ViewBuilder

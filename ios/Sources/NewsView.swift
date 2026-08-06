@@ -28,7 +28,10 @@ import SwiftUI
 // always a clear way OUT (back button, "Open in <source>", Share).
 //
 // Self-contained: it reads no @EnvironmentObject (no convo), so it drops into
-// the tab bar without any re-injection ceremony.
+// the tab bar without any re-injection ceremony. Ambient focus goes through
+// `Conversation.shared` directly — same instance the rest of the app injects —
+// so the cover needs no environment plumbing (Catalyst drops @EnvironmentObject
+// across cover boundaries; the singleton is immune).
 
 // =============================================================================
 // MARK: - The house style (one design system, applied uniformly)
@@ -181,6 +184,18 @@ enum NewsFormat {
         f.dateFormat = "EEEE '·' MMM d"
         return f.string(from: d).uppercased()
     }
+}
+
+// =============================================================================
+// MARK: - Ambient focus
+// =============================================================================
+
+/// The list-level ambient-focus line, shared by the feed's own appearance and
+/// the detail cover's dismissal so both report the same surface. `count: nil`
+/// is the count-free variant the detail restores with (it can't see the model).
+private func newsBrowsingFocus(count: Int?) -> String {
+    let counted = count.flatMap { $0 > 0 ? " (\($0) ranked stories)" : nil } ?? ""
+    return "[FOCUS] Ido is browsing his News feed\(counted). No single story is open."
 }
 
 // =============================================================================
@@ -716,6 +731,14 @@ struct NewsView: View {
         .fullScreenCover(item: $openStory) { story in
             NewsDetailView(story: story)
         }
+        // Ambient focus: the feed reports itself on appearance and again after
+        // each load, so the story count reflects what's actually on screen.
+        // Via Conversation.shared — this view stays free of @EnvironmentObject
+        // (see the header note).
+        .onAppear { Conversation.shared.setFocus(newsBrowsingFocus(count: model.stories.count)) }
+        .onChange(of: model.stories.count) { _, newCount in
+            Conversation.shared.setFocus(newsBrowsingFocus(count: newCount))
+        }
         .task {
             if model.stories.isEmpty { await model.load() }
         }
@@ -993,6 +1016,30 @@ struct NewsDetailView: View {
                 .scrollIndicators(.hidden)
             }
         }
+        // Ambient focus: this story on appear; on disappear, restore the feed
+        // focus only if this story still owns it (InboxView's MailDetailView
+        // stale-guard pattern — another screen may have claimed focus while
+        // the cover was up).
+        .onAppear { Conversation.shared.setFocus(storyFocus) }
+        .onDisappear {
+            if Conversation.shared.currentFocus == storyFocus {
+                Conversation.shared.setFocus(newsBrowsingFocus(count: nil))
+            }
+        }
+    }
+
+    /// This story's ambient-focus line — built from immutable story data so
+    /// appear and disappear agree byte-for-byte (the stale-guard comparator).
+    /// Human-readable first, machine-usable ids after: the article URL is the
+    /// durable handle she can fetch, share, or forward.
+    private var storyFocus: String {
+        var line = "[FOCUS] Ido is reading a news story: "
+            + "\"\(String(story.title.prefix(160)))\" (\(story.primarySource)"
+        if let t = story.relativeTime { line += ", \(t)" }
+        line += "). Any request like 'read it to me', 'summarize', 'תקריאי' refers to THIS story.\n"
+            + "story_id: \(story.id)\n"
+            + "url: \(story.link)"
+        return line
     }
 
     // MARK: bar (drawn — presented as a full-screen cover with no system nav

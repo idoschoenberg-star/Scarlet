@@ -381,6 +381,9 @@ struct VideoView: View {
     // One sheet (Mac-Catalyst rule) for playback; confirmationDialog for delete.
     @State private var playing: VideoModel.Clip?
     @State private var pendingDelete: VideoModel.Clip?
+    /// The focus line last claimed for a playing clip; the player's dismissal
+    /// restores the library focus only if this still owns it (stale-guard).
+    @State private var openedFocus: String?
 
     var body: some View {
         NavigationStack {
@@ -420,7 +423,7 @@ struct VideoView: View {
                 } ?? "")
             }
             // One .sheet only — the video player (Mac-Catalyst one-sheet rule).
-            .sheet(item: $playing) { clip in
+            .sheet(item: $playing, onDismiss: restoreBrowsingFocus) { clip in
                 clipPlayer(for: clip)
             }
         }
@@ -606,7 +609,7 @@ struct VideoView: View {
 
     private func thumbnail(_ clip: VideoModel.Clip, isOffline: Bool) -> some View {
         Button {
-            if clip.hasSource { playing = clip }
+            if clip.hasSource { play(clip) }
         } label: {
             ZStack {
                 Rectangle().fill(Color.black.opacity(0.55))
@@ -757,6 +760,35 @@ struct VideoView: View {
         return "[FOCUS] Ido is on the Videos screen (\(n) clip\(n == 1 ? "" : "s") in his library). "
             + "He can ask you to bring videos about a topic — that queues a Mac fetch (clip_fetch_now); "
             + "to keep one for offline he taps Save offline. No single clip is open."
+    }
+
+    /// A playing clip's ambient-focus line — human-readable first, the durable
+    /// clip id after so "save this offline", "delete it" need no explanation.
+    private func clipFocus(_ clip: VideoModel.Clip) -> String {
+        var line = "[FOCUS] Ido is watching a video clip: \"\(clip.title)\""
+        if !clip.channel.isEmpty { line += " (\(clip.channel))" }
+        line += ", \(Self.durationString(clip.durationS)).\n"
+            + "clip_id: \(clip.id)"
+        return line
+    }
+
+    /// Claim focus for the clip, then present the player (DeskView's open()
+    /// pattern — the claim rides with the presentation, not the sheet's view).
+    private func play(_ clip: VideoModel.Clip) {
+        let f = clipFocus(clip)
+        openedFocus = f
+        convo.setFocus(f)
+        playing = clip
+    }
+
+    /// Stale-guard (InboxView's MailDetailView pattern): restore the library
+    /// focus only if the closed player still owns it — another screen may
+    /// have claimed focus while the sheet was up.
+    private func restoreBrowsingFocus() {
+        if let f = openedFocus, convo.currentFocus == f {
+            convo.setFocus(browsingFocus)
+        }
+        openedFocus = nil
     }
 
     static func durationString(_ s: Int) -> String {

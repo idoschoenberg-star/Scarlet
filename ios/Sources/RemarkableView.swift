@@ -21,7 +21,9 @@ import PDFKit
 // Self-contained: it reads NO `@EnvironmentObject` (no `convo`). Send-to-Notes
 // posts the backend `note_create` op directly — the same Mac-agent path
 // NotesView uses — so this view drops into the section catalog with no
-// re-injection ceremony and no Mac-Catalyst environment-drop risk.
+// re-injection ceremony and no Mac-Catalyst environment-drop risk. Ambient
+// focus goes through `Conversation.shared` directly (the same instance the
+// rest of the app injects), preserving that property.
 //
 // Catalyst discipline: the reader is a PUSH (`navigationDestination(item:)`),
 // pairing is an inline empty-state, and the Send-to-Notes result is an `.alert`.
@@ -336,6 +338,17 @@ struct RemarkableView: View {
             }
             .scarletScreen()
             .toolbar(.hidden, for: .navigationBar)
+            // Ambient focus: the browser reports itself on appearance, on every
+            // folder hop, and again after each load so the item count reflects
+            // what's actually on screen. Via Conversation.shared — this view
+            // stays free of @EnvironmentObject (see the header note).
+            .onAppear { Conversation.shared.setFocus(browsingFocus) }
+            .onChange(of: model.folderStack) { _, _ in
+                Conversation.shared.setFocus(browsingFocus)
+            }
+            .onChange(of: model.items.count) { _, _ in
+                Conversation.shared.setFocus(browsingFocus)
+            }
             .navigationDestination(item: $openDoc) { doc in
                 RmReaderView(item: doc)
                     .preferredColorScheme(.dark)
@@ -351,6 +364,16 @@ struct RemarkableView: View {
             // spinner when nothing is cached yet, so this never blanks or flickers.
             if model.phase != .notConnected { await model.load() }
         }
+    }
+
+    /// The list-level ambient-focus line — where he is in the notebook tree
+    /// and how much is on screen.
+    private var browsingFocus: String {
+        let place = model.folderStack.last.map { "the \"\($0.name)\" folder" } ?? "the top level"
+        let n = model.items.count
+        return "[FOCUS] Ido is browsing his reMarkable notebooks — \(place)"
+            + (n > 0 ? " (\(n) item\(n == 1 ? "" : "s"))." : ".")
+            + " He can open a notebook to read its handwritten pages. No document is open."
     }
 
     // MARK: header (title + breadcrumb + back + refresh)
@@ -692,10 +715,44 @@ struct RmReaderView: View {
         .scarletScreen()
         .toolbar(.hidden, for: .navigationBar)
         .task { await load() }
+        // Ambient focus: this document on appear, RE-set as pages land and as
+        // he swipes, so she always knows which page is under his eyes. On pop,
+        // restore the browser focus only if this reader still owns it
+        // (InboxView's MailDetailView stale-guard pattern) — the browser's own
+        // onAppear then re-reports the precise folder line.
+        .onAppear { Conversation.shared.setFocus(readerFocus) }
+        .onChange(of: loading) { _, _ in Conversation.shared.setFocus(readerFocus) }
+        .onChange(of: currentPage) { _, _ in Conversation.shared.setFocus(readerFocus) }
+        .onDisappear {
+            if Conversation.shared.currentFocus == readerFocus {
+                Conversation.shared.setFocus(
+                    "[FOCUS] Ido is browsing his reMarkable notebooks. No document is open.")
+            }
+        }
         .alert("Send to Notes", isPresented: $showSendAlert) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(sendMessage)
+        }
+    }
+
+    /// This document's ambient-focus line — deterministic from view state, so
+    /// the disappear stale-guard can compare against the last line set.
+    /// Human-readable first, the durable document id after.
+    private var readerFocus: String {
+        var line = "[FOCUS] Ido opened his reMarkable \(kindWord): \"\(item.name)\"."
+        if isNotebook {
+            line += " He is on page \(min(currentPage + 1, pageCount)) of \(pageCount) (handwritten)."
+        }
+        line += "\ndoc_id: \(item.id)"
+        return line
+    }
+
+    private var kindWord: String {
+        switch (item.kind ?? "").lowercased() {
+        case "pdf":  return "PDF"
+        case "epub": return "ePub"
+        default:     return "notebook"
         }
     }
 

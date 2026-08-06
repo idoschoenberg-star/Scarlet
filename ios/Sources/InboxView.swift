@@ -1578,6 +1578,7 @@ struct MailDetailView: View {
             + "subject: \(message.subject)\n"
             + "received: \(received)\n"
             + "message_id: \(message.id)\n"
+            + "channel: outlook\n"
             + "preview: \(String(message.preview.prefix(280)))"
     }
 }
