@@ -18,12 +18,12 @@ enum OrientationGate {
         iPhoneMask = mask
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene }).first else { return }
-        if #available(iOS 16.0, *) {
-            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
-            scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        } else {
-            UIViewController.attemptRotationToUpdateSupportedInterfaceOrientations()
-        }
+        // Min deployment target is iOS 17, so the modern geometry API is always
+        // available — no legacy fallback (the old
+        // attemptRotationToUpdateSupportedInterfaceOrientations was removed from
+        // recent SDKs and won't even compile).
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+        scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
     }
 }
 
