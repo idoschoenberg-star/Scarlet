@@ -81,6 +81,11 @@ final class Conversation: ObservableObject {
     /// second socket.
     private var reconnectTask: Task<Void, Never>?
     private var observersInstalled = false
+    /// Token for the engine-configuration-change observer. Held so it can be
+    /// rebound to a fresh engine after recreateAudioNodes() (the observer is
+    /// bound to a specific engine object; a swapped engine would otherwise go
+    /// unobserved, re-opening the Mac device-churn crash).
+    private var engineConfigObserver: NSObjectProtocol?
     /// A rebuilt socket is a brand-new ElevenLabs conversation with amnesia —
     /// flag it so she's told this is a continuation, not a fresh caller.
     private var resumedSession = false
@@ -101,8 +106,12 @@ final class Conversation: ObservableObject {
 
     // Audio — built once, reused across reconnects. Re-running mic setup
     // (a second installTap on the same bus) is an instant NSException crash.
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // `var`, not `let`: a media-services reset (mediad restart) invalidates the
+    // engine/player OBJECTS themselves, so recovery must REPLACE them, not just
+    // restart them — see recreateAudioNodes(). Reassigned ONLY there, on the
+    // main actor; every normal rebuild keeps the same instances.
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private var converter: AVAudioConverter?
     private var playFormat: AVAudioFormat?
     private var audioReady = false
@@ -587,8 +596,14 @@ final class Conversation: ObservableObject {
         let delay = min(30.0, 0.9 * pow(2.0, Double(attempt)))
         reconnectTask = Task {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            if wantLive, !Task.isCancelled { await connect() }
+            // Clear the single-flight latch BEFORE connect(): if connect() fails
+            // it calls scheduleReconnect() synchronously from its own catch, and
+            // with `reconnecting` still true that re-schedule early-returns —
+            // silently killing the ladder after ONE failed attempt (orb frozen
+            // on "Reconnecting…"). Cleared here, each failed attempt re-arms the
+            // next rung of the backoff ladder up to maxReconnectAttempts.
             reconnecting = false
+            if wantLive, !Task.isCancelled { await connect() }
         }
     }
 
@@ -1020,6 +1035,81 @@ final class Conversation: ObservableObject {
         try? ensureAudio()
     }
 
+    /// A media-services reset (mediad restarted) invalidates the engine and
+    /// player OBJECTS themselves — not just their configuration — so the usual
+    /// stopAudio()+ensureAudio() on the SAME instances isn't enough; we must
+    /// REPLACE them. Tear the old graph down best-effort (after the reset these
+    /// objects may already be corpses), drop the single input tap together with
+    /// the old engine, then stand up fresh nodes. Setting `audioReady=false`
+    /// forces ensureAudio() through its FULL build path, which reinstalls the
+    /// ONE input tap on the NEW input node — so we never end up with two live
+    /// taps. Re-entrancy-guarded by `audioRebuilding`, the same latch
+    /// rebuildAudioGraph() uses. Called ONLY from the media-services-reset path;
+    /// normal rebuilds keep reusing rebuildAudioGraph()/ensureAudio().
+    @MainActor
+    private func recreateAudioNodes() {
+        guard !audioRebuilding else { return }
+        audioRebuilding = true
+        defer { audioRebuilding = false }
+        // Tear down the OLD graph. Best-effort: after a media reset these calls
+        // act on possibly-invalid objects. Remove the tap only if we believe one
+        // is installed (audioReady), so we never leave a second tap behind when
+        // the fresh engine's tap goes in.
+        if audioReady { engine.inputNode.removeTap(onBus: 0) }
+        engine.stop()
+        if player.engine != nil { engine.detach(player) }
+        // Drop the stale converter under the lock — a tap callback dispatched
+        // just before the reset could still snapshot it; nil (or the old strong
+        // ref it already captured) is safe, a torn read is not.
+        os_unfair_lock_lock(audioStateLock)
+        converter = nil
+        os_unfair_lock_unlock(audioStateLock)
+        // Fresh objects — the old engine/player are unusable after the reset.
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+        player.volume = speakerOn ? 1 : 0   // preserve the current voice-on/off state
+        // The config-change observer was bound to the OLD engine object; rebind
+        // it to the new one so the Mac device-churn guard keeps firing.
+        observeEngineConfigChanges()
+        // Reset playback + capture bookkeeping so the rebuilt graph starts clean
+        // and the echo gate isn't left stuck closed.
+        audioReady = false
+        pendingBuffers = 0
+        speechTailUntil = Date.distantPast
+        isUserSpeaking = false; bargeRun = 0
+    }
+
+    /// The media server (mediad) was reset — the WHOLE audio stack (engine,
+    /// player, converter, session) is now invalid, and NOTHING else on any code
+    /// path clears `audioReady` here. This is a classic long-idle crash: without
+    /// this observer, playPCM would later find `audioReady` still true, call
+    /// start()/play() on a dead engine, and take an uncatchable CoreAudio
+    /// exception (SIGABRT). Recreate the nodes wholesale, then — if we're still
+    /// meant to be live — rebuild the graph from scratch on the fresh nodes.
+    @MainActor
+    private func handleMediaServicesReset() {
+        recreateAudioNodes()
+        guard wantLive else { return }
+        try? ensureAudio()
+    }
+
+    /// (Re)register the engine-configuration-change observer against the CURRENT
+    /// `engine`. The observer is bound to a specific engine object, so after
+    /// recreateAudioNodes() swaps the engine we must rebind — otherwise a device
+    /// or format change on the new engine goes unobserved and the Mac "quit
+    /// unexpectedly" churn crash returns. Removes any prior token first so we
+    /// never double-register.
+    private func observeEngineConfigChanges() {
+        if let tok = engineConfigObserver {
+            NotificationCenter.default.removeObserver(tok)
+            engineConfigObserver = nil
+        }
+        engineConfigObserver = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.rebuildAudioGraph() }
+        }
+    }
+
     /// Server announced a different output rate — rewire only the player leg.
     private func rebuildPlayback() {
         guard audioReady else { return }
@@ -1059,7 +1149,20 @@ final class Conversation: ObservableObject {
             let samples = raw.bindMemory(to: Int16.self)
             for i in 0..<Int(frames) { ch[0][i] = Float(samples[i]) / 32768.0 }
         }
-        if !engine.isRunning { try? engine.start() }
+        // THE crash guard. Over a long idle the engine can go dormant/invalid
+        // while `audioReady` stays true (background suspension, a coalesced
+        // interruption, a media-services reset). A swallowed `try?` here would
+        // fail SILENTLY, and then player.play()/scheduleBuffer on a stopped
+        // engine throws an uncatchable CoreAudio ObjC exception → SIGABRT. So:
+        // try to start; if that throws, rebuild the graph; and if the engine
+        // STILL isn't running, drop this frame (the server re-streams) rather
+        // than touch the player. player.play()/scheduleBuffer below are reached
+        // ONLY with a verified-running engine.
+        if !engine.isRunning {
+            do { try engine.start() }
+            catch { rebuildAudioGraph() }
+        }
+        guard engine.isRunning else { return }   // never play on a dead engine
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
@@ -1147,10 +1250,17 @@ final class Conversation: ObservableObject {
         // The audio engine's I/O format changed (device swap, sample-rate
         // renegotiation, an interface or headphones coming/going). Rebuild the
         // capture graph on the NEW format — the single most important guard
-        // against the continuous Mac "quit unexpectedly" crashes.
+        // against the continuous Mac "quit unexpectedly" crashes. Registered via
+        // a helper so it can be REBOUND to a fresh engine after a media reset.
+        observeEngineConfigChanges()
+        // The media server (mediad) was reset — the ENTIRE audio stack (engine,
+        // player, session) is now invalid. There is no other observer for this,
+        // and nothing else clears `audioReady` on this path, so over a long idle
+        // it is a prime source of the resume crash. Recreate the nodes and
+        // rebuild from scratch.
         NotificationCenter.default.addObserver(
-            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.rebuildAudioGraph() }
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.handleMediaServicesReset() }
         }
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -1160,7 +1270,15 @@ final class Conversation: ObservableObject {
                 // a route change must NOT restart the engine or re-grab the route,
                 // or she'd steal the speaker back from Spotify. `wantLive &&
                 // audioReady` is true only when she's genuinely live and unmuted.
-                if self.wantLive, self.audioReady, !self.engine.isRunning { try? self.engine.start() }
+                // A route change during a long idle can find the engine stopped
+                // with `audioReady` still true. Don't swallow a failed restart:
+                // if start() throws, the engine is likely invalid, so fall
+                // through to a full rebuild rather than leaving a dead engine +
+                // audioReady==true for playPCM to trip over.
+                if self.wantLive, self.audioReady, !self.engine.isRunning {
+                    do { try self.engine.start() }
+                    catch { self.rebuildAudioGraph() }
+                }
                 if self.wantLive, self.audioReady { self.routeToSpeakerIfReceiver() }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
