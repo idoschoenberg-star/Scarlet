@@ -19,9 +19,13 @@ import SwiftUI
 // right-to-left and hugs the right edge; an English one reads left-to-right and
 // hugs the left — in the very same feed. (Same discipline as DraftView.)
 //
-// Detail is a PUSH (NavigationLink), never a sheet — Mac Catalyst allows only
-// one sheet presentation per view, and there is always a clear way OUT to the
-// origin ("Open in <source>" + Share).
+// Detail opens as a self-contained `.fullScreenCover` (NOT a nested
+// NavigationLink push). On iPhone, News sits in the TabView "More" overflow,
+// which iOS backs with a UIKit navigation controller; a SwiftUI NavigationStack
+// nested inside that, pushed via NavigationLink, made back/dismiss unreliable.
+// A cover owns its own presentation, so its drawn back button always dismisses.
+// Catalyst-safe: News has NO `.sheet`, so exactly one cover is fine. There is
+// always a clear way OUT (back button, "Open in <source>", Share).
 //
 // Self-contained: it reads no @EnvironmentObject (no convo), so it drops into
 // the tab bar without any re-injection ceremony.
@@ -88,8 +92,8 @@ enum NewsStyle {
             return rtl ? .system(size: 19.5, weight: .semibold)
                        : .system(size: 18,   weight: .semibold, design: .serif)
         case .body:
-            return rtl ? .system(size: 17.5, weight: .regular)
-                       : .system(size: 16.5, weight: .regular)
+            return rtl ? .system(size: 18,   weight: .regular)
+                       : .system(size: 17,   weight: .regular)
         }
     }
 
@@ -599,10 +603,10 @@ struct NewsFeatureCard: View {
             VStack(alignment: .leading, spacing: 9) {
                 NewsKicker(source: story.primarySource, time: story.relativeTime)
                 NewsText(text: story.title, role: .title,
-                         color: NewsStyle.ink, lineLimit: 3)
+                         color: NewsStyle.ink, lineLimit: 4)
                 if let summary = story.summary {
                     NewsText(text: summary, role: .body,
-                             color: NewsStyle.inkSecondary, lineLimit: 3)
+                             color: NewsStyle.inkSecondary, lineLimit: 4)
                 }
             }
             .padding(16)
@@ -682,6 +686,12 @@ struct NewsView: View {
     @StateObject private var model = NewsModel()
     @Environment(\.horizontalSizeClass) private var hSize
     @State private var refreshSpin = false
+    /// The tapped story, presented as a self-contained full-screen cover. On
+    /// iPhone, News lives in the TabView "More" overflow, which iOS backs with a
+    /// UIKit navigation controller; wrapping our own NavigationStack inside it and
+    /// pushing detail via NavigationLink made back/dismiss unreliable ("can't go
+    /// back"). A cover owns its own presentation, so its back button always works.
+    @State private var openStory: NewsStory?
 
     private var columns: [GridItem] {
         let count = hSize == .regular ? 2 : 1
@@ -690,20 +700,22 @@ struct NewsView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            ZStack {
-                LinearGradient(colors: [NewsStyle.canvasTop, NewsStyle.canvasBottom],
-                               startPoint: .top, endPoint: .bottom)
-                    .ignoresSafeArea()
+        ZStack {
+            LinearGradient(colors: [NewsStyle.canvasTop, NewsStyle.canvasBottom],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    topBar
-                    feed
-                }
+            VStack(spacing: 0) {
+                topBar
+                feed
             }
-            .toolbar(.hidden, for: .navigationBar)
         }
         .tint(NewsStyle.accent)
+        // Detail is a self-contained cover, not a nested push. Catalyst-safe:
+        // News has NO `.sheet`, so exactly one cover is allowed.
+        .fullScreenCover(item: $openStory) { story in
+            NewsDetailView(story: story)
+        }
         .task {
             if model.stories.isEmpty { await model.load() }
         }
@@ -820,7 +832,7 @@ struct NewsView: View {
 
         return LazyVStack(alignment: .leading, spacing: NewsStyle.sectionGap) {
             if let lead = stories.first {
-                NavigationLink { NewsDetailView(story: lead) } label: {
+                Button { openStory = lead } label: {
                     NewsHeroCard(story: lead)
                 }
                 .buttonStyle(.plain)
@@ -832,7 +844,7 @@ struct NewsView: View {
                     NewsSectionHeader(title: "Top Stories")
                     LazyVGrid(columns: columns, alignment: .leading, spacing: NewsStyle.cardGap) {
                         ForEach(features) { story in
-                            NavigationLink { NewsDetailView(story: story) } label: {
+                            Button { openStory = story } label: {
                                 NewsFeatureCard(story: story)
                             }
                             .buttonStyle(.plain)
@@ -846,7 +858,7 @@ struct NewsView: View {
                     NewsSectionHeader(title: "More to Read")
                     LazyVGrid(columns: columns, alignment: .leading, spacing: NewsStyle.cardGap) {
                         ForEach(rest) { story in
-                            NavigationLink { NewsDetailView(story: story) } label: {
+                            Button { openStory = story } label: {
                                 NewsCompactRow(story: story)
                             }
                             .buttonStyle(.plain)
@@ -981,11 +993,12 @@ struct NewsDetailView: View {
                 .scrollIndicators(.hidden)
             }
         }
-        .toolbar(.hidden, for: .navigationBar)
     }
 
-    // MARK: bar (drawn — the app hides the system nav bar; Catalyst has no
-    // edge-swipe-back — so we draw the way back and Share ourselves).
+    // MARK: bar (drawn — presented as a full-screen cover with no system nav
+    // bar; Catalyst has no edge-swipe-back — so we draw the way back and Share
+    // ourselves. The back chevron dismisses the cover, which is reliable now
+    // that detail no longer pushes onto a nested SwiftUI stack.)
 
     private var detailBar: some View {
         HStack(spacing: 10) {
@@ -996,6 +1009,7 @@ struct NewsDetailView: View {
                     Text("News").font(.system(size: 16, weight: .semibold))
                 }
                 .foregroundStyle(NewsStyle.accent)
+                .contentShape(Rectangle())   // full label is tappable, not just glyphs
             }
             .buttonStyle(.plain)
             Spacer(minLength: 8)
@@ -1009,7 +1023,11 @@ struct NewsDetailView: View {
             }
         }
         .padding(.horizontal, NewsStyle.pageHPadding)
-        .padding(.top, 10)
+        // The enclosing content VStack already respects the top safe area (only
+        // the gradient ignores it), so the bar sits below the status bar /
+        // Dynamic Island. This extra top pad guarantees the chevron clears the
+        // island's rounded corner and stays fully tappable on notch/island phones.
+        .padding(.top, 14)
         .padding(.bottom, 10)
         .overlay(alignment: .bottom) {
             Rectangle().fill(NewsStyle.hairline).frame(height: 1)
