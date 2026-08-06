@@ -1,6 +1,7 @@
 import AVKit
 import Foundation
 import SwiftUI
+import WebKit
 
 /// Videos — a curated, offline-first clip library. Ido tells Scarlet a topic or
 /// instruction ("the 10 most popular Claude Code clips, ranked by popularity")
@@ -17,6 +18,19 @@ import SwiftUI
 ///     than adding a duplicate op.
 ///   • POST op=clip_delete  {id}  → removes the clip server-side.
 ///   • POST op=clip_played  {id}  → marks a clip watched (fire-and-forget).
+///
+/// STANDING FETCHES — Ido's "keep the list at ten" flow. The server tops the
+/// list back up on clip_played / clip_delete; the app only shows the
+/// accumulation (ready/target) and the on/off switch per fetch:
+///   • GET  op=clip_rules       → { rules:[{id,query,mode,target,criteria,
+///                                  enabled,ready_count,pending_count,last_run_at}] }
+///   • POST op=clip_rule_save   {id?,query,mode,target} → { ok, rule:{…} } —
+///     the server starts filling immediately. `mode` is one of two DIFFERENT
+///     functions: "download" (files fetched on the Mac, kept offline for
+///     flights) or "online" (stream-only rows: youtube_id set, storage_path
+///     absent — nothing to save locally).
+///   • POST op=clip_rule_toggle {id,enabled}      → { ok }
+///   • POST op=clip_rule_remove {id,delete_clips} → { ok }
 ///
 /// OFFLINE is client-side, exactly like the web app: "Save offline" downloads
 /// the clip's `url` into an app-private folder so it plays with no network; the
@@ -124,6 +138,7 @@ enum ClipMetaCache {
             "id": clip.id, "title": clip.title, "channel": clip.channel,
             "duration_s": clip.durationS, "views": clip.views,
             "thumb_url": clip.thumbURL ?? "", "url": clip.url ?? "",
+            "storage_path": clip.storagePath ?? "", "youtube_id": clip.youtubeID ?? "",
         ]
         write(all)
     }
@@ -164,9 +179,30 @@ final class VideoModel: ObservableObject {
         let views: Int
         let thumbURL: String?
         let url: String?     // remote stream/download URL; nil until the Mac finishes
+        let storagePath: String?  // server-side file path; absent for online clips
+        let youtubeID: String?    // set for stream-only ("online") clips
 
-        /// Playable if it has a remote source or a downloaded copy on hand.
-        var hasSource: Bool { url != nil || ClipStore.isOffline(id) }
+        /// Stream-only clip from an ONLINE fetch: no file anywhere — it plays
+        /// by streaming YouTube and there is nothing to save for offline.
+        var isOnlineStream: Bool { storagePath == nil && youtubeID != nil }
+
+        /// Playable if it has a remote source, a stream, or a downloaded copy.
+        var hasSource: Bool { url != nil || isOnlineStream || ClipStore.isOffline(id) }
+    }
+
+    /// One standing fetch, as `op=clip_rules` returns it.
+    struct FetchRule: Identifiable, Equatable {
+        let id: String
+        let query: String
+        let mode: String       // "download" | "online" — two different functions
+        let target: Int
+        let criteria: String
+        var enabled: Bool      // mutable for the optimistic toggle flip
+        let readyCount: Int
+        let pendingCount: Int
+        let lastRunAt: String?
+
+        var isDownload: Bool { mode == "download" }
     }
 
     @Published var clips: [Clip] = []
@@ -178,9 +214,19 @@ final class VideoModel: ObservableObject {
     @Published var fetching = false
     @Published var fetchNote = ""
 
+    // Standing fetches.
+    @Published var rules: [FetchRule] = []
+    @Published var rulesError = ""
+    /// The last `op=clips` load failed (URLError) — the device looks offline.
+    @Published var networkDown = false
+    /// Honest stall line when a download fetch has pending items but nothing
+    /// has arrived after ~3 minutes of polling (the Mac looks offline).
+    @Published var macStallNote = ""
+
     /// How many freshly-fetched clips still to auto-download for offline.
     private var autoOfflineRemaining = 0
     private var pollTask: Task<Void, Never>?
+    private var rulesPollTask: Task<Void, Never>?
 
     // MARK: load
 
@@ -194,9 +240,11 @@ final class VideoModel: ObservableObject {
             let parsed = arr.compactMap(Self.parseClip)
             clips = parsed
             errorText = ""
+            networkDown = false
             // Keep the offline metadata cache warm for anything already saved.
             for c in parsed where ClipStore.isOffline(c.id) { ClipMetaCache.put(c) }
         } catch {
+            networkDown = true
             // Offline: fall back to the downloaded library from the metadata cache.
             if clips.isEmpty {
                 let cached = ClipMetaCache.offlineClips()
@@ -270,6 +318,127 @@ final class VideoModel: ObservableObject {
     func stopPolling() {
         pollTask?.cancel()
         pollTask = nil
+        rulesPollTask?.cancel()
+        rulesPollTask = nil
+    }
+
+    // MARK: standing fetches (the "keep the list at ten" rules)
+
+    /// Load the standing fetches. Offline is calm (the view greys online rows
+    /// and says so); any real server error is surfaced honestly.
+    func loadRules() async {
+        do {
+            _ = try await fetchRules()
+            rulesError = ""
+            restartRulesPollIfNeeded()
+        } catch {
+            if !(error is URLError) {
+                rulesError = Self.honestMessage(error, fallback: "Couldn't load your fetches.")
+            }
+        }
+    }
+
+    /// Create a standing fetch. The server starts filling immediately; the new
+    /// row appears at 0/N and the poll watches it fill up. Throws the server's
+    /// own message so the editor can show it.
+    func saveRule(query: String, mode: String, target: Int) async throws {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { throw ClipAPIError(message: "Give the fetch a topic first.") }
+        let body: [String: Any] = ["query": q, "mode": mode, "target": min(max(target, 1), 10)]
+        let data = try await Self.requestChecked("op=clip_rule_save", method: "POST", body: body)
+        try Self.ensureOK(data, fallback: "The server couldn't save that fetch.")
+        await loadRules()
+    }
+
+    /// Turn a fetch on/off. Optimistic: the switch flips immediately and is
+    /// reverted (with an honest message) if the server says no.
+    func setRule(_ id: String, enabled: Bool) {
+        guard let idx = rules.firstIndex(where: { $0.id == id }),
+              rules[idx].enabled != enabled else { return }
+        let previous = rules[idx].enabled
+        rules[idx].enabled = enabled
+        Task {
+            do {
+                let data = try await Self.requestChecked(
+                    "op=clip_rule_toggle", method: "POST",
+                    body: ["id": id, "enabled": enabled])
+                try Self.ensureOK(data, fallback: "The server couldn't switch that fetch.")
+                rulesError = ""
+                restartRulesPollIfNeeded()
+            } catch {
+                if let j = rules.firstIndex(where: { $0.id == id }) {
+                    rules[j].enabled = previous
+                }
+                rulesError = Self.honestMessage(
+                    error,
+                    fallback: "Couldn't turn that fetch \(enabled ? "on" : "off") — it's back the way it was.")
+            }
+        }
+    }
+
+    /// Remove a fetch, optionally deleting the clips it accumulated.
+    func removeRule(_ rule: FetchRule, deleteClips: Bool) {
+        Task {
+            do {
+                let data = try await Self.requestChecked(
+                    "op=clip_rule_remove", method: "POST",
+                    body: ["id": rule.id, "delete_clips": deleteClips])
+                try Self.ensureOK(data, fallback: "The server couldn't remove that fetch.")
+                rules.removeAll { $0.id == rule.id }
+                rulesError = ""
+                if deleteClips { await load() }
+                restartRulesPollIfNeeded()
+            } catch {
+                rulesError = Self.honestMessage(error, fallback: "Couldn't remove that fetch.")
+            }
+        }
+    }
+
+    /// GET + parse `op=clip_rules`, replacing `rules`. Shared by the initial
+    /// load and the pending-items poll loop.
+    @discardableResult
+    private func fetchRules() async throws -> [FetchRule] {
+        let data = try await Self.requestChecked("op=clip_rules", method: "GET")
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        let arr = (obj["rules"] as? [[String: Any]]) ?? []
+        let parsed = arr.compactMap(Self.parseRule)
+        rules = parsed
+        return parsed
+    }
+
+    /// While any enabled fetch has pending items, re-check every 15s so the
+    /// accumulation counts fill in live. If a DOWNLOAD fetch stays pending for
+    /// ~3 minutes with nothing arriving, say honestly that the Mac looks
+    /// offline (downloads run there, not on this device).
+    private func restartRulesPollIfNeeded() {
+        rulesPollTask?.cancel()
+        macStallNote = ""
+        guard rules.contains(where: { $0.enabled && $0.pendingCount > 0 }) else { return }
+        rulesPollTask = Task { [weak self] in
+            guard let self else { return }
+            var lastProgress = Date()
+            var lastReady = self.rules.reduce(0) { $0 + $1.readyCount }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                if Task.isCancelled { break }
+                guard let updated = try? await self.fetchRules() else { continue }
+                let ready = updated.reduce(0) { $0 + $1.readyCount }
+                if ready > lastReady {
+                    lastReady = ready
+                    lastProgress = Date()
+                    self.macStallNote = ""
+                    await self.load()   // fresh clips have landed — show them
+                }
+                guard updated.contains(where: { $0.enabled && $0.pendingCount > 0 }) else {
+                    self.macStallNote = ""
+                    break
+                }
+                let downloadStalled = updated.contains { $0.enabled && $0.isDownload && $0.pendingCount > 0 }
+                if downloadStalled && Date().timeIntervalSince(lastProgress) > 180 {
+                    self.macStallNote = "Downloads run on Ido's Mac — it looks offline right now."
+                }
+            }
+        }
     }
 
     // MARK: offline + delete
@@ -339,7 +508,36 @@ final class VideoModel: ObservableObject {
             durationS: intVal(d["duration_s"]),
             views: intVal(d["views"]),
             thumbURL: strOrNil(d["thumb_url"]),
-            url: strOrNil(d["url"])
+            url: strOrNil(d["url"]),
+            storagePath: strOrNil(d["storage_path"]),
+            youtubeID: strOrNil(d["youtube_id"])
+        )
+    }
+
+    /// Parse one standing-fetch dict from `op=clip_rules`.
+    nonisolated static func parseRule(_ d: [String: Any]) -> FetchRule? {
+        func str(_ any: Any?) -> String? {
+            if let s = any as? String, !s.isEmpty { return s }
+            if let i = any as? Int { return String(i) }
+            return nil
+        }
+        func intVal(_ any: Any?) -> Int {
+            if let i = any as? Int { return i }
+            if let dd = any as? Double { return Int(dd) }
+            if let s = any as? String { return Int(s) ?? 0 }
+            return 0
+        }
+        guard let id = str(d["id"]), let query = str(d["query"]) else { return nil }
+        return FetchRule(
+            id: id,
+            query: query,
+            mode: (d["mode"] as? String) == "online" ? "online" : "download",
+            target: max(1, intVal(d["target"])),
+            criteria: (d["criteria"] as? String) ?? "",
+            enabled: (d["enabled"] as? Bool) ?? true,
+            readyCount: intVal(d["ready_count"]),
+            pendingCount: intVal(d["pending_count"]),
+            lastRunAt: str(d["last_run_at"])
         )
     }
 
@@ -362,6 +560,50 @@ final class VideoModel: ObservableObject {
         }
         return data
     }
+
+    /// Like `request`, but reads an `{error}` JSON body on a failed status so
+    /// the caller can surface the server's honest message — never silent.
+    static func requestChecked(_ query: String, method: String,
+                               body: [String: Any]? = nil) async throws -> Data {
+        guard let url = URL(string: "\(AppConfig.apiBase)/app-api?v=2&\(query)") else {
+            throw URLError(.badURL)
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        if let body {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            if let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               let msg = obj["error"] as? String, !msg.isEmpty {
+                throw ClipAPIError(message: msg)
+            }
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    /// A 200 body must still say `ok:true`; otherwise throw its `{error}`.
+    nonisolated static func ensureOK(_ data: Data, fallback: String) throws {
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if (obj["ok"] as? Bool) == true { return }
+        let msg = (obj["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        throw ClipAPIError(message: msg ?? fallback)
+    }
+
+    /// The server's own words when it gave any; the honest fallback otherwise.
+    nonisolated static func honestMessage(_ error: Error, fallback: String) -> String {
+        (error as? ClipAPIError)?.message ?? fallback
+    }
+}
+
+/// A server-reported error carrying the `{error}` body's message verbatim.
+struct ClipAPIError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 // MARK: - View
@@ -378,9 +620,24 @@ struct VideoView: View {
     @State private var count = 10
     @FocusState private var queryFocused: Bool
 
-    // One sheet (Mac-Catalyst rule) for playback; confirmationDialog for delete.
+    // Standing-fetch editor (INLINE, not a sheet — the one sheet stays the player).
+    @State private var showingRuleEditor = false
+    @State private var newQuery = ""
+    @State private var newMode = "download"
+    @State private var newTarget = 5
+    @State private var editorSaving = false
+    @State private var editorError = ""
+    @FocusState private var newQueryFocused: Bool
+
+    /// Both removals (a clip, a fetch) share the view's ONE confirmationDialog.
+    private enum PendingRemoval {
+        case clip(VideoModel.Clip)
+        case rule(VideoModel.FetchRule)
+    }
+
+    // One sheet (Mac-Catalyst rule) for playback; confirmationDialog for removals.
     @State private var playing: VideoModel.Clip?
-    @State private var pendingDelete: VideoModel.Clip?
+    @State private var pendingRemoval: PendingRemoval?
     /// The focus line last claimed for a playing clip; the player's dismissal
     /// restores the library focus only if this still owns it (stale-guard).
     @State private var openedFocus: String?
@@ -389,6 +646,7 @@ struct VideoView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    fetchesSection
                     curateCard
                     if model.fetching { fetchingBanner }
                     libraryHeader
@@ -407,28 +665,322 @@ struct VideoView: View {
             .onAppear { convo.setFocus(browsingFocus) }
             .onChange(of: model.clips.count) { _, _ in convo.setFocus(browsingFocus) }
             .confirmationDialog(
-                "Delete this clip?",
-                isPresented: Binding(get: { pendingDelete != nil },
-                                     set: { if !$0 { pendingDelete = nil } }),
+                removalTitle,
+                isPresented: Binding(get: { pendingRemoval != nil },
+                                     set: { if !$0 { pendingRemoval = nil } }),
                 titleVisibility: .visible
             ) {
-                Button("Delete", role: .destructive) {
-                    if let c = pendingDelete { model.deleteClip(c) }
-                    pendingDelete = nil
+                switch pendingRemoval {
+                case .some(.clip(let c)):
+                    Button("Delete", role: .destructive) {
+                        model.deleteClip(c)
+                        pendingRemoval = nil
+                    }
+                    Button("Cancel", role: .cancel) { pendingRemoval = nil }
+                case .some(.rule(let r)):
+                    Button("Remove fetch, keep its clips") {
+                        model.removeRule(r, deleteClips: false)
+                        pendingRemoval = nil
+                    }
+                    Button("Remove fetch and delete its clips", role: .destructive) {
+                        model.removeRule(r, deleteClips: true)
+                        pendingRemoval = nil
+                    }
+                    Button("Cancel", role: .cancel) { pendingRemoval = nil }
+                case .none:
+                    EmptyView()
                 }
-                Button("Cancel", role: .cancel) { pendingDelete = nil }
             } message: {
-                Text(pendingDelete.map {
-                    "“\($0.title)” will be removed from your library and this phone."
-                } ?? "")
+                Text(removalMessage)
             }
             // One .sheet only — the video player (Mac-Catalyst one-sheet rule).
+            // Downloaded clips and ONLINE (stream) clips both ride this sheet;
+            // clipPlayer(for:) picks the engine, and dismissal restores the
+            // library's ambient focus (stale-guarded).
             .sheet(item: $playing, onDismiss: restoreBrowsingFocus) { clip in
                 clipPlayer(for: clip)
             }
         }
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.loadRules()
+        }
         .onDisappear { model.stopPolling() }
+    }
+
+    private var removalTitle: String {
+        switch pendingRemoval {
+        case .some(.clip): return "Delete this clip?"
+        case .some(.rule): return "Remove this fetch?"
+        case .none: return ""
+        }
+    }
+
+    private var removalMessage: String {
+        switch pendingRemoval {
+        case .some(.clip(let c)):
+            return "“\(c.title)” will be removed from your library and this phone."
+        case .some(.rule(let r)):
+            return "“\(r.query)” will stop fetching. You can keep the clips it brought, or delete them too."
+        case .none:
+            return ""
+        }
+    }
+
+    // MARK: standing fetches
+
+    /// The section only takes over the top of the page when there are rules or
+    /// the editor is open; otherwise just the compact "+ New fetch" affordance.
+    @ViewBuilder
+    private var fetchesSection: some View {
+        if model.rules.isEmpty && !showingRuleEditor {
+            Button {
+                openRuleEditor()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus.circle")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("New fetch")
+                        .font(.scarletCaptionEmph)
+                }
+                .foregroundStyle(scarletRose)
+                .padding(.horizontal, 12).padding(.vertical, 7)
+                .background(.white.opacity(0.05), in: Capsule())
+                .overlay(Capsule().stroke(.white.opacity(0.08), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Fetches")
+                        .font(.system(size: 13, weight: .semibold))
+                        .tracking(0.6)
+                        .foregroundStyle(.white.opacity(0.55))
+                    Spacer()
+                    if !showingRuleEditor {
+                        Button {
+                            openRuleEditor()
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "plus.circle")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("New fetch")
+                                    .font(.scarletCaptionEmph)
+                            }
+                            .foregroundStyle(scarletRose)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                ForEach(model.rules) { rule in
+                    ruleRow(rule)
+                }
+                if showingRuleEditor { ruleEditor }
+                if model.networkDown && model.rules.contains(where: { !$0.isDownload }) {
+                    Text("Online fetches need internet — your downloaded clips are ready below.")
+                        .font(.scarletCaption)
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                if !model.macStallNote.isEmpty {
+                    Text(model.macStallNote)
+                        .font(.scarletCaption)
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                if !model.rulesError.isEmpty {
+                    Text(model.rulesError)
+                        .font(.scarletDetail)
+                        .foregroundStyle(Color(red: 1, green: 0.5, blue: 0.5))
+                }
+            }
+        }
+    }
+
+    /// One standing fetch: mode glyph, query, accumulation ("3/10 · +2 coming"),
+    /// and the on/off switch. Remove lives in the context menu (confirmed).
+    private func ruleRow(_ rule: VideoModel.FetchRule) -> some View {
+        // Offline, an online-mode fetch can't do anything — grey it calmly.
+        let dimmed = model.networkDown && !rule.isDownload
+        return HStack(spacing: 12) {
+            Image(systemName: rule.isDownload ? "arrow.down.circle" : "play.circle")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(rule.enabled ? scarletRose : .white.opacity(0.35))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(rule.query)
+                    .font(.scarletDetailEmph)
+                    .foregroundStyle(paper)
+                    .lineLimit(2)
+                HStack(spacing: 8) {
+                    Text("\(rule.readyCount)/\(rule.target)")
+                        .font(.scarletCaptionEmph)
+                        .foregroundStyle(rule.readyCount >= rule.target
+                                         ? scarletRose : .white.opacity(0.65))
+                    if rule.pendingCount > 0 {
+                        Text("+\(rule.pendingCount) coming")
+                            .font(.scarletCaption)
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                    if !rule.enabled {
+                        Text("Off")
+                            .font(.scarletCaption)
+                            .foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { rule.enabled },
+                set: { model.setRule(rule.id, enabled: $0) }
+            ))
+            .labelsHidden()
+            .tint(scarletRose)
+            .disabled(dimmed)
+        }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.08), lineWidth: 1))
+        .opacity(dimmed ? 0.45 : 1)
+        .contextMenu {
+            Button(role: .destructive) {
+                pendingRemoval = .rule(rule)
+            } label: {
+                Label("Remove fetch", systemImage: "trash")
+            }
+        }
+    }
+
+    /// Inline editor — deliberately NOT a sheet (the view's one sheet is the
+    /// player). Topic, the two clearly-labeled functions, target, save.
+    private var ruleEditor: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New fetch")
+                .font(.scarletDetailEmph)
+                .foregroundStyle(paper)
+            TextField("A topic Scarlet keeps stocked — e.g. Claude Code clips",
+                      text: $newQuery, axis: .vertical)
+                .lineLimit(1...3)
+                .textInputAutocapitalization(.sentences)
+                .padding(12)
+                .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
+                .focused($newQueryFocused)
+            modeOption("download", icon: "arrow.down.circle",
+                       title: "Fetch & download",
+                       subtitle: "Kept offline on this device — ready for flights")
+            modeOption("online", icon: "play.circle",
+                       title: "Fetch online",
+                       subtitle: "Watch now by streaming — needs internet")
+            HStack(spacing: 10) {
+                Text("Keep ready")
+                    .font(.scarletDetail)
+                    .foregroundStyle(.secondary)
+                Text("\(newTarget)")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(paper)
+                    .frame(minWidth: 26)
+                Stepper("", value: $newTarget, in: 1...10)
+                    .labelsHidden()
+                Spacer()
+            }
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 14))
+            if !editorError.isEmpty {
+                Text(editorError)
+                    .font(.scarletDetail)
+                    .foregroundStyle(Color(red: 1, green: 0.5, blue: 0.5))
+            }
+            HStack {
+                Button("Cancel") {
+                    showingRuleEditor = false
+                    editorError = ""
+                    newQueryFocused = false
+                }
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.7))
+                .buttonStyle(.plain)
+                Spacer()
+                Button {
+                    Task { await saveNewRule() }
+                } label: {
+                    HStack(spacing: 6) {
+                        if editorSaving {
+                            ProgressView().controlSize(.mini).tint(.white)
+                        } else {
+                            Image(systemName: "plus.circle.fill")
+                        }
+                        Text(editorSaving ? "Starting…" : "Start fetch")
+                    }
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18).padding(.vertical, 10)
+                    .background(Capsule().fill(canSaveRule ? scarletRose : scarletRose.opacity(0.35)))
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSaveRule)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.08), lineWidth: 1))
+    }
+
+    private func modeOption(_ mode: String, icon: String,
+                            title: String, subtitle: String) -> some View {
+        let selected = newMode == mode
+        return Button {
+            newMode = mode
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(selected ? scarletRose : .white.opacity(0.5))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.scarletDetailEmph)
+                        .foregroundStyle(paper)
+                    Text(subtitle)
+                        .font(.scarletCaption)
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+                Spacer()
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(selected ? scarletRose : .white.opacity(0.3))
+            }
+            .padding(10)
+            .background(.white.opacity(selected ? 0.08 : 0.03),
+                        in: RoundedRectangle(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .stroke(selected ? scarletRose.opacity(0.5) : .white.opacity(0.06), lineWidth: 1))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var canSaveRule: Bool {
+        !newQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !editorSaving
+    }
+
+    private func openRuleEditor() {
+        newQuery = ""
+        newMode = "download"
+        newTarget = 5
+        editorError = ""
+        showingRuleEditor = true
+    }
+
+    private func saveNewRule() async {
+        guard canSaveRule else { return }
+        editorSaving = true
+        do {
+            try await model.saveRule(query: newQuery, mode: newMode, target: newTarget)
+            showingRuleEditor = false
+            editorError = ""
+            newQueryFocused = false
+        } catch {
+            editorError = VideoModel.honestMessage(
+                error, fallback: "Couldn't start that fetch — try again.")
+        }
+        editorSaving = false
     }
 
     // MARK: curate bar
@@ -636,12 +1188,16 @@ struct VideoView: View {
                         .foregroundStyle(.white.opacity(0.92))
                         .shadow(color: .black.opacity(0.5), radius: 6)
                 }
-                // Duration + offline badges.
+                // Duration + offline/stream badges. An ONLINE clip streams and
+                // never shows the offline checkmark.
                 VStack {
                     HStack {
                         Spacer()
                         if isOffline {
                             badge("arrow.down.circle.fill", "Offline", tint: scarletRose)
+                        } else if clip.isOnlineStream {
+                            badge("antenna.radiowaves.left.and.right", "Stream",
+                                  tint: .black.opacity(0.6))
                         }
                     }
                     Spacer()
@@ -690,31 +1246,45 @@ struct VideoView: View {
 
     private func clipActions(_ clip: VideoModel.Clip, isOffline: Bool, isDownloading: Bool) -> some View {
         HStack(spacing: 10) {
-            // Save offline / Saved toggle.
-            Button {
-                if isOffline { model.removeOffline(clip) }
-                else { Task { await model.saveOffline(clip) } }
-            } label: {
+            if clip.isOnlineStream && !isOffline {
+                // Stream-only clip — there is no file to keep on the phone;
+                // that's what a "Fetch & download" rule is for.
                 HStack(spacing: 5) {
-                    if isDownloading {
-                        ProgressView().controlSize(.mini).tint(scarletRose)
-                    } else {
-                        Image(systemName: isOffline ? "checkmark.circle.fill" : "arrow.down.circle")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    Text(isDownloading ? "Saving…" : (isOffline ? "Saved offline" : "Save offline"))
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text("Streams online")
                         .font(.system(size: 13, weight: .semibold))
                 }
-                .foregroundStyle(isOffline ? scarletRose : .white.opacity(0.85))
+                .foregroundStyle(.white.opacity(0.45))
                 .padding(.horizontal, 12).padding(.vertical, 8)
-                .background(.white.opacity(0.06), in: Capsule())
+                .background(.white.opacity(0.04), in: Capsule())
+            } else {
+                // Save offline / Saved toggle.
+                Button {
+                    if isOffline { model.removeOffline(clip) }
+                    else { Task { await model.saveOffline(clip) } }
+                } label: {
+                    HStack(spacing: 5) {
+                        if isDownloading {
+                            ProgressView().controlSize(.mini).tint(scarletRose)
+                        } else {
+                            Image(systemName: isOffline ? "checkmark.circle.fill" : "arrow.down.circle")
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        Text(isDownloading ? "Saving…" : (isOffline ? "Saved offline" : "Save offline"))
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                    .foregroundStyle(isOffline ? scarletRose : .white.opacity(0.85))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(.white.opacity(0.06), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .disabled(isDownloading || (!isOffline && clip.url == nil))
             }
-            .buttonStyle(.plain)
-            .disabled(isDownloading || (!isOffline && clip.url == nil))
             Spacer()
             // Delete (confirmed).
             Button {
-                pendingDelete = clip
+                pendingRemoval = .clip(clip)
             } label: {
                 Image(systemName: "trash")
                     .font(.system(size: 14, weight: .semibold))
@@ -731,11 +1301,17 @@ struct VideoView: View {
 
     @ViewBuilder
     private func clipPlayer(for clip: VideoModel.Clip) -> some View {
-        let source: URL? = ClipStore.isOffline(clip.id)
-            ? ClipStore.localURL(for: clip.id)
-            : clip.url.flatMap { URL(string: $0) }
-        if let url = source {
-            ClipPlayerView(title: clip.title, url: url) { model.markPlayed(clip) }
+        if ClipStore.isOffline(clip.id) {
+            ClipPlayerView(title: clip.title, url: ClipStore.localURL(for: clip.id)) {
+                model.markPlayed(clip)
+            }
+        } else if clip.isOnlineStream, let ytID = clip.youtubeID {
+            // ONLINE clip — stream the YouTube embed; played on dismissal
+            // (there's no reliable end-of-playback signal from the embed).
+            ClipStreamView(youtubeID: ytID)
+                .onDisappear { model.markPlayed(clip) }
+        } else if let remote = clip.url.flatMap({ URL(string: $0) }) {
+            ClipPlayerView(title: clip.title, url: remote) { model.markPlayed(clip) }
         } else {
             ZStack {
                 Color.black.ignoresSafeArea()
@@ -855,4 +1431,55 @@ struct ClipPlayerView: View {
             }
         }
     }
+}
+
+// MARK: - Stream player (ONLINE clips; self-contained, no @EnvironmentObject)
+
+/// Full-bleed YouTube-embed streaming for ONLINE clips (no file anywhere),
+/// with the same black ground and close affordance as ClipPlayerView. Rides
+/// the library's single player sheet.
+struct ClipStreamView: View {
+    let youtubeID: String
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.black.ignoresSafeArea()
+            YouTubeEmbedWebView(youtubeID: youtubeID)
+                .ignoresSafeArea()
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 38, height: 38)
+                    .background(Circle().fill(Color.black.opacity(0.55)))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+        }
+    }
+}
+
+/// The WKWebView host for the YouTube embed (AVPlayer can't stream YouTube).
+private struct YouTubeEmbedWebView: UIViewRepresentable {
+    let youtubeID: String
+
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.isOpaque = false
+        web.backgroundColor = .black
+        web.scrollView.isScrollEnabled = false
+        web.scrollView.backgroundColor = .black
+        if let url = URL(string: "https://www.youtube.com/embed/\(youtubeID)?playsinline=1") {
+            web.load(URLRequest(url: url))
+        }
+        return web
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
