@@ -53,8 +53,15 @@ targets:
         CFBundleDisplayName: Talk
         CFBundleIconName: AppIcon
         UILaunchScreen: {}
+        # iPhone: portrait for the app, PLUS landscape so a full-screen photo can
+        # rotate. The app stays portrait everywhere except the full-screen photo
+        # viewer — an AppDelegate orientation gate (OrientationGate) narrows the
+        # live mask to portrait and only opens landscape while that viewer is up.
+        # (Info.plist here is the ceiling; the gate restricts within it.)
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         # iPad supports all orientations (and, on a Mac, a freely resizable
         # window) so the three-pane layout gets real width to work with.
         "UISupportedInterfaceOrientations~ipad":

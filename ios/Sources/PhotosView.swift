@@ -1018,6 +1018,11 @@ struct FullScreenPager: View {
             .padding(.horizontal, 12)
             .padding(.top, 12)
         }
+        // Full-screen photos may be viewed in landscape OR portrait (iPhone);
+        // restore portrait for the rest of the app on close.
+        .onAppear { OrientationGate.allow(.allButUpsideDown) }
+        .onDisappear { OrientationGate.allow(.portrait) }
+        .statusBarHidden(true)
     }
 }
 

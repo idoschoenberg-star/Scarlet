@@ -2,8 +2,44 @@ import Combine
 import SwiftUI
 import UIKit
 
+/// iPhone orientation gate. The app is portrait everywhere EXCEPT the full-screen
+/// photo viewer, which opens landscape so a photo can be viewed 16:9. iPad/Mac
+/// always keep every orientation. `allow(...)` flips the live mask and asks the
+/// window scene to re-evaluate so the device rotates immediately.
+enum OrientationGate {
+    /// The iPhone mask right now — portrait by default; widened only while the
+    /// full-screen photo viewer is on screen.
+    static var iPhoneMask: UIInterfaceOrientationMask = .portrait
+
+    static func allow(_ mask: UIInterfaceOrientationMask) {
+        // iPhone only — iPad/Mac always keep every orientation, so never
+        // constrain their window geometry here.
+        guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+        iPhoneMask = mask
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first else { return }
+        if #available(iOS 16.0, *) {
+            scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { _ in }
+            scene.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+        } else {
+            UIViewController.attemptRotationToUpdateSupportedInterfaceOrientations()
+        }
+    }
+}
+
+/// Minimal app delegate: the ONLY reason it exists is to answer the system's
+/// supported-orientation query from OrientationGate. iPad/Mac get everything;
+/// iPhone gets the gated mask.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        UIDevice.current.userInterfaceIdiom == .phone ? OrientationGate.iPhoneMask : .all
+    }
+}
+
 @main
 struct ScarletTalkApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var session = AppSession()
 
     init() {
