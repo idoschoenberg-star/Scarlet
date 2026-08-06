@@ -1018,6 +1018,13 @@ final class Conversation: ObservableObject {
     /// Single-flight guard so a burst of configuration-change notifications
     /// can't re-enter the rebuild.
     private var audioRebuilding = false
+    /// Throttle for playPCM's self-heal path: after a double failure (engine
+    /// start throws AND the rebuild's ensureAudio() also fails transiently),
+    /// audioReady can be stuck false with a live socket and no other trigger to
+    /// recover — she'd go silent for the rest of the session. playPCM retries a
+    /// full node rebuild, throttled to this cadence so incoming frames (~50/s)
+    /// can't hammer CoreAudio.
+    private var lastAudioRecoveryAttempt = Date.distantPast
 
     /// The audio hardware/format changed under a live session — a device swap,
     /// a sample-rate renegotiation, or a phone/Teams call taking then releasing
@@ -1089,7 +1096,13 @@ final class Conversation: ObservableObject {
     @MainActor
     private func handleMediaServicesReset() {
         recreateAudioNodes()
-        guard wantLive else { return }
+        // Muted → the session was intentionally handed to other apps (Spotify has
+        // the speaker). Recreate the nodes so a later unmute gets fresh objects,
+        // but do NOT ensureAudio() — that calls setActive(true) and STEALS the
+        // speaker back while Ido believes she's muted (she'd become audible again).
+        // Unmute is the only thing that reactivates. Mirrors the interruption-ended
+        // (micOn) and route-change (audioReady) guards.
+        guard wantLive, micOn else { return }
         try? ensureAudio()
     }
 
@@ -1133,7 +1146,25 @@ final class Conversation: ObservableObject {
         // exception (hard crash), and even when it doesn't it resurrects an ended
         // session into a phantom "listening" state. end()/stopAudio() clear both
         // flags synchronously, so any post-teardown frame is dropped here.
-        guard wantLive, audioReady else { return }
+        guard wantLive else { return }
+        // Self-heal (never drop forever): audioReady can be stuck false after a
+        // double failure — engine.start() threw AND the rebuild's ensureAudio()
+        // also failed transiently (e.g. the input was momentarily held). The
+        // socket is still live so nothing else retries, and she'd stay silent for
+        // the rest of the session. Attempt a throttled full node rebuild instead
+        // of dropping every frame. Only when genuinely live+unmuted — a muted
+        // session's audioReady==false is the CORRECT resting state (speaker handed
+        // to Spotify), never something to "recover" from.
+        if !audioReady {
+            guard micOn else { return }
+            let now = Date()
+            if now.timeIntervalSince(lastAudioRecoveryAttempt) > 2 {
+                lastAudioRecoveryAttempt = now
+                recreateAudioNodes()
+                try? ensureAudio()
+            }
+            guard audioReady else { return }
+        }
         // He just barged in — drop the tail of the killed turn so her voice
         // can't crawl back over him. Cleared when his next turn lands.
         if barged { return }
@@ -1160,7 +1191,17 @@ final class Conversation: ObservableObject {
         // ONLY with a verified-running engine.
         if !engine.isRunning {
             do { try engine.start() }
-            catch { rebuildAudioGraph() }
+            catch {
+                // A throw here can mean the engine OBJECT is dead — a media-services
+                // reset that raced AHEAD of (or instead of) its notification, so
+                // playPCM reaches an invalidated engine. rebuildAudioGraph() restarts
+                // the SAME objects; on a corpse its engine.connect()/removeTap raise
+                // an uncatchable CoreAudio exception → SIGABRT (the very crash this
+                // guards). recreateAudioNodes() REPLACES the objects wholesale, then
+                // ensureAudio() rebuilds on the fresh nodes — the safe recovery.
+                recreateAudioNodes()
+                if micOn { try? ensureAudio() }
+            }
         }
         guard engine.isRunning else { return }   // never play on a dead engine
         if !player.isPlaying { player.play() }
