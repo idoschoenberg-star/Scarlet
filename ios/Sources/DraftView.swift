@@ -76,14 +76,15 @@ final class DraftModel: ObservableObject {
         var writingStartedAt: Date? = nil
     }
 
-    /// One autocomplete row, as `op=contactsearch` returns it — the server
-    /// ranks by relevance (frequent contacts first), like Outlook's own.
+    /// One autocomplete row. For EMAIL it comes from `op=contactsearch` (the
+    /// Outlook directory); for WHATSAPP/IMESSAGE it comes from `op=wa_chats` /
+    /// `op=im_chats` (his real chat list) — so a photo forward to WhatsApp
+    /// resolves a NAME through WhatsApp, never through the email list.
     struct Contact: Identifiable {
-        let name: String
-        let email: String
-        let title: String
-
-        var id: String { email }
+        let id: String          // unique row key (email address, or chat jid/handle)
+        let name: String        // display name
+        let subtitle: String    // email address, or "WhatsApp"/"iMessage" + last message
+        let insertValue: String // what lands in the To field when picked
     }
 
     enum Phase: Equatable {
@@ -179,49 +180,79 @@ final class DraftModel: ObservableObject {
         let to = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
         let instr = instruction.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !to.isEmpty else { return }
+        // Photo forward with NO typed note → send an EMPTY instruction so the
+        // server lands a photos-only draft (no invented cover text). Ido asked to
+        // be able to send photos with no annotation, especially on WhatsApp. A
+        // plain new email with no note still gets a minimal "Draft this email."
         var body: [String: Any] = [
             "channel": channel,
             "recipient": to,
             "instruction": instr.isEmpty
-                ? (attachmentIDs.isEmpty ? "Draft this email."
-                   : "Write a brief, warm cover note from Ido; the photo(s) are attached.")
+                ? (attachmentIDs.isEmpty ? "Draft this email." : "")
                 : instr,
         ]
         if !attachmentIDs.isEmpty { body["attachment_upload_ids"] = attachmentIDs }
         compose(body)
     }
 
-    /// Outlook-style To-field autocomplete: debounce ~350ms, then ask the
-    /// server for relevance-ranked matches. Skips (and clears) when the text
-    /// already holds an address ("@" or "<"), is under 2 characters, or is
-    /// exactly the suggestion just picked.
-    func searchContacts(_ q: String) {
+    /// To-field autocomplete, CHANNEL-AWARE: email channels search the Outlook
+    /// directory; WhatsApp/iMessage search his real chat list so a name resolves
+    /// through the RIGHT place (a WhatsApp forward is a name, not an email).
+    /// Debounce ~300ms; skips when under 2 chars or exactly the picked value.
+    /// For email an "@"/"<" in the field means it's already an address; chat
+    /// names never contain those, so that guard only applies to email.
+    func searchContacts(_ q: String, channel: String = "email_outlook") {
         searchTask?.cancel()
         let text = q.trimmingCharacters(in: .whitespaces)
-        guard text.count >= 2, !text.contains("@"), !text.contains("<"),
-              text != pickedSuggestion else {
+        let isChat = channel == "whatsapp" || channel == "imessage"
+        guard text.count >= 2, text != pickedSuggestion,
+              isChat || (!text.contains("@") && !text.contains("<")) else {
             suggestions = []
             return
         }
         searchTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 350_000_000)
+            try? await Task.sleep(nanoseconds: 300_000_000)
             if Task.isCancelled { return }
-            // Percent-encode down to alphanumerics before the query string,
-            // same as InboxModel does with Graph ids.
-            let encoded = text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? text
-            guard let data = try? await Self.request("op=contactsearch&q=\(encoded)", method: "GET") else { return }
-            if Task.isCancelled { return }
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-            let found: [Contact] = ((obj?["contacts"] as? [[String: Any]]) ?? []).compactMap { c in
-                guard let email = c["email"] as? String, !email.isEmpty else { return nil }
-                return Contact(
-                    name: (c["name"] as? String) ?? "",
-                    email: email,
-                    title: (c["title"] as? String) ?? ""
-                )
+            let found: [Contact]
+            switch channel {
+            case "whatsapp": found = await Self.searchChats(op: "wa_chats", keyField: "jid", query: text, label: "WhatsApp")
+            case "imessage": found = await Self.searchChats(op: "im_chats", keyField: "handle", query: text, label: "iMessage")
+            default:         found = await Self.searchEmailContacts(text)
             }
             if Task.isCancelled { return }
             self?.suggestions = found
+        }
+    }
+
+    /// Outlook directory search (email channels).
+    private static func searchEmailContacts(_ text: String) async -> [Contact] {
+        let encoded = text.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? text
+        guard let data = try? await request("op=contactsearch&q=\(encoded)", method: "GET") else { return [] }
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return ((obj?["contacts"] as? [[String: Any]]) ?? []).compactMap { c in
+            guard let email = c["email"] as? String, !email.isEmpty else { return nil }
+            let name = (c["name"] as? String) ?? ""
+            return Contact(id: email, name: name, subtitle: email,
+                           insertValue: name.isEmpty ? email : "\(name) <\(email)>")
+        }
+    }
+
+    /// WhatsApp / iMessage chat search: pull his recent chat list and filter by
+    /// name locally. The picked value is the chat's DISPLAY NAME — the server
+    /// resolves it to the real jid/handle at approval (never an email).
+    private static func searchChats(op: String, keyField: String, query: String, label: String) async -> [Contact] {
+        guard let data = try? await request("op=\(op)", method: "GET") else { return [] }
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        let chats = (obj?["chats"] as? [[String: Any]]) ?? []
+        let ql = query.lowercased()
+        return chats.compactMap { c -> Contact? in
+            guard let name = (c["name"] as? String), !name.isEmpty,
+                  name.lowercased().contains(ql) else { return nil }
+            let key = (c[keyField] as? String) ?? name
+            let last = (c["last"] as? String) ?? ""
+            return Contact(id: key, name: name,
+                           subtitle: last.isEmpty ? label : "\(label) · \(last)",
+                           insertValue: name)
         }
     }
 
@@ -1077,13 +1108,39 @@ struct DraftView: View {
 
     /// New-mail mode: just the To field (with autocomplete) — the instruction
     /// arrives through the unified input row below.
+    /// The channel this new-mail/forward form targets.
+    private var draftChannel: String { forwardChannel ?? "email_outlook" }
+
+    /// To-field placeholder — names the RIGHT place to resolve (WhatsApp/iMessage
+    /// contact vs. an email address).
+    private var toPlaceholder: String {
+        switch draftChannel {
+        case "whatsapp": return "To — a WhatsApp contact…"
+        case "imessage": return "To — an iMessage contact…"
+        default:         return "To — a name or an email address…"
+        }
+    }
+
+    /// Attachment hint — for chat channels it says plainly that a note is
+    /// optional and an empty note sends the photo with no text.
+    private var attachHint: String {
+        let n = attachmentUploadIDs.count
+        let ph = "photo\(n == 1 ? "" : "s")"
+        switch draftChannel {
+        case "whatsapp", "imessage":
+            return "\(n) \(ph) ready — pick a contact. A note is optional: leave it empty to send the \(ph) with no text."
+        default:
+            return "\(n) \(ph) will be attached — add a recipient, then speak or type an optional note below."
+        }
+    }
+
     private var newMailForm: some View {
         VStack(alignment: .leading, spacing: 14) {
             if !attachmentUploadIDs.isEmpty {
                 HStack(spacing: 8) {
                     Image(systemName: "paperclip")
                         .font(.system(size: 13, weight: .semibold))
-                    Text("\(attachmentUploadIDs.count) photo\(attachmentUploadIDs.count == 1 ? "" : "s") will be attached — add a recipient, then speak or type an optional note below.")
+                    Text(attachHint)
                         .font(.footnote)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1092,13 +1149,13 @@ struct DraftView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(scarletRose.opacity(0.10), in: RoundedRectangle(cornerRadius: 14))
             }
-            TextField("To — a name or an email address…", text: $newTo)
+            TextField(toPlaceholder, text: $newTo)
                 .textInputAutocapitalization(.words)
                 .autocorrectionDisabled()
                 .padding(12)
                 .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                 .onChange(of: newTo) { _, newValue in
-                    model.searchContacts(newValue)
+                    model.searchContacts(newValue, channel: draftChannel)
                 }
             if !suggestionRows.isEmpty {
                 suggestionList
@@ -1139,12 +1196,12 @@ struct DraftView: View {
                     pickSuggestion(contact)
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(contact.name.isEmpty ? contact.email : contact.name)
+                        Text(contact.name.isEmpty ? contact.subtitle : contact.name)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(.primary)
                             .lineLimit(1)
                             .truncationMode(.tail)
-                        Text(contact.email)
+                        Text(contact.subtitle)
                             .font(.system(size: 13))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
@@ -1166,11 +1223,11 @@ struct DraftView: View {
     /// Tap-to-fill: "Name <email>" lands in To, the list closes, and focus
     /// hops to the unified input row — free typing stays just as valid.
     private func pickSuggestion(_ contact: DraftModel.Contact) {
-        let line = contact.name.isEmpty
-            ? contact.email
-            : "\(contact.name) <\(contact.email)>"
-        model.suggestionPicked(line)
-        newTo = line
+        // Email → "Name <email>"; WhatsApp/iMessage → the bare display name (the
+        // server resolves it to the real jid/handle). insertValue already carries
+        // the right form for the channel.
+        model.suggestionPicked(contact.insertValue)
+        newTo = contact.insertValue
         revisionFocused = true
     }
 
