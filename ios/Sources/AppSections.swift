@@ -174,9 +174,11 @@ final class SectionOrderStore: ObservableObject {
     }
 
     private func push() async {
-        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)
-        comps?.queryItems = (comps?.queryItems ?? []) + [URLQueryItem(name: "op", value: "section_order")]
-        guard let url = comps?.url else { return }
+        guard var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return }
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "section_order"))
+        comps.queryItems = items
+        guard let url = comps.url else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
@@ -187,9 +189,11 @@ final class SectionOrderStore: ObservableObject {
     }
 
     private static func fetchOrder() async -> [String]? {
-        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)
-        comps?.queryItems = (comps?.queryItems ?? []) + [URLQueryItem(name: "op", value: "section_order")]
-        guard let url = comps?.url else { return nil }
+        guard var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return nil }
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "section_order"))
+        comps.queryItems = items
+        guard let url = comps.url else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
