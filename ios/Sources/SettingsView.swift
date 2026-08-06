@@ -126,7 +126,7 @@ struct SettingsView: View {
                                         }
                                     }
                                     if let d = v.desc, !d.isEmpty {
-                                        Text(d).font(.footnote).foregroundStyle(.secondary)
+                                        Text(d).font(.scarletDetail).foregroundStyle(.secondary)
                                     }
                                 }
                             }
@@ -140,7 +140,7 @@ struct SettingsView: View {
                         }
                     }
                     if !m.note.isEmpty {
-                        Text(m.note).font(.footnote).foregroundStyle(.secondary)
+                        Text(m.note).font(.scarletDetail).foregroundStyle(.secondary)
                     }
                 } header: {
                     Text("Scarlet's voice")

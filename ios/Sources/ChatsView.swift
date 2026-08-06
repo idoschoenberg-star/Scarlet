@@ -913,7 +913,7 @@ struct ChatsView: View {
             VStack(spacing: 10) {
                 ProgressView()
                 Text("Fetching \(model.channel.displayName)…")
-                    .font(.footnote).foregroundStyle(.secondary)
+                    .font(.scarletDetail).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if model.chats.isEmpty && !model.errorText.isEmpty {
@@ -946,7 +946,7 @@ struct ChatsView: View {
         List {
             if !model.errorText.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                     .listRowBackground(Color.clear)
             }
@@ -1342,7 +1342,7 @@ struct ChatThreadView: View {
         VStack(spacing: 8) {
             if !model.errorText.isEmpty && !model.messages.isEmpty {
                 Text(model.errorText)
-                    .font(.footnote)
+                    .font(.scarletDetail)
                     .foregroundStyle(Color(red: 1, green: 0.45, blue: 0.45))
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1473,12 +1473,12 @@ struct ChatThreadView: View {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(channel.accent)
             Text("Staged in Teams — one tap to send there")
-                .font(.footnote)
+                .font(.scarletDetail)
                 .foregroundStyle(.white.opacity(0.85))
             Spacer(minLength: 6)
             if let url = model.stagedURL {
                 Link("Open Teams", destination: url)
-                    .font(.footnote.weight(.semibold))
+                    .font(.scarletDetailEmph)
                     .foregroundStyle(channel.accent)
             }
         }
@@ -1896,7 +1896,7 @@ struct WAPhotoView: View {
                         Image(systemName: "photo")
                             .font(.system(size: 36))
                         Text("Couldn't load this photo")
-                            .font(.footnote)
+                            .font(.scarletDetail)
                     }
                     .foregroundStyle(.white.opacity(0.55))
                 } else {

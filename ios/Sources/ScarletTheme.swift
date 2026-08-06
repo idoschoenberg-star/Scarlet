@@ -64,6 +64,32 @@ enum ScarletTheme {
     // MARK: Metrics
     static let cardRadius: CGFloat = 18
     static let screenPadding: CGFloat = 16
+
+    // MARK: Spacing (one rhythm across every screen)
+
+    /// Screen horizontal inset — the reading margin, same on every section.
+    static let gutter: CGFloat = 16
+    /// Gap between stacked rows / cards in a list.
+    static let rowGap: CGFloat = 12
+    /// Gap between major sections within a screen.
+    static let sectionGap: CGFloat = 26
+    /// Inner padding of a card.
+    static let cardPadding: CGFloat = 16
+
+    // MARK: Elevation
+
+    /// The soft ambient shadow that lifts a card off `ink`. Subtle by design —
+    /// depth, not drama.
+    static let shadowColor = Color.black.opacity(0.28)
+    static let shadowRadius: CGFloat = 12
+    static let shadowY: CGFloat = 6
+
+    // MARK: Motion (one feel — calm, never springy-cartoonish)
+
+    /// Standard ease for content transitions (appear/disappear, layout shifts).
+    static let ease: Animation = .easeInOut(duration: 0.28)
+    /// Gentle spring for interactive/selected-state moves.
+    static let spring: Animation = .spring(response: 0.42, dampingFraction: 0.86)
 }
 
 // MARK: - Modifiers
@@ -86,6 +112,10 @@ private struct ScarletCard: ViewModifier {
                 RoundedRectangle(cornerRadius: ScarletTheme.cardRadius, style: .continuous)
                     .stroke(ScarletTheme.hairline, lineWidth: 1)
             )
+            // A soft ambient lift so cards read as one elevation everywhere.
+            .shadow(color: ScarletTheme.shadowColor,
+                    radius: ScarletTheme.shadowRadius,
+                    x: 0, y: ScarletTheme.shadowY)
     }
 }
 
@@ -94,4 +124,107 @@ extension View {
     func scarletScreen() -> some View { modifier(ScarletScreen()) }
     /// An elevated card on the base surface.
     func scarletCard(strong: Bool = false) -> some View { modifier(ScarletCard(strong: strong)) }
+    /// Standard inner padding for a card's content (pairs with `.scarletCard()`).
+    func scarletCardPadding() -> some View { padding(ScarletTheme.cardPadding) }
+}
+
+// MARK: - Shared header idioms
+//
+// One header vocabulary the whole app shares so every section reads like a
+// page in the same publication: a big hero title with an accent-tinted glyph,
+// an optional subtitle, and an optional trailing control.
+
+/// The one screen-header: accent glyph · hero title (+ optional subtitle) ·
+/// trailing control. Drop it at the top of a section's `VStack` in place of an
+/// ad-hoc `Text(...).font(.scarletHero)` row.
+struct ScarletHeader<Trailing: View>: View {
+    let title: String
+    var subtitle: String? = nil
+    var systemImage: String? = nil
+    var accent: Color = ScarletTheme.rose
+    @ViewBuilder var trailing: () -> Trailing
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(accent)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(accent.opacity(0.16))
+                    )
+            }
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.scarletHero)
+                    .foregroundStyle(ScarletTheme.textPrimary)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.scarletDetail)
+                        .foregroundStyle(ScarletTheme.textSecondary)
+                }
+            }
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .padding(.horizontal, ScarletTheme.gutter)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+    }
+}
+
+extension ScarletHeader where Trailing == EmptyView {
+    init(_ title: String,
+         subtitle: String? = nil,
+         systemImage: String? = nil,
+         accent: Color = ScarletTheme.rose) {
+        self.init(title: title, subtitle: subtitle,
+                  systemImage: systemImage, accent: accent,
+                  trailing: { EmptyView() })
+    }
+}
+
+/// A grouping header *within* a screen: a short accent bar + a section-size
+/// label. The consistent way to title a block below the screen header.
+struct ScarletSectionHeader: View {
+    let title: String
+    var accent: Color = ScarletTheme.rose
+    init(_ title: String, accent: Color = ScarletTheme.rose) {
+        self.title = title
+        self.accent = accent
+    }
+    var body: some View {
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(accent)
+                .frame(width: 3, height: 18)
+            Text(title)
+                .font(.scarletSection)
+                .foregroundStyle(ScarletTheme.textPrimary)
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+/// An accent chip — the shared idiom for a small status/tag pill (chrome only,
+/// accent tint on `ink`, never a reading ground).
+struct ScarletChip: View {
+    let text: String
+    var systemImage: String? = nil
+    var accent: Color = ScarletTheme.rose
+    var body: some View {
+        HStack(spacing: 5) {
+            if let systemImage {
+                Image(systemName: systemImage).font(.system(size: 11, weight: .semibold))
+            }
+            Text(text).font(.scarletCaptionEmph)
+        }
+        .foregroundStyle(accent)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(accent.opacity(0.15)))
+        .overlay(Capsule().stroke(accent.opacity(0.30), lineWidth: 1))
+    }
 }

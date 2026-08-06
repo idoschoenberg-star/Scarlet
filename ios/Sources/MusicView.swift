@@ -301,7 +301,7 @@ struct MusicView: View {
                     }
                     if let note = model.snapshot.note, !note.isEmpty {
                         Text(note)
-                            .font(.footnote)
+                            .font(.scarletDetail)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.top, 4)
@@ -324,7 +324,7 @@ struct MusicView: View {
                 .foregroundStyle(.white)
             Spacer()
             Text(model.provider.displayName)
-                .font(.caption.weight(.semibold))
+                .font(.scarletCaptionEmph)
                 .foregroundStyle(scarletRose)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
@@ -348,7 +348,7 @@ struct MusicView: View {
                     .lineLimit(1)
                 if !np.artist.isEmpty {
                     Text(np.artist)
-                        .font(.subheadline)
+                        .font(.scarletDetail)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -384,7 +384,7 @@ struct MusicView: View {
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(scarletRose)
             Text("Or just say \u{201C}play \u{2026}\u{201D} to Scarlet \u{2014} she\u{2019}ll start it here.")
-                .font(.subheadline)
+                .font(.scarletBody)
                 .foregroundStyle(.white.opacity(0.9))
             Spacer(minLength: 0)
         }
@@ -429,11 +429,11 @@ struct MusicView: View {
                     }
                 }
                 Text(pl.name)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.scarletBodyEmph)
                     .foregroundStyle(.white)
                     .lineLimit(1)
                 Text(pl.count == 1 ? "1 track" : "\(pl.count) tracks")
-                    .font(.caption)
+                    .font(.scarletCaption)
                     .foregroundStyle(.secondary)
             }
             .frame(width: 148, alignment: .leading)
@@ -472,12 +472,12 @@ struct MusicView: View {
             artwork(tr.imageURL, size: 46, corner: 8)
             VStack(alignment: .leading, spacing: 2) {
                 Text(tr.title)
-                    .font(.subheadline.weight(.medium))
+                    .font(.scarletBodyEmph)
                     .foregroundStyle(.white)
                     .lineLimit(1)
                 if !tr.artist.isEmpty {
                     Text(tr.artist)
-                        .font(.caption)
+                        .font(.scarletDetail)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -499,9 +499,8 @@ struct MusicView: View {
     // -- Shared pieces
 
     private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(.title3.weight(.bold))
-            .foregroundStyle(.white)
+        // Shared in-screen grouping idiom: accent bar + section-size label.
+        ScarletSectionHeader(text, accent: scarletRose)
     }
 
     /// Artwork with a graceful placeholder — never force-unwraps a URL, and
@@ -539,7 +538,7 @@ struct MusicView: View {
         VStack(spacing: 14) {
             ProgressView().tint(scarletRose)
             Text("Loading your music\u{2026}")
-                .font(.subheadline)
+                .font(.scarletBody)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -551,7 +550,7 @@ struct MusicView: View {
                 .font(.system(size: 42))
                 .foregroundStyle(.secondary)
             Text(text)
-                .font(.subheadline)
+                .font(.scarletBody)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Button("Try Again") { Task { await model.load() } }
@@ -572,7 +571,7 @@ struct MusicView: View {
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
             Text("Once it\u{2019}s connected, your playlists and saved tracks show up here \u{2014} and you can just say \u{201C}play \u{2026}\u{201D} to Scarlet.")
-                .font(.subheadline)
+                .font(.scarletBody)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
             Button("Refresh") { Task { await model.load() } }
@@ -587,7 +586,7 @@ struct MusicView: View {
     private var flashToast: some View {
         if !model.flash.isEmpty {
             Text(model.flash)
-                .font(.footnote.weight(.medium))
+                .font(.scarletDetailEmph)
                 .foregroundStyle(.white)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 11)
