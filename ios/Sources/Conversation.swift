@@ -39,6 +39,16 @@ final class Conversation: ObservableObject {
     /// reference to this live instance.
     @Published var inputLevel: Float = 0
 
+    /// True while HIS voice is above the speaking threshold — a debounced
+    /// (hysteresis) read of `inputLevel`, only trusted when her voice isn't in
+    /// the room (not `echoRisk`), so her own loudspeaker can't light it. Drives
+    /// the orb's "you're talking" reaction and is the onset half of barge-in.
+    @Published var isUserSpeaking = false
+
+    /// Record permission is standing-denied. Published so the UI can show an
+    /// honest "enable the mic in Settings" affordance instead of a dead orb.
+    @Published var micDenied = false
+
     /// She has heard him and is composing a reply — the beat between his words
     /// ending and her voice starting. Drives the orb's "thinking" shimmer. Set
     /// when a user turn lands, cleared the instant her audio begins.
@@ -126,6 +136,23 @@ final class Conversation: ObservableObject {
     /// Meter smoothing state — only ever touched on the main actor.
     private var levelSmoothed: Float = 0
 
+    // MARK: user-speech + barge-in thresholds (all on the smoothed 0…1 meter)
+    //
+    // Two jobs off one envelope-followed level: a low-hysteresis pair that
+    // lights `isUserSpeaking` for the orb, and a HIGHER, sustained gate that
+    // decides a real barge-in while she's talking. The barge gate must clear
+    // her post-AEC echo residual — Apple's AEC (kept on everywhere) cancels her
+    // loudspeaker voice at the mic, so what survives above this line during her
+    // speech is HIM, not her. A brief click can't trip it: it also has to hold
+    // for `bargeSustainBuffers` consecutive tap callbacks (~200 ms).
+    private static let speakOnLevel: Float = 0.14
+    private static let speakOffLevel: Float = 0.07
+    private static let bargeLevel: Float = 0.5
+    private static let bargeSustainBuffers = 5
+    /// Consecutive over-threshold tap callbacks while she's speaking. Reset the
+    /// instant the level dips or the turn ends, so only sustained speech barges.
+    private var bargeRun = 0
+
     // How many of her audio buffers are scheduled-but-unfinished. This is the
     // ONLY truthful "is she audibly speaking" signal: the server streams her
     // audio faster than realtime, so its own idea of the turn ends while the
@@ -170,6 +197,7 @@ final class Conversation: ObservableObject {
         stopAudio()
         endBackgroundAssertion()
         barged = false; thinking = false
+        isUserSpeaking = false; bargeRun = 0
         state = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
     }
@@ -530,12 +558,30 @@ final class Conversation: ObservableObject {
     private func ensureMicPermission() async -> Bool {
         let session = AVAudioSession.sharedInstance()
         switch session.recordPermission {
-        case .granted: return true
-        case .denied:  return false
+        case .granted:
+            micDenied = false
+            return true
+        case .denied:
+            micDenied = true
+            return false
         case .undetermined:
-            return await withCheckedContinuation { cont in
+            let granted = await withCheckedContinuation { cont in
                 session.requestRecordPermission { ok in cont.resume(returning: ok) }
             }
+            micDenied = !granted
+            if granted {
+                // First-ever grant. The input hardware needs a beat to spin up
+                // after the permission dialog dismisses; if `ensureAudio()` reads
+                // `inputNode.outputFormat` in that gap it gets a 0-rate / 0-channel
+                // placeholder and builds a converter over garbage — the classic
+                // silent-dead-mic on the very first launch. Prime the session and
+                // yield briefly so the graph is built against a real input format.
+                try? session.setCategory(.playAndRecord, mode: .voiceChat,
+                                         options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                try? session.setActive(true)
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+            return granted
         @unknown default:
             return false
         }
@@ -725,6 +771,15 @@ final class Conversation: ObservableObject {
 
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
+        // First-launch / just-granted race: if the input isn't up yet the format
+        // comes back as 0 Hz / 0 channels. Building a converter over that yields a
+        // tap that captures nothing (silent dead mic). Refuse it — connect()'s
+        // catch surfaces an honest "try again", and the priming in
+        // ensureMicPermission() means a real launch almost never lands here.
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+            throw NSError(domain: "Scarlet.Audio", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Microphone input not ready yet."])
+        }
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
                                    channels: 1, interleaved: true)!
         let newConverter = AVAudioConverter(from: inFormat, to: target)
@@ -857,6 +912,41 @@ final class Conversation: ObservableObject {
                 self.levelSmoothed = next
                 self.inputLevel = next
                 MicSettings.shared.level = next
+
+                // "Is he talking" for the orb — hysteresis so it doesn't flicker
+                // on the threshold. Only trusted when her voice isn't in the room:
+                // during her speech the meter carries echo residual, not a clean
+                // read of him, so we don't assert user-speaking from it there.
+                if self.echoRisk {
+                    self.isUserSpeaking = false
+                } else if self.micOn {
+                    if next > Conversation.speakOnLevel { self.isUserSpeaking = true }
+                    else if next < Conversation.speakOffLevel { self.isUserSpeaking = false }
+                } else {
+                    self.isUserSpeaking = false
+                }
+
+                // BARGE-IN: he starts talking while she's mid-sentence → cut her
+                // off. Runs on the post-AEC input, above the echo-residual line,
+                // and only after it HOLDS for a few callbacks — so her own
+                // loudspeaker (mostly cancelled by AEC) and stray clicks can't
+                // false-trigger. When it fires, `interrupt()` silences her
+                // instantly, clears the echo gate (mic reopens so the server
+                // hears him), and latches `barged` to drop the killed turn's tail.
+                if self.state == .speaking, self.micOn, self.speakerOn, !self.chatMode {
+                    if next >= Conversation.bargeLevel {
+                        self.bargeRun += 1
+                        if self.bargeRun >= Conversation.bargeSustainBuffers {
+                            self.bargeRun = 0
+                            self.interrupt()
+                        }
+                    } else {
+                        self.bargeRun = 0
+                    }
+                } else {
+                    self.bargeRun = 0
+                }
+
                 // Half-duplex: her ears open only when her voice isn't in the
                 // room. Kills echo barge-in AND echo phantom turns at the root.
                 guard self.micOn, !self.echoRisk else { return }
@@ -973,6 +1063,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        isUserSpeaking = false; bargeRun = 0
         engine.stop()
         audioReady = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
