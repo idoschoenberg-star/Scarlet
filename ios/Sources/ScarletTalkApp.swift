@@ -46,6 +46,10 @@ struct ScarletTalkApp: App {
         // Install the crash black-box before anything else can die, so the
         // faulting stack is captured and reported on the next launch.
         FlightRecorder.installCrashHandlers()
+        // Watch memory pressure too — a jetsam/EXC_RESOURCE kill delivers no
+        // signal the crash handlers can catch, so the low-memory-warning count
+        // and peak footprint are the only evidence it leaves.
+        FlightRecorder.installMemoryWarningObserver()
     }
 
     var body: some Scene {
@@ -199,7 +203,7 @@ struct RootView: View {
                 Task { await recoverActiveDraft() }
                 Task { await sections.refresh() }
             }
-            FlightRecorder.note(screen: "phase:\(phase)")
+            FlightRecorder.phase("\(phase)")
         }
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
@@ -347,16 +351,80 @@ enum FlightRecorder {
     private static let stateKey = "scarlet.flight.state"
     private static let aliveKey = "scarlet.flight.alive"
     private static let crashKey = "scarlet.flight.crash"
+    private static let phaseKey = "scarlet.flight.phase"
+    private static let memWarnKey = "scarlet.flight.memwarns"
+    private static let peakMemKey = "scarlet.flight.peakmem"
     /// One capture per process — the first fault wins (an NSException that
     /// aborts would otherwise be overwritten by the ensuing SIGABRT's thinner
     /// stack).
     private static var didCapture = false
 
+    /// App build number ("176") + short version, stamped on every event so a
+    /// report is never ambiguous about WHICH build produced it — the single
+    /// most important missing datum when diagnosing a field crash.
+    static var build: String {
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        return "\(v) (\(b))"
+    }
+
+    /// Live resident memory in MB (phys_footprint — the number jetsam judges).
+    /// A high value right before an uncatchable kill is the fingerprint of an
+    /// EXC_RESOURCE / jetsam termination (which delivers NO signal, so the crash
+    /// handlers can't see it — only this can).
+    static func memoryMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint / (1024 * 1024))
+    }
+
+    /// A content SCREEN Ido navigated to (email-reader, talk, a photo…). Kept
+    /// SEPARATE from the lifecycle phase so a background transition can never
+    /// erase which view was actually on screen when the app died — the exact
+    /// gap that hid an Amwell-inbox crash behind a bare "phase:inactive".
     static func note(screen: String) {
         let d = UserDefaults.standard
         d.set(["screen": screen, "ts": ISO8601DateFormatter().string(from: Date())],
               forKey: stateKey)
         d.set(true, forKey: aliveKey)
+        trackPeakMemory()
+    }
+
+    /// A lifecycle PHASE transition (active/inactive/background) — recorded under
+    /// its own key so it complements, never overwrites, the content screen.
+    static func phase(_ phase: String) {
+        let d = UserDefaults.standard
+        d.set(["phase": phase, "ts": ISO8601DateFormatter().string(from: Date()),
+               "mem_mb": memoryMB()],
+              forKey: phaseKey)
+        d.set(true, forKey: aliveKey)
+        trackPeakMemory()
+    }
+
+    /// Persist the high-water mark of resident memory so a jetsam kill (which
+    /// leaves no other trace) can be inferred from how close we were to the limit.
+    private static func trackPeakMemory() {
+        let mb = memoryMB()
+        if mb > UserDefaults.standard.integer(forKey: peakMemKey) {
+            UserDefaults.standard.set(mb, forKey: peakMemKey)
+        }
+    }
+
+    /// Count iOS low-memory warnings this run. A jetsam kill is almost always
+    /// preceded by one or more of these; seeing them in the next launch's report
+    /// converts "unclean exit, cause unknown" into "ran out of memory".
+    static func installMemoryWarningObserver() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { _ in
+            let d = UserDefaults.standard
+            d.set(d.integer(forKey: memWarnKey) + 1, forKey: memWarnKey)
+        }
     }
 
     /// Install once at launch. Captures BOTH uncaught Obj-C/Swift exceptions and
@@ -395,13 +463,21 @@ enum FlightRecorder {
         didCapture = true
         let d = UserDefaults.standard
         let last = d.dictionary(forKey: stateKey) ?? [:]
+        let ph = d.dictionary(forKey: phaseKey) ?? [:]
+        // Only cheap, already-persisted reads here — no live syscalls in the
+        // signal handler beyond what already ran.
         d.set([
             "type": type, "name": name, "reason": reason,
+            "build": build,
             // callStackSymbols runs top-first (the faulting frame leads), so a
             // prefix still names the culprit; cap keeps the JSON body sane.
             "stack": String(stack.prefix(9000)),
             "last_screen": last["screen"] ?? "unknown",
             "last_ts": last["ts"] ?? "",
+            "last_phase": ph["phase"] ?? "unknown",
+            "phase_ts": ph["ts"] ?? "",
+            "peak_mem_mb": d.integer(forKey: peakMemKey),
+            "mem_warnings": d.integer(forKey: memWarnKey),
             "ts": ISO8601DateFormatter().string(from: Date()),
         ], forKey: crashKey)
         d.synchronize() // we are about to die — force it to disk
@@ -414,13 +490,30 @@ enum FlightRecorder {
             d.removeObject(forKey: crashKey)
             d.set(true, forKey: aliveKey) // handled — don't also fire unclean_exit
             post(kind: "crash", detail: crash)
+            resetRunCounters(d)
             return
         }
-        // Otherwise: the pre-existing heuristic (freeze/jetsam kill no handler caught).
-        guard d.bool(forKey: aliveKey) else { d.set(true, forKey: aliveKey); return }
+        // Otherwise: the pre-existing heuristic (freeze/jetsam kill no handler
+        // caught) — now enriched so an UNCATCHABLE kill still tells its story:
+        // which screen + phase, the memory high-water mark, and how many low-mem
+        // warnings preceded it (a jetsam kill's signature), plus the build.
+        guard d.bool(forKey: aliveKey) else { d.set(true, forKey: aliveKey); resetRunCounters(d); return }
         let last = d.dictionary(forKey: stateKey) ?? [:]
+        let ph = d.dictionary(forKey: phaseKey) ?? [:]
         post(kind: "unclean_exit",
-             detail: ["last_screen": last["screen"] ?? "unknown", "last_ts": last["ts"] ?? ""])
+             detail: ["last_screen": last["screen"] ?? "unknown", "last_ts": last["ts"] ?? "",
+                      "last_phase": ph["phase"] ?? "unknown", "phase_ts": ph["ts"] ?? "",
+                      "peak_mem_mb": d.integer(forKey: peakMemKey),
+                      "mem_warnings": d.integer(forKey: memWarnKey),
+                      "build": build])
+        resetRunCounters(d)
+    }
+
+    /// Per-run counters (peak memory, low-mem warnings) must not bleed across
+    /// launches — reset them once the previous run's report has been emitted.
+    private static func resetRunCounters(_ d: UserDefaults) {
+        d.set(0, forKey: peakMemKey)
+        d.set(0, forKey: memWarnKey)
     }
 
     private static func post(kind: String, detail: [String: Any]) {
