@@ -1,9 +1,11 @@
 import SwiftUI
+import UIKit   // UIApplication.openSettingsURLString for the denied-mic deep link
 
 /// The one-pager: breathing orb, live transcript, Mic / Voice, big End button.
 struct TalkView: View {
     @EnvironmentObject var session: AppSession
     @ObservedObject var convo: Conversation   // owned by RootView, survives tab switches
+    @Environment(\.openURL) private var openURL
     @State private var showSettings = false
     @State private var showType = false
     @State private var typed = ""
@@ -12,10 +14,10 @@ struct TalkView: View {
     /// The orb yields space to the transcript while he's typing/dictating.
     private var orbSize: CGFloat { typeFocused ? 110 : 200 }
 
-    /// The orb's visual state, derived from the conversation. `youTalk` fires
-    /// when his mic level crosses a small threshold while she's not speaking, so
-    /// the orb visibly answers his voice; `thinking` is the beat after his words
-    /// land, before hers begin.
+    /// The orb's visual state, derived from the conversation. `youTalk` fires on
+    /// the debounced `isUserSpeaking` signal (hysteresis on his mic level) while
+    /// she's not speaking, so the orb visibly answers his voice without flicker;
+    /// `thinking` is the beat after his words land, before hers begin.
     private var orbMode: OrbMode {
         switch convo.state {
         case .idle:       return .asleep
@@ -23,7 +25,7 @@ struct TalkView: View {
         case .speaking:   return .sheTalk
         case .listening:
             if convo.thinking { return .thinking }
-            return convo.inputLevel > 0.12 ? .youTalk : .listening
+            return convo.isUserSpeaking ? .youTalk : .listening
         }
     }
 
@@ -76,10 +78,26 @@ struct TalkView: View {
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
             // Discoverability for barge-in — only while she's actually talking.
+            // Barge-in is automatic now (just start talking); the tap is the
+            // manual fallback for a noisy room where onset detection holds back.
             if convo.state == .speaking {
-                Text("tap the orb to interrupt")
+                Text("just start talking to interrupt — or tap the orb")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.4))
+            }
+            // Honest denied-mic UI: a live session can't hear him without record
+            // permission. Point straight at the toggle instead of a dead orb.
+            if convo.micDenied {
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
+                } label: {
+                    Label("Enable microphone in Settings", systemImage: "mic.slash.fill")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(Color(red: 0.75, green: 0.15, blue: 0.23),
+                                    in: Capsule())
+                }
             }
 
             // Her reply lives here — always a real, readable, scrollable area

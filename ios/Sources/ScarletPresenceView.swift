@@ -113,8 +113,25 @@ struct ScarletPresenceView: View {
 
     // MARK: orb + status
 
+    /// Ambient breathing pulse — the calm idle-of-listening motion. Yields to
+    /// the live level reaction the instant he starts talking, so the two scale
+    /// inputs never animate the orb at once.
     private var shouldPulse: Bool {
-        convo.state == .listening && convo.micOn && !convo.chatMode
+        convo.state == .listening && convo.micOn && !convo.chatMode && !convo.isUserSpeaking
+    }
+
+    /// His voice is driving the orb right now (listening, mic open, speaking).
+    private var userReacting: Bool {
+        convo.state == .listening && convo.micOn && !convo.chatMode && convo.isUserSpeaking
+    }
+
+    /// One scale input at a time: his live (already envelope-smoothed) level
+    /// while he talks, otherwise the ambient breathe. Calm, not a VU jump.
+    private var orbScale: CGFloat {
+        if userReacting {
+            return 1.0 + min(max(CGFloat(convo.inputLevel), 0), 1) * 0.4
+        }
+        return pulsing ? 1.12 : 1.0
     }
 
     @ViewBuilder
@@ -142,10 +159,17 @@ struct ScarletPresenceView: View {
                             .foregroundStyle(.white)
                     }
                 }
-                .scaleEffect(pulsing ? 1.12 : 1.0)
+                // Brighten a touch while he's actually talking — a quiet "I
+                // hear you" without leaving the scarlet family.
+                .shadow(color: scarlet.opacity(userReacting ? 0.7 : 0),
+                        radius: userReacting ? 8 : 0)
+                .scaleEffect(orbScale)
                 .animation(pulsing ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
                                    : .easeInOut(duration: 0.2),
                            value: pulsing)
+                // Track his live level smoothly (envelope already applied
+                // upstream) — a short ease so speech reads as a calm swell.
+                .animation(.easeOut(duration: 0.12), value: convo.inputLevel)
                 // Fence the repeatForever pulse in: without this, any layout
                 // shift around the capsule (list refresh, keyboard, stamp
                 // tick) gets captured by the repeating animation and the
