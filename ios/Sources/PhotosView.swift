@@ -905,6 +905,10 @@ struct PhotoPagerView: View {
     @State private var currentID: String = ""
     @State private var showFullScreen = false
 
+    /// Live vertical offset while Ido is swiping the photo down to dismiss —
+    /// the Apple-Photos "pull down to close" gesture. 0 when at rest.
+    @State private var dragOffset: CGFloat = 0
+
     /// Auto-hiding chrome (Apple-Photos behavior).
     @StateObject private var chrome = ChromeTimer()
 
@@ -948,11 +952,24 @@ struct PhotoPagerView: View {
             .tabViewStyle(.page(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            controlsOverlay
+            // ALWAYS-available exit — never fades. Mac Catalyst has no
+            // edge-swipe-back and the nav bar is hidden, so an auto-hiding
+            // Back was a trap: if the chrome had faded, the only way out was
+            // the non-obvious "tap to reveal" step. This one is permanent.
+            persistentBack
+
+            // Secondary actions (Ask · Forward · Expand) — these still
+            // auto-hide so the photo reads clean; a tap brings them back.
+            actionButtons
                 .opacity(chrome.visible ? 1 : 0)
                 .allowsHitTesting(chrome.visible)
                 .animation(.easeInOut(duration: 0.25), value: chrome.visible)
         }
+        .offset(y: dragOffset)
+        // Swipe DOWN to dismiss (Apple-Photos). Vertically-dominant, downward
+        // drags only — horizontal swipes stay with the TabView pager and pinch
+        // stays with the photo. simultaneousGesture so paging still works.
+        .simultaneousGesture(dismissDrag)
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
@@ -1022,12 +1039,13 @@ struct PhotoPagerView: View {
         }
     }
 
-    // MARK: overlay controls (Back · Ask · Forward · Expand) — auto-hiding
+    // MARK: overlay controls
 
-    private var controlsOverlay: some View {
-        HStack(spacing: 10) {
-            // Own Back button — the guaranteed way out (list root hides the nav
-            // bar; Mac Catalyst has no edge-swipe-back).
+    /// The guaranteed, always-present way out (list root hides the nav bar;
+    /// Mac Catalyst has no edge-swipe-back). Never auto-hides — a viewer must
+    /// never trap Ido, on any device.
+    private var persistentBack: some View {
+        HStack {
             Button { dismiss() } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "chevron.left")
@@ -1038,6 +1056,16 @@ struct PhotoPagerView: View {
                 .padding(.horizontal, 12).padding(.vertical, 7)
                 .background(Capsule().fill(Color.black.opacity(0.5)))
             }
+            .buttonStyle(.plain)
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+    }
+
+    /// Ask · Forward · Expand — auto-hiding so the picture stays clean.
+    private var actionButtons: some View {
+        HStack(spacing: 10) {
             Spacer()
             circleButton("bubble.left.and.text.bubble.right") { chrome.bump(); askScarlet() }
             circleButton("arrowshape.turn.up.right") { chrome.bump(); showChannelDialog = true }
@@ -1045,6 +1073,26 @@ struct PhotoPagerView: View {
         }
         .padding(.horizontal, 12)
         .padding(.top, 12)
+    }
+
+    /// Downward, vertically-dominant drag → dismiss past a threshold; otherwise
+    /// spring back. Guarded so horizontal (paging) and pinch (zoom) are untouched.
+    private var dismissDrag: some Gesture {
+        DragGesture(minimumDistance: 20)
+            .onChanged { v in
+                if v.translation.height > 0,
+                   v.translation.height > abs(v.translation.width) {
+                    dragOffset = v.translation.height
+                }
+            }
+            .onEnded { v in
+                if v.translation.height > 120,
+                   v.translation.height > abs(v.translation.width) {
+                    dismiss()
+                } else {
+                    withAnimation(.easeOut(duration: 0.2)) { dragOffset = 0 }
+                }
+            }
     }
 
     private func circleButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
@@ -1143,6 +1191,9 @@ struct FullScreenPager: View {
     @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
 
+    /// Live vertical offset while swiping the photo down to dismiss. 0 at rest.
+    @State private var dragOffset: CGFloat = 0
+
     /// Auto-hiding chrome (Apple-Photos behavior).
     @StateObject private var chrome = ChromeTimer()
 
@@ -1177,11 +1228,21 @@ struct FullScreenPager: View {
             .tabViewStyle(.page(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            controlsOverlay
+            // ALWAYS-available exit — never fades. A fullScreenCover has no
+            // system chrome and Mac Catalyst has no swipe-back, so an
+            // auto-hiding Close was a trap: this one is permanent.
+            persistentClose
+
+            // Ask · Forward — auto-hide so the photo reads clean; a tap reveals.
+            actionButtons
                 .opacity(chrome.visible ? 1 : 0)
                 .allowsHitTesting(chrome.visible)
                 .animation(.easeInOut(duration: 0.25), value: chrome.visible)
         }
+        .offset(y: dragOffset)
+        // Swipe DOWN to dismiss (Apple-Photos). Downward, vertically-dominant
+        // drags only — horizontal stays with the pager, pinch with the photo.
+        .simultaneousGesture(dismissDrag)
         // Full-screen photos may be viewed in landscape OR portrait (iPhone) —
         // a natural toggle; restore portrait for the rest of the app on close.
         .onAppear { OrientationGate.allow(.allButUpsideDown); chrome.bump() }
@@ -1207,17 +1268,48 @@ struct FullScreenPager: View {
         }
     }
 
-    // MARK: overlay controls (Close · Ask · Forward) — auto-hiding
+    // MARK: overlay controls
 
-    private var controlsOverlay: some View {
-        HStack(spacing: 10) {
+    /// The always-present Close — never auto-hides, so the immersive viewer can
+    /// never trap Ido (no swipe-back, no system cover chrome on Mac Catalyst).
+    private var persistentClose: some View {
+        HStack {
             circleButton("chevron.down") { dismiss() }
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 12)
+    }
+
+    /// Ask · Forward — auto-hiding so the picture stays clean.
+    private var actionButtons: some View {
+        HStack(spacing: 10) {
             Spacer()
             circleButton("bubble.left.and.text.bubble.right") { chrome.bump(); askScarlet() }
             circleButton("arrowshape.turn.up.right") { chrome.bump(); onForward() }
         }
         .padding(.horizontal, 12)
         .padding(.top, 12)
+    }
+
+    /// Downward, vertically-dominant drag → dismiss past a threshold; otherwise
+    /// spring back. Horizontal (paging) and pinch (zoom) are left untouched.
+    private var dismissDrag: some Gesture {
+        DragGesture(minimumDistance: 20)
+            .onChanged { v in
+                if v.translation.height > 0,
+                   v.translation.height > abs(v.translation.width) {
+                    dragOffset = v.translation.height
+                }
+            }
+            .onEnded { v in
+                if v.translation.height > 120,
+                   v.translation.height > abs(v.translation.width) {
+                    dismiss()
+                } else {
+                    withAnimation(.easeOut(duration: 0.2)) { dragOffset = 0 }
+                }
+            }
     }
 
     private func circleButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
