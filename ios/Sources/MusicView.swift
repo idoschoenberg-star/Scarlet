@@ -74,9 +74,28 @@ protocol MusicProvider {
     /// on a real transport/auth failure so the view can show a retry.
     func fetchLibrary() async throws -> MusicLibrarySnapshot
     /// Start playback of an exact provider URI (a tapped playlist or track).
-    func play(uri: String) async throws
+    /// Returns where sound is ACTUALLY coming out — the server verifies real
+    /// playback before reporting ok, so a success here means audio is rolling.
+    func play(uri: String) async throws -> MusicPlayOutcome
     /// Resume / pause whatever is currently loaded (the now-playing button).
     func setPlaying(_ playing: Bool) async throws
+}
+
+/// Verified playback destination (device name + type, e.g. "Ido's iPhone",
+/// "Smartphone"). Lets the UI say honestly when music went to a speaker or
+/// Mac instead of the phone in his hand.
+struct MusicPlayOutcome {
+    let device: String?
+    let deviceType: String?
+}
+
+/// The server's honest playback failure ("Spotify isn't open near you — …"),
+/// carried verbatim so the flash message never lies about what went wrong.
+/// Without this, a 200 response whose BODY was {error: …} read as success and
+/// the page showed "now playing" over silence.
+struct MusicPlayError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
 /// Spotify implementation over `app-api`. Holds no secret — the edge function
@@ -97,8 +116,18 @@ struct SpotifyMusicProvider: MusicProvider {
         )
     }
 
-    func play(uri: String) async throws {
-        _ = try await MusicAPI.post("music_play", body: ["uri": uri])
+    func play(uri: String) async throws -> MusicPlayOutcome {
+        let data = try await MusicAPI.post("music_play", body: ["uri": uri])
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        // The edge function returns failures as 200s with an `error` body —
+        // surface them as real errors so the UI never paints success over one.
+        if let err = obj["error"] as? String, !err.isEmpty {
+            throw MusicPlayError(message: err)
+        }
+        return MusicPlayOutcome(
+            device: obj["device"] as? String,
+            deviceType: obj["device_type"] as? String
+        )
     }
 
     func setPlaying(_ playing: Bool) async throws {
@@ -251,21 +280,30 @@ final class MusicModel: ObservableObject {
         Task { @MainActor in
             defer { startingURI = nil }
             do {
-                try await provider.play(uri: uri)
-                // Playback started → there's an active device now; clear recovery.
+                let outcome = try await provider.play(uri: uri)
+                // Playback VERIFIED rolling (the server checks before ok) →
+                // clear recovery. If sound went somewhere other than the phone
+                // in his hand (a speaker, the Mac), say so — silence with a
+                // "playing" card is the one thing this page must never show.
                 needsDevice = false
-                flash = ""
+                if let type = outcome.deviceType, type.lowercased() != "smartphone",
+                   let dev = outcome.device {
+                    flash = "Playing on \(dev)"
+                } else {
+                    flash = ""
+                }
                 // Give the device a beat, then refresh the now-playing card.
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 snapshot = (try? await provider.fetchLibrary()) ?? snapshot
             } catch {
                 // Connect can only play to an already-open Spotify app. Surface a
-                // calm, persistent "Open Spotify" affordance rather than a toast —
-                // and, because that card sits at the top of the scroll far from a
-                // tapped track, also flash a short message near the action so the
-                // tap never looks silently ignored.
+                // calm, persistent "Open Spotify" affordance, plus the SERVER'S
+                // honest reason near the action when it gave one — it names the
+                // real situation ("only registered device is Mac Studio…"),
+                // which a generic line would hide.
                 needsDevice = true
-                flash = "Open Spotify on a device to play"
+                let msg = (error as? MusicPlayError)?.message ?? ""
+                flash = msg.isEmpty ? "Open Spotify on a device to play" : String(msg.prefix(140))
             }
         }
     }
@@ -364,12 +402,25 @@ struct MusicView: View {
                 .font(.system(size: 34, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
             Spacer()
-            Text(model.provider.displayName)
-                .font(.scarletCaptionEmph)
+            // The provider pill IS the door to the real app — always available,
+            // so Ido can hop between Spotify and this page at any moment (not
+            // only when the no-device recovery card happens to be showing).
+            Button {
+                openSpotify()
+            } label: {
+                HStack(spacing: 5) {
+                    Text(model.provider.displayName)
+                        .font(.scarletCaptionEmph)
+                    Image(systemName: "arrow.up.forward")
+                        .font(.system(size: 10, weight: .bold))
+                }
                 .foregroundStyle(scarletRose)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(Capsule().fill(scarletRose.opacity(0.16)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open \(model.provider.displayName)")
         }
     }
 
