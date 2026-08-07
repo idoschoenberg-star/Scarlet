@@ -97,6 +97,11 @@ targets:
         # App Shortcut still works via the app name; bare-"Scarlet" Siri
         # recognition can be re-added later with a valid, non-empty synonym.
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
+        # Embedded Reminders server: the app reads/writes Apple Reminders
+        # directly via EventKit (no Mac bridge). Both keys carry the same
+        # string — the second is the iOS 17+ full-access variant.
+        NSRemindersUsageDescription: "So Scarlet can show and manage your Apple Reminders."
+        NSRemindersFullAccessUsageDescription: "So Scarlet can show and manage your Apple Reminders."
         NSPhotoLibraryUsageDescription: "So Scarlet can show your recent photos and let you view them full-screen."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
         NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."

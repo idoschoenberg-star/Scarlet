@@ -152,6 +152,14 @@ final class RemindersModel: ObservableObject {
     /// the header falls back to the app-fetch stamp then).
     @Published var macFieldsPresent = false
 
+    /// LOCAL-FIRST: true when the list on screen came straight from this
+    /// device's Apple Reminders store (EventKit) — live data, no Mac bridge.
+    /// All mutations then write through RemindersKit instead of the server.
+    @Published var localMode = false
+    /// Reminders access is requested at most once per launch; a denial falls
+    /// back to the server path without re-prompting.
+    private var localAccessRequested = false
+
     private var rawReminders: [[String: Any]] = []
     /// Monotonic load token: a slow fetch landing after a newer one is dropped.
     private var loadGeneration = 0
@@ -167,6 +175,19 @@ final class RemindersModel: ObservableObject {
         // Freshness gate: with rows already on screen, a re-appearance within
         // the TTL is a no-op. An empty list always fetches.
         if !reminders.isEmpty, !fresh.shouldFetch(force: force) { return }
+        // LOCAL-FIRST: with on-device Reminders access, this device's EventKit
+        // store IS the truth — read it directly, skip the Mac bridge entirely.
+        // First load asks once; a denial drops through to the server path.
+        let kit = RemindersKit.shared
+        if !kit.authorized, !kit.denied, !localAccessRequested {
+            localAccessRequested = true
+            await kit.requestAccess()
+        }
+        if kit.authorized {
+            await loadLocal()
+            return
+        }
+        localMode = false
         guard TokenStore.token != nil else {
             errorText = "Locked — unlock Scarlet to see your reminders."
             return
@@ -201,6 +222,62 @@ final class RemindersModel: ObservableObject {
         }
     }
 
+    // MARK: read — local (EventKit, the embedded Reminders server)
+
+    /// Read incomplete reminders straight off the device, paint them, then
+    /// best-effort mirror the snapshot to the server (fire-and-forget) so the
+    /// voice agent's server-side list_reminders stays truthful.
+    private func loadLocal() async {
+        loading = reminders.isEmpty
+        let locals = await RemindersKit.shared.fetchOpen()
+        localMode = true
+        loading = false
+        reminders = locals.map { l in
+            RemItem(id: l.id, title: l.title, notes: l.notes,
+                    dueAt: l.dueAt, remindAt: nil, priority: l.priority,
+                    done: false, updatedAt: nil)
+        }
+        updatedAt = Date()
+        errorText = ""
+        fresh.markFetched()
+        pushDeviceSnapshot(locals)
+    }
+
+    /// AFTER rendering: POST the on-device snapshot to
+    /// `op=reminders_device_sync` so the `tasks` table mirrors this device.
+    /// Fire-and-forget — a failure here never touches the UI.
+    private func pushDeviceSnapshot(_ locals: [LocalReminder]) {
+        guard let token = TokenStore.token, !locals.isEmpty else { return }
+        let iso = ISO8601DateFormatter()
+        let payload: [String: Any] = [
+            "full_snapshot": true,
+            "reminders": locals.map { l -> [String: Any] in
+                var d: [String: Any] = [
+                    "ext_id": l.id,
+                    "title": l.title,
+                    "notes": l.notes,
+                    "priority": l.priority,
+                    "done": false,
+                    "list": l.listName,
+                ]
+                if let due = l.dueAt { d["due_at"] = iso.string(from: due) }
+                return d
+            },
+        ]
+        guard let url = URL(string: AppConfig.apiBase + "/app-api?v=2&op=reminders_device_sync"),
+              JSONSerialization.isValidJSONObject(payload),
+              let body = try? JSONSerialization.data(withJSONObject: payload)
+        else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        Task.detached {
+            _ = try? await URLSession.shared.data(for: req)
+        }
+    }
+
     // MARK: complete / undo
 
     /// Flip `done` locally right away (and allow flipping straight back — the
@@ -215,6 +292,17 @@ final class RemindersModel: ObservableObject {
         if let ri = rawReminders.firstIndex(where: { ($0["id"] as? String) == reminder.id }) {
             rawReminders[ri]["done"] = newDone
             saveCache()
+        }
+        // LOCAL mode: write straight through EventKit; a failure reverts the
+        // flip and surfaces the store's own words.
+        if localMode {
+            if let err = RemindersKit.shared.complete(id: reminder.id, done: newDone) {
+                if let i = reminders.firstIndex(where: { $0.id == reminder.id }) {
+                    reminders[i].done = !newDone
+                }
+                errorText = "Couldn't update \"\(reminder.title)\" — \(err)"
+            }
+            return
         }
         // A just-added row that hasn't reloaded yet has no server id.
         guard !reminder.id.hasPrefix("local-") else { return }
@@ -247,6 +335,16 @@ final class RemindersModel: ObservableObject {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         addErrorText = ""
+        // LOCAL mode: create in the default Apple Reminders list on-device
+        // (synchronous), then reload from the store — no optimistic ghost row.
+        if localMode {
+            if let err = RemindersKit.shared.create(title: t, notes: nil, dueAt: due) {
+                addErrorText = "Couldn't add \"\(t)\" — \(err)"
+            } else {
+                Task { await self.load(force: true) }
+            }
+            return
+        }
         let localId = "local-" + UUID().uuidString
         let optimistic = RemItem(id: localId, title: t, notes: "",
                                  dueAt: due, remindAt: nil, priority: 0,
@@ -305,6 +403,18 @@ final class RemindersModel: ObservableObject {
             rawReminders[ri]["notes"] = notes
             rawReminders[ri]["priority"] = priority
             saveCache()
+        }
+        // LOCAL mode: write the edit straight through EventKit; a failure
+        // reverts and surfaces the store's own words.
+        if localMode {
+            if let err = RemindersKit.shared.update(id: id, title: t, notes: notes,
+                                                    priority: priority) {
+                if let i = reminders.firstIndex(where: { $0.id == id }) {
+                    reminders[i] = previous
+                }
+                errorText = "Couldn't save your edit — \(err)"
+            }
+            return
         }
         guard !id.hasPrefix("local-") else { return }
         Task {
@@ -519,7 +629,13 @@ struct RemindersView: View {
     /// only old servers fall back to the app-fetch stamp.
     @ViewBuilder
     private var syncStatusLine: some View {
-        if model.macFieldsPresent {
+        if model.localMode {
+            // The list came straight off this device's Reminders store — it
+            // is live by construction; no bridge, no staleness to report.
+            Text("On-device · Apple Reminders (live)")
+                .font(.system(size: 12))
+                .foregroundStyle(RemUI.gray)
+        } else if model.macFieldsPresent {
             if model.macOnline {
                 Text("Synced with Apple · just now")
                     .font(.system(size: 12))
