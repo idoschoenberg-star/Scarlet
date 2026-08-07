@@ -69,7 +69,8 @@ final class Conversation: ObservableObject {
     /// (handshake, event names, audio payload, tool shape, interrupt, context
     /// injection, sample rates) branches on this.
     enum RTEngine { case openai, elevenlabs }
-    private let engine: RTEngine = .openai
+    // NB: named `voiceEngine`, NOT `engine` — `engine` is the AVAudioEngine below.
+    private let voiceEngine: RTEngine = .openai
 
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
@@ -266,7 +267,7 @@ final class Conversation: ObservableObject {
         barged = true
         thinking = false
         flushPlayback()                     // instant silence + echo gate cleared + → listening
-        switch engine {
+        switch voiceEngine {
         case .openai:
             // Cancel her in-flight response server-side; playback is already
             // flushed above so the tail can't crawl back over him.
@@ -532,7 +533,7 @@ final class Conversation: ObservableObject {
             pendingOutbound.removeAll()
             return
         }
-        switch engine {
+        switch voiceEngine {
         case .openai:    await connectOpenAI()
         case .elevenlabs: await connectElevenLabs()
         }
@@ -801,7 +802,7 @@ final class Conversation: ObservableObject {
     /// OpenAI: create a user message item, then explicitly ask for a response.
     /// ElevenLabs: the native `user_message` event (auto-responds).
     private func sendUserText(_ text: String) {
-        switch engine {
+        switch voiceEngine {
         case .openai:
             send(["type": "conversation.item.create",
                   "item": ["type": "message", "role": "user",
@@ -817,7 +818,7 @@ final class Conversation: ObservableObject {
     /// OpenAI: a user message item with NO following response.create.
     /// ElevenLabs: the native `contextual_update` event.
     private func sendContext(_ text: String) {
-        switch engine {
+        switch voiceEngine {
         case .openai:
             send(["type": "conversation.item.create",
                   "item": ["type": "message", "role": "user",
@@ -832,7 +833,7 @@ final class Conversation: ObservableObject {
     /// so she continues the turn with the result in hand.
     /// ElevenLabs: the native `client_tool_result` event.
     private func sendToolResult(callId: String, output: String) {
-        switch engine {
+        switch voiceEngine {
         case .openai:
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output",
@@ -847,7 +848,7 @@ final class Conversation: ObservableObject {
     // MARK: protocol
 
     private func handle(_ ev: [String: Any]) {
-        switch engine {
+        switch voiceEngine {
         case .openai:     handleOpenAI(ev)
         case .elevenlabs: handleElevenLabs(ev)
         }
@@ -1325,7 +1326,7 @@ final class Conversation: ObservableObject {
                 // they crossed a very high barge line. AEC lets the server own
                 // turn-taking honestly. `echoRisk` is kept only for the orb cue.
                 guard self.micOn else { return }
-                switch self.engine {
+                switch self.voiceEngine {
                 case .openai:
                     // Server VAD auto-commits + auto-creates responses — never
                     // send input_audio_buffer.commit / response.create per turn.
