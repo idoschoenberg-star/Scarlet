@@ -26,6 +26,10 @@ struct MusicPlayerView: View {
     /// position instead of the live tick, and seeks on release.
     @State private var scrubFraction: Double?
 
+    /// Drives the device picker — the player's SINGLE sheet (Catalyst allows one
+    /// per view). "Connect to a device", like Spotify's own now-playing screen.
+    @State private var showDevices = false
+
     private let rose = MusicUI.rose
 
     var body: some View {
@@ -41,6 +45,8 @@ struct MusicPlayerView: View {
             }
         }
         .overlay(alignment: .bottom) { MusicFlashToast(model: model) }
+        // The device picker — the player's SINGLE sheet (Catalyst: one per view).
+        .sheet(isPresented: $showDevices) { devicePickerSheet }
         // Resync the progress/queue every ~5s while the player is open (the
         // 1s tick between polls is local).
         .task {
@@ -94,11 +100,53 @@ struct MusicPlayerView: View {
                 .tracking(1.5)
                 .foregroundStyle(rose)
             Spacer()
-            // Symmetry spacer so the label stays centered.
-            Color.clear.frame(width: 44, height: 44)
+            // Connect to a device — opens the room/speaker picker.
+            Button {
+                Task { await model.loadDevices() }
+                showDevices = true
+            } label: {
+                Image(systemName: "hifispeaker.and.homepod")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Choose a device")
         }
         .padding(.horizontal, 10)
         .padding(.top, 8)
+    }
+
+    // MARK: device picker (the player's single sheet)
+
+    private var devicePickerSheet: some View {
+        ZStack {
+            ScarletTheme.ink.ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("Play on")
+                        .font(.scarletTitle)
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Button { showDevices = false } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 24))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Close")
+                }
+                ScrollView {
+                    // Tapping a device dismisses the picker; the chooser starts
+                    // playback on that room via the shared model.
+                    MusicDeviceChooser(model: model) { showDevices = false }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(20)
+        }
+        .presentationDetents([.medium, .large])
     }
 
     // MARK: player body
@@ -264,21 +312,33 @@ struct MusicPlayerView: View {
     @ViewBuilder
     private func deviceLine(_ st: MusicPlayerState) -> some View {
         if let dev = st.device {
-            HStack(spacing: 8) {
-                Image(systemName: "hifispeaker.2.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                Text("Playing on \(dev.name)")
-                    .font(.scarletDetail)
-            }
-            .foregroundStyle(rose)
-        } else {
+            // Tap to switch rooms — opens the device picker.
             Button {
-                MusicUI.openSpotify()
+                Task { await model.loadDevices() }
+                showDevices = true
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "hifispeaker.2.fill")
                         .font(.system(size: 14, weight: .semibold))
-                    Text("No active device \u{2014} Open Spotify")
+                    Text("Playing on \(dev.name)")
+                        .font(.scarletDetail)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .opacity(0.7)
+                }
+                .foregroundStyle(rose)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Switch device — playing on \(dev.name)")
+        } else {
+            Button {
+                Task { await model.loadDevices() }
+                showDevices = true
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "hifispeaker.and.homepod")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text("Choose a device")
                         .font(.scarletDetailEmph)
                 }
                 .foregroundStyle(ScarletTheme.ink)
@@ -287,7 +347,7 @@ struct MusicPlayerView: View {
                 .background(Capsule().fill(ScarletTheme.accent(for: .music)))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Open Spotify")
+            .accessibilityLabel("Choose a device")
         }
     }
 

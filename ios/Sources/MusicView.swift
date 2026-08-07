@@ -90,6 +90,30 @@ struct MusicDevice: Equatable {
     let type: String
 }
 
+/// A Spotify Connect endpoint the account can play to right now (an open Spotify
+/// app, or an always-registered speaker/AVR like Sonos). Powers the device
+/// picker so Ido taps a room instead of hunting for an active device.
+/// From `op=music_devices`.
+struct MusicPlaybackDevice: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let type: String
+    let isActive: Bool
+    let volumePercent: Int?
+
+    /// SF Symbol matching the device kind — a computer, phone, TV, or speaker.
+    var symbol: String {
+        switch type.lowercased() {
+        case "computer": return "desktopcomputer"
+        case "smartphone": return "iphone"
+        case "tablet": return "ipad"
+        case "tv", "castvideo": return "tv"
+        case "avr", "stb", "audiodongle", "castaudio": return "hifispeaker.and.homepod"
+        default: return "hifispeaker.2.fill"
+        }
+    }
+}
+
 /// One "up next" row from the live queue.
 struct MusicQueueItem: Identifiable, Equatable {
     let id: String
@@ -173,6 +197,13 @@ protocol MusicProvider {
     /// Returns where sound is ACTUALLY coming out — the server verifies real
     /// playback before reporting ok, so a success here means audio is rolling.
     func play(uri: String) async throws -> MusicPlayOutcome
+    /// Start playback of a URI on a SPECIFIC device (the device picker's choice).
+    /// `deviceId == nil` behaves exactly like `play(uri:)`.
+    func play(uri: String, deviceId: String?) async throws -> MusicPlayOutcome
+    /// The devices the account can play to right now (for the picker).
+    func fetchDevices() async throws -> [MusicPlaybackDevice]
+    /// Move playback to a chosen device (the picker's "play here" / transfer).
+    func transfer(to deviceId: String) async throws
     /// pause / resume / next / previous.
     func control(_ action: String) async throws
     /// Jump to a position in the current track.
@@ -186,6 +217,13 @@ extension MusicProvider {
     func setPlaying(_ playing: Bool) async throws {
         try await control(playing ? "resume" : "pause")
     }
+    /// Defaults so non-Spotify providers keep compiling: no device targeting,
+    /// no picker. The Spotify provider overrides all three.
+    func play(uri: String, deviceId: String?) async throws -> MusicPlayOutcome {
+        try await play(uri: uri)
+    }
+    func fetchDevices() async throws -> [MusicPlaybackDevice] { [] }
+    func transfer(to deviceId: String) async throws {}
 }
 
 /// Verified playback destination (device name + type, e.g. "Ido's iPhone",
@@ -278,7 +316,13 @@ struct SpotifyMusicProvider: MusicProvider {
     }
 
     func play(uri: String) async throws -> MusicPlayOutcome {
-        let data = try await MusicAPI.post("music_play", body: ["uri": uri])
+        try await play(uri: uri, deviceId: nil)
+    }
+
+    func play(uri: String, deviceId: String?) async throws -> MusicPlayOutcome {
+        var body: [String: Any] = ["uri": uri]
+        if let deviceId, !deviceId.isEmpty { body["device"] = deviceId }
+        let data = try await MusicAPI.post("music_play", body: body)
         let obj = Self.json(data)
         // The edge function returns failures as 200s with an `error` body —
         // surface them as real errors so the UI never paints success over one.
@@ -289,6 +333,30 @@ struct SpotifyMusicProvider: MusicProvider {
             device: obj["device"] as? String,
             deviceType: obj["device_type"] as? String
         )
+    }
+
+    func fetchDevices() async throws -> [MusicPlaybackDevice] {
+        let data = try await MusicAPI.get("music_devices")
+        let obj = Self.json(data)
+        if let err = obj["error"] as? String, !err.isEmpty {
+            throw MusicPlayError(message: err)
+        }
+        let rows = (obj["devices"] as? [[String: Any]]) ?? []
+        return rows.compactMap { d in
+            guard let id = d["id"] as? String, !id.isEmpty else { return nil }
+            return MusicPlaybackDevice(
+                id: id,
+                name: (d["name"] as? String) ?? "Unknown device",
+                type: (d["type"] as? String) ?? "",
+                isActive: (d["is_active"] as? Bool) ?? false,
+                volumePercent: (d["volume_percent"] as? Int) ?? (d["volume_percent"] as? Double).map(Int.init)
+            )
+        }
+    }
+
+    func transfer(to deviceId: String) async throws {
+        let data = try await MusicAPI.post("music_transfer", body: ["device_id": deviceId])
+        try Self.throwIfError(Self.json(data))
     }
 
     func control(_ action: String) async throws {
@@ -551,6 +619,91 @@ enum MusicUI {
     }
 }
 
+/// The device picker — the rooms/speakers/computers the account can play to.
+/// Tapping one starts Ido's last pick there (or transfers current audio). Used
+/// inline on the no-device recovery card AND inside the full player's sheet, so
+/// it never violates Catalyst's one-sheet-per-view rule. Pure presentation over
+/// `MusicModel` — no sheet of its own.
+struct MusicDeviceChooser: View {
+    @ObservedObject var model: MusicModel
+    /// Called after a device is tapped (e.g. to dismiss a presenting sheet).
+    var onPick: (() -> Void)? = nil
+
+    private let accent = ScarletTheme.accent(for: .music)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("Play in a room")
+                    .font(.scarletDetailEmph)
+                    .foregroundStyle(.secondary)
+                if model.loadingDevices {
+                    ProgressView().scaleEffect(0.7)
+                }
+                Spacer()
+                Button {
+                    Task { await model.loadDevices() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Refresh devices")
+            }
+            if model.devices.isEmpty {
+                Text(model.loadingDevices
+                     ? "Finding your speakers\u{2026}"
+                     : "No Spotify devices found. Open Spotify on a speaker, TV, Mac or your phone, then refresh.")
+                    .font(.scarletDetail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(model.devices) { device in
+                    Button {
+                        model.playOnDevice(device)
+                        onPick?()
+                    } label: {
+                        HStack(spacing: 11) {
+                            Image(systemName: device.symbol)
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(device.isActive ? accent : .secondary)
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(device.name)
+                                    .font(.scarletBody)
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                if device.isActive {
+                                    Text("Active now")
+                                        .font(.scarletCaption)
+                                        .foregroundStyle(accent)
+                                }
+                            }
+                            Spacer(minLength: 6)
+                            if model.routingToDeviceId == device.id {
+                                ProgressView().scaleEffect(0.75)
+                            } else {
+                                Image(systemName: "play.circle.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundStyle(accent)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(Color.white.opacity(device.isActive ? 0.10 : 0.05))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(model.routingToDeviceId != nil)
+                }
+            }
+        }
+    }
+}
+
 /// Ambient-focus line prefixes — the stale-guard tokens: the page only
 /// restores its own focus if the current focus still belongs to one of its
 /// child screens (another section may have claimed focus meanwhile).
@@ -640,6 +793,16 @@ final class MusicModel: ObservableObject {
     /// The uri currently being started, to show a spinner on the tapped row.
     @Published var startingURI: String?
 
+    /// The rooms the account can play to right now (device picker). Loaded lazily
+    /// when the picker opens or the no-device recovery appears.
+    @Published var devices: [MusicPlaybackDevice] = []
+    @Published var loadingDevices = false
+    /// The device id currently being started from the picker (row spinner).
+    @Published var routingToDeviceId: String?
+    /// The last thing Ido asked to play — so the device picker can start THAT on
+    /// the chosen room. `nil` → the picker transfers whatever's loaded instead.
+    @Published var lastPlayURI: String?
+
     /// The live player snapshot (`music_state`) and when it arrived — the
     /// arrival stamp lets the progress bar tick locally between polls.
     @Published var playerState: MusicPlayerState?
@@ -720,6 +883,7 @@ final class MusicModel: ObservableObject {
         guard !uri.isEmpty, startingURI == nil else { return }
         flash = ""
         startingURI = uri
+        lastPlayURI = uri
         retryWatch?.cancel()
         retryWatchActive = false
         Task { @MainActor in
@@ -748,6 +912,9 @@ final class MusicModel: ObservableObject {
                 // real situation ("only registered device is Mac Studio…"),
                 // which a generic line would hide.
                 needsDevice = true
+                // Preload the rooms so the recovery card's device picker is ready
+                // the instant it appears — Ido taps a speaker and it plays there.
+                Task { await self.loadDevices() }
                 let playError = error as? MusicPlayError
                 if playError?.retrying == true {
                     // The server keeps retrying for ~24s once Spotify registers
@@ -758,6 +925,51 @@ final class MusicModel: ObservableObject {
                     let msg = playError?.message ?? ""
                     flash = msg.isEmpty ? "Open Spotify on a device to play" : String(msg.prefix(140))
                 }
+            }
+        }
+    }
+
+    /// Load the rooms/devices the account can play to (device picker). Quiet on
+    /// failure — the picker simply shows what it has (or the "Open Spotify" copy).
+    func loadDevices() async {
+        guard TokenStore.token != nil else { return }
+        loadingDevices = true
+        defer { loadingDevices = false }
+        if let list = try? await provider.fetchDevices() {
+            devices = list
+        }
+    }
+
+    /// Play the last-requested track/playlist on a CHOSEN device (the picker), or
+    /// — if nothing is queued to start — transfer whatever's loaded to that room.
+    /// Verified end-to-end: on success the recovery state clears and we reflect
+    /// what's actually playing where.
+    func playOnDevice(_ device: MusicPlaybackDevice) {
+        guard routingToDeviceId == nil else { return }
+        routingToDeviceId = device.id
+        retryWatch?.cancel()
+        retryWatchActive = false
+        Task { @MainActor in
+            defer { routingToDeviceId = nil }
+            do {
+                if let uri = lastPlayURI, !uri.isEmpty {
+                    _ = try await provider.play(uri: uri, deviceId: device.id)
+                } else {
+                    try await provider.transfer(to: device.id)
+                }
+                needsDevice = false
+                flash = "Playing on \(device.name)"
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                await refreshState()
+                await loadDevices()
+                snapshot = (try? await provider.fetchLibrary()) ?? snapshot
+            } catch {
+                let msg = (error as? MusicPlayError)?.message ?? ""
+                flash = msg.isEmpty
+                    ? "Couldn\u{2019}t start on \(device.name) — is it powered on?"
+                    : String(msg.prefix(140))
+                // Refresh the list — the chosen device may have dropped off.
+                await loadDevices()
             }
         }
     }
@@ -1469,37 +1681,42 @@ struct MusicView: View {
     private var deviceRecovery: some View {
         let accent = ScarletTheme.accent(for: .music)
         let retrying = model.retryWatchActive
-        return HStack(spacing: 12) {
-            Image(systemName: "hifispeaker.2.fill")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(accent)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(retrying
-                     ? "Open \(model.provider.displayName) — it\u{2019}ll start by itself"
-                     : "No active \(model.provider.displayName) device")
-                    .font(.scarletBodyEmph)
-                    .foregroundStyle(.white)
-                    .lineLimit(2)
-                Text(retrying
-                     ? "Your pick is queued — it plays the moment \(model.provider.displayName) wakes up."
-                     : "Open \(model.provider.displayName) once so Scarlet can play to it.")
-                    .font(.scarletDetail)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "hifispeaker.2.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(accent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(retrying
+                         ? "Open \(model.provider.displayName) — it\u{2019}ll start by itself"
+                         : "Pick where to play")
+                        .font(.scarletBodyEmph)
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                    Text(retrying
+                         ? "Your pick is queued — it plays the moment \(model.provider.displayName) wakes up."
+                         : "Tap a room below, or open \(model.provider.displayName) on the device you want.")
+                        .font(.scarletDetail)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 8)
+                Button {
+                    MusicUI.openSpotify()
+                } label: {
+                    Text("Open")
+                        .font(.scarletDetailEmph)
+                        .foregroundStyle(ScarletTheme.ink)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 9)
+                        .background(Capsule().fill(accent))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open \(model.provider.displayName)")
             }
-            Spacer(minLength: 8)
-            Button {
-                MusicUI.openSpotify()
-            } label: {
-                Text("Open \(model.provider.displayName)")
-                    .font(.scarletDetailEmph)
-                    .foregroundStyle(ScarletTheme.ink)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 9)
-                    .background(Capsule().fill(accent))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Open \(model.provider.displayName)")
+            // Inline device picker — no sheet, so it never collides with the
+            // page's single player sheet (Catalyst allows one sheet per view).
+            MusicDeviceChooser(model: model)
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1511,6 +1728,7 @@ struct MusicView: View {
                         .stroke(accent.opacity(0.45), lineWidth: 1)
                 )
         )
+        .task { if model.devices.isEmpty { await model.loadDevices() } }
     }
 
     // MARK: voice hint
