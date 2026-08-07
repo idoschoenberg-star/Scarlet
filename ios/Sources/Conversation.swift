@@ -63,10 +63,22 @@ final class Conversation: ObservableObject {
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
 
+    /// Which realtime backend this client speaks. OpenAI Realtime is the DEFAULT
+    /// (native full-duplex, semantic-VAD turn-taking); ElevenLabs is preserved
+    /// intact as a fallback branch. Every network-protocol decision below
+    /// (handshake, event names, audio payload, tool shape, interrupt, context
+    /// injection, sample rates) branches on this.
+    enum RTEngine { case openai, elevenlabs }
+    private let engine: RTEngine = .openai
+
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
     private var token = ""
     private var outputRate: Double = 16000
+    /// Mic capture target sample rate. OpenAI Realtime wants 24 kHz PCM16 mono;
+    /// ElevenLabs wants 16 kHz. Set from `engine` in connect() and read when
+    /// building the capture format and the tap's resample ratios.
+    private var micTargetRate: Double = 24000
 
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
@@ -254,7 +266,14 @@ final class Conversation: ObservableObject {
         barged = true
         thinking = false
         flushPlayback()                     // instant silence + echo gate cleared + → listening
-        send(["type": "user_activity"])     // ElevenLabs: the user is active now
+        switch engine {
+        case .openai:
+            // Cancel her in-flight response server-side; playback is already
+            // flushed above so the tail can't crawl back over him.
+            send(["type": "response.cancel"])
+        case .elevenlabs:
+            send(["type": "user_activity"])     // ElevenLabs: the user is active now
+        }
         if micOn { status = "Go ahead — I'm listening…" }
     }
 
@@ -413,7 +432,7 @@ final class Conversation: ObservableObject {
             deliverUserMessage(text)
         } else {
             guard state == .listening || state == .speaking else { return }
-            send(["type": "user_message", "text": text])
+            sendUserText(text)
         }
     }
 
@@ -429,7 +448,7 @@ final class Conversation: ObservableObject {
         thinking = true
         switch state {
         case .listening, .speaking:
-            send(["type": "user_message", "text": text])
+            sendUserText(text)
         case .connecting:
             pendingOutbound.append(text)
         case .idle:
@@ -445,7 +464,7 @@ final class Conversation: ObservableObject {
         guard !pendingOutbound.isEmpty else { return }
         let queued = pendingOutbound
         pendingOutbound.removeAll()
-        for text in queued { send(["type": "user_message", "text": text]) }
+        for text in queued { sendUserText(text) }
     }
 
     /// Her most recent line — surfaced by the floating presence capsule.
@@ -464,7 +483,7 @@ final class Conversation: ObservableObject {
         guard text != currentFocus else { return }
         currentFocus = text
         guard state == .listening || state == .speaking else { return }
-        send(["type": "contextual_update", "text": text ?? "[FOCUS] Nothing focused."])
+        sendContext(text ?? "[FOCUS] Nothing focused.")
     }
 
     // MARK: car / eyes-free driving mode
@@ -488,8 +507,7 @@ final class Conversation: ObservableObject {
     /// screen.
     private func announceDrivingMode() {
         guard state == .listening || state == .speaking else { return }
-        send(["type": "contextual_update",
-              "text": "[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action."])
+        sendContext("[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action.")
     }
 
     /// CarPlay scene connected — treat as authoritative eyes-free driving even
@@ -514,6 +532,100 @@ final class Conversation: ObservableObject {
             pendingOutbound.removeAll()
             return
         }
+        switch engine {
+        case .openai:    await connectOpenAI()
+        case .elevenlabs: await connectElevenLabs()
+        }
+    }
+
+    /// OpenAI Realtime handshake: POST realtime-session to mint an ephemeral
+    /// client secret, then open the OpenAI WS directly with that secret. The
+    /// session (persona, semantic-VAD turn-taking with interrupt_response:false,
+    /// voice, tools, input transcription) is ALREADY configured server-side at
+    /// mint, so we send NO session.update — just connect and stream 24 kHz PCM16.
+    private func connectOpenAI() async {
+        // OpenAI Realtime uses 24 kHz PCM16 in BOTH directions. Set the rates
+        // BEFORE ensureAudio() so the capture format, tap resample ratios, and
+        // playback graph are all built at 24k with no post-build renegotiation.
+        micTargetRate = 24000
+        outputRate = 24000
+        do {
+            var req = URLRequest(url: AppConfig.realtimeURL)
+            req.httpMethod = "POST"
+            req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+            let (data, _) = try await URLSession.shared.data(for: req)
+            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard let secret = obj?["client_secret"] as? String, !secret.isEmpty else {
+                status = "Couldn't start — try again."; state = .idle; wantLive = false
+                pendingOutbound.removeAll()   // no session is coming — don't replay stale text later
+                return
+            }
+            // The user may have tapped End while we were fetching the secret — do
+            // NOT resurrect a session he explicitly hung up on.
+            guard wantLive else { return }
+            // Audio-start failure is NOT a transport drop — reconnecting can't fix
+            // a dead mic/engine, it just loops. Surface it and stop.
+            do {
+                try ensureAudio()
+            } catch {
+                status = "Can't reach the microphone right now. Check it's free (not held by another app) and try again."
+                state = .idle; wantLive = false
+                reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+                pendingOutbound.removeAll()
+                return
+            }
+            // If the graph was already up at a different playback rate (e.g. a
+            // reconnect after an engine switch), rewire the player leg to 24k.
+            if audioReady, playFormat?.sampleRate != outputRate { rebuildPlayback() }
+            guard let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                status = "Couldn't start — try again."; state = .idle; wantLive = false
+                pendingOutbound.removeAll()
+                return
+            }
+            // Connected: a real socket is coming up. Clear the backoff counter.
+            reconnectAttempts = 0
+            var wsReq = URLRequest(url: url)
+            wsReq.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
+            wsReq.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+            let task = wsSession.webSocketTask(with: wsReq)
+            ws = task
+            task.resume()
+            // NO session.update — the session is configured server-side at mint.
+            listen()
+            // A reconnect is a brand-new socket: never carry a barge-in latch or
+            // a "thinking" flag across it, or her resumed speech would be dropped
+            // by playPCM's `barged` gate (silent, until he happens to speak) and
+            // the orb could shimmer forever. Same reset start() does.
+            barged = false; thinking = false
+            state = .listening
+            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            // A fresh socket knows nothing about the screen — replay the current
+            // focus (non-interrupting) so a reconnect regains ambient context.
+            if let focus = currentFocus { sendContext(focus) }
+            if resumedSession {
+                resumedSession = false
+                // Recent transcript lines ride along so the renewed session keeps
+                // the thread instead of greeting him like a stranger.
+                let recent = transcript.suffix(6)
+                    .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
+                    .joined(separator: "\n")
+                sendContext("[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent)
+            }
+            // Car / eyes-free: now that we're connected, re-check the live route.
+            evaluateDrivingMode(forceAnnounce: true)
+            // Socket is live and context is replayed — deliver anything typed,
+            // dictated, or shared while she was asleep/connecting. Exactly once.
+            flushPendingOutbound()
+        } catch {
+            if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
+        }
+    }
+
+    /// ElevenLabs Conversational-AI handshake (fallback branch): POST
+    /// eleven-session for a signed URL, then open that URL directly. Preserved
+    /// intact — 16 kHz capture, metadata-negotiated playback rate.
+    private func connectElevenLabs() async {
+        micTargetRate = 16000
         do {
             var req = URLRequest(url: AppConfig.elevenURL)
             req.httpMethod = "POST"
@@ -679,9 +791,129 @@ final class Conversation: ObservableObject {
         ws?.send(.string(s)) { _ in }
     }
 
+    // MARK: engine-aware wire helpers
+    //
+    // The three send shapes that differ between backends. `send(_:)` stays the
+    // engine-agnostic JSON transport; these pick the right envelope so the call
+    // sites (setFocus, deliverUserMessage, runTool, …) stay engine-neutral.
+
+    /// A REAL user turn — text that should reach her like speech, so she SPEAKS.
+    /// OpenAI: create a user message item, then explicitly ask for a response.
+    /// ElevenLabs: the native `user_message` event (auto-responds).
+    private func sendUserText(_ text: String) {
+        switch engine {
+        case .openai:
+            send(["type": "conversation.item.create",
+                  "item": ["type": "message", "role": "user",
+                           "content": [["type": "input_text", "text": text]]]])
+            send(["type": "response.create"])
+        case .elevenlabs:
+            send(["type": "user_message", "text": text])
+        }
+    }
+
+    /// NON-interrupting context ([FOCUS], driving mode, resumed-session recap):
+    /// she learns it without it counting as a user turn — nothing barges in.
+    /// OpenAI: a user message item with NO following response.create.
+    /// ElevenLabs: the native `contextual_update` event.
+    private func sendContext(_ text: String) {
+        switch engine {
+        case .openai:
+            send(["type": "conversation.item.create",
+                  "item": ["type": "message", "role": "user",
+                           "content": [["type": "input_text", "text": text]]]])
+        case .elevenlabs:
+            send(["type": "contextual_update", "text": text])
+        }
+    }
+
+    /// Return a tool's result to the model.
+    /// OpenAI: a function_call_output item keyed by call_id, then response.create
+    /// so she continues the turn with the result in hand.
+    /// ElevenLabs: the native `client_tool_result` event.
+    private func sendToolResult(callId: String, output: String) {
+        switch engine {
+        case .openai:
+            send(["type": "conversation.item.create",
+                  "item": ["type": "function_call_output",
+                           "call_id": callId, "output": output]])
+            send(["type": "response.create"])
+        case .elevenlabs:
+            send(["type": "client_tool_result", "tool_call_id": callId,
+                  "result": output, "is_error": false])
+        }
+    }
+
     // MARK: protocol
 
     private func handle(_ ev: [String: Any]) {
+        switch engine {
+        case .openai:     handleOpenAI(ev)
+        case .elevenlabs: handleElevenLabs(ev)
+        }
+    }
+
+    /// OpenAI Realtime inbound events (top-level "type"). Mirrors the ElevenLabs
+    /// state transitions (transcript, thinking, barge latch, tool dispatch) onto
+    /// the OpenAI event names. All other event types are ignored.
+    private func handleOpenAI(_ ev: [String: Any]) {
+        switch ev["type"] as? String {
+        // Her audio — both the current and legacy delta names carry base64 24k PCM16.
+        case "response.output_audio.delta", "response.audio.delta":
+            if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
+        // Her full transcript for the turn.
+        case "response.output_audio_transcript.done", "response.audio_transcript.done":
+            if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
+        // His transcribed speech (server-side input transcription).
+        case "conversation.item.input_audio_transcription.completed":
+            if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !t.isEmpty {
+                transcript.append(.init(text: t, fromHer: false))
+                // His turn has landed: release any barge-in latch (her NEW reply
+                // may now play) and light the "thinking" state until she speaks.
+                barged = false
+                thinking = true
+            }
+        // A tool call is fully specified — run it. `arguments` is a JSON STRING.
+        case "response.function_call_arguments.done":
+            // A tool turn is an observable response — the "thinking" beat is over.
+            thinking = false
+            let name = ev["name"] as? String ?? ""
+            let callId = ev["call_id"] as? String ?? ""
+            var params: [String: Any] = [:]
+            if let argStr = ev["arguments"] as? String,
+               let d = argStr.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                params = obj
+            }
+            runTool(name: name, callId: callId, params: params)
+        // Turn finished — clear any residual "thinking" shimmer.
+        case "response.done":
+            thinking = false
+        // interrupt_response:false → the server will NOT auto-interrupt her when
+        // he starts talking (full-duplex). Do NOT flush here; her reply
+        // continues and local barge-in (the meter) owns cutting her off.
+        case "input_audio_buffer.speech_started":
+            break
+        case "error":
+            let err = ev["error"] as? [String: Any]
+            let code = (err?["code"] as? String) ?? ""
+            let message = (err?["message"] as? String) ?? ""
+            print("OpenAI Realtime error: \(code) \(message)")
+            // Only an expired/invalid session or credential warrants a reconnect;
+            // benign per-turn errors (e.g. "no active response to cancel") must not.
+            let hay = (code + " " + message).lowercased()
+            if hay.contains("expired") || hay.contains("session_expired")
+                || hay.contains("invalid_api_key") || hay.contains("authentication")
+                || hay.contains("unauthorized") {
+                if wantLive { scheduleReconnect() }
+            }
+        default: break   // session.created/updated, response.output_item.*, rate_limits.updated, input_audio_buffer.committed, …
+        }
+    }
+
+    private func handleElevenLabs(_ ev: [String: Any]) {
         switch ev["type"] as? String {
         case "conversation_initiation_metadata":
             if let m = ev["conversation_initiation_metadata_event"] as? [String: Any],
@@ -720,15 +952,22 @@ final class Conversation: ObservableObject {
             // Clearing it here also stops the orb shimmering forever on a silent
             // tool action that never produces audio (e.g. opening a draft window).
             thinking = false
-            if let c = ev["client_tool_call"] as? [String: Any] { runTool(c) }
+            if let c = ev["client_tool_call"] as? [String: Any] {
+                let name = c["tool_name"] as? String ?? ""
+                let callId = c["tool_call_id"] as? String ?? ""
+                let params = c["parameters"] as? [String: Any] ?? [:]
+                runTool(name: name, callId: callId, params: params)
+            }
         default: break
         }
     }
 
-    private func runTool(_ c: [String: Any]) {
-        let name = c["tool_name"] as? String ?? ""
-        let callId = c["tool_call_id"] as? String ?? ""
-        let params = c["parameters"] as? [String: Any] ?? [:]
+    /// Run a tool the model requested and return its result. `name`, `callId`,
+    /// and `params` are already normalized by the engine-specific event parse,
+    /// so the body is engine-agnostic except for how the RESULT is returned
+    /// (sendToolResult) — the same tool proxy and on-device special-cases serve
+    /// both backends.
+    private func runTool(name: String, callId: String, params: [String: Any]) {
         // send_photos runs ENTIRELY on-device (the photo library lives here): it
         // selects by place/time, uploads the matches, and opens a draft with them
         // attached — no server tool handler exists or should. Handle it locally
@@ -736,8 +975,7 @@ final class Conversation: ObservableObject {
         if name == "send_photos" {
             Task { @MainActor in
                 let out = await handleSendPhotos(params)
-                send(["type": "client_tool_result", "tool_call_id": callId,
-                      "result": String(out.prefix(4000)), "is_error": false])
+                sendToolResult(callId: callId, output: String(out.prefix(4000)))
             }
             return
         }
@@ -772,8 +1010,7 @@ final class Conversation: ObservableObject {
             // 12k cap: every tool result lives in the agent's context for the
             // REST of the conversation — 30k results made hour-long dialogues
             // slower and slower until replies timed out entirely.
-            send(["type": "client_tool_result", "tool_call_id": callId,
-                  "result": String(out.prefix(12000)), "is_error": false])
+            sendToolResult(callId: callId, output: String(out.prefix(12000)))
             // A voice-started draft: compose_draft came back with a draft id,
             // so tell the shell to open the drafting table over whatever
             // screen is showing.
@@ -888,7 +1125,11 @@ final class Conversation: ObservableObject {
             throw NSError(domain: "Scarlet.Audio", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Microphone input not ready yet."])
         }
-        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
+        // Capture target rate is engine-driven (OpenAI 24k, ElevenLabs 16k).
+        // Snapshot into a local `let` so the tap closure below captures a stable
+        // constant instead of reading the property on the real-time audio thread.
+        let micRate = micTargetRate
+        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: micRate,
                                    channels: 1, interleaved: true)!
         let newConverter = AVAudioConverter(from: inFormat, to: target)
         os_unfair_lock_lock(audioStateLock)
@@ -956,7 +1197,7 @@ final class Conversation: ObservableObject {
                     let base = interleaved ? fdata[0].advanced(by: chIndex) : fdata[chIndex]
 
                     let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
-                    let ratio = inRate / 16000.0
+                    let ratio = inRate / micRate
                     let outCount = max(0, Int(Double(frames) / ratio))
                     var pcm = [Int16](); pcm.reserveCapacity(outCount)
                     var i = 0
@@ -994,7 +1235,7 @@ final class Conversation: ObservableObject {
                     return
                 }
                 let inRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
-                let ratio = 16000.0 / inRate
+                let ratio = micRate / inRate
                 let outCap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 64
                 if let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCap) {
                     var fed = false
@@ -1084,7 +1325,15 @@ final class Conversation: ObservableObject {
                 // they crossed a very high barge line. AEC lets the server own
                 // turn-taking honestly. `echoRisk` is kept only for the orb cue.
                 guard self.micOn else { return }
-                self.send(["user_audio_chunk": data.base64EncodedString()])
+                switch self.engine {
+                case .openai:
+                    // Server VAD auto-commits + auto-creates responses — never
+                    // send input_audio_buffer.commit / response.create per turn.
+                    self.send(["type": "input_audio_buffer.append",
+                               "audio": data.base64EncodedString()])
+                case .elevenlabs:
+                    self.send(["user_audio_chunk": data.base64EncodedString()])
+                }
             }
         }
         engine.prepare()

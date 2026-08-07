@@ -6,6 +6,10 @@ enum AppConfig {
     static let apiBase = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1"
     static var unlockURL: URL   { URL(string: "\(apiBase)/app-api?op=unlock")! }
     static var elevenURL: URL   { URL(string: "\(apiBase)/eleven-session")! }
+    /// OpenAI Realtime session mint (ephemeral client secret). Same backend the
+    /// web app uses — persona, semantic-VAD turn-taking and tools are baked in
+    /// at mint time, so the native client just connects and streams audio.
+    static var realtimeURL: URL { URL(string: "\(apiBase)/realtime-session")! }
     static var appAPIURL: URL   { URL(string: "\(apiBase)/app-api?v=2")! }
     static let fullAppURL = URL(string: "https://raw.githack.com/idoschoenberg-star/Scarlet/main/index.html")!
     static func toolURL(_ name: String) -> URL {
