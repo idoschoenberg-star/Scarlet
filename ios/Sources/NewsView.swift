@@ -25,7 +25,11 @@ import SwiftUI
 // nested inside that, pushed via NavigationLink, made back/dismiss unreliable.
 // A cover owns its own presentation, so its drawn back button always dismisses.
 // Catalyst-safe: News has NO `.sheet`, so exactly one cover is fine. There is
-// always a clear way OUT (back button, "Open in <source>", Share).
+// always a clear way OUT — the drawn back chevron, an interactive edge-swipe
+// back (a cover has no system one), and Share. "Open in <source>" is a
+// SECONDARY action that opens the house in-app reader sheet (LibraryWebView),
+// never bouncing Ido out to external Safari: closing it lands back in the
+// detail, and closing the detail lands back in the feed. No dead ends.
 //
 // Self-contained: it reads no @EnvironmentObject (no convo), so it drops into
 // the tab bar without any re-injection ceremony. Ambient focus goes through
@@ -1013,14 +1017,21 @@ struct NewsView: View {
 }
 
 // =============================================================================
-// MARK: - NewsDetailView (push, not a sheet) — always a way out to the source
+// MARK: - NewsDetailView (fullScreenCover) — always a way BACK, source in-app
 // =============================================================================
 
 struct NewsDetailView: View {
     let story: NewsStory
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
     @Environment(\.horizontalSizeClass) private var hSize
+
+    /// The source page Ido asked to read, presented as the detail's ONE
+    /// `.sheet` (Catalyst-safe: this view has no other sheet; NewsView's
+    /// fullScreenCover lives on a different view). In-app — dismissing the
+    /// reader lands back HERE, never out of the app flow.
+    @State private var openLink: NewsWebItem?
+    /// Live x-offset while the edge-swipe-back drag is in flight.
+    @State private var backDragX: CGFloat = 0
 
     private var heroHeight: CGFloat { hSize == .regular ? 420 : 300 }
 
@@ -1063,6 +1074,20 @@ struct NewsDetailView: View {
                 .scrollIndicators(.hidden)
             }
         }
+        // Interactive back: the whole page follows an edge-started drag and
+        // dismisses past the threshold — the system edge-swipe a fullScreenCover
+        // doesn't provide (and Catalyst never has). PhotosView's dismissDrag
+        // discipline: simultaneous, so the ScrollView keeps vertical scrolling;
+        // the gesture only claims edge-started, horizontally-dominant drags.
+        .offset(x: max(0, backDragX))
+        .simultaneousGesture(backSwipe)
+        // The in-app source reader (house pattern: LibraryWebView). ONE sheet
+        // on this view — the Catalyst-safe cover(NewsView)+sheet(here) pair,
+        // same shape FoodView uses.
+        .sheet(item: $openLink) { item in
+            NewsSourceSheet(item: item)
+                .preferredColorScheme(.dark)
+        }
         // Ambient focus: this story on appear; on disappear, restore the feed
         // focus only if this story still owns it (InboxView's MailDetailView
         // stale-guard pattern — another screen may have claimed focus while
@@ -1089,16 +1114,42 @@ struct NewsDetailView: View {
         return line
     }
 
+    // MARK: the way back (drawn bar + edge swipe)
+
+    /// Edge swipe → back. Starts only at the leading edge
+    /// (so it can never fight the vertical ScrollView), tracks the finger, and
+    /// dismisses past the threshold; otherwise springs home. This restores the
+    /// interactive back a fullScreenCover lacks.
+    private var backSwipe: some Gesture {
+        DragGesture(minimumDistance: 20)
+            .onChanged { v in
+                guard v.startLocation.x < 44,
+                      v.translation.width > 0,
+                      abs(v.translation.width) > abs(v.translation.height) else { return }
+                backDragX = v.translation.width
+            }
+            .onEnded { v in
+                guard v.startLocation.x < 44 else { return }
+                if v.translation.width > 110,
+                   abs(v.translation.width) > abs(v.translation.height) {
+                    dismiss()
+                } else {
+                    withAnimation(.easeOut(duration: 0.2)) { backDragX = 0 }
+                }
+            }
+    }
+
     // MARK: bar (drawn — presented as a full-screen cover with no system nav
-    // bar; Catalyst has no edge-swipe-back — so we draw the way back and Share
-    // ourselves. The back chevron dismisses the cover, which is reliable now
-    // that detail no longer pushes onto a nested SwiftUI stack.)
+    // bar, so we draw the way back and Share ourselves. The back chevron
+    // dismisses the cover, which is reliable now that detail no longer pushes
+    // onto a nested SwiftUI stack. `chevron.backward` = the house left chevron
+    // in the app's LTR chrome, and it self-mirrors if the bar ever runs RTL.)
 
     private var detailBar: some View {
         HStack(spacing: 10) {
             Button { dismiss() } label: {
                 HStack(spacing: 3) {
-                    Image(systemName: "chevron.left")
+                    Image(systemName: "chevron.backward")
                         .font(.system(size: 16, weight: .semibold))
                     Text("News").font(.system(size: 16, weight: .semibold))
                 }
@@ -1134,8 +1185,11 @@ struct NewsDetailView: View {
     private var heroImage: some View {
         if story.imageURL != nil {
             Button {
-                // A video hero opens the source (where the clip actually plays).
-                if story.hasVideo, let url = story.articleURL { openURL(url) }
+                // A video hero opens the source (where the clip actually plays)
+                // — in the IN-APP reader, so closing it returns right here.
+                if story.hasVideo, let url = story.articleURL {
+                    openLink = NewsWebItem(url: url, title: story.primarySource)
+                }
             } label: {
                 ZStack {
                     NewsImage(url: story.imageURL)
@@ -1150,13 +1204,15 @@ struct NewsDetailView: View {
         }
     }
 
-    // MARK: the way out
+    // MARK: the source (secondary — reading happens here; this goes deeper)
 
     private var openButton: some View {
         Group {
             if let url = story.articleURL {
                 Button {
-                    openURL(url)
+                    // In-app reader sheet — never a bounce out to Safari.
+                    // Dismissing it lands back in this detail.
+                    openLink = NewsWebItem(url: url, title: story.primarySource)
                 } label: {
                     HStack(spacing: 9) {
                         Image(systemName: story.hasVideo ? "play.rectangle.fill" : "safari.fill")
@@ -1191,7 +1247,10 @@ struct NewsDetailView: View {
                     .font(.system(size: 11.5, weight: .heavy))
                     .tracking(1.4)
                     .foregroundStyle(NewsStyle.inkTertiary)
-                FlowChips(links: alts) { openURL($0) }
+                FlowChips(links: alts) { source, url in
+                    openLink = NewsWebItem(url: url,
+                                           title: source.isEmpty ? "Source" : source)
+                }
             }
             .padding(.top, 4)
         }
@@ -1209,10 +1268,72 @@ struct NewsDetailView: View {
     }
 }
 
+// =============================================================================
+// MARK: - In-app source reader (secondary action — never bounces out to Safari)
+// =============================================================================
+
+/// Identifiable wrapper so `.sheet(item:)` can drive the reader off a URL
+/// (LibraryWebItem's shape, News-local on purpose).
+struct NewsWebItem: Identifiable {
+    let url: URL
+    let title: String
+    var id: String { url.absoluteString }
+}
+
+/// The source page, read INSIDE the app — the LibraryWebSheet reader pattern
+/// in News clothes (drawn back chevron + Share over a WKWebView). Presented as
+/// a `.sheet`, so iOS keeps its native pull-down-to-dismiss; the drawn "Story"
+/// back button is the always-visible way out (Catalyst sheets have no system
+/// chrome). Either way, dismissal lands back in the story detail.
+struct NewsSourceSheet: View {
+    let item: NewsWebItem
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button { dismiss() } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "chevron.backward")
+                            .font(.system(size: 16, weight: .semibold))
+                        Text("Story").font(.system(size: 16, weight: .semibold))
+                    }
+                    .foregroundStyle(NewsStyle.accent)
+                    .contentShape(Rectangle())   // full label tappable
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 8)
+                Text(item.title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(NewsStyle.ink)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 8)
+                ShareLink(item: item.url) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(NewsStyle.accent)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, NewsStyle.pageHPadding)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(NewsStyle.hairline).frame(height: 1)
+            }
+            LibraryWebView(url: item.url)
+                .ignoresSafeArea(edges: .bottom)
+        }
+        .background(NewsStyle.canvasBottom.ignoresSafeArea())
+    }
+}
+
 /// A simple wrapping row of tappable source chips (no external layout deps).
+/// Hands back the SOURCE NAME with the URL so the caller can title its reader.
 struct FlowChips: View {
     let links: [NewsSourceLink]
-    let onTap: (URL) -> Void
+    let onTap: (String, URL) -> Void
 
     var body: some View {
         // A LazyVGrid with adaptive item widths wraps chips cleanly on any width.
@@ -1221,7 +1342,9 @@ struct FlowChips: View {
                   alignment: .leading, spacing: 8) {
             ForEach(links) { link in
                 Button {
-                    if let u = URL(string: link.link), link.link.hasPrefix("http") { onTap(u) }
+                    if let u = URL(string: link.link), link.link.hasPrefix("http") {
+                        onTap(link.source, u)
+                    }
                 } label: {
                     HStack(spacing: 5) {
                         Text(link.source.isEmpty ? "Source" : link.source)
