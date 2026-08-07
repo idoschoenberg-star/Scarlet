@@ -387,6 +387,10 @@ struct NewsText: View {
     var role: NewsStyle.Role
     var color: Color = NewsStyle.ink
     var lineLimit: Int? = nil
+    /// Scale floor: below 1 lets an unbreakable long line shrink slightly
+    /// before truncating (the hero headline passes 0.85 as its ceiling —
+    /// wrap first, then scale, only then ellipsize). Default 1 = never scale.
+    var minScale: CGFloat = 1
     /// Force a light color when the text sits over an image scrim.
     var overImage: Bool = false
 
@@ -397,6 +401,7 @@ struct NewsText: View {
             .foregroundStyle(color)
             .lineSpacing(NewsStyle.lineSpacing(role, rtl: rtl))
             .lineLimit(lineLimit)
+            .minimumScaleFactor(minScale)
             // Reading-START alignment: `.leading` resolves against the text's OWN
             // layout direction (set just below) — LEFT for English, RIGHT for
             // Hebrew — so every string hugs the edge it reads from. The old code
@@ -425,29 +430,35 @@ struct NewsImage: View {
     let url: URL?
 
     var body: some View {
-        ZStack {
-            NewsStyle.imageFill
-            if let url {
-                AsyncImage(url: url,
-                           transaction: Transaction(animation: .easeInOut(duration: 0.35))) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().aspectRatio(contentMode: .fill)
-                            .transition(.opacity)
-                    case .empty:
-                        placeholder(spinning: true)
-                    case .failure:
-                        placeholder(spinning: false)
-                    @unknown default:
-                        placeholder(spinning: false)
+        // The letterbox fill IS the layout: a Color adopts exactly the size the
+        // parent proposes. The image rides in an .overlay, whose content never
+        // reports size back to layout — so an aspect-FILL photo (fixed height ×
+        // intrinsic aspect, often far WIDER than the card) can no longer inflate
+        // the card and hand overlaid text an over-wide frame. (That intrinsic
+        // width was how the hero headline escaped the card's right edge.)
+        NewsStyle.imageFill
+            .overlay {
+                if let url {
+                    AsyncImage(url: url,
+                               transaction: Transaction(animation: .easeInOut(duration: 0.35))) { phase in
+                        switch phase {
+                        case .success(let image):
+                            image.resizable().aspectRatio(contentMode: .fill)
+                                .transition(.opacity)
+                        case .empty:
+                            placeholder(spinning: true)
+                        case .failure:
+                            placeholder(spinning: false)
+                        @unknown default:
+                            placeholder(spinning: false)
+                        }
                     }
+                } else {
+                    placeholder(spinning: false)
                 }
-            } else {
-                placeholder(spinning: false)
             }
-        }
-        .clipped()
-        .contentShape(Rectangle())
+            .clipped()
+            .contentShape(Rectangle())
     }
 
     private func placeholder(spinning: Bool) -> some View {
@@ -523,66 +534,71 @@ struct NewsHeroCard: View {
     private var rtl: Bool { story.title.isRTLDominant }
 
     var body: some View {
-        ZStack(alignment: rtl ? .bottomTrailing : .bottomLeading) {
-            // Image — or, when there's none, a rich scarlet gradient so the lead
-            // still looks deliberately art-directed rather than empty.
-            Group {
-                if story.imageURL != nil {
-                    NewsImage(url: story.imageURL)
-                } else {
-                    LinearGradient(
-                        colors: [Color(red: 0.62, green: 0.10, blue: 0.22),
-                                 Color(red: 0.30, green: 0.05, blue: 0.13)],
-                        startPoint: .topLeading, endPoint: .bottomTrailing)
-                }
-            }
-            .frame(height: height)
-            .frame(maxWidth: .infinity)
-            .clipped()
-
-            // Legibility scrim — the clean gradient that lets text sit safely
-            // over photography. This is the ONLY place text overlaps an image.
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.10), .black.opacity(0.86)],
-                startPoint: .top, endPoint: .bottom)
-                .frame(height: height)
-
-            // Headline block, pinned to the bottom reading edge. The block runs
-            // in the headline's own direction, so for a Hebrew lead the badge and
-            // time hug the right edge too — the whole card reads as one language.
-            VStack(alignment: .leading, spacing: 10) {
-                leadBadge
-                NewsText(text: story.title,
-                         role: .display(hSize == .regular ? 34 : 29),
-                         color: .white,
-                         lineLimit: 4,
-                         overImage: true)
-                if let time = story.relativeTime {
-                    Text(time)
-                        .font(NewsStyle.meta)
-                        .foregroundStyle(.white.opacity(0.82))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .shadow(color: .black.opacity(0.4), radius: 6, y: 1)
-                }
-            }
-            // Constrain the overlay to the CARD's width (the feature card
-            // already does this) — without it the headline block can lay out
-            // wider than the card and the first line clips at the edge instead
-            // of wrapping. `.leading` is reading-start under the flipped
-            // direction, so Hebrew still hugs the right.
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(22)
-            .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
-
-            if story.hasVideo {
-                NewsPlayBadge(size: 62)
+        // The HEADLINE BLOCK is the card's layout, measured against the CARD
+        // frame — never against the image. The photo + scrim ride behind it as
+        // a `.background`, which is sized BY the card, so a wide photo can no
+        // longer hand the text an over-wide frame (the old right-edge overflow:
+        // the aspect-fill image's intrinsic width inflated the ZStack, and the
+        // headline wrapped to THAT width instead of the visible card's).
+        // `minHeight` keeps the magazine scale; a long headline at a big type
+        // size GROWS the card rather than clipping.
+        //
+        // Headline pinned to the bottom reading edge. The block runs in the
+        // headline's own direction, so for a Hebrew lead the badge and time hug
+        // the right edge too — the whole card reads as one language.
+        VStack(alignment: .leading, spacing: 10) {
+            leadBadge
+            NewsText(text: story.title,
+                     role: .display(hSize == .regular ? 34 : 29),
+                     color: .white,
+                     lineLimit: 3,
+                     minScale: 0.85,
+                     overImage: true)
+            if let time = story.relativeTime {
+                Text(time)
+                    .font(NewsStyle.meta)
+                    .foregroundStyle(.white.opacity(0.82))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .shadow(color: .black.opacity(0.4), radius: 6, y: 1)
             }
         }
-        .frame(height: height)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(22)
+        // `.bottomLeading` resolves against the flipped direction set just
+        // below — bottom-LEFT for English, bottom-RIGHT for Hebrew — so
+        // `.leading` keeps its reading-start meaning.
+        .frame(maxWidth: .infinity, minHeight: height, alignment: .bottomLeading)
+        .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
+        // Backdrop attaches OUTSIDE the flipped environment (a `.background`'s
+        // content doesn't inherit modifiers applied earlier in this chain), so
+        // photography is never mirrored for a Hebrew lead.
+        .background(heroBackdrop)
+        .overlay { if story.hasVideo { NewsPlayBadge(size: 62) } }
         .clipShape(RoundedRectangle(cornerRadius: NewsStyle.heroRadius, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: NewsStyle.heroRadius, style: .continuous)
             .stroke(.white.opacity(0.10), lineWidth: 1))
         .shadow(color: .black.opacity(0.5), radius: 22, y: 12)
+    }
+
+    /// Image — or, when there's none, a rich scarlet gradient so the lead still
+    /// looks deliberately art-directed rather than empty — under the legibility
+    /// scrim that lets text sit safely over photography. This is the ONLY place
+    /// text overlaps an image. Sized by the card frame (via `.background`);
+    /// `NewsImage` adopts that size exactly and clips its aspect-fill overflow.
+    private var heroBackdrop: some View {
+        ZStack {
+            if story.imageURL != nil {
+                NewsImage(url: story.imageURL)
+            } else {
+                LinearGradient(
+                    colors: [Color(red: 0.62, green: 0.10, blue: 0.22),
+                             Color(red: 0.30, green: 0.05, blue: 0.13)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing)
+            }
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.10), .black.opacity(0.86)],
+                startPoint: .top, endPoint: .bottom)
+        }
     }
 
     private var leadBadge: some View {
@@ -857,6 +873,19 @@ struct NewsView: View {
         }
         .scrollIndicators(.hidden)
         .refreshable { await model.load(force: true) }
+        // Clearance for the LAST card. The phone shell's tab bar is the SYSTEM
+        // TabView bar (ScarletTalkApp.phoneTabs) — it publishes its REAL,
+        // device-correct height into the bottom safe area, and safeAreaInset
+        // STACKS this gap on top of that, so the final headline scrolls fully
+        // clear of the floating bar with no hardcoded bar height. On iPad/Mac
+        // (SplitShell — no tab bar) the same inset degrades to just this
+        // breathing gap. Replaces the old `.padding(.bottom, 40)` magic number
+        // that used to live on feedContent.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear
+                .frame(height: NewsStyle.cardGap)
+                .allowsHitTesting(false)
+        }
     }
 
     /// The magazine, laid out: the LEAD, then feature cards ("Top Stories"),
@@ -910,7 +939,8 @@ struct NewsView: View {
             footerNote
         }
         .padding(.horizontal, NewsStyle.pageHPadding)
-        .padding(.bottom, 40)
+        // Bottom clearance comes from the ScrollView's safeAreaInset (real tab
+        // bar height + gap) — NOT a padding constant here.
     }
 
     private var footerNote: some View {
@@ -1211,3 +1241,138 @@ struct FlowChips: View {
         }
     }
 }
+
+// =============================================================================
+// MARK: - Previews (design-time only — mock stories, no network, no backend)
+// =============================================================================
+//
+// Four cases guard the two headline fixes:
+//   (a) lead card, 95-char ENGLISH headline — must wrap inside the card
+//       (3 lines, then a slight scale, never past the right edge);
+//   (b) lead card, 95-char HEBREW headline — same, mirrored: text hugs the
+//       RIGHT edge and wraps leftward (per-item RTL environment);
+//   (c) a scrolling feed inside a real TabView — the last card must scroll
+//       fully clear of the system tab bar (safeAreaInset, no magic number);
+//   (d) lead + top-stories cards at .xxxLarge Dynamic Type — cards GROW to
+//       fit, nothing clips.
+
+#if DEBUG
+
+private enum NewsPreviewData {
+    /// Exactly 95 characters — the reported overflow length.
+    static let english95 =
+        "Fed signals surprise rate pivot as world markets rally and lawmakers brace for a bruising fight"
+    /// Exactly 95 characters, Hebrew — the RTL twin of the case above.
+    static let hebrew95 =
+        "ראש הממשלה כינס הלילה את הקבינט לדיון חירום על מתווה החטופים והפסקת האש מול עמדת המתווכים בקהיר"
+
+    static func story(_ n: Int, title: String, summary: String? = nil,
+                      source: String = "Reuters", image: String? = nil,
+                      video: Bool = false) -> NewsStory {
+        NewsStory(
+            id: "preview-\(n)",
+            title: title,
+            summary: summary,
+            sources: [source],
+            published: ISO8601DateFormatter().string(from: Date().addingTimeInterval(-5400)),
+            link: "https://example.com/story-\(n)",
+            links: [NewsSourceLink(source: source, link: "https://example.com/story-\(n)")],
+            image: image,
+            media: video ? [NewsMedia(type: "video",
+                                      url: "https://example.com/clip-\(n).mp4",
+                                      source: source)] : [],
+            priority: Double(100 - n),
+            lane: nil,
+            lang: nil)
+    }
+
+    static let englishLead = story(0, title: english95,
+                                   summary: "A mock standfirst long enough to wrap onto a second line so the summary spacing is visible too.")
+    static let hebrewLead = story(1, title: hebrew95,
+                                  summary: "תקציר לדוגמה בעברית, ארוך מספיק כדי לרדת שורה ולבדוק את יישור הטקסט לימין.",
+                                  source: "Ynet")
+
+    /// Enough stories that the feed scrolls on any phone: 1 lead + 4 features
+    /// + a compact-row long tail, English and Hebrew interleaved.
+    static var feed: [NewsStory] {
+        [englishLead, hebrewLead]
+            + (2...12).map { n in
+                story(n,
+                      title: n.isMultiple(of: 3)
+                          ? "מהדורה \(n): כותרת עברית קצרה יותר לבדיקת שורות דחוסות בפיד"
+                          : "Story \(n): a medium-length mock headline that wraps to a couple of lines on a phone",
+                      summary: n.isMultiple(of: 2)
+                          ? "Short mock summary for card \(n)." : nil,
+                      source: n.isMultiple(of: 3) ? "Haaretz" : "AP",
+                      image: "https://example.com/img-\(n).jpg",
+                      video: n == 4)
+            }
+    }
+}
+
+/// Case (c): the feed seeded with mock stories inside the REAL phone shell
+/// shape (system TabView) so the bottom inset is visually checkable against
+/// the actual tab bar. @MainActor so init may seed the shared model directly —
+/// with stories already present, NewsView's .task skips its network load.
+@MainActor
+private struct NewsFeedPreviewHost: View {
+    init() {
+        let m = NewsModel.shared
+        m.stories = NewsPreviewData.feed
+        m.sourcesOK = ["Reuters", "AP", "Ynet", "Haaretz"]
+        m.fetchedAt = ISO8601DateFormatter().string(from: Date())
+        m.phase = .loaded
+    }
+    var body: some View {
+        TabView {
+            NewsView()
+                .tabItem { Label("News", systemImage: "newspaper") }
+        }
+        .preferredColorScheme(.dark)
+    }
+}
+
+/// Shared single-card stage: feed-identical padding + canvas.
+private struct NewsCardPreviewStage<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: NewsStyle.sectionGap) { content }
+                .padding(.horizontal, NewsStyle.pageHPadding)
+                .padding(.vertical, 24)
+        }
+        .background(
+            LinearGradient(colors: [NewsStyle.canvasTop, NewsStyle.canvasBottom],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea())
+        .preferredColorScheme(.dark)
+    }
+}
+
+#Preview("Lead — 95ch English (LTR)") {
+    NewsCardPreviewStage {
+        NewsHeroCard(story: NewsPreviewData.englishLead)
+    }
+}
+
+#Preview("Lead — 95ch Hebrew (RTL)") {
+    NewsCardPreviewStage {
+        NewsHeroCard(story: NewsPreviewData.hebrewLead)
+    }
+}
+
+#Preview("Feed — scrolls clear of tab bar") {
+    NewsFeedPreviewHost()
+}
+
+#Preview("Lead + Top Stories — XXXL type") {
+    NewsCardPreviewStage {
+        NewsHeroCard(story: NewsPreviewData.englishLead)
+        NewsSectionHeader(title: "Top Stories")
+        NewsFeatureCard(story: NewsPreviewData.feed[2])
+        NewsFeatureCard(story: NewsPreviewData.feed[3])
+    }
+    .environment(\.dynamicTypeSize, .xxxLarge)
+}
+
+#endif
