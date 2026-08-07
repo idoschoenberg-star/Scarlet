@@ -265,6 +265,9 @@ struct NewsStory: Identifiable {
 
 @MainActor
 final class NewsModel: ObservableObject {
+    /// One instance for the app: the fetched feed survives the section view
+    /// being destroyed (iPad/Mac sidebar switches).
+    static let shared = NewsModel()
 
     enum Phase { case loading, loaded, empty, error }
 
@@ -274,9 +277,16 @@ final class NewsModel: ObservableObject {
     @Published var phase: Phase = .loading
     @Published var errorText = ""
 
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh.
+    private let fresh = Freshness(ttl: 120)
+
     /// Fetch (or re-fetch) the ranked feed. Safe to call repeatedly — a failed
     /// refresh keeps whatever's already on screen rather than blanking it.
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with stories already on screen, a re-appearance
+        // within the TTL is a no-op. An empty feed always fetches.
+        if !stories.isEmpty, !fresh.shouldFetch(force: force) { return }
         if stories.isEmpty { phase = .loading }
         errorText = ""
         do {
@@ -288,6 +298,7 @@ final class NewsModel: ObservableObject {
             sourcesOK = (obj?["sources_ok"] as? [String]) ?? []
             fetchedAt = (obj?["fetched_at"] as? String) ?? fetchedAt
             phase = parsed.isEmpty ? .empty : .loaded
+            fresh.markFetched()
         } catch {
             if stories.isEmpty {
                 phase = .error
@@ -554,6 +565,12 @@ struct NewsHeroCard: View {
                         .shadow(color: .black.opacity(0.4), radius: 6, y: 1)
                 }
             }
+            // Constrain the overlay to the CARD's width (the feature card
+            // already does this) — without it the headline block can lay out
+            // wider than the card and the first line clips at the edge instead
+            // of wrapping. `.leading` is reading-start under the flipped
+            // direction, so Hebrew still hugs the right.
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(22)
             .environment(\.layoutDirection, rtl ? .rightToLeft : .leftToRight)
 
@@ -698,7 +715,7 @@ struct NewsSectionHeader: View {
 // =============================================================================
 
 struct NewsView: View {
-    @StateObject private var model = NewsModel()
+    @ObservedObject private var model = NewsModel.shared
     @Environment(\.horizontalSizeClass) private var hSize
     @State private var refreshSpin = false
     /// The tapped story, presented as a self-contained full-screen cover. On
@@ -783,7 +800,7 @@ struct NewsView: View {
                 withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
                     refreshSpin = true
                 }
-                await model.load()
+                await model.load(force: true)
                 withAnimation(.default) { refreshSpin = false }
             }
         } label: {
@@ -807,7 +824,7 @@ struct NewsView: View {
                 Label("Managed in Settings — coming here soon", systemImage: "slider.horizontal.3")
             }
             Button {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             } label: {
                 Label("Refresh feed", systemImage: "arrow.clockwise")
             }
@@ -839,7 +856,7 @@ struct NewsView: View {
             }
         }
         .scrollIndicators(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     /// The magazine, laid out: the LEAD, then feature cards ("Top Stories"),
@@ -935,7 +952,7 @@ struct NewsView: View {
                 .foregroundStyle(NewsStyle.inkSecondary)
                 .multilineTextAlignment(.center)
             Button {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             } label: {
                 Text("Try again")
                     .font(.system(size: 15, weight: .semibold))

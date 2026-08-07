@@ -779,6 +779,11 @@ struct MusicFlashToast: View {
 
 @MainActor
 final class MusicModel: ObservableObject {
+    /// One instance for the app: the fetched library survives the section
+    /// view being destroyed (iPad/Mac sidebar switches). MusicPlayerView and
+    /// the playlist sheets receive this same instance via @ObservedObject.
+    static let shared = MusicModel()
+
     @Published var snapshot = MusicLibrarySnapshot()
     @Published var loading = false
     @Published var errorText = ""
@@ -821,6 +826,9 @@ final class MusicModel: ObservableObject {
     let provider: MusicProvider
     private var retryWatch: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh.
+    private let fresh = Freshness(ttl: 120)
 
     init(provider: MusicProvider = SpotifyMusicProvider()) {
         self.provider = provider
@@ -835,7 +843,10 @@ final class MusicModel: ObservableObject {
         playerState?.track != nil && playerState?.device != nil
     }
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with a library already on screen, a re-appearance
+        // within the TTL is a no-op. An empty library always fetches.
+        if !isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             snapshot = MusicLibrarySnapshot()
             errorText = "Locked — unlock Scarlet to see your music."
@@ -846,6 +857,7 @@ final class MusicModel: ObservableObject {
         defer { loading = false }
         do {
             snapshot = try await provider.fetchLibrary()
+            fresh.markFetched()
             // Proactively surface the calm "Open Spotify" card whenever nothing
             // can actually play — but only when the library otherwise loaded
             // (connected, has content). Don't trip it on an empty/not-connected
@@ -1138,7 +1150,7 @@ final class MusicModel: ObservableObject {
 // MARK: - View (the Music page)
 
 struct MusicView: View {
-    @StateObject private var model = MusicModel()
+    @ObservedObject private var model = MusicModel.shared
     @EnvironmentObject private var convo: Conversation
 
     /// The pushed playlist (navigationDestination — Catalyst-safe, sidebar
@@ -1191,7 +1203,7 @@ struct MusicView: View {
             }
         }
         .refreshable {
-            await model.load()
+            await model.load(force: true)
             await model.refreshState()
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -1874,7 +1886,7 @@ struct MusicView: View {
                 .font(.scarletBody)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Try Again") { Task { await model.load() } }
+            Button("Try Again") { Task { await model.load(force: true) } }
                 .buttonStyle(.borderedProminent)
                 .tint(scarletRose)
         }
@@ -1895,7 +1907,7 @@ struct MusicView: View {
                 .font(.scarletBody)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Refresh") { Task { await model.load() } }
+            Button("Refresh") { Task { await model.load(force: true) } }
                 .buttonStyle(.bordered)
                 .tint(scarletRose)
         }

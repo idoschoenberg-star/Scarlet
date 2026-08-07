@@ -128,6 +128,9 @@ enum RmFormat {
 
 @MainActor
 final class RemarkableModel: ObservableObject {
+    /// One instance for the app: the fetched listing survives the section
+    /// view being destroyed (iPad/Mac sidebar switches).
+    static let shared = RemarkableModel()
 
     enum Phase { case loading, loaded, empty, error, notConnected }
 
@@ -142,6 +145,10 @@ final class RemarkableModel: ObservableObject {
     @Published var connectError = ""
 
     private var rawRoot: [[String: Any]] = []   // cached root listing (raw)
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Folder navigation clears `items`, so it
+    /// always fetches; only same-folder re-appearances are gated.
+    private let fresh = Freshness(ttl: 120)
 
     var currentFolderId: String { folderStack.last?.id ?? "" }
 
@@ -180,7 +187,10 @@ final class RemarkableModel: ObservableObject {
 
     /// Fetch the current folder's listing. A failed refresh keeps whatever's
     /// already on screen rather than blanking it.
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with a listing already on screen, a re-appearance
+        // within the TTL is a no-op. An empty listing always fetches.
+        if !items.isEmpty, !fresh.shouldFetch(force: force) { return }
         if items.isEmpty { phase = .loading }
         errorText = ""
         let folderId = currentFolderId
@@ -201,6 +211,7 @@ final class RemarkableModel: ObservableObject {
             let parsed = raw.compactMap { Self.item(from: $0) }.sorted(by: Self.order)
             items = parsed
             phase = parsed.isEmpty ? .empty : .loaded
+            fresh.markFetched()
             if folderId.isEmpty {
                 rawRoot = raw
                 saveCache()
@@ -232,7 +243,7 @@ final class RemarkableModel: ObservableObject {
                 folderStack = []
                 items = []
                 phase = .loading
-                await load()
+                await load(force: true)
             } else {
                 connectError = (obj["error"] as? String) ?? "That code didn't work — grab a fresh one and try again."
             }
@@ -322,7 +333,7 @@ final class RemarkableModel: ObservableObject {
 // =============================================================================
 
 struct RemarkableView: View {
-    @StateObject private var model = RemarkableModel()
+    @ObservedObject private var model = RemarkableModel.shared
 
     /// The document being read — drives a PUSH into the detail column (never a
     /// window-covering sheet), consistent with News/Notes.
@@ -397,7 +408,7 @@ struct RemarkableView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Spacer()
-                Button { Task { await model.load() } } label: {
+                Button { Task { await model.load(force: true) } } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(RmTheme.accent)
@@ -472,7 +483,7 @@ struct RemarkableView: View {
         }
         .listStyle(.insetGrouped)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     private func open(_ item: RmItem) {
@@ -520,7 +531,7 @@ struct RemarkableView: View {
                 .font(.scarletBody)
                 .foregroundStyle(ScarletTheme.textSecondary)
                 .multilineTextAlignment(.center)
-            Button { Task { await model.load() } } label: {
+            Button { Task { await model.load(force: true) } } label: {
                 Text("Try again")
                     .font(.scarletBodyEmph)
                     .foregroundStyle(.white)

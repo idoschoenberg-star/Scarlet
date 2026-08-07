@@ -169,6 +169,9 @@ enum ClipMetaCache {
 
 @MainActor
 final class VideoModel: ObservableObject {
+    /// One instance for the app: the fetched clip library survives the
+    /// section view being destroyed (iPad/Mac sidebar switches).
+    static let shared = VideoModel()
 
     /// One clip, as `op=clips` returns it.
     struct Clip: Identifiable, Equatable {
@@ -227,10 +230,17 @@ final class VideoModel: ObservableObject {
     private var autoOfflineRemaining = 0
     private var pollTask: Task<Void, Never>?
     private var rulesPollTask: Task<Void, Never>?
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh and the
+    /// arrival polls.
+    private let fresh = Freshness(ttl: 120)
 
     // MARK: load
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with clips already on screen, a re-appearance
+        // within the TTL is a no-op. An empty library always fetches.
+        if !clips.isEmpty, !fresh.shouldFetch(force: force) { return }
         if clips.isEmpty { loading = true }
         defer { loading = false }
         do {
@@ -241,6 +251,7 @@ final class VideoModel: ObservableObject {
             clips = parsed
             errorText = ""
             networkDown = false
+            fresh.markFetched()
             // Keep the offline metadata cache warm for anything already saved.
             for c in parsed where ClipStore.isOffline(c.id) { ClipMetaCache.put(c) }
         } catch {
@@ -299,17 +310,17 @@ final class VideoModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 5_000_000_000)
             if Task.isCancelled { break }
             elapsed += 5
-            await load()
-            let fresh = clips.filter { !known.contains($0.id) }
-            for c in fresh where c.url != nil && !ClipStore.isOffline(c.id) {
+            await load(force: true)
+            let freshClips = clips.filter { !known.contains($0.id) }
+            for c in freshClips where c.url != nil && !ClipStore.isOffline(c.id) {
                 if autoOfflineRemaining <= 0 { break }
                 autoOfflineRemaining -= 1
                 await saveOffline(c)
             }
-            if !fresh.isEmpty {
-                fetchNote = "Downloaded \(fresh.count) new clip\(fresh.count == 1 ? "" : "s")…"
+            if !freshClips.isEmpty {
+                fetchNote = "Downloaded \(freshClips.count) new clip\(freshClips.count == 1 ? "" : "s")…"
             }
-            if fresh.count >= want { break }
+            if freshClips.count >= want { break }
         }
         fetching = false
         fetchNote = ""
@@ -386,7 +397,7 @@ final class VideoModel: ObservableObject {
                 try Self.ensureOK(data, fallback: "The server couldn't remove that fetch.")
                 rules.removeAll { $0.id == rule.id }
                 rulesError = ""
-                if deleteClips { await load() }
+                if deleteClips { await load(force: true) }
                 restartRulesPollIfNeeded()
             } catch {
                 rulesError = Self.honestMessage(error, fallback: "Couldn't remove that fetch.")
@@ -427,7 +438,7 @@ final class VideoModel: ObservableObject {
                     lastReady = ready
                     lastProgress = Date()
                     self.macStallNote = ""
-                    await self.load()   // fresh clips have landed — show them
+                    await self.load(force: true)   // fresh clips have landed — show them
                 }
                 guard updated.contains(where: { $0.enabled && $0.pendingCount > 0 }) else {
                     self.macStallNote = ""
@@ -609,7 +620,7 @@ struct ClipAPIError: LocalizedError {
 // MARK: - View
 
 struct VideoView: View {
-    @StateObject private var model = VideoModel()
+    @ObservedObject private var model = VideoModel.shared
     @EnvironmentObject private var convo: Conversation
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
@@ -1080,7 +1091,7 @@ struct VideoView: View {
                 .foregroundStyle(.white.opacity(0.55))
             Spacer()
             Button {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 15, weight: .semibold))

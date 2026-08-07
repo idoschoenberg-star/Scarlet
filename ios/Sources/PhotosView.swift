@@ -45,6 +45,12 @@ import UIKit
 
 @MainActor
 final class PhotosModel: ObservableObject {
+    /// One instance for the app: the fetched assets and the warm thumbnail
+    /// cache survive the section view being destroyed (iPad/Mac sidebar
+    /// switches). No freshness gate — the source is the local photo library,
+    /// not the network, and `requestAndLoad` re-syncs authorization too.
+    static let shared = PhotosModel()
+
     /// Authorization outcome that drives which state the screen shows.
     enum Access: Equatable {
         case unknown      // haven't asked yet
@@ -262,7 +268,7 @@ final class ChromeTimer: ObservableObject {
 // MARK: - Photos page (grid)
 
 struct PhotosView: View {
-    @StateObject private var model = PhotosModel()
+    @ObservedObject private var model = PhotosModel.shared
     @EnvironmentObject private var convo: Conversation
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)

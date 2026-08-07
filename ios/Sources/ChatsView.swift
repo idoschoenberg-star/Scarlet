@@ -445,6 +445,10 @@ final class ChatsDiskCache: @unchecked Sendable {
 
 @MainActor
 final class ChatListModel: ObservableObject {
+    /// One instance for the app: the fetched chat lists survive the section
+    /// view being destroyed (iPad/Mac sidebar switches).
+    static let shared = ChatListModel()
+
     @Published var channel: ChatChannel = .teams
     @Published var chats: [ChatSummary] = []
     @Published var loading = false
@@ -456,6 +460,9 @@ final class ChatListModel: ObservableObject {
     /// Monotonic load token: a slow fetch landing after a channel switch is
     /// dropped (same discipline as InboxModel).
     private var loadGeneration = 0
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh / channel swaps.
+    private let fresh = Freshness(ttl: 30)
 
     /// Instant paint: the default channel's cached rows load synchronously
     /// before the first body evaluation; the network refresh reconciles.
@@ -480,10 +487,14 @@ final class ChatListModel: ObservableObject {
             chats = []
             updatedAt = nil
         }
-        Task { await load() }
+        // Forced: the freshness stamp tracks the other channel's fetch.
+        Task { await load(force: true) }
     }
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with rows already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !chats.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             chats = []
             errorText = "Locked — unlock Scarlet to see your chats."
@@ -503,6 +514,7 @@ final class ChatListModel: ObservableObject {
             withAnimation(.snappy) { chats = fetched }
             updatedAt = Date()
             ChatsDiskCache.shared.storeList(want, chats: fetched)
+            fresh.markFetched()
         } catch {
             guard generation == loadGeneration, want == channel else { return }
             errorText = "Couldn't reach \(want.displayName) — check your connection."
@@ -802,7 +814,7 @@ struct ChatAvatarView: View {
 // MARK: - Chats hub (list level)
 
 struct ChatsView: View {
-    @StateObject private var model = ChatListModel()
+    @ObservedObject private var model = ChatListModel.shared
     @EnvironmentObject private var convo: Conversation
 
     var body: some View {
@@ -842,7 +854,7 @@ struct ChatsView: View {
             Spacer()
             updatedStamp
             Button {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 20, weight: .medium))
@@ -923,7 +935,7 @@ struct ChatsView: View {
                 Text(model.errorText)
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.load() } }
+                Button("Try again") { Task { await model.load(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(model.channel.accent)
             }
@@ -967,7 +979,7 @@ struct ChatsView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 }
 

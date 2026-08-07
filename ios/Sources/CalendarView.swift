@@ -225,13 +225,24 @@ final class CalendarModel: ObservableObject {
     /// One load at a time; pull-to-refresh during a `.task` load is a no-op.
     private var inFlight = false
 
+    /// One instance for the app: the fetched agenda survives the section view
+    /// being destroyed (iPad/Mac sidebar switches).
+    static let shared = CalendarModel()
+
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh and mutations.
+    private let fresh = Freshness(ttl: 60)
+
     /// Local-first: paint from the cache synchronously, before any network.
     init() {
         loadCache()
     }
 
     /// One `cal_range` call: 7 days back through 21 days forward (≤42 days).
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with an agenda already on screen, a re-appearance
+        // within the TTL is a no-op. An empty agenda always fetches.
+        if !days.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard !inFlight else { return }
         guard TokenStore.token != nil else {
             days = []
@@ -262,6 +273,7 @@ final class CalendarModel: ObservableObject {
                 rebuild(Self.parseEvents(raws))
             }
             saveCache()
+            fresh.markFetched()
         } catch {
             errorText = "Couldn't reach the calendar — check your connection."
         }
@@ -432,7 +444,7 @@ final class CalendarModel: ObservableObject {
             eventDayKeys = Set(days.filter { !$0.events.isEmpty }.map { $0.id })
             rawEvents.removeAll { ($0["id"] as? String) == id }
             saveCache()
-            Task { await self.load() }
+            Task { await self.load(force: true) }
             return true
         } catch {
             return false
@@ -464,7 +476,7 @@ final class CalendarModel: ObservableObject {
 // MARK: - Calendar page
 
 struct CalendarView: View {
-    @StateObject private var model = CalendarModel()
+    @ObservedObject private var model = CalendarModel.shared
     @EnvironmentObject private var convo: Conversation
 
     @State private var selectedDay = CalDates.cal.startOfDay(for: Date())
@@ -748,7 +760,7 @@ struct CalendarView: View {
                 Text(model.errorText)
                     .font(.scarletBody).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.load() } }
+                Button("Try again") { Task { await model.load(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(CalStyle.accent)
             }
@@ -789,7 +801,7 @@ struct CalendarView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     /// "TODAY · FRIDAY, AUGUST 1" — Outlook's small-caps gray day header.

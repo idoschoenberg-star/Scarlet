@@ -126,6 +126,10 @@ enum RemDates {
 
 @MainActor
 final class RemindersModel: ObservableObject {
+    /// One instance for the app: the fetched list survives the section view
+    /// being destroyed (iPad/Mac sidebar switches).
+    static let shared = RemindersModel()
+
     @Published var reminders: [RemItem] = []
     @Published var loading = false
     @Published var errorText = ""
@@ -136,15 +140,33 @@ final class RemindersModel: ObservableObject {
     @Published var highlightId: String?
     @Published var updatedAt: Date?
 
+    /// Honest Mac-bridge sync state, straight from the server. The list comes
+    /// through the home Mac's sync agent — the app's own fetch time says
+    /// nothing about how fresh the DATA is when that Mac is offline.
+    /// `macStaleMinutes`: minutes since the Mac agent last checked in
+    /// (nil = never, or an old server that doesn't send the field).
+    @Published var macStaleMinutes: Int?
+    /// True when the Mac agent checked in within the last ~5 minutes.
+    @Published var macOnline = false
+    /// The server actually sent the sync-state fields (old servers don't —
+    /// the header falls back to the app-fetch stamp then).
+    @Published var macFieldsPresent = false
+
     private var rawReminders: [[String: Any]] = []
     /// Monotonic load token: a slow fetch landing after a newer one is dropped.
     private var loadGeneration = 0
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh and mutations.
+    private let fresh = Freshness(ttl: 60)
 
     init() { loadCache() }
 
     // MARK: read
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with rows already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !reminders.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             errorText = "Locked — unlock Scarlet to see your reminders."
             return
@@ -165,7 +187,14 @@ final class RemindersModel: ObservableObject {
             reminders = Self.parse(raw)
             updatedAt = Date()
             errorText = ""
+            // Mac-bridge sync state (optional — old servers omit both fields).
+            let staleField = obj["mac_stale_minutes"]
+            let onlineField = obj["mac_online"]
+            macFieldsPresent = (staleField != nil) || (onlineField != nil)
+            macStaleMinutes = Self.optionalInt(staleField)
+            macOnline = (onlineField as? Bool) ?? false
             saveCache()
+            fresh.markFetched()
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach your reminders — check your connection."
@@ -242,7 +271,7 @@ final class RemindersModel: ObservableObject {
                     let serverError = (obj?["error"] as? String) ?? ""
                     throw RemError.rejected(serverError)
                 }
-                await self.load()
+                await self.load(force: true)
             } catch {
                 withAnimation(.snappy(duration: 0.2)) {
                     self.reminders.removeAll { $0.id == localId }
@@ -331,6 +360,14 @@ final class RemindersModel: ObservableObject {
         return 0
     }
 
+    /// Like `intValue`, but honest about absence: nil / NSNull / junk → nil.
+    private static func optionalInt(_ v: Any?) -> Int? {
+        if let i = v as? Int { return i }
+        if let d = v as? Double { return Int(d) }
+        if let s = v as? String { return Int(s) }
+        return nil
+    }
+
     // MARK: cache — Documents/reminders-cache.json
 
     static var cacheURL: URL {
@@ -384,7 +421,7 @@ final class RemindersModel: ObservableObject {
 // MARK: - Page
 
 struct RemindersView: View {
-    @StateObject private var model = RemindersModel()
+    @ObservedObject private var model = RemindersModel.shared
     @EnvironmentObject var convo: Conversation
 
     @State private var quickAdd = ""
@@ -426,7 +463,7 @@ struct RemindersView: View {
             }
             .reportsModalPresence(activeSheet != nil)
             .sheet(item: $activeSheet, onDismiss: {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             }) { sheet in
                 switch sheet {
                 case .addWithDate(let title):
@@ -462,22 +499,56 @@ struct RemindersView: View {
                     .font(.system(size: 34, weight: .bold))
                     .foregroundStyle(.white)
                 Spacer()
-                Button { Task { await model.load() } } label: {
+                Button { Task { await model.load(force: true) } } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 20, weight: .medium))
                         .foregroundStyle(RemUI.blue)
                 }
                 .disabled(model.loading)
             }
-            if let stamp = model.updatedAt {
-                Text(RemDates.updatedStamp(stamp))
-                    .font(.system(size: 12))
-                    .foregroundStyle(RemUI.gray)
-            }
+            syncStatusLine
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 8)
+    }
+
+    /// HONEST freshness line. The list flows through the home Mac's sync
+    /// agent, so the app's own fetch time can lie ("updated just now" over
+    /// days-old data). When the server reports the bridge state, show THAT;
+    /// only old servers fall back to the app-fetch stamp.
+    @ViewBuilder
+    private var syncStatusLine: some View {
+        if model.macFieldsPresent {
+            if model.macOnline {
+                Text("Synced with Apple · just now")
+                    .font(.system(size: 12))
+                    .foregroundStyle(RemUI.gray)
+            } else if let m = model.macStaleMinutes {
+                if m > 5 {
+                    Text("⚠️ Mac bridge offline — list may be outdated (last sync \(Self.staleAge(m)) ago)")
+                        .font(.system(size: 12))
+                        .foregroundStyle(RemUI.orange)
+                } else {
+                    Text("Synced with Apple · \(Self.staleAge(m)) ago")
+                        .font(.system(size: 12))
+                        .foregroundStyle(RemUI.gray)
+                }
+            } else {
+                Text("⚠️ Mac bridge has never synced")
+                    .font(.system(size: 12))
+                    .foregroundStyle(RemUI.orange)
+            }
+        } else if let stamp = model.updatedAt {
+            Text(RemDates.updatedStamp(stamp))
+                .font(.system(size: 12))
+                .foregroundStyle(RemUI.gray)
+        }
+    }
+
+    /// "45m" under two hours, "3h" beyond.
+    private static func staleAge(_ minutes: Int) -> String {
+        minutes < 120 ? "\(max(minutes, 0))m" : "\(minutes / 60)h"
     }
 
     // MARK: content
@@ -566,7 +637,7 @@ struct RemindersView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     // MARK: quick-add
@@ -676,7 +747,7 @@ struct RemindersView: View {
             Text(message)
                 .font(.system(size: 17)).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Try again") { Task { await model.load() } }
+            Button("Try again") { Task { await model.load(force: true) } }
                 .buttonStyle(.bordered)
                 .tint(RemUI.blue)
         }

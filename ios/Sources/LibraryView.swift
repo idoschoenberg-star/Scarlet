@@ -103,6 +103,10 @@ struct LibraryItem: Identifiable {
 
 @MainActor
 final class LibraryModel: ObservableObject {
+    /// One instance for the app: the fetched shelves survive the section view
+    /// being destroyed (iPad/Mac sidebar switches).
+    static let shared = LibraryModel()
+
     @Published var shelf: LibraryShelf = .library
     @Published var items: [LibraryItem] = []
     @Published var loading = false
@@ -114,6 +118,9 @@ final class LibraryModel: ObservableObject {
     /// Monotonic load token: a slow fetch landing after a shelf switch is
     /// dropped (same discipline as InboxModel / ChatListModel).
     private var loadGeneration = 0
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh and mutations.
+    private let fresh = Freshness(ttl: 60)
 
     /// Segment tap: swap the shelf and refetch. The old shelf's rows clear
     /// right away so a slow network never shows Library rows under
@@ -126,7 +133,10 @@ final class LibraryModel: ObservableObject {
         Task { await load() }
     }
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with rows already on screen, a re-appearance within
+        // the TTL is a no-op. An empty shelf always fetches.
+        if !items.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             items = []
             errorText = "Locked — unlock Scarlet to see your Library."
@@ -148,6 +158,7 @@ final class LibraryModel: ObservableObject {
             guard generation == loadGeneration, want == shelf else { return }
             items = fetched
             loadStamp += 1
+            fresh.markFetched()
         } catch {
             guard generation == loadGeneration, want == shelf else { return }
             errorText = "Couldn't reach the Library — check your connection."
@@ -173,7 +184,7 @@ final class LibraryModel: ObservableObject {
                 errorText = archived
                     ? "Couldn't archive \"\(item.title)\" — refreshed the shelf."
                     : "Couldn't restore \"\(item.title)\" — refreshed the shelf."
-                await load()
+                await load(force: true)
             }
         }
     }
@@ -194,7 +205,7 @@ final class LibraryModel: ObservableObject {
                 }
             } catch {
                 errorText = "Couldn't delete \"\(item.title)\" — refreshed the shelf."
-                await load()
+                await load(force: true)
             }
         }
     }
@@ -248,7 +259,7 @@ final class LibraryModel: ObservableObject {
 // MARK: - Library page
 
 struct LibraryView: View {
-    @StateObject private var model = LibraryModel()
+    @ObservedObject private var model = LibraryModel.shared
     @EnvironmentObject private var convo: Conversation
 
     /// ONE presentation driver for every viewer. The photo, video/audio, and
@@ -386,7 +397,7 @@ struct LibraryView: View {
                 .foregroundStyle(.white)
             Spacer()
             Button {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 20, weight: .medium))
@@ -456,7 +467,7 @@ struct LibraryView: View {
                 Text(model.errorText)
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.load() } }
+                Button("Try again") { Task { await model.load(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(scarletRose)
             }
@@ -506,7 +517,7 @@ struct LibraryView: View {
         }
         .listStyle(.plain)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     @ViewBuilder

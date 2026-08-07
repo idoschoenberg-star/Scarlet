@@ -70,6 +70,10 @@ enum NotesDates {
 
 @MainActor
 final class NotesModel: ObservableObject {
+    /// One instance for the app: the fetched notes survive the section view
+    /// being destroyed (iPad/Mac sidebar switches).
+    static let shared = NotesModel()
+
     @Published var notes: [NoteItem] = []
     /// The Mac agent answered queued/error — the home Mac is asleep. Cached
     /// notes (if any) keep rendering under an asleep banner.
@@ -80,10 +84,16 @@ final class NotesModel: ObservableObject {
 
     private var rawNotes: [[String: Any]] = []
     private var loadGeneration = 0
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh.
+    private let fresh = Freshness(ttl: 60)
 
     init() { loadCache() }
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with notes already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !notes.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             errorText = "Locked — unlock Scarlet to see your notes."
             return
@@ -104,6 +114,7 @@ final class NotesModel: ObservableObject {
                 updatedAt = Date()
                 errorText = ""
                 saveCache()
+                fresh.markFetched()
             } else {
                 // queued / error / unrecognized → the home Mac is asleep.
                 macAsleep = true
@@ -213,7 +224,7 @@ final class NotesModel: ObservableObject {
 // MARK: - Page
 
 struct NotesView: View {
-    @StateObject private var model = NotesModel()
+    @ObservedObject private var model = NotesModel.shared
     @EnvironmentObject var convo: Conversation
 
     /// The note being read — drives a PUSH into the detail column (not a
@@ -253,12 +264,12 @@ struct NotesView: View {
             .onChange(of: reading) { _, newValue in
                 if newValue == nil {
                     restoreBrowsingFocus()
-                    Task { await model.load() }
+                    Task { await model.load(force: true) }
                 }
             }
             // The new-note drafting window — the single `.sheet`.
             .sheet(item: $draftSeed, onDismiss: {
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             }) { seed in
                 DraftView(seed: nil, channelSeed: seed)
                     .environmentObject(convo)
@@ -282,7 +293,7 @@ struct NotesView: View {
                     .foregroundStyle(.white)
                 Spacer()
                 newNoteButton
-                Button { Task { await model.load() } } label: {
+                Button { Task { await model.load(force: true) } } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 20, weight: .medium))
                         .foregroundStyle(NotesUI.yellow)
@@ -333,7 +344,7 @@ struct NotesView: View {
                 Text("Your home Mac is asleep — notes will load when it wakes.")
                     .font(.system(size: 17)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.load() } }
+                Button("Try again") { Task { await model.load(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(NotesUI.yellow)
             }
@@ -378,7 +389,7 @@ struct NotesView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.load() }
+        .refreshable { await model.load(force: true) }
     }
 
     // MARK: shared bits
@@ -398,7 +409,7 @@ struct NotesView: View {
             Text(message)
                 .font(.system(size: 17)).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Try again") { Task { await model.load() } }
+            Button("Try again") { Task { await model.load(force: true) } }
                 .buttonStyle(.bordered)
                 .tint(NotesUI.yellow)
         }

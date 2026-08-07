@@ -218,6 +218,10 @@ enum DeskDates {
 
 @MainActor
 final class DeskModel: ObservableObject {
+    /// One instance for the app: the fetched Desk lists survive the section
+    /// view being destroyed (iPad/Mac sidebar switches).
+    static let shared = DeskModel()
+
     @Published var leaf: DeskLeaf = .reminders
     @Published var reminders: [DeskReminder] = []
     @Published var notes: [DeskNote] = []
@@ -243,6 +247,11 @@ final class DeskModel: ObservableObject {
     /// Monotonic load token: a slow fetch landing after a segment switch is
     /// dropped (LibraryModel / InboxModel discipline).
     private var loadGeneration = 0
+    /// Per-leaf staleness gates: re-appearing within the TTL paints what's
+    /// already loaded instead of refetching. Forced by pull-to-refresh and
+    /// after mutations.
+    private let freshReminders = Freshness(ttl: 30)
+    private let freshNotes = Freshness(ttl: 30)
 
     init() {
         loadCache()
@@ -264,16 +273,19 @@ final class DeskModel: ObservableObject {
         Task { await load() }
     }
 
-    func load() async {
+    func load(force: Bool = false) async {
         switch leaf {
-        case .reminders: await loadReminders()
-        case .notes: await loadNotes()
+        case .reminders: await loadReminders(force: force)
+        case .notes: await loadNotes(force: force)
         }
     }
 
     // MARK: reminders
 
-    func loadReminders() async {
+    func loadReminders(force: Bool = false) async {
+        // Freshness gate: with rows already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !reminders.isEmpty, !freshReminders.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             errorText = "Locked — unlock Scarlet to see your Desk."
             return
@@ -295,6 +307,7 @@ final class DeskModel: ObservableObject {
             remindersUpdated = Date()
             errorText = ""
             saveCache()
+            freshReminders.markFetched()
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach your reminders — check your connection."
@@ -374,7 +387,7 @@ final class DeskModel: ObservableObject {
                 }
                 // Server confirmed — silent refresh (loadReminders only
                 // spins when the list is empty, so nothing flashes).
-                await self.loadReminders()
+                await self.loadReminders(force: true)
             } catch {
                 withAnimation(.snappy(duration: 0.2)) {
                     self.reminders.removeAll { $0.id == localId }
@@ -488,7 +501,10 @@ final class DeskModel: ObservableObject {
 
     // MARK: notes
 
-    func loadNotes() async {
+    func loadNotes(force: Bool = false) async {
+        // Freshness gate: with notes already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !notes.isEmpty, !freshNotes.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             errorText = "Locked — unlock Scarlet to see your Desk."
             return
@@ -509,6 +525,7 @@ final class DeskModel: ObservableObject {
                 notesUpdated = Date()
                 errorText = ""
                 saveCache()
+                freshNotes.markFetched()
             } else {
                 // queued / error / unrecognized → the home Mac is asleep.
                 macAsleep = true
@@ -671,7 +688,7 @@ final class DeskModel: ObservableObject {
 // MARK: - Desk page
 
 struct DeskView: View {
-    @StateObject private var model = DeskModel()
+    @ObservedObject private var model = DeskModel.shared
     @EnvironmentObject var convo: Conversation
 
     @State private var quickAdd = ""
@@ -752,7 +769,7 @@ struct DeskView: View {
                 set: { if !$0 {
                     restoreBrowsingFocus()
                     activeSheet = nil
-                    Task { await model.load() }
+                    Task { await model.load(force: true) }
                 } }
             )) {
                 if case .note(let note) = activeSheet {
@@ -776,7 +793,7 @@ struct DeskView: View {
                 }
             ), onDismiss: {
                 restoreBrowsingFocus()
-                Task { await model.load() }
+                Task { await model.load(force: true) }
             }) { sheet in
                 if case .draft(let seed) = sheet {
                     DraftView(seed: nil, channelSeed: seed)
@@ -810,7 +827,7 @@ struct DeskView: View {
                     newNoteButton
                 }
                 Button {
-                    Task { await model.load() }
+                    Task { await model.load(force: true) }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 20, weight: .medium))
@@ -1028,7 +1045,7 @@ struct DeskView: View {
         // The Reorder header toggle drives edit mode directly (no
         // EditButton) — iOS 17's List shows the drag handles when active.
         .environment(\.editMode, $remindersEditMode)
-        .refreshable { await model.loadReminders() }
+        .refreshable { await model.loadReminders(force: true) }
     }
 
     // MARK: quick-add — Reminders' "＋ New Reminder" affordance, pinned
@@ -1143,7 +1160,7 @@ struct DeskView: View {
                 Text("Your home Mac is asleep — notes will load when it wakes.")
                     .font(.callout).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.loadNotes() } }
+                Button("Try again") { Task { await model.loadNotes(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(DeskUI.yellow)
             }
@@ -1194,7 +1211,7 @@ struct DeskView: View {
         .listStyle(.insetGrouped)
         .listSectionSpacing(18)
         .scrollContentBackground(.hidden)
-        .refreshable { await model.loadNotes() }
+        .refreshable { await model.loadNotes(force: true) }
     }
 
     // MARK: shared bits
@@ -1214,7 +1231,7 @@ struct DeskView: View {
             Text(message)
                 .font(.callout).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Try again") { Task { await model.load() } }
+            Button("Try again") { Task { await model.load(force: true) } }
                 .buttonStyle(.bordered)
                 .tint(leafAccent)
         }

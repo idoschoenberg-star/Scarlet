@@ -186,6 +186,10 @@ private struct InboxCache: Codable {
 
 @MainActor
 final class InboxModel: ObservableObject {
+    /// One instance for the app: the fetched inbox survives the section view
+    /// being destroyed (iPad/Mac sidebar switches), so returning is instant.
+    static let shared = InboxModel()
+
     @Published var messages: [MailMessage] = []
     @Published var loading = false
     @Published var errorText = ""
@@ -210,6 +214,9 @@ final class InboxModel: ObservableObject {
     private var loadGeneration = 0
     /// In-memory copy of the disk mirror; every mutation re-persists it.
     private var cache: InboxCache
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh / tab swaps.
+    private let fresh = Freshness(ttl: 30)
 
     /// Local-first: the last snapshot paints synchronously, before the first
     /// network byte, so opening the tab never shows a spinner over history.
@@ -228,7 +235,8 @@ final class InboxModel: ObservableObject {
             messages = localized(cache.rows(for: newTab).map { $0.asMessage })
         }
         lastUpdated = cache.stamp(for: newTab)
-        Task { await load() }
+        // Forced: the freshness stamp tracks the other tab's fetch.
+        Task { await load(force: true) }
     }
 
     /// Cached rows re-filtered through local state: pending archives stay
@@ -243,7 +251,10 @@ final class InboxModel: ObservableObject {
         return out
     }
 
-    func load() async {
+    func load(force: Bool = false) async {
+        // Freshness gate: with rows already on screen, a re-appearance within
+        // the TTL is a no-op. An empty list always fetches.
+        if !messages.isEmpty, !fresh.shouldFetch(force: force) { return }
         guard TokenStore.token != nil else {
             messages = []
             errorText = "Locked — unlock Scarlet to see the inbox."
@@ -307,6 +318,7 @@ final class InboxModel: ObservableObject {
             cache.set(rows: fetched, stamp: Date(), for: tab)
             lastUpdated = cache.stamp(for: tab)
             persistCache()
+            fresh.markFetched()
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach the inbox — check your connection."
@@ -601,7 +613,7 @@ struct SenderAvatar: View {
 // MARK: - Inbox list
 
 struct InboxView: View {
-    @StateObject private var model = InboxModel()
+    @ObservedObject private var model = InboxModel.shared
     @EnvironmentObject private var convo: Conversation
     @State private var showCompose = false
 
@@ -752,7 +764,7 @@ struct InboxView: View {
                 Text(model.errorText)
                     .font(.scarletBody).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.load() } }
+                Button("Try again") { Task { await model.load(force: true) } }
                     .buttonStyle(.bordered)
                     .tint(OutlookStyle.accentBlue)
             }
@@ -838,7 +850,7 @@ struct InboxView: View {
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
-            .refreshable { await model.load() }
+            .refreshable { await model.load(force: true) }
         }
     }
 
@@ -1155,7 +1167,7 @@ struct MailDetailView: View {
             failed = true
             // The id rotated because the mail moved/was archived elsewhere —
             // refresh the list so the stale row (and its dead id) disappears.
-            if e.moved { await model.load() }
+            if e.moved { await model.load(force: true) }
         } catch {
             failureText = ""
             failed = true

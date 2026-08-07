@@ -36,6 +36,9 @@ private enum AmwellStyle {
 
 @MainActor
 final class AmwellModel: ObservableObject {
+    /// One instance for the app: the fetched quote/intel survive the section
+    /// view being destroyed (iPad/Mac sidebar switches).
+    static let shared = AmwellModel()
 
     /// One point on the price series. `t` is epoch-millis (backend sends ms).
     struct ChartPoint: Identifiable {
@@ -103,7 +106,14 @@ final class AmwellModel: ObservableObject {
     /// screen so a transient failure never blanks the page.
     var hasAnyData: Bool { quote != nil || intel != nil }
 
-    func load() async {
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh.
+    private let fresh = Freshness(ttl: 120)
+
+    func load(force: Bool = false) async {
+        // Freshness gate: with data already on screen, a re-appearance within
+        // the TTL is a no-op. An empty page always fetches.
+        if hasAnyData, !fresh.shouldFetch(force: force) { return }
         if quoteState != .ready { quoteState = .loading }
         if intelState != .ready { intelState = .loading }
         // Fetch both concurrently; a failure in one must not sink the other.
@@ -118,6 +128,7 @@ final class AmwellModel: ObservableObject {
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             quote = Self.parseQuote(obj)
             quoteState = .ready
+            fresh.markFetched()
         } catch {
             // Keep any prior quote on screen; only flip to failed on cold start.
             quoteState = (quote == nil) ? .failed : .ready
@@ -130,6 +141,7 @@ final class AmwellModel: ObservableObject {
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
             intel = Self.parseIntel(obj)
             intelState = .ready
+            fresh.markFetched()
         } catch {
             intelState = (intel == nil) ? .failed : .ready
         }
@@ -315,7 +327,7 @@ private enum AmwellFmt {
 // MARK: - View
 
 struct AmwellView: View {
-    @StateObject private var model = AmwellModel()
+    @ObservedObject private var model = AmwellModel.shared
 
     var body: some View {
         NavigationStack {
@@ -335,7 +347,7 @@ struct AmwellView: View {
             .scarletScreen()   // shared near-black ink ground; up/down/teal stay as accents
             .navigationTitle("Amwell")
             .navigationBarTitleDisplayMode(.inline)
-            .refreshable { await model.load() }
+            .refreshable { await model.load(force: true) }
             .task {
                 if model.quoteState == .idle { await model.load() }
             }

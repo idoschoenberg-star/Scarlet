@@ -352,6 +352,10 @@ private struct FoodPending: Identifiable {
 
 @MainActor
 final class FoodModel: ObservableObject {
+    /// One instance for the app: the fetched nutrition data survives the
+    /// section view being destroyed (iPad/Mac sidebar switches).
+    static let shared = FoodModel()
+
     @Published fileprivate var day: FoodDay?
     @Published fileprivate var week: FoodWeek?
     @Published fileprivate var pending: [FoodPending] = []
@@ -366,12 +370,20 @@ final class FoodModel: ObservableObject {
 
     private var rawDay: [String: Any]?
     private var rawWeek: [String: Any]?
+    /// Staleness gate: re-appearing within the TTL paints what's already
+    /// loaded instead of refetching. Forced by pull-to-refresh.
+    private let fresh = Freshness(ttl: 120)
 
     init() { loadCache() }
 
     // MARK: refresh (local-first: cache already painted in init)
 
-    func refresh() async {
+    func refresh(force: Bool = false) async {
+        // Freshness gate: with data already on screen, a re-appearance within
+        // the TTL is a no-op. An empty model always fetches.
+        if day != nil || week != nil {
+            guard fresh.shouldFetch(force: force) else { return }
+        }
         refreshing = true
         async let d: Void = refreshDay()
         async let w: Void = refreshWeek()
@@ -394,6 +406,7 @@ final class FoodModel: ObservableObject {
             updatedAt = Date()
             dayError = ""
             saveCache()
+            fresh.markFetched()
         } catch {
             if day == nil { dayError = "Couldn't load today's nutrition — check your connection." }
         }
@@ -581,7 +594,7 @@ private enum FoodScope: String, CaseIterable, Identifiable {
 // MARK: - View
 
 struct FoodView: View {
-    @StateObject private var model = FoodModel()
+    @ObservedObject private var model = FoodModel.shared
     @EnvironmentObject var convo: Conversation
 
     @State private var scope: FoodScope = .day
@@ -694,7 +707,7 @@ struct FoodView: View {
                     .foregroundStyle(.white.opacity(0.4))
             }
             Button {
-                Task { await model.refresh() }
+                Task { await model.refresh(force: true) }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 20, weight: .medium))
@@ -721,7 +734,7 @@ struct FoodView: View {
             .animation(.snappy(duration: 0.3), value: scope)
         }
         .scrollIndicators(.hidden)
-        .refreshable { await model.refresh() }
+        .refreshable { await model.refresh(force: true) }
     }
 
     // MARK: DAY
