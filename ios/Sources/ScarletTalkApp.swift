@@ -192,6 +192,9 @@ struct RootView: View {
             FlightRecorder.note(screen: "talk")
             Task { await sections.refresh() }
             Task { await recoverActiveDraft() }
+            // Report the phone's REAL position so "where am I", weather, nearby
+            // and directions are about where Ido actually is — not a stale share.
+            LocationReporter.shared.refresh()
             // Cold-launch "Talk to Scarlet": the intent may have fired before
             // the observer above was listening, so drain the pending flag once.
             if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
@@ -202,6 +205,9 @@ struct RootView: View {
             if phase == .active {
                 Task { await recoverActiveDraft() }
                 Task { await sections.refresh() }
+                // Refresh location on every foreground so a move (travel!) is
+                // reflected before he next asks "where am I".
+                LocationReporter.shared.refresh()
             }
             FlightRecorder.phase("\(phase)")
             // AFTER phase() (which re-arms the unclean-exit flag): background
