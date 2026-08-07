@@ -178,10 +178,18 @@ final class Conversation: ObservableObject {
     // loudspeaker voice at the mic, so what survives above this line during her
     // speech is HIM, not her. A brief click can't trip it: it also has to hold
     // for `bargeSustainBuffers` consecutive tap callbacks (~200 ms).
-    private static let speakOnLevel: Float = 0.14
-    private static let speakOffLevel: Float = 0.07
-    private static let bargeLevel: Float = 0.5
-    private static let bargeSustainBuffers = 5
+    // Retuned for post-AEC audio: with VPIO's echo cancellation + noise
+    // suppression + AGC, his speech is cleanly separable from suppressed
+    // background and her (now-cancelled) voice, so the bars can be far more
+    // sensitive and responsive without false-triggering on noise.
+    private static let speakOnLevel: Float = 0.10
+    private static let speakOffLevel: Float = 0.05
+    // 0.5 (−30 dBFS) demanded a LOUD signal — it only cleared un-cancelled
+    // loudspeaker echo, and buried normal overlap speech. Post-AEC, 0.30
+    // (~−42 dBFS) sits safely above suppressed noise and well below his
+    // AGC-normalized voice → snappy, reliable barge-in.
+    private static let bargeLevel: Float = 0.30
+    private static let bargeSustainBuffers = 3
     /// Consecutive over-threshold tap callbacks while she's speaking. Reset the
     /// instant the level dips or the turn ends, so only sustained speech barges.
     private var bargeRun = 0
@@ -850,6 +858,26 @@ final class Conversation: ObservableObject {
         try startAudioSession()
 
         let input = engine.inputNode
+        // Apple Voice-Processing I/O — hardware ACOUSTIC ECHO CANCELLATION +
+        // NOISE SUPPRESSION + AUTO GAIN. This is the processing FaceTime/Phone
+        // (and OpenAI's app) use; without it the raw mic hears her loudspeaker
+        // voice and room noise, which is why she "sometimes hears, sometimes
+        // doesn't" and falls apart in loud rooms. The whole echo/barge design
+        // below was ALREADY written assuming AEC is on — this is the switch that
+        // finally makes that true. Must be toggled with the engine STOPPED and
+        // BEFORE the input format is read / the graph is connected / the tap is
+        // installed (it reshapes inputNode.outputFormat to VPIO mono and emits a
+        // configuration-change). Idempotent via isVoiceProcessingEnabled so a
+        // rebuild that re-enters here doesn't spin the config-change observer.
+        // It THROWS on routes that can't host VPIO (some Bluetooth HFP / pro
+        // interfaces): on failure we simply keep the raw path — a missing AEC is
+        // a quality regression, never a crash. Re-applied automatically after
+        // recreateAudioNodes() swaps in a fresh engine (its node defaults off).
+        if engine.isRunning { engine.stop() }
+        if !input.isVoiceProcessingEnabled {
+            do { try input.setVoiceProcessingEnabled(true) }
+            catch { /* VPIO unavailable on this route — keep raw capture */ }
+        }
         let inFormat = input.outputFormat(forBus: 0)
         // First-launch / just-granted race: if the input isn't up yet the format
         // comes back as 0 Hz / 0 channels. Building a converter over that yields a
@@ -1048,9 +1076,14 @@ final class Conversation: ObservableObject {
                     self.bargeRun = 0
                 }
 
-                // Half-duplex: her ears open only when her voice isn't in the
-                // room. Kills echo barge-in AND echo phantom turns at the root.
-                guard self.micOn, !self.echoRisk else { return }
+                // FULL-DUPLEX: with real AEC (VPIO) removing her loudspeaker
+                // voice from the mic, we stream continuously — like OpenAI
+                // Realtime — instead of closing his ears while she talks. That
+                // half-duplex gate (and its 0.35s tail) was the root cause of
+                // "she doesn't hear me": his words mid-turn were dropped unless
+                // they crossed a very high barge line. AEC lets the server own
+                // turn-taking honestly. `echoRisk` is kept only for the orb cue.
+                guard self.micOn else { return }
                 self.send(["user_audio_chunk": data.base64EncodedString()])
             }
         }
@@ -1260,9 +1293,11 @@ final class Conversation: ObservableObject {
                 // first buffer's completion used to flip state mid-sentence.
                 self.pendingBuffers = max(0, self.pendingBuffers - 1)
                 if self.pendingBuffers == 0 {
-                    // Short grace so the room's reverb tail can't reach the
-                    // mic as a phantom user turn.
-                    self.speechTailUntil = Date().addingTimeInterval(0.35)
+                    // Tiny grace only. Full-duplex + AEC mean the mic no longer
+                    // carries her reverb tail, so this no longer gates his audio
+                    // (only the orb cue); keep it brief so an eager reply the
+                    // instant she stops isn't visually swallowed.
+                    self.speechTailUntil = Date().addingTimeInterval(0.08)
                     if self.state == .speaking {
                         self.state = .listening
                         if self.micOn { self.status = "Listening…" }
