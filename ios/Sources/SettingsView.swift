@@ -9,6 +9,28 @@ struct VoiceOption: Identifiable {
     let preview: String?
 }
 
+/// The OpenAI Realtime voices the backend allowlists (realtime-session).
+/// Static on purpose: the active engine's voices are fixed by OpenAI, so no
+/// network round-trip is needed to list them.
+struct OpenAIVoice: Identifiable {
+    let id: String
+    let name: String
+    let desc: String?
+}
+
+let openAIVoices: [OpenAIVoice] = [
+    OpenAIVoice(id: "marin",   name: "Marin",   desc: "Default — warm, the ChatGPT-class voice"),
+    OpenAIVoice(id: "cedar",   name: "Cedar",   desc: nil),
+    OpenAIVoice(id: "alloy",   name: "Alloy",   desc: nil),
+    OpenAIVoice(id: "ash",     name: "Ash",     desc: nil),
+    OpenAIVoice(id: "ballad",  name: "Ballad",  desc: nil),
+    OpenAIVoice(id: "coral",   name: "Coral",   desc: nil),
+    OpenAIVoice(id: "echo",    name: "Echo",    desc: nil),
+    OpenAIVoice(id: "sage",    name: "Sage",    desc: nil),
+    OpenAIVoice(id: "shimmer", name: "Shimmer", desc: nil),
+    OpenAIVoice(id: "verse",   name: "Verse",   desc: nil),
+]
+
 @MainActor
 final class SettingsModel: ObservableObject {
     @Published var voices: [VoiceOption] = []
@@ -82,6 +104,9 @@ struct SettingsView: View {
 
     @StateObject private var m = SettingsModel()
     @Environment(\.dismiss) private var dismiss
+    // The voice for the active (OpenAI Realtime) engine. Read by Conversation
+    // when minting the next session; "marin" is the server default.
+    @AppStorage("openaiVoice") private var openaiVoice: String = "marin"
 
     var body: some View {
         NavigationStack {
@@ -107,6 +132,34 @@ struct SettingsView: View {
                     Text("Personalization")
                 } footer: {
                     Text("Your priorities and preferences live here — change them by tapping, typing, or just telling Scarlet.")
+                }
+
+                // The ACTIVE engine's voices — OpenAI Realtime. Selection is
+                // stored locally and sent with the next session mint, matching
+                // the same tap-to-check flow as the section below.
+                Section {
+                    ForEach(openAIVoices) { v in
+                        Button { openaiVoice = v.id } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Text(v.name).fontWeight(.semibold)
+                                    Spacer()
+                                    if v.id == openaiVoice {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .foregroundStyle(Color(red: 1, green: 0.35, blue: 0.42))
+                                    }
+                                }
+                                if let d = v.desc, !d.isEmpty {
+                                    Text(d).font(.scarletDetail).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text("OpenAI voice")
+                } footer: {
+                    Text("Applies from your next session (tap End, then Start).")
                 }
 
                 Section {
@@ -143,9 +196,9 @@ struct SettingsView: View {
                         Text(m.note).font(.scarletDetail).foregroundStyle(.secondary)
                     }
                 } header: {
-                    Text("Scarlet's voice")
+                    Text("ElevenLabs (fallback engine)")
                 } footer: {
-                    Text("Tap play to hear a sample. Changes apply from your next conversation.")
+                    Text("Used only when the fallback engine is active. Tap play to hear a sample; changes apply from your next conversation.")
                 }
 
                 // Microphone: live level meter (ground truth), input-device and

@@ -112,6 +112,14 @@ struct MusicPlaybackDevice: Identifiable, Equatable {
         default: return "hifispeaker.2.fill"
         }
     }
+
+    /// True when the server's "name" is an opaque hex id (some Sonos/AVR
+    /// endpoints register that way) — never worth showing a human raw.
+    var hasOpaqueName: Bool { MusicUI.isOpaqueDeviceName(name) }
+
+    /// Human word for the device kind ("Speaker", "AVR") — the display
+    /// fallback when the name is an opaque hex id.
+    var typeLabel: String { MusicUI.deviceKindLabel(type) }
 }
 
 /// One "up next" row from the live queue.
@@ -617,19 +625,97 @@ enum MusicUI {
         }
         #endif
     }
+
+    /// True when a Spotify Connect device "name" is really an opaque hex id
+    /// (20+ hex chars) — some speakers/AVRs register that way.
+    static func isOpaqueDeviceName(_ name: String) -> Bool {
+        name.range(of: "^[0-9a-fA-F]{20,}$", options: .regularExpression) != nil
+    }
+
+    /// Human word for a Connect device type ("Speaker", "AVR", "TV") — what a
+    /// hex-named device displays as instead of the raw id.
+    static func deviceKindLabel(_ type: String) -> String {
+        switch type.lowercased() {
+        case "computer": return "Computer"
+        case "smartphone": return "Phone"
+        case "tablet": return "Tablet"
+        case "tv", "castvideo": return "TV"
+        case "avr": return "AVR"
+        case "stb": return "Receiver"
+        default: return "Speaker"
+        }
+    }
+
+    /// A human-safe device name for flashes/focus lines: real names pass
+    /// through; opaque hex ids render as the device kind ("Speaker").
+    static func deviceDisplayName(name: String, type: String) -> String {
+        isOpaqueDeviceName(name) ? deviceKindLabel(type) : name
+    }
 }
 
 /// The device picker — the rooms/speakers/computers the account can play to.
-/// Tapping one starts Ido's last pick there (or transfers current audio). Used
-/// inline on the no-device recovery card AND inside the full player's sheet, so
-/// it never violates Catalyst's one-sheet-per-view rule. Pure presentation over
-/// `MusicModel` — no sheet of its own.
+/// The FIRST row is always this very device ("This iPhone" / "This iPad" /
+/// "This Mac") — Ido's standing directive: play-on-this-device leads. When
+/// Spotify is open here it's a normal Connect target; when it isn't, tapping
+/// arms the server's play-when-device-appears retry (deviceless play) and
+/// wakes Spotify so playback starts by itself. Server devices follow, with the
+/// matched this-device row de-duplicated and opaque hex names rendered as
+/// their kind ("Speaker 1"). Used inline on the no-device recovery card AND
+/// inside the full player's sheet, so it never violates Catalyst's
+/// one-sheet-per-view rule. Pure presentation over `MusicModel` — no sheet of
+/// its own.
 struct MusicDeviceChooser: View {
     @ObservedObject var model: MusicModel
     /// Called after a device is tapped (e.g. to dismiss a presenting sheet).
     var onPick: (() -> Void)? = nil
 
     private let accent = ScarletTheme.accent(for: .music)
+
+    /// "This iPhone" / "This iPad" / "This Mac" — the pinned first row's label.
+    private static var thisDeviceLabel: String {
+        #if targetEnvironment(macCatalyst)
+        return "This Mac"
+        #elseif canImport(UIKit)
+        return UIDevice.current.model.hasPrefix("iPad") ? "This iPad" : "This iPhone"
+        #else
+        return "This Mac"
+        #endif
+    }
+
+    /// The Spotify Connect `type` this hardware registers as when its Spotify
+    /// app is open — how we match a server device that IS this device.
+    private static var thisDeviceType: String {
+        #if targetEnvironment(macCatalyst)
+        return "computer"
+        #elseif canImport(UIKit)
+        return UIDevice.current.model.hasPrefix("iPad") ? "tablet" : "smartphone"
+        #else
+        return "computer"
+        #endif
+    }
+
+    private static var thisDeviceSymbol: String {
+        switch thisDeviceType {
+        case "computer": return "desktopcomputer"
+        case "tablet": return "ipad"
+        default: return "iphone"
+        }
+    }
+
+    /// The server device that IS this phone/iPad/Mac (Spotify open here).
+    /// Prefers the active one if several of the same kind are registered.
+    private var thisDevice: MusicPlaybackDevice? {
+        let kind = Self.thisDeviceType
+        let matches = model.devices.filter { $0.type.lowercased() == kind }
+        return matches.first(where: { $0.isActive }) ?? matches.first
+    }
+
+    /// Server devices minus the one already pinned as "This iPhone" — the
+    /// matched device must never appear twice.
+    private var otherDevices: [MusicPlaybackDevice] {
+        guard let mine = thisDevice else { return model.devices }
+        return model.devices.filter { $0.id != mine.id }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -651,56 +737,112 @@ struct MusicDeviceChooser: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Refresh devices")
             }
-            if model.devices.isEmpty {
-                Text(model.loadingDevices
-                     ? "Finding your speakers\u{2026}"
-                     : "No Spotify devices found. Open Spotify on a speaker, TV, Mac or your phone, then refresh.")
-                    .font(.scarletDetail)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            // Play on THIS device is always the first row — before any room.
+            thisDeviceRow
+            if otherDevices.isEmpty {
+                if model.loadingDevices {
+                    Text("Finding your speakers\u{2026}")
+                        .font(.scarletDetail)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             } else {
-                ForEach(model.devices) { device in
-                    Button {
+                ForEach(otherDevices) { device in
+                    deviceRow(
+                        symbol: device.symbol,
+                        title: model.displayName(for: device),
+                        subtitle: device.isActive ? "Active now" : nil,
+                        subtitleIsAccent: true,
+                        isActive: device.isActive,
+                        showsSpinner: model.routingToDeviceId == device.id
+                    ) {
                         model.playOnDevice(device)
                         onPick?()
-                    } label: {
-                        HStack(spacing: 11) {
-                            Image(systemName: device.symbol)
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(device.isActive ? accent : .secondary)
-                                .frame(width: 24)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(device.name)
-                                    .font(.scarletBody)
-                                    .foregroundStyle(.white)
-                                    .lineLimit(1)
-                                if device.isActive {
-                                    Text("Active now")
-                                        .font(.scarletCaption)
-                                        .foregroundStyle(accent)
-                                }
-                            }
-                            Spacer(minLength: 6)
-                            if model.routingToDeviceId == device.id {
-                                ProgressView().scaleEffect(0.75)
-                            } else {
-                                Image(systemName: "play.circle.fill")
-                                    .font(.system(size: 20))
-                                    .foregroundStyle(accent)
-                            }
-                        }
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(Color.white.opacity(device.isActive ? 0.10 : 0.05))
-                        )
                     }
-                    .buttonStyle(.plain)
-                    .disabled(model.routingToDeviceId != nil)
                 }
             }
         }
+    }
+
+    /// The pinned first row. Matched to a live Connect device → plays straight
+    /// to it; not registered yet → deviceless play (server retry) + wake
+    /// Spotify, which then starts the queued pick by itself.
+    @ViewBuilder
+    private var thisDeviceRow: some View {
+        if let mine = thisDevice {
+            deviceRow(
+                symbol: Self.thisDeviceSymbol,
+                title: Self.thisDeviceLabel,
+                subtitle: mine.isActive ? "Active now" : nil,
+                subtitleIsAccent: true,
+                isActive: mine.isActive,
+                showsSpinner: model.routingToDeviceId == mine.id
+            ) {
+                model.playOnDevice(mine)
+                onPick?()
+            }
+        } else {
+            deviceRow(
+                symbol: Self.thisDeviceSymbol,
+                title: Self.thisDeviceLabel,
+                subtitle: "Opens Spotify once \u{2014} playback starts by itself",
+                subtitleIsAccent: false,
+                isActive: false,
+                showsSpinner: false
+            ) {
+                model.playHereByWakingSpotify()
+                onPick?()
+            }
+        }
+    }
+
+    /// One tappable device row — shared by the pinned this-device row and the
+    /// server-device list so every row looks and behaves identically.
+    private func deviceRow(
+        symbol: String,
+        title: String,
+        subtitle: String?,
+        subtitleIsAccent: Bool,
+        isActive: Bool,
+        showsSpinner: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 11) {
+                Image(systemName: symbol)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(isActive ? accent : .secondary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.scarletBody)
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.scarletCaption)
+                            .foregroundStyle(subtitleIsAccent ? accent : Color.secondary)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: 6)
+                if showsSpinner {
+                    ProgressView().scaleEffect(0.75)
+                } else {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(accent)
+                }
+            }
+            .padding(.vertical, 8)
+            .padding(.horizontal, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.white.opacity(isActive ? 0.10 : 0.05))
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(model.routingToDeviceId != nil)
     }
 }
 
@@ -909,7 +1051,7 @@ final class MusicModel: ObservableObject {
                 needsDevice = false
                 if let type = outcome.deviceType, type.lowercased() != "smartphone",
                    let dev = outcome.device {
-                    flash = "Playing on \(dev)"
+                    flash = "Playing on \(MusicUI.deviceDisplayName(name: dev, type: type))"
                 } else {
                     flash = ""
                 }
@@ -952,6 +1094,31 @@ final class MusicModel: ObservableObject {
         }
     }
 
+    /// Human display name for a picker device: real names pass through; opaque
+    /// hex names render as their kind plus a stable index among same-kind
+    /// hex-named devices — "Speaker 1", never the raw hex.
+    func displayName(for device: MusicPlaybackDevice) -> String {
+        guard device.hasOpaqueName else { return device.name }
+        var n = 0
+        for d in devices where d.hasOpaqueName && d.typeLabel == device.typeLabel {
+            n += 1
+            if d.id == device.id { return "\(device.typeLabel) \(n)" }
+        }
+        return device.typeLabel
+    }
+
+    /// The pinned "This iPhone" row when Spotify ISN'T registered on this
+    /// hardware yet: fire the last pick with NO device target — the server
+    /// accepts it and keeps retrying (~24s) until a device appears — then wake
+    /// Spotify so this device registers and the queued play starts by itself.
+    /// With nothing queued, just wake Spotify so the next tap has a device.
+    func playHereByWakingSpotify() {
+        if let uri = lastPlayURI, !uri.isEmpty {
+            play(uri: uri)  // deviceless → arms the server-side retry window
+        }
+        MusicUI.openSpotify()
+    }
+
     /// Play the last-requested track/playlist on a CHOSEN device (the picker), or
     /// — if nothing is queued to start — transfer whatever's loaded to that room.
     /// Verified end-to-end: on success the recovery state clears and we reflect
@@ -970,7 +1137,7 @@ final class MusicModel: ObservableObject {
                     try await provider.transfer(to: device.id)
                 }
                 needsDevice = false
-                flash = "Playing on \(device.name)"
+                flash = "Playing on \(displayName(for: device))"
                 try? await Task.sleep(nanoseconds: 700_000_000)
                 await refreshState()
                 await loadDevices()
@@ -978,7 +1145,7 @@ final class MusicModel: ObservableObject {
             } catch {
                 let msg = (error as? MusicPlayError)?.message ?? ""
                 flash = msg.isEmpty
-                    ? "Couldn\u{2019}t start on \(device.name) — is it powered on?"
+                    ? "Couldn\u{2019}t start on \(displayName(for: device)) — is it powered on?"
                     : String(msg.prefix(140))
                 // Refresh the list — the chosen device may have dropped off.
                 await loadDevices()
@@ -1001,7 +1168,7 @@ final class MusicModel: ObservableObject {
                     needsDevice = false
                     retryWatchActive = false
                     if let d = s.device, d.type.lowercased() != "smartphone" {
-                        flash = "Playing on \(d.name)"
+                        flash = "Playing on \(MusicUI.deviceDisplayName(name: d.name, type: d.type))"
                     }
                     snapshot = (try? await provider.fetchLibrary()) ?? snapshot
                     return
@@ -1231,7 +1398,7 @@ struct MusicView: View {
         var line = "[FOCUS] Ido is on his Music page (\(model.provider.displayName))."
         if let st = model.playerState, let tr = st.track, st.device != nil {
             let byArtist = tr.artist.isEmpty ? "" : " by \(tr.artist)"
-            let dev = st.device.map { " on \($0.name)" } ?? ""
+            let dev = st.device.map { " on \(MusicUI.deviceDisplayName(name: $0.name, type: $0.type))" } ?? ""
             line += " \(st.isPlaying ? "Now playing" : "Paused"): \"\(tr.title)\"\(byArtist)\(dev)."
         } else if let np = s.nowPlaying {
             let byArtist = np.artist.isEmpty ? "" : " by \(np.artist)"

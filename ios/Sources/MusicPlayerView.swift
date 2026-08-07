@@ -73,7 +73,9 @@ struct MusicPlayerView: View {
         let byArtist = tr.artist.isEmpty ? "" : " by \(tr.artist)"
         var line = MusicFocus.playerPrefix + " screen — \"\(tr.title)\"\(byArtist)"
         if let st = model.playerState {
-            if let dev = st.device { line += ", \(st.isPlaying ? "playing" : "paused") on \(dev.name)" }
+            if let dev = st.device {
+                line += ", \(st.isPlaying ? "playing" : "paused") on \(MusicUI.deviceDisplayName(name: dev.name, type: dev.type))"
+            }
             if !st.queue.isEmpty { line += ". \(st.queue.count) tracks are up next" }
         }
         line += ". He sees the progress bar, transport controls, and the queue —"
@@ -312,6 +314,8 @@ struct MusicPlayerView: View {
     @ViewBuilder
     private func deviceLine(_ st: MusicPlayerState) -> some View {
         if let dev = st.device {
+            // Human-safe name — an opaque hex id renders as its kind ("Speaker").
+            let devName = MusicUI.deviceDisplayName(name: dev.name, type: dev.type)
             // Tap to switch rooms — opens the device picker.
             Button {
                 Task { await model.loadDevices() }
@@ -320,7 +324,7 @@ struct MusicPlayerView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "hifispeaker.2.fill")
                         .font(.system(size: 14, weight: .semibold))
-                    Text("Playing on \(dev.name)")
+                    Text("Playing on \(devName)")
                         .font(.scarletDetail)
                     Image(systemName: "chevron.right")
                         .font(.system(size: 11, weight: .semibold))
@@ -329,7 +333,7 @@ struct MusicPlayerView: View {
                 .foregroundStyle(rose)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Switch device — playing on \(dev.name)")
+            .accessibilityLabel("Switch device — playing on \(devName)")
         } else {
             Button {
                 Task { await model.loadDevices() }

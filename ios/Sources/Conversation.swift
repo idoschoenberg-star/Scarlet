@@ -551,7 +551,15 @@ final class Conversation: ObservableObject {
         micTargetRate = 24000
         outputRate = 24000
         do {
-            var req = URLRequest(url: AppConfig.realtimeURL)
+            // Append the chosen OpenAI voice (Settings → "OpenAI voice") so the
+            // mint uses it; the server allowlists and falls back to its default.
+            var mintURL = AppConfig.realtimeURL
+            if let v = UserDefaults.standard.string(forKey: "openaiVoice"), !v.isEmpty,
+               var comps = URLComponents(url: mintURL, resolvingAgainstBaseURL: false) {
+                comps.queryItems = (comps.queryItems ?? []) + [URLQueryItem(name: "voice", value: v)]
+                if let u = comps.url { mintURL = u }
+            }
+            var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             let (data, _) = try await URLSession.shared.data(for: req)
