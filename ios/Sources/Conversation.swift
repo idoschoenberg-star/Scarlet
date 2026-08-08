@@ -1310,26 +1310,15 @@ final class Conversation: ObservableObject {
                     self.isUserSpeaking = false
                 }
 
-                // BARGE-IN: he starts talking while she's mid-sentence → cut her
-                // off. Runs on the post-AEC input, above the echo-residual line,
-                // and only after it HOLDS for a few callbacks — so her own
-                // loudspeaker (mostly cancelled by AEC) and stray clicks can't
-                // false-trigger. When it fires, `interrupt()` silences her
-                // instantly, clears the echo gate (mic reopens so the server
-                // hears him), and latches `barged` to drop the killed turn's tail.
-                if self.state == .speaking, self.micOn, self.speakerOn, !self.chatMode {
-                    if next >= Conversation.bargeLevel {
-                        self.bargeRun += 1
-                        if self.bargeRun >= Conversation.bargeSustainBuffers {
-                            self.bargeRun = 0
-                            self.interrupt()
-                        }
-                    } else {
-                        self.bargeRun = 0
-                    }
-                } else {
-                    self.bargeRun = 0
-                }
+                // NO automatic voice barge-in. The meter gate cut her off on
+                // post-AEC echo residual of HER OWN voice (mid-reply truncation:
+                // audio dies, text continues — the server had already streamed
+                // the full turn) and on any overlap speech from Ido, violating
+                // the contract that she finishes the whole thought. The orb TAP
+                // (interrupt()) is the one intentional way to cut her off; his
+                // overlap speech still streams full-duplex and lands as his next
+                // turn, answered when she finishes.
+                self.bargeRun = 0
 
                 // FULL-DUPLEX: with real AEC (VPIO) removing her loudspeaker
                 // voice from the mic, we stream continuously — like OpenAI
