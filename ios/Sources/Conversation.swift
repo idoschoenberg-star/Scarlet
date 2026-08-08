@@ -63,6 +63,15 @@ final class Conversation: ObservableObject {
     /// deltas grow it, the .done event finalizes it. Nil between replies.
     private var herLiveIndex: Int? = nil
 
+    /// OpenAI allows ONE active response at a time. A response.create sent
+    /// while one is open is rejected ("already has an active response") and
+    /// the app used to ignore that error — so when a FAST tool (location,
+    /// weather) returned before the function-call response closed, the
+    /// follow-up answer was never created and the conversation dead-ended
+    /// in silence. Track the active response; queue the create until done.
+    private var responseActive = false
+    private var pendingResponseCreate = false
+
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
@@ -767,8 +776,11 @@ final class Conversation: ObservableObject {
         }
         reconnecting = true
         // The socket is going down mid-stream — close any half-streamed reply
-        // bubble so the resumed session can't append into a stale line.
+        // bubble so the resumed session can't append into a stale line, and
+        // forget response bookkeeping (the new session starts clean).
         herLiveIndex = nil
+        responseActive = false
+        pendingResponseCreate = false
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
         // pretend to resume a thread that never existed.
@@ -859,6 +871,13 @@ final class Conversation: ObservableObject {
     /// A REAL user turn — text that should reach her like speech, so she SPEAKS.
     /// OpenAI: create a user message item, then explicitly ask for a response.
     /// ElevenLabs: the native `user_message` event (auto-responds).
+    /// Ask for her next response, respecting the one-active-response rule:
+    /// if one is open, the create is queued and fired on its response.done.
+    private func requestResponse() {
+        if responseActive { pendingResponseCreate = true }
+        else { send(["type": "response.create"]) }
+    }
+
     private func sendUserText(_ text: String) {
         // If the transport is dead, requeue the turn — it flushes when the
         // reconnect (kicked by send's error path) brings a fresh socket up.
@@ -869,7 +888,7 @@ final class Conversation: ObservableObject {
                   "item": ["type": "message", "role": "user",
                            "content": [["type": "input_text", "text": text]]]],
                  onError: requeue)
-            send(["type": "response.create"])
+            requestResponse()
         case .elevenlabs:
             send(["type": "user_message", "text": text], onError: requeue)
         }
@@ -900,7 +919,7 @@ final class Conversation: ObservableObject {
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output",
                            "call_id": callId, "output": output]])
-            send(["type": "response.create"])
+            requestResponse()
         case .elevenlabs:
             send(["type": "client_tool_result", "tool_call_id": callId,
                   "result": output, "is_error": false])
@@ -981,11 +1000,20 @@ final class Conversation: ObservableObject {
                 params = obj
             }
             runTool(name: name, callId: callId, params: params)
-        // Turn finished — clear any residual "thinking" shimmer and close the
-        // streaming bubble so the next reply starts a fresh line.
+        case "response.created":
+            responseActive = true
+        // Turn finished — clear any residual "thinking" shimmer, close the
+        // streaming bubble, and fire any create that waited its turn (the
+        // fast-tool race: a tool result arriving before its call's response
+        // closed used to lose the follow-up answer entirely).
         case "response.done":
             thinking = false
             herLiveIndex = nil
+            responseActive = false
+            if pendingResponseCreate {
+                pendingResponseCreate = false
+                send(["type": "response.create"])
+            }
         // interrupt_response:false → the server will NOT auto-interrupt her when
         // he starts talking (full-duplex). Do NOT flush here; her reply
         // continues and local barge-in (the meter) owns cutting her off.
