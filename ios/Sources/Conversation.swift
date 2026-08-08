@@ -97,6 +97,14 @@ final class Conversation: ObservableObject {
     /// during the reconnect window can't resurrect the session or spawn a
     /// second socket.
     private var reconnectTask: Task<Void, Never>?
+
+    /// WebSocket heartbeat. A half-open socket ACCEPTS sends into the void —
+    /// mic audio and typed turns "succeed" locally while the peer is gone, so
+    /// neither the send-error path nor the receive loop notices for minutes
+    /// (the 07:44 silent session: instruction given, nothing ever heard). A
+    /// ping every 20s forces the truth out of the transport; a failed pong
+    /// kicks the reconnect ladder.
+    private var pingTask: Task<Void, Never>?
     private var observersInstalled = false
     /// Token for the engine-configuration-change observer. Held so it can be
     /// rebound to a fresh engine after recreateAudioNodes() (the observer is
@@ -250,6 +258,7 @@ final class Conversation: ObservableObject {
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
+        pingTask?.cancel(); pingTask = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -610,6 +619,7 @@ final class Conversation: ObservableObject {
             task.resume()
             // NO session.update — the session is configured server-side at mint.
             listen()
+            startPing()
             // A reconnect is a brand-new socket: never carry a barge-in latch or
             // a "thinking" flag across it, or her resumed speech would be dropped
             // by playPCM's `barged` gate (silent, until he happens to speak) and
@@ -676,6 +686,7 @@ final class Conversation: ObservableObject {
             task.resume()
             send(["type": "conversation_initiation_client_data"])
             listen()
+            startPing()
             // A reconnect is a brand-new socket: never carry a barge-in latch or
             // a "thinking" flag across it, or her resumed speech would be dropped
             // by playPCM's `barged` gate (silent, until he happens to speak) and
@@ -707,6 +718,20 @@ final class Conversation: ObservableObject {
             flushPendingOutbound()
         } catch {
             if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
+        }
+    }
+
+    /// Start (or restart) the transport heartbeat for the current socket.
+    private func startPing() {
+        pingTask?.cancel()
+        pingTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 20_000_000_000)
+                guard let self, self.wantLive, !Task.isCancelled else { return }
+                self.ws?.sendPing { [weak self] err in
+                    if err != nil { Task { @MainActor in self?.scheduleReconnect() } }
+                }
+            }
         }
     }
 
@@ -753,6 +778,7 @@ final class Conversation: ObservableObject {
         // text instead of dead-sending it to the nil socket.
         state = .connecting
         status = "Reconnecting…"
+        pingTask?.cancel(); pingTask = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         // Exponential backoff: 0.9s, 1.8s, 3.6s … capped at 30s.
