@@ -63,6 +63,11 @@ struct ScarletTalkApp: App {
                 }
             }
             .preferredColorScheme(.dark)
+            // Spotify App Remote auth callback (scarlettalk://spotify-login) —
+            // stashes the token so later "This iPhone" plays skip the bounce.
+            .onOpenURL { url in
+                SpotifyRemote.shared.handleCallback(url)
+            }
         }
     }
 }

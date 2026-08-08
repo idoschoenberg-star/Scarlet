@@ -1115,8 +1115,16 @@ final class MusicModel: ObservableObject {
     func playHereByWakingSpotify() {
         if let uri = lastPlayURI, !uri.isEmpty {
             play(uri: uri)  // deviceless → arms the server-side retry window
+            // Preferred: App Remote wakes Spotify, starts THIS uri and hops
+            // straight back — playback just begins. Fall back to the plain
+            // app-open when the SDK can't run here (Mac, Spotify missing).
+            Task { @MainActor in
+                let ok = await SpotifyRemote.shared.playHere(uri: uri)
+                if !ok { MusicUI.openSpotify() }
+            }
+        } else {
+            MusicUI.openSpotify()
         }
-        MusicUI.openSpotify()
     }
 
     /// Play the last-requested track/playlist on a CHOSEN device (the picker), or

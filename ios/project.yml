@@ -20,12 +20,22 @@ settings:
     PROVISIONING_PROFILE_SPECIFIER: "ScarletTalk AppStore"
     SWIFT_VERSION: "5.9"
 
+# Swift Package dependencies. SpotifyiOS is the official App Remote SDK
+# (binary xcframework via SPM) — wakes the Spotify app and starts playback for
+# the "This iPhone" row without Ido navigating the Spotify app himself.
+packages:
+  SpotifyiOS:
+    url: https://github.com/spotify/ios-sdk
+    exactVersion: 5.0.1
+
 targets:
   ScarletTalk:
     type: application
     platform: iOS
     sources:
       - path: Sources
+    dependencies:
+      - package: SpotifyiOS
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.idoschoenberg.scarlettalk
@@ -116,6 +126,14 @@ targets:
           - whatsapp
           - facetime
           - facetime-audio
+          # Spotify App Remote probes canOpenURL("spotify:") before waking the
+          # Spotify app for play-on-this-device.
+          - spotify
+        # Callback scheme for Spotify authorizeAndPlayURI — registered in the
+        # Spotify dashboard as the Redirect URI "scarlettalk://spotify-login".
+        CFBundleURLTypes:
+          - CFBundleURLName: com.idoschoenberg.scarlettalk
+            CFBundleURLSchemes: [scarlettalk]
         ITSAppUsesNonExemptEncryption: false
     # XcodeGen GENERATES the entitlements file at this path from these
     # properties, same as Info.plist above.
