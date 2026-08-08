@@ -72,6 +72,16 @@ final class Conversation: ObservableObject {
     private var responseActive = false
     private var pendingResponseCreate = false
 
+    /// A response can FAIL server-side — response.done arrives with status
+    /// "failed" and NO output (seen live as rate_limit_exceeded when the org's
+    /// token-per-minute ceiling was hit). Without a retry the turn dies
+    /// silently: no answer, no error — exactly the "I asked and nothing
+    /// happened" failure. Honor the server's suggested wait and re-create the
+    /// response, a bounded number of times, so throttling feels like a short
+    /// pause instead of being ignored.
+    private var failedResponseRetries = 0
+    private var responseRetryTask: Task<Void, Never>?
+
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
@@ -268,6 +278,8 @@ final class Conversation: ObservableObject {
         reconnectAttempts = 0
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         pingTask?.cancel(); pingTask = nil
+        responseRetryTask?.cancel(); responseRetryTask = nil
+        failedResponseRetries = 0
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -781,6 +793,8 @@ final class Conversation: ObservableObject {
         herLiveIndex = nil
         responseActive = false
         pendingResponseCreate = false
+        responseRetryTask?.cancel(); responseRetryTask = nil
+        failedResponseRetries = 0
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
         // pretend to resume a thread that never existed.
@@ -884,6 +898,7 @@ final class Conversation: ObservableObject {
         let requeue: () -> Void = { [weak self] in self?.pendingOutbound.append(text) }
         switch voiceEngine {
         case .openai:
+            failedResponseRetries = 0   // a fresh turn earns a fresh retry budget
             send(["type": "conversation.item.create",
                   "item": ["type": "message", "role": "user",
                            "content": [["type": "input_text", "text": text]]]],
@@ -1010,6 +1025,34 @@ final class Conversation: ObservableObject {
             thinking = false
             herLiveIndex = nil
             responseActive = false
+            if let resp = ev["response"] as? [String: Any],
+               (resp["status"] as? String) == "failed" {
+                let err = (resp["status_details"] as? [String: Any])?["error"] as? [String: Any]
+                let message = (err?["message"] as? String) ?? ""
+                print("response failed: \((err?["code"] as? String) ?? "?") \(message)")
+                if failedResponseRetries < 3 {
+                    failedResponseRetries += 1
+                    // One retried create regenerates from the full conversation,
+                    // so a create queued behind the failed response is subsumed.
+                    pendingResponseCreate = false
+                    var wait = Double(failedResponseRetries) * 2.0
+                    if let r = message.range(of: #"try again in [0-9.]+s"#,
+                                             options: .regularExpression),
+                       let secs = Double(message[r].filter { "0123456789.".contains($0) }) {
+                        wait = min(max(secs + 0.5, 1.0), 20.0)
+                    }
+                    thinking = true   // she IS still coming — keep the shimmer honest
+                    responseRetryTask?.cancel()
+                    responseRetryTask = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                        guard let self, !Task.isCancelled, self.wantLive else { return }
+                        self.requestResponse()
+                    }
+                    break
+                }
+            } else {
+                failedResponseRetries = 0
+            }
             if pendingResponseCreate {
                 pendingResponseCreate = false
                 send(["type": "response.create"])
