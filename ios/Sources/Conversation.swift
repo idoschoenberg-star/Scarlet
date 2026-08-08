@@ -59,6 +59,10 @@ final class Conversation: ObservableObject {
     /// dropped so a half-sent response can't keep talking over him.
     private var barged = false
 
+    /// Index of the transcript line her CURRENT reply is streaming into —
+    /// deltas grow it, the .done event finalizes it. Nil between replies.
+    private var herLiveIndex: Int? = nil
+
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
     var hasAutoStarted = false
@@ -737,6 +741,9 @@ final class Conversation: ObservableObject {
             return
         }
         reconnecting = true
+        // The socket is going down mid-stream — close any half-streamed reply
+        // bubble so the resumed session can't append into a stale line.
+        herLiveIndex = nil
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
         // pretend to resume a thread that never existed.
@@ -799,10 +806,22 @@ final class Conversation: ObservableObject {
         }
     }
 
-    private func send(_ obj: [String: Any]) {
+    private func send(_ obj: [String: Any], onError: (() -> Void)? = nil) {
         guard let d = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: d, encoding: .utf8) else { return }
-        ws?.send(.string(s)) { _ in }
+        // A dead-for-send socket must not swallow a turn silently (a typed
+        // question while muted was the only traffic — it vanished: no reply,
+        // no reconnect, nothing). Any send failure kicks the reconnect ladder;
+        // onError lets a user turn requeue itself so it flushes on the new
+        // socket instead of being lost.
+        ws?.send(.string(s)) { [weak self] err in
+            if err != nil {
+                Task { @MainActor in
+                    onError?()
+                    self?.scheduleReconnect()
+                }
+            }
+        }
     }
 
     // MARK: engine-aware wire helpers
@@ -815,14 +834,18 @@ final class Conversation: ObservableObject {
     /// OpenAI: create a user message item, then explicitly ask for a response.
     /// ElevenLabs: the native `user_message` event (auto-responds).
     private func sendUserText(_ text: String) {
+        // If the transport is dead, requeue the turn — it flushes when the
+        // reconnect (kicked by send's error path) brings a fresh socket up.
+        let requeue: () -> Void = { [weak self] in self?.pendingOutbound.append(text) }
         switch voiceEngine {
         case .openai:
             send(["type": "conversation.item.create",
                   "item": ["type": "message", "role": "user",
-                           "content": [["type": "input_text", "text": text]]]])
+                           "content": [["type": "input_text", "text": text]]]],
+                 onError: requeue)
             send(["type": "response.create"])
         case .elevenlabs:
-            send(["type": "user_message", "text": text])
+            send(["type": "user_message", "text": text], onError: requeue)
         }
     }
 
@@ -875,10 +898,33 @@ final class Conversation: ObservableObject {
         // Her audio — both the current and legacy delta names carry base64 24k PCM16.
         case "response.output_audio.delta", "response.audio.delta":
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
-        // Her full transcript for the turn.
-        case "response.output_audio_transcript.done", "response.audio_transcript.done":
-            if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
+        // Her reply text, STREAMED — the bubble grows as she composes. Before
+        // this, her text appeared only at the .done event, i.e. after the whole
+        // audio stream finished: with the speaker muted that read as "no reply
+        // at all" for long answers. Covers audio-transcript and text deltas.
+        case "response.output_audio_transcript.delta", "response.audio_transcript.delta",
+             "response.output_text.delta", "response.text.delta":
+            if let d = ev["delta"] as? String, !d.isEmpty {
+                thinking = false
+                if let i = herLiveIndex, i < transcript.count {
+                    transcript[i] = .init(text: transcript[i].text + d, fromHer: true)
+                } else {
+                    transcript.append(.init(text: d, fromHer: true))
+                    herLiveIndex = transcript.count - 1
+                }
+            }
+        // Her full transcript for the turn — replaces the streamed bubble with
+        // the authoritative final text (or appends if no deltas arrived).
+        case "response.output_audio_transcript.done", "response.audio_transcript.done",
+             "response.output_text.done", "response.text.done":
+            let final = ((ev["transcript"] as? String) ?? (ev["text"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let i = herLiveIndex, i < transcript.count {
+                if !final.isEmpty { transcript[i] = .init(text: final, fromHer: true) }
+                herLiveIndex = nil
+            } else if !final.isEmpty {
+                transcript.append(.init(text: final, fromHer: true))
+            }
         // His transcribed speech (server-side input transcription).
         case "conversation.item.input_audio_transcription.completed":
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -902,9 +948,11 @@ final class Conversation: ObservableObject {
                 params = obj
             }
             runTool(name: name, callId: callId, params: params)
-        // Turn finished — clear any residual "thinking" shimmer.
+        // Turn finished — clear any residual "thinking" shimmer and close the
+        // streaming bubble so the next reply starts a fresh line.
         case "response.done":
             thinking = false
+            herLiveIndex = nil
         // interrupt_response:false → the server will NOT auto-interrupt her when
         // he starts talking (full-duplex). Do NOT flush here; her reply
         // continues and local barge-in (the meter) owns cutting her off.
