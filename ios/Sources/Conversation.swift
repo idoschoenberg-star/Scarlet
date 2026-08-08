@@ -930,6 +930,10 @@ final class Conversation: ObservableObject {
         // at all" for long answers. Covers audio-transcript and text deltas.
         case "response.output_audio_transcript.delta", "response.audio_transcript.delta",
              "response.output_text.delta", "response.text.delta":
+            // A cancelled turn's text must die with its audio: after a barge
+            // the server still flushes deltas, and streaming them painted words
+            // she never spoke — the transcript diverged from her voice.
+            if barged { break }
             if let d = ev["delta"] as? String, !d.isEmpty {
                 thinking = false
                 if let i = herLiveIndex, i < transcript.count {
@@ -943,6 +947,9 @@ final class Conversation: ObservableObject {
         // the authoritative final text (or appends if no deltas arrived).
         case "response.output_audio_transcript.done", "response.audio_transcript.done",
              "response.output_text.done", "response.text.done":
+            // For a cancelled turn keep only what streamed BEFORE the barge —
+            // the authoritative final would resurrect the whole unspoken reply.
+            if barged { herLiveIndex = nil; break }
             let final = ((ev["transcript"] as? String) ?? (ev["text"] as? String) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if let i = herLiveIndex, i < transcript.count {
