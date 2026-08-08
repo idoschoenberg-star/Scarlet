@@ -595,7 +595,12 @@ final class Conversation: ObservableObject {
             reconnectAttempts = 0
             var wsReq = URLRequest(url: url)
             wsReq.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-            wsReq.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+            // NO "OpenAI-Beta: realtime=v1" header: the mint uses the GA
+            // client_secrets API, and mixing a GA secret with the beta protocol
+            // header makes OpenAI answer with an error event and close — the
+            // app then re-minted forever (the build-190 listening/reconnecting
+            // loop). CI-verified: without the header the first server event is
+            // session.created; with it, error.
             let task = wsSession.webSocketTask(with: wsReq)
             ws = task
             task.resume()
