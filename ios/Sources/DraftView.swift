@@ -23,6 +23,16 @@ struct DraftSeed {
     /// Reply-All server-side; these let the header show it up front.
     var toLine: String = ""
     var ccLine: String = ""
+    /// Unified-inbox binding (the All-new list): the `inbound_events` row id.
+    /// When set, compose sends `event_id` INSTEAD of `message_id` — the
+    /// server resolves the real message from the signal row and grounds the
+    /// reply in THAT conversation (the same binding the web Signals reader
+    /// and the voice sweep's `compose_draft original_event_id` use).
+    var eventId: String = ""
+    /// Compose channel — email_outlook by default (the Amwell inbox); the
+    /// All-new list passes the item's own channel (email_gmail / whatsapp /
+    /// imessage / teams), mirroring the web Signals page's DRAFT_SRC map.
+    var channel: String = "email_outlook"
 
     var recipientLine: String {
         var s = ""
@@ -146,11 +156,19 @@ final class DraftModel: ObservableObject {
     func startReply(seed: DraftSeed, instruction: String) {
         guard phase == .idle, draftId == nil else { return }
         var body: [String: Any] = [
-            "channel": "email_outlook",
+            "channel": seed.channel,
             "recipient": seed.recipientLine,
             "instruction": instruction,
-            "message_id": seed.messageId,
         ]
+        // Binding: a signal-row reply (the All-new list) rides its event_id —
+        // the server resolves the real message from `inbound_events`; the
+        // Amwell inbox rides the Graph message_id directly. One path, one
+        // window — only the id field differs.
+        if seed.eventId.isEmpty {
+            body["message_id"] = seed.messageId
+        } else {
+            body["event_id"] = seed.eventId
+        }
         let original = seed.originalLine
         if !original.isEmpty { body["original"] = original }
         compose(body)
@@ -780,7 +798,10 @@ struct DraftView: View {
     // attach mode) — the badge and approve wording follow the draft itself.
 
     private var channel: String {
-        model.draft?.channel ?? channelSeed?.channel ?? "email_outlook"
+        // Seed replies carry their own channel too (the All-new list replies
+        // to Gmail/chat items through this same window) — the badge must
+        // match from the first frame, not only once the draft row lands.
+        model.draft?.channel ?? channelSeed?.channel ?? seed?.channel ?? "email_outlook"
     }
 
     private var badgeText: String {

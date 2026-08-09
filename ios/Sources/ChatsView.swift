@@ -803,14 +803,33 @@ struct ChatAvatarView: View {
 
 struct ChatsView: View {
     @StateObject private var model = ChatListModel()
+    /// The unified All-new list (the Signals page evolved) — lives in the
+    /// hub's leading segment so message triage starts from ONE place.
+    @StateObject private var signals = SignalsModel()
+    /// Badge counts for the segment bubbles (shared store, polled by
+    /// RootView's existing backstop loop — no timer here).
+    @ObservedObject private var counts = InboxCounts.shared
+    /// true → the "All" segment (unified list); false → a channel mirror.
+    @State private var showingAll = true
     @EnvironmentObject private var convo: Conversation
+
+    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
+
+    /// The All segment's ambient-focus line — mirrors chatsBrowsingFocus's
+    /// shape so every segment reports itself the same way.
+    private static let allNewFocus =
+        "[FOCUS] Ido is browsing his unified All-new inbox — every open message across Amwell Outlook, Gmail, Teams, WhatsApp and iMessage. No single item open."
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 headerBar
                 channelSwitcher
-                content
+                if showingAll {
+                    SignalsListView(model: signals)
+                } else {
+                    content
+                }
             }
             .background(ScarletBackground().ignoresSafeArea())
             // Scarlet lives at the bottom of the LIST screen only — a pushed
@@ -822,16 +841,29 @@ struct ChatsView: View {
             // Custom header on the list screen; pushed threads keep the
             // system bar for Back (same pattern as InboxView).
             .toolbar(.hidden, for: .navigationBar)
-            // Ambient focus: the list reports itself on appearance and again
-            // on every channel switch.
-            .onAppear { convo.setFocus(chatsBrowsingFocus(model.channel)) }
+            // Ambient focus: the showing segment reports itself on appearance
+            // and again on every segment/channel switch.
+            .onAppear {
+                convo.setFocus(showingAll ? Self.allNewFocus
+                                          : chatsBrowsingFocus(model.channel))
+            }
             .onChange(of: model.channel) { _, newChannel in
                 convo.setFocus(chatsBrowsingFocus(newChannel))
+            }
+            .onChange(of: showingAll) { _, nowAll in
+                convo.setFocus(nowAll ? Self.allNewFocus
+                                      : chatsBrowsingFocus(model.channel))
+                if nowAll { Task { await signals.load() } }
             }
         }
         // .task re-runs every time this tab is selected → refresh on appear
         // (the cached rows are already painted; this reconciles silently).
-        .task { await model.load() }
+        // The unified list and the badge counts refresh on the same beat.
+        .task {
+            await signals.load()
+            await model.load()
+            await InboxCounts.shared.refresh()
+        }
     }
 
     private var headerBar: some View {
@@ -841,25 +873,61 @@ struct ChatsView: View {
                 .foregroundStyle(.white)
             Spacer()
             updatedStamp
+            if showingAll {
+                sweepButton
+            }
             Button {
-                Task { await model.load() }
+                Task {
+                    if showingAll {
+                        await signals.load()
+                        await InboxCounts.shared.refresh()
+                    } else {
+                        await model.load()
+                    }
+                }
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(.white)
             }
-            .disabled(model.loading)
+            .disabled(showingAll ? signals.loading : model.loading)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
     }
 
+    /// "Sweep" — start the voice review-and-react session over what's new.
+    /// Reuses the ask-about-email deep link wholesale: RootView (which owns
+    /// the live Conversation) switches to Talk, wakes her if needed, and
+    /// delivers the line — the sweep runs in the SAME session, either shell.
+    private var sweepButton: some View {
+        Button {
+            NotificationCenter.default.post(
+                name: .scarletAskAboutEmail, object: nil,
+                userInfo: ["text": "Sweep my inbox — take me through what's new."])
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("Sweep")
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(scarletRose)
+            .padding(.horizontal, 11)
+            .frame(height: 30)
+            .background(Capsule().fill(scarletRose.opacity(0.18)))
+            .overlay(Capsule().stroke(scarletRose.opacity(0.45), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+    }
+
     /// "updated 3m ago" — cache-freshness, re-rendered each minute. Reads as
     /// a whisper next to the refresh arrow; absent until a first fetch lands.
+    /// Follows the showing segment (unified list vs. channel mirror).
     @ViewBuilder
     private var updatedStamp: some View {
-        if let updated = model.updatedAt {
+        if let updated = (showingAll ? signals.updatedAt : model.updatedAt) {
             TimelineView(.periodic(from: .now, by: 60)) { _ in
                 Text("updated \(ChatTimeFormat.agoLabel(updated))")
                     .font(.system(size: 11))
@@ -868,10 +936,13 @@ struct ChatsView: View {
         }
     }
 
-    /// Slim three-segment switcher; the selected segment tints in its
-    /// channel's accent and restyles the whole page.
+    /// Slim segment switcher — All (the unified list) then the three channel
+    /// mirrors; the selected segment tints in its accent and restyles the
+    /// page. Each segment wears its iOS-convention red unread bubble, hidden
+    /// at zero (counts from `op=inbox_counts`, the one source of truth).
     private var channelSwitcher: some View {
         HStack(spacing: 4) {
+            allSegment
             ForEach(ChatChannel.allCases) { ch in
                 segment(ch)
             }
@@ -882,9 +953,48 @@ struct ChatsView: View {
         .padding(.bottom, 8)
     }
 
+    /// The unified-inbox segment, in the house rose accent.
+    private var allSegment: some View {
+        Button {
+            withAnimation(.snappy) { showingAll = true }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "tray.full.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("All")
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(showingAll ? scarletRose : Color.white.opacity(0.55))
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(
+                Capsule().fill(showingAll
+                    ? scarletRose.opacity(0.18) : Color.clear)
+            )
+            .overlay(
+                Capsule().stroke(showingAll
+                    ? scarletRose.opacity(0.45) : Color.clear, lineWidth: 1)
+            )
+            .overlay(alignment: .topTrailing) {
+                UnreadCountBadge(count: counts.totalUnread)
+                    .offset(x: 4, y: -6)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
     private func segment(_ ch: ChatChannel) -> some View {
         Button {
-            withAnimation(.snappy) { model.setChannel(ch) }
+            withAnimation(.snappy) {
+                showingAll = false
+                if model.channel == ch {
+                    // Returning to the already-loaded channel from All:
+                    // setChannel would no-op, so refresh it directly.
+                    Task { await model.load() }
+                } else {
+                    model.setChannel(ch)
+                }
+            }
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: ch.icon)
@@ -892,19 +1002,27 @@ struct ChatsView: View {
                 Text(ch.displayName)
                     .font(.system(size: 14, weight: .semibold))
             }
-            .foregroundStyle(model.channel == ch ? ch.accent : Color.white.opacity(0.55))
+            .foregroundStyle(isSelected(ch) ? ch.accent : Color.white.opacity(0.55))
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity)
             .background(
-                Capsule().fill(model.channel == ch
+                Capsule().fill(isSelected(ch)
                     ? ch.accent.opacity(0.18) : Color.clear)
             )
             .overlay(
-                Capsule().stroke(model.channel == ch
+                Capsule().stroke(isSelected(ch)
                     ? ch.accent.opacity(0.45) : Color.clear, lineWidth: 1)
             )
+            .overlay(alignment: .topTrailing) {
+                UnreadCountBadge(count: counts.unread(ch.rawValue))
+                    .offset(x: 4, y: -6)
+            }
         }
         .buttonStyle(.plain)
+    }
+
+    private func isSelected(_ ch: ChatChannel) -> Bool {
+        !showingAll && model.channel == ch
     }
 
     @ViewBuilder

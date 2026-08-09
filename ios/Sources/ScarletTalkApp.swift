@@ -34,6 +34,11 @@ struct RootView: View {
     // The one process-wide conversation — shared with the CarPlay scene so the
     // car continues the same session instead of racing a second audio graph.
     @StateObject private var convo = Conversation.shared
+    /// Unified-inbox badge counts (`op=inbox_counts`) — drive the Inbox and
+    /// Chats tab badges here and the segment/sidebar bubbles elsewhere.
+    /// Refreshed by piggybacking the existing backstop loop below (the store
+    /// gates itself to ~30s) — no timer of its own.
+    @ObservedObject private var counts = InboxCounts.shared
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
     /// The compose_draft tool arguments (recipient, instruction, channel) posted
@@ -135,6 +140,9 @@ struct RootView: View {
         .task {
             while !Task.isCancelled {
                 if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
+                // Badge counts ride the same heartbeat — the store's own
+                // stale-gate turns this into a ~30s poll, no extra timer.
+                await InboxCounts.shared.refreshIfStale()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
@@ -156,8 +164,12 @@ struct RootView: View {
         }
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
+        // Badges refresh immediately too: stale counts on wake read as lies.
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await recoverActiveDraft() } }
+            if phase == .active {
+                Task { await recoverActiveDraft() }
+                Task { await InboxCounts.shared.refresh() }
+            }
             FlightRecorder.note(screen: "phase:\(phase)")
         }
         .onChange(of: tab) { _, newTab in
@@ -198,6 +210,9 @@ struct RootView: View {
             InboxView()
                 .environmentObject(convo)
                 .tabItem { Label("Inbox", systemImage: "envelope.fill") }
+                // iOS-convention red tab badge, hidden at zero: the Amwell
+                // focused unread count (`op=inbox_counts` outlook_mail).
+                .badge(counts.inboxBadge)
                 .tag(Tab.inbox)
             CalendarView()
                 .environmentObject(convo)
@@ -206,6 +221,9 @@ struct RootView: View {
             ChatsView()
                 .environmentObject(convo)
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
+                // Everything the Inbox tab doesn't carry (Teams / WhatsApp /
+                // iMessage / Gmail) — the two badges sum to total_unread.
+                .badge(counts.chatsBadge)
                 .tag(Tab.chats)
             LibraryView()
                 .environmentObject(convo)
