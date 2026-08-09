@@ -52,7 +52,7 @@ struct RootView: View {
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, library, health, desk }
+    enum Tab: Hashable { case talk, inbox, calendar, chats, library, health, desk, settings }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -219,6 +219,15 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Desk", systemImage: "checklist") }
                 .tag(Tab.desk)
+            // Settings must be REACHABLE on the phone: with 5+ tabs iOS folds
+            // the tail into "More", so this row lands in the More list — the
+            // iOS-convention home for Settings, and the phone twin of the
+            // sidebar's pinned Settings row on iPad/Mac. (The Talk screen's
+            // gear shortcut stays; this is the discoverable path.)
+            SettingsView(presentedAsSheet: false)
+                .background(ScarletBackground().ignoresSafeArea())
+                .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                .tag(Tab.settings)
         }
     }
 
