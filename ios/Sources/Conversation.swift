@@ -103,11 +103,24 @@ final class Conversation: ObservableObject {
 
     // Audio — built once, reused across reconnects. Re-running mic setup
     // (a second installTap on the same bus) is an instant NSException crash.
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // `var`, not `let`: a media-services reset orphans both objects and Apple's
+    // contract for that notification is to discard and recreate them (see the
+    // reset observer). Still exactly ONE live instance at any moment — the
+    // singleton invariant holds.
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private var converter: AVAudioConverter?
     private var playFormat: AVAudioFormat?
     private var audioReady = false
+    /// True from interruption `.began` (another app — Spotify starting to play,
+    /// a phone call, Siri — took the audio session) until a successful recovery.
+    /// While set, NOTHING drives the torn-down audio unit: incoming speech
+    /// audio is dropped (player.play() against a dead engine is an NSException
+    /// crash, not a throw — THE "moved music to the phone mid-call" crash) and
+    /// the route-change / config-change observers stand down instead of
+    /// fighting the other app for the session. The call itself — socket,
+    /// transcript, state — stays fully alive; audio comes back on `.ended`.
+    private var interrupted = false
 
     // Live-tunable capture settings, mirrored from MicSettings and read on the
     // audio thread the same way `converter` is. Channel/gain changes take
@@ -163,6 +176,9 @@ final class Conversation: ObservableObject {
         // second socket alongside this fresh one.
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0   // fresh session — start the backoff ladder over
+        // A stale interrupted flag from a previous session would silently drop
+        // every audio buffer of this one — a fresh start reclaims the session.
+        interrupted = false
         self.token = token
         wantLive = true
         state = .connecting
@@ -471,15 +487,21 @@ final class Conversation: ObservableObject {
             // NOT resurrect a session he explicitly hung up on.
             guard wantLive else { return }
             // Audio-start failure is NOT a transport drop — reconnecting can't fix
-            // a dead mic/engine, it just loops. Surface it and stop.
+            // a dead mic/engine, it just loops. Surface it and stop — UNLESS an
+            // interruption is in progress (another app holds the session, e.g.
+            // Spotify playing mid-call): there audio is EXPECTED to be
+            // unavailable, so bring the socket up anyway and continue in text;
+            // the interruption's .ended handler restores the audio.
             do {
                 try ensureAudio()
-            } catch {
+            } catch where !interrupted {
                 status = "Can't reach the microphone right now. Check it's free (not held by another app) and try again."
                 state = .idle; wantLive = false
                 reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
                 pendingOutbound.removeAll()
                 return
+            } catch {
+                // Interrupted: proceed without audio — the call lives in text.
             }
             // Connected: a real socket is up. Clear the backoff counter.
             reconnectAttempts = 0
@@ -798,6 +820,16 @@ final class Conversation: ObservableObject {
 
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
+        // While another app owns the audio session (an interruption in
+        // progress, e.g. Spotify mid-handoff) the input node can report a dead
+        // 0 Hz / 0-channel format — and installTap with that format is an
+        // NSException crash `try?` can't catch. Throw a real error instead:
+        // callers treat it as "audio not available yet", and the
+        // interruption-ended / route-change handlers retry with a live format.
+        guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+            throw NSError(domain: "ScarletAudio", code: 1, userInfo:
+                [NSLocalizedDescriptionKey: "Input format unavailable — audio session held elsewhere"])
+        }
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000,
                                    channels: 1, interleaved: true)!
         let newConverter = AVAudioConverter(from: inFormat, to: target)
@@ -955,11 +987,19 @@ final class Conversation: ObservableObject {
     /// Outlook, where audio devices churn constantly.
     @MainActor
     private func rebuildAudioGraph() {
-        guard wantLive, audioReady, !audioRebuilding else { return }
+        // Never rebuild while another app owns the session (`interrupted`):
+        // ensureAudio would read a dead input format and fight the other app
+        // for activation. `.ended` clears the flag and calls back here.
+        // No `audioReady` requirement — a rebuild whose ensureAudio threw
+        // leaves audio down but the call alive, and the next route change /
+        // foreground retries through this same path (stopAudio() is already
+        // a no-op when nothing is built).
+        guard wantLive, !interrupted, !audioRebuilding else { return }
         audioRebuilding = true
         defer { audioRebuilding = false }
         stopAudio()
         try? ensureAudio()
+        if audioReady, state == .listening, micOn { status = "Listening…" }
     }
 
     /// Server announced a different output rate — rewire only the player leg.
@@ -978,6 +1018,12 @@ final class Conversation: ObservableObject {
     }
 
     private func playPCM(base64: String) {
+        // Session stolen (Spotify started playing, a phone call, Siri): the
+        // socket keeps streaming her audio, but the audio unit is torn down.
+        // Drop the buffers — scheduling them would pile up pendingBuffers whose
+        // completions never fire (echo gate stuck shut), and starting playback
+        // would trap. Her words still arrive as transcript text.
+        guard !interrupted else { return }
         guard let data = Data(base64Encoded: base64),
               let fmt = playFormat else { return }
         let frames = AVAudioFrameCount(data.count / 2)
@@ -989,6 +1035,13 @@ final class Conversation: ObservableObject {
             for i in 0..<Int(frames) { ch[0][i] = Float(samples[i]) / 32768.0 }
         }
         if !engine.isRunning { try? engine.start() }
+        // THE crash the "Spotify started mid-call" report traced to: if that
+        // start FAILED (another app holds the session — `try?` swallows the
+        // error), player.play() against a non-running engine raises
+        // 'required condition is false: _engine->IsRunning()' — an NSException,
+        // not a throw. Never drive the player unless the engine truly runs;
+        // dropping the buffer degrades to text, which recovery undoes.
+        guard engine.isRunning else { return }
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
@@ -1056,31 +1109,85 @@ final class Conversation: ObservableObject {
                     // stay closed forever, leaving her frozen (mic dead, stuck in
                     // .speaking). Treat the interruption as a barge-in reset: clear
                     // the gate and return to listening so she recovers on .ended.
+                    // Mark the pipeline interrupted FIRST — from this instant no
+                    // one may drive the dead audio unit (playPCM drops buffers,
+                    // the observers stand down) — then pause the engine ourselves
+                    // so its state matches reality. The call survives: socket,
+                    // transcript, and reconnect logic are all untouched.
+                    self.interrupted = true
                     self.flushPlayback()
+                    self.engine.pause()
+                    if self.wantLive {
+                        self.status = "Sound paused — another app is playing. Still here in text."
+                    }
                 case .ended:
                     // A call (Teams/phone) that grabbed the mic likely changed
                     // the input device/format; rebuild rather than restart the
                     // stale graph (a restart with a mismatched format crashes).
+                    // We attempt the resume even without .shouldResume — a live
+                    // conversation going permanently mute is worse than ducking
+                    // whatever else was playing — and every step is guarded, so
+                    // a session we can't reclaim leaves audio paused (the next
+                    // route change retries), never crashed.
+                    self.interrupted = false
                     try? self.startAudioSession()
                     if self.wantLive { self.rebuildAudioGraph() }
                 default: break
                 }
             }
         }
+        // The media server itself died and restarted (mediaserverd reset — rare,
+        // but aggressive session handoffs can trigger it). Every audio object we
+        // hold is orphaned; Apple's contract is to DISCARD the engine and player
+        // and build fresh ones — driving the orphans traps. The config-change
+        // observer below deliberately uses `object: nil` so it follows us to the
+        // replacement engine (there is only ever one in this process).
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.interrupted = false
+                os_unfair_lock_lock(self.audioStateLock)
+                self.converter = nil
+                os_unfair_lock_unlock(self.audioStateLock)
+                self.pendingBuffers = 0
+                self.speechTailUntil = Date.distantPast
+                self.engine = AVAudioEngine()
+                self.player = AVAudioPlayerNode()
+                self.player.volume = self.speakerOn ? 1 : 0
+                self.audioReady = false
+                if self.wantLive { self.rebuildAudioGraph() }
+            }
+        }
         // The audio engine's I/O format changed (device swap, sample-rate
         // renegotiation, an interface or headphones coming/going). Rebuild the
         // capture graph on the NEW format — the single most important guard
         // against the continuous Mac "quit unexpectedly" crashes.
+        // `object: nil`, NOT `object: engine`: a media-services reset replaces
+        // the engine instance, and an observer bound to the old one would go
+        // deaf forever. There is exactly one engine in this process, so nil is
+        // unambiguous. rebuildAudioGraph itself refuses to run mid-interruption.
         NotificationCenter.default.addObserver(
-            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.rebuildAudioGraph() }
         }
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                if self.wantLive, !self.engine.isRunning { try? self.engine.start() }
-                if self.wantLive { self.routeToSpeakerIfReceiver() }
+                // Never poke the engine while another app owns the session —
+                // start() would fail (or worse) and we'd be fighting Spotify
+                // for the hardware. `.ended` is the resume signal, not this.
+                if self.wantLive, !self.interrupted {
+                    if !self.audioReady {
+                        // Audio stayed down after a failed recovery (dead input
+                        // format at .ended) — fresh hardware truth, try again.
+                        self.rebuildAudioGraph()
+                    } else if !self.engine.isRunning {
+                        try? self.engine.start()
+                    }
+                    self.routeToSpeakerIfReceiver()
+                }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
                 self.evaluateDrivingMode()
@@ -1100,11 +1207,20 @@ final class Conversation: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
-                self?.endBackgroundAssertion()
+                guard let self else { return }
+                self.endBackgroundAssertion()
                 // The socket often dies while backgrounded with no callback —
                 // probe it NOW so the first thing he types on return doesn't
                 // fall into a corpse.
-                self?.pingNow()
+                self.pingNow()
+                // If audio died while we were away (an interruption whose
+                // .ended never reached us, or a failed recovery), coming back
+                // to the foreground is the moment to reclaim it.
+                if self.wantLive, !self.audioReady {
+                    self.interrupted = false
+                    try? self.startAudioSession()
+                    self.rebuildAudioGraph()
+                }
             }
         }
         // Live-tunable mic settings (channel, gain) changed in Settings: re-read
