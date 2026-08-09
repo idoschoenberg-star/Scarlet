@@ -86,6 +86,10 @@ struct SplitShell: View {
 
     @State private var section: ShellSection = .talk
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    /// Unified-inbox badge counts — same shared store as the phone's tab
+    /// badges (RootView's backstop loop refreshes it above this shell), so
+    /// the sidebar and the tab bar always tell one story.
+    @ObservedObject private var counts = InboxCounts.shared
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -182,6 +186,9 @@ struct SplitShell: View {
                 Text(s.title)
                     .font(.system(size: 15, weight: section == s ? .semibold : .regular))
                 Spacer(minLength: 0)
+                // Unread bubble, hidden at zero — mirrors the phone's tab
+                // badges (Inbox = Amwell focused, Chats = everything else).
+                UnreadCountBadge(count: sidebarBadge(s))
             }
             .foregroundStyle(section == s ? .white : .white.opacity(0.72))
             .padding(.horizontal, 12)
@@ -195,6 +202,16 @@ struct SplitShell: View {
         }
         .buttonStyle(.plain)
         .keyboardShortcut(s.shortcutKey, modifiers: .command)
+    }
+
+    /// Which unread count a sidebar row wears — identical numbers to the
+    /// phone's tab badges, so the two shells never disagree.
+    private func sidebarBadge(_ s: ShellSection) -> Int {
+        switch s {
+        case .inbox: return counts.inboxBadge
+        case .chats: return counts.chatsBadge
+        default: return 0
+        }
     }
 
     // MARK: - Detail column
