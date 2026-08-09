@@ -72,6 +72,28 @@ final class Conversation: ObservableObject {
     /// moment the socket goes live. Main-actor confined, so it can't race the flush.
     private var pendingOutbound: [String] = []
 
+    // The always-answer guarantee. A cell socket can die WITHOUT the receive
+    // callback ever firing (NAT timeout on hotel LTE): the app then sits in
+    // .listening against a corpse, and a typed question vanishes into it with
+    // the send error silently discarded — the "answering silently" dead end.
+    // Three guards close it:
+    //  1. sendUserMessage() checks the send completion — a failed send requeues
+    //     the text and rebuilds the socket.
+    //  2. A reply watchdog arms on every user turn — no sign of life from her
+    //     (audio, text, or a tool call) within the window means the session is
+    //     stalled: requeue the question and rebuild.
+    //  3. A transport-level ping loop detects the dead socket within seconds
+    //     even while nobody is talking, instead of never.
+    /// The user turn currently awaiting her first sign of life; requeued on
+    /// stall or transport death so it is ALWAYS eventually answered.
+    private var awaitingReplyText: String?
+    private var replyWatchdog: Task<Void, Never>?
+    /// How long a user turn may go with zero response events before the
+    /// session is declared stalled. Signs of life (first audio/text/tool
+    /// event) cancel it — so a long tool run doesn't trip it, only silence.
+    private let replyWatchdogSeconds: UInt64 = 25
+    private var livenessTask: Task<Void, Never>?
+
     /// Background-task assertion held while a live session is backgrounded.
     /// UIBackgroundModes:[audio] keeps the engine alive while audio plays, but
     /// this assertion bridges the quiet gaps (nobody speaking) so iOS doesn't
@@ -154,6 +176,8 @@ final class Conversation: ObservableObject {
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
+        replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
+        livenessTask?.cancel(); livenessTask = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -290,13 +314,70 @@ final class Conversation: ObservableObject {
     private func deliverUserMessage(_ text: String) {
         switch state {
         case .listening, .speaking:
-            send(["type": "user_message", "text": text])
+            sendUserMessage(text)
         case .connecting:
             pendingOutbound.append(text)
         case .idle:
             pendingOutbound.append(text)
             start(token: TokenStore.token ?? "")
         }
+    }
+
+    /// A user turn with the always-answer guarantee: the send completion is
+    /// checked (not discarded), and the reply watchdog arms. Either failure
+    /// path requeues the text and rebuilds the socket, so the question is
+    /// re-asked on the fresh session instead of vanishing.
+    private func sendUserMessage(_ text: String) {
+        awaitingReplyText = text
+        armReplyWatchdog()
+        guard let d = try? JSONSerialization.data(withJSONObject: ["type": "user_message", "text": text]),
+              let s = String(data: d, encoding: .utf8) else { return }
+        ws?.send(.string(s)) { [weak self] error in
+            guard error != nil else { return }
+            Task { @MainActor in
+                guard let self, self.wantLive else { return }
+                // The socket rejected it, so it was NOT delivered — requeue
+                // (guarding against the watchdog/reconnect having done so
+                // already) and rebuild. Even a rapid burst where several sends
+                // fail requeues each exactly once.
+                if !self.pendingOutbound.contains(text) {
+                    self.pendingOutbound.insert(text, at: 0)
+                }
+                if self.awaitingReplyText == text {
+                    self.awaitingReplyText = nil
+                    self.replyWatchdog?.cancel(); self.replyWatchdog = nil
+                }
+                self.scheduleReconnect()
+            }
+        }
+    }
+
+    private func armReplyWatchdog() {
+        replyWatchdog?.cancel()
+        replyWatchdog = Task { [weak self] in
+            guard let secs = self?.replyWatchdogSeconds else { return }
+            try? await Task.sleep(nanoseconds: secs * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.replyWatchdogFired()
+        }
+    }
+
+    private func replyWatchdogFired() {
+        guard wantLive, let text = awaitingReplyText else { return }
+        awaitingReplyText = nil
+        // Total silence for the whole window — the session is stalled or the
+        // socket is dead. Hold the question and rebuild; connect() re-asks it.
+        pendingOutbound.insert(text, at: 0)
+        status = "Stalled — reconnecting…"
+        scheduleReconnect()
+    }
+
+    /// Her first response event for the outstanding turn — the reply is coming,
+    /// stand the watchdog down.
+    private func noteSignsOfLife() {
+        guard awaitingReplyText != nil || replyWatchdog != nil else { return }
+        awaitingReplyText = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
     }
 
     /// Send everything queued while the socket was down, exactly once, in order.
@@ -306,7 +387,7 @@ final class Conversation: ObservableObject {
         guard !pendingOutbound.isEmpty else { return }
         let queued = pendingOutbound
         pendingOutbound.removeAll()
-        for text in queued { send(["type": "user_message", "text": text]) }
+        for text in queued { sendUserMessage(text) }
     }
 
     /// Her most recent line — surfaced by the floating presence capsule.
@@ -428,6 +509,10 @@ final class Conversation: ObservableObject {
             // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
             // driving mode if we're already on a car route.
             evaluateDrivingMode(forceAnnounce: true)
+            // Transport truth: without pings a cell socket killed by a NAT
+            // timeout looks "connected" forever and the receive callback never
+            // fires — this loop finds the corpse within seconds instead of never.
+            startLivenessPings()
             // Socket is live and context is replayed — deliver anything typed,
             // dictated, or shared while she was asleep/connecting. Exactly once.
             flushPendingOutbound()
@@ -467,6 +552,13 @@ final class Conversation: ObservableObject {
             return
         }
         reconnecting = true
+        // A turn still waiting for its reply rides over to the rebuilt session:
+        // requeue it so connect() re-asks it — never silently dropped.
+        if let text = awaitingReplyText {
+            awaitingReplyText = nil
+            replyWatchdog?.cancel(); replyWatchdog = nil
+            pendingOutbound.insert(text, at: 0)
+        }
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
         // pretend to resume a thread that never existed.
@@ -486,6 +578,36 @@ final class Conversation: ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             if wantLive, !Task.isCancelled { await connect() }
             reconnecting = false
+        }
+    }
+
+    /// Repeating transport-level ping. WebSocket pings ride below the ElevenLabs
+    /// protocol, so they cost nothing in the conversation — but a socket the
+    /// network silently killed fails the pong, which is the ONLY timely signal
+    /// of a dead cell connection while nobody is talking. Single instance:
+    /// re-arming cancels the previous loop.
+    private func startLivenessPings() {
+        livenessTask?.cancel()
+        livenessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, !Task.isCancelled, self.wantLive else { return }
+                self.pingNow()
+            }
+        }
+    }
+
+    /// One transport ping; a failed pong means the socket is a corpse → rebuild.
+    /// Also called on return to foreground, where a backgrounded socket has
+    /// often died without any callback ever firing.
+    private func pingNow() {
+        guard wantLive, state == .listening || state == .speaking, let ws else { return }
+        ws.sendPing { [weak self] error in
+            guard error != nil else { return }
+            Task { @MainActor in
+                guard let self, self.wantLive else { return }
+                self.scheduleReconnect()
+            }
         }
     }
 
@@ -524,23 +646,33 @@ final class Conversation: ObservableObject {
                 rebuildPlayback()
             }
         case "audio":
+            noteSignsOfLife()
             if let a = ev["audio_event"] as? [String: Any], let b64 = a["audio_base_64"] as? String {
                 playPCM(base64: b64)
             }
         case "agent_response":
+            noteSignsOfLife()
             if let x = ev["agent_response_event"] as? [String: Any],
                let t = (x["agent_response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
         case "user_transcript":
             if let x = ev["user_transcription_event"] as? [String: Any],
                let t = (x["user_transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !t.isEmpty { transcript.append(.init(text: t, fromHer: false)) }
+               !t.isEmpty {
+                transcript.append(.init(text: t, fromHer: false))
+                // A SPOKEN turn the server heard gets the same always-answer
+                // guarantee as a typed one: if no reply ever starts, the
+                // watchdog requeues this text on the rebuilt session.
+                awaitingReplyText = t
+                armReplyWatchdog()
+            }
         case "interruption":
             flushPlayback()
         case "ping":
             let id = (ev["ping_event"] as? [String: Any])?["event_id"]
             send(["type": "pong", "event_id": id as Any])
         case "client_tool_call":
+            noteSignsOfLife()
             if let c = ev["client_tool_call"] as? [String: Any] { runTool(c) }
         default: break
         }
@@ -967,7 +1099,13 @@ final class Conversation: ObservableObject {
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.endBackgroundAssertion() }
+            Task { @MainActor in
+                self?.endBackgroundAssertion()
+                // The socket often dies while backgrounded with no callback —
+                // probe it NOW so the first thing he types on return doesn't
+                // fall into a corpse.
+                self?.pingNow()
+            }
         }
         // Live-tunable mic settings (channel, gain) changed in Settings: re-read
         // them so the running tap picks them up on its next buffer. A device
