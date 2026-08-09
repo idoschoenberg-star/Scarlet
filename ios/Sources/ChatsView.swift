@@ -826,7 +826,12 @@ struct ChatsView: View {
                 headerBar
                 channelSwitcher
                 if showingAll {
+                    // Explicit re-injection: Catalyst drops the ancestor
+                    // environment across presentation boundaries and
+                    // SignalsListView reads `convo` — a missing injection
+                    // is a SIGTRAP on open (pre-flight gate enforces this).
                     SignalsListView(model: signals)
+                        .environmentObject(convo)
                 } else {
                     content
                 }
