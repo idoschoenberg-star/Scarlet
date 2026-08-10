@@ -756,6 +756,21 @@ final class Conversation: ObservableObject {
                     NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
                 }
             }
+            // "Call Phyllis" → the server resolved the number; open the call
+            // NOW: tel: raises iOS's one-tap Call confirm (Apple's floor, and
+            // Ido's approve loop); wa.me / tg: open the person with the call
+            // button one tap away. Scheme allowlist so a server bug can never
+            // open an arbitrary URL.
+            if name == "start_call",
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let urlStr = obj["url"] as? String,
+               let url = URL(string: urlStr),
+               ["tel", "https", "tg"].contains(url.scheme ?? "") {
+                Task { @MainActor in
+                    UIApplication.shared.open(url)
+                }
+            }
         }
     }
 
