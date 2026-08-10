@@ -758,34 +758,29 @@ struct InboxView: View {
                         // ZStack + zero-opacity link: full NavigationLink
                         // behavior without the disclosure chevron Outlook
                         // doesn't have.
-                        ZStack {
-                            NavigationLink {
-                                MailDetailView(message: message, model: model)
-                                    // Mac Catalyst drops @EnvironmentObject across
-                                    // the NavigationLink→destination boundary, so
-                                    // MailDetailView's `convo` traps
-                                    // (EnvironmentObject.error → SIGTRAP) on open.
-                                    // Re-inject like every DraftView call site.
-                                    .environmentObject(convo)
-                            } label: {
-                                EmptyView()
+                        OutlookArchiveSwipe(
+                            baseBackground: message.flagged
+                                ? OutlookStyle.flaggedRowTint : Color.clear,
+                            onArchive: { model.archive(message) }
+                        ) {
+                            ZStack {
+                                NavigationLink {
+                                    MailDetailView(message: message, model: model)
+                                        // Mac Catalyst drops @EnvironmentObject across
+                                        // the NavigationLink→destination boundary, so
+                                        // MailDetailView's `convo` traps
+                                        // (EnvironmentObject.error → SIGTRAP) on open.
+                                        // Re-inject like every DraftView call site.
+                                        .environmentObject(convo)
+                                } label: {
+                                    EmptyView()
+                                }
+                                .opacity(0)
+                                InboxRow(message: message, accent: OutlookStyle.accentBlue)
                             }
-                            .opacity(0)
-                            InboxRow(message: message, accent: OutlookStyle.accentBlue)
                         }
-                        .listRowBackground(message.flagged
-                            ? OutlookStyle.flaggedRowTint : Color.clear)
                         .listRowSeparatorTint(OutlookStyle.separator)
-                        // Outlook's swipes: long-swipe left = green Archive,
-                        // long-swipe right = orange Flag (plus Read/Unread).
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button {
-                                model.archive(message)
-                            } label: {
-                                Label("Archive", systemImage: "archivebox.fill")
-                            }
-                            .tint(OutlookStyle.archiveGreen)
-                        }
+                        // Leading swipe stays Outlook's: orange Flag + Read/Unread.
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
                             Button {
                                 model.toggleFlag(message)
@@ -872,6 +867,94 @@ struct InboxView: View {
             return dateHeaderFormat.string(from: day)
         }
         return oldDateHeaderFormat.string(from: day)
+    }
+}
+
+/// Outlook-fidelity archive swipe. The system `.swipeActions` renders the
+/// action as a floating rounded button that stops at partial reveal — not
+/// Outlook's look. Here the row rides the finger over a full-bleed green bar
+/// that spans the entire line height and grows with the drag; the archive
+/// glyph sits pinned at the trailing edge, pops (with a haptic) at the 45%
+/// commit point, and past it the row flies off and the archive fires.
+/// Below it, release springs the row back. Leading swipes (flag / read) stay
+/// on the system implementation and are untouched by this gesture.
+private struct OutlookArchiveSwipe<Content: View>: View {
+    let baseBackground: Color
+    let onArchive: () -> Void
+    @ViewBuilder let content: Content
+
+    @State private var offset: CGFloat = 0
+    @State private var width: CGFloat = 1
+    @State private var pastThreshold = false
+    @State private var committed = false
+
+    private var progress: CGFloat { min(1, -offset / max(width, 1)) }
+
+    var body: some View {
+        content
+            .background(GeometryReader { geo in
+                Color.clear
+                    .onAppear { width = geo.size.width }
+                    .onChange(of: geo.size.width) { width = geo.size.width }
+            })
+            .offset(x: min(0, offset))
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 18)
+                    .onChanged { v in
+                        guard !committed else { return }
+                        let dx = v.translation.width, dy = v.translation.height
+                        // Leftward, horizontal-dominant drags only — vertical
+                        // scrolling and the leading (rightward) system swipe
+                        // keep full ownership of everything else.
+                        guard dx < 0, abs(dx) > abs(dy) * 1.2 else {
+                            if offset != 0 {
+                                withAnimation(.spring(duration: 0.25)) { offset = 0 }
+                            }
+                            return
+                        }
+                        offset = dx
+                        let past = progress >= 0.45
+                        if past != pastThreshold {
+                            pastThreshold = past
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                        }
+                    }
+                    .onEnded { _ in
+                        guard !committed else { return }
+                        if pastThreshold {
+                            committed = true
+                            withAnimation(.easeOut(duration: 0.18)) { offset = -width }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { onArchive() }
+                        } else {
+                            pastThreshold = false
+                            withAnimation(.spring(duration: 0.3)) { offset = 0 }
+                        }
+                    }
+            )
+            .listRowBackground(
+                ZStack(alignment: .trailing) {
+                    baseBackground
+                    // The revealed strip: full row height, exactly as wide as
+                    // the drag — the Outlook "full line", not a rounded chip.
+                    OutlookStyle.archiveGreen
+                        .frame(width: max(0, -offset))
+                    if -offset > 44 {
+                        VStack(spacing: 3) {
+                            Image(systemName: "archivebox.fill")
+                                .font(.system(size: 18, weight: .semibold))
+                            if pastThreshold {
+                                Text("Archive")
+                                    .font(.system(size: 11, weight: .semibold))
+                            }
+                        }
+                        .foregroundStyle(.white)
+                        .scaleEffect(pastThreshold ? 1.12 : 1.0)
+                        .animation(.spring(duration: 0.18), value: pastThreshold)
+                        .padding(.trailing, 22)
+                        .transition(.opacity)
+                    }
+                }
+            )
     }
 }
 
