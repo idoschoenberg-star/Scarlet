@@ -130,6 +130,9 @@ struct MusicPlayerState: Equatable {
     var durationMs: Int
     var isPlaying: Bool
     var deviceName: String?
+    /// The remote device's current volume (0-100); nil when the device
+    /// doesn't report one. Drives the in-app volume slider.
+    var volumePercent: Int?
     var queue: [MusicQueueItem]
 }
 
@@ -481,6 +484,7 @@ final class MusicModel: ObservableObject {
                     durationMs: (obj["duration_ms"] as? Int) ?? 0,
                     isPlaying: (obj["is_playing"] as? Bool) ?? false,
                     deviceName: (obj["device"] as? [String: Any])?["name"] as? String,
+                    volumePercent: (obj["device"] as? [String: Any])?["volume_percent"] as? Int,
                     queue: queue
                 )
             }
@@ -552,6 +556,36 @@ final class MusicModel: ObservableObject {
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
             await refreshState()
+        }
+    }
+
+    /// The volume the slider is showing mid-drag; nil = trust the poll.
+    @Published var volumeDraft: Double?
+    private var volumeSendTask: Task<Void, Never>?
+
+    /// Remote-speaker volume via music_control {action:'volume'} — the same
+    /// Spotify Connect call Spotify's own slider makes, so the app and the
+    /// Spotify app stay in sync. Sends are debounced so a drag lands as one
+    /// or two API calls; the state poll re-syncs truth afterwards.
+    func setVolume(_ percent: Double) {
+        volumeDraft = percent
+        volumeSendTask?.cancel()
+        volumeSendTask = Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                let data = try await Self.request("op=music_control", method: "POST",
+                                                  body: ["action": "volume", "volume": Int(percent)])
+                let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+                if let err = obj["error"] as? String { showToast(err) }
+            } catch {
+                showToast("This speaker doesn't allow remote volume.")
+            }
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            if !Task.isCancelled {
+                volumeDraft = nil
+                await refreshState()
+            }
         }
     }
 
@@ -2794,6 +2828,28 @@ private struct MusicTrackDetailView: View {
                         .font(.system(size: 12))
                 }
                 .foregroundStyle(MusicStyle.secondary)
+            }
+            // Remote-speaker volume — mirrors Spotify's own slider through
+            // Spotify Connect, so changes here move the speaker for real.
+            if p.volumePercent != nil || model.volumeDraft != nil {
+                HStack(spacing: 10) {
+                    Image(systemName: "speaker.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MusicStyle.secondary)
+                    Slider(
+                        value: Binding(
+                            get: { model.volumeDraft ?? Double(p.volumePercent ?? 50) },
+                            set: { model.setVolume($0) }
+                        ),
+                        in: 0...100
+                    )
+                    .tint(MusicStyle.green)
+                    .accessibilityLabel("Speaker volume")
+                    Image(systemName: "speaker.wave.3.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MusicStyle.secondary)
+                }
+                .padding(.horizontal, 8)
             }
         }
     }
