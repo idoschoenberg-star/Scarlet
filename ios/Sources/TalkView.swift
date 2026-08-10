@@ -11,6 +11,9 @@ struct TalkView: View {
 
     /// The orb yields space to the transcript while he's typing/dictating.
     private var orbSize: CGFloat { typeFocused ? 110 : 200 }
+    /// The transcript compresses too, so the control row and End button stay
+    /// on screen above the keyboard — the dead-end fix's first belt.
+    private var transcriptMin: CGFloat { typeFocused ? 70 : 150 }
 
     var body: some View {
         VStack(spacing: 20) {
@@ -56,8 +59,10 @@ struct TalkView: View {
             // (never squeezed to nothing), and it takes any spare height so a
             // silent answer is easy to read.
             Transcript(lines: convo.transcript)
-                .frame(minHeight: 150, maxHeight: .infinity)
+                .frame(minHeight: transcriptMin, maxHeight: .infinity)
                 .layoutPriority(1)
+                // Second belt: tapping the transcript always lowers the keyboard.
+                .simultaneousGesture(TapGesture().onEnded { typeFocused = false })
 
             if showType {
                 HStack(spacing: 8) {
@@ -67,6 +72,31 @@ struct TalkView: View {
                         .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 14))
                         .focused($typeFocused)
                         .onSubmit { convo.sendText(typed); typed = "" }
+                        // Third belt — the guaranteed exit: a bar riding ON TOP
+                        // of the keyboard with Done plus live Mic/Voice toggles,
+                        // so muted-mic + muted-voice + open-keyboard can never
+                        // trap him again (the delete-and-reinstall dead end).
+                        .toolbar {
+                            ToolbarItemGroup(placement: .keyboard) {
+                                Button {
+                                    convo.toggleMic()
+                                } label: {
+                                    Image(systemName: convo.micOn ? "mic.fill" : "mic.slash.fill")
+                                }
+                                Button {
+                                    convo.toggleSpeaker()
+                                } label: {
+                                    Image(systemName: convo.speakerOn ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                                }
+                                Spacer()
+                                Button("Done") {
+                                    typeFocused = false
+                                    showType = false
+                                    convo.endTyping()
+                                }
+                                .fontWeight(.semibold)
+                            }
+                        }
                     Button {
                         convo.sendText(typed); typed = ""
                     } label: {
@@ -175,6 +205,9 @@ struct Transcript: View {
                 }.padding(14)
             }
             .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 20))
+            // Dragging the transcript pulls the keyboard down with it —
+            // the same escape iMessage teaches every thumb.
+            .scrollDismissesKeyboard(.interactively)
             .onChange(of: lines.count) { _, _ in
                 if let last = lines.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
             }
