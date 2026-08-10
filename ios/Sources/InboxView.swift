@@ -508,7 +508,9 @@ enum OutlookStyle {
     /// Microsoft blue — filled primary actions.
     static let primaryBlue = Color(hex: 0x0F6CBD)
     /// Full-swipe Archive.
-    static let archiveGreen = Color(hex: 0x498205)
+    // Microsoft's Fluent green (#107C10) — the strong archive/success green
+    // Outlook mobile uses; 0x498205 was Outlook web's weaker olive tone.
+    static let archiveGreen = Color(hex: 0x107C10)
     /// The follow-up flag: glyph, leading swipe.
     static let flagOrange = Color(hex: 0xCA5010)
     /// Secondary text: previews, times, section headers.
