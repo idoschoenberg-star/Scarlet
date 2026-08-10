@@ -1,22 +1,36 @@
 import SwiftUI
 import UIKit
 
-/// Native Music (Spotify) — the app's mirror of the web Music section: library
-/// shelves (playlists / liked / recently played), search across tracks,
-/// playlists, albums and artists, tap-to-play on Ido's Spotify devices with
-/// the backend's own honest success/failure line surfaced as a toast, a
-/// now-playing dock that polls `music_state` only while the screen is visible,
-/// and a full track sheet (art, album, stats, transport) via `music_track`.
+/// Native Music — a mirror of the real Spotify app's structure inside the
+/// Music tab. Four top-level segments (the house capsule switcher):
+///
+///   For You   — Spotify Home: horizontal rails (Recently played, Your top
+///               tracks, Fresh from your artists, New releases, Your top
+///               artists as round avatars). Every card taps to play.
+///   Library   — Your Library: filter chips (Playlists / Liked / Podcasts),
+///               playlist rows → pushed playlist detail with a green circular
+///               Play, Liked with a Play-all.
+///   Podcasts  — show subscriptions → pushed show detail with newest-first
+///               episodes (progress bar when Spotify grants resume points).
+///   Search    — the existing debounced search across tracks / artists /
+///               albums / playlists.
 ///
 /// Playback always happens on a real Spotify device (Connect) — the server
 /// verifies sound is actually coming out before claiming success, and its
 /// `note`/`error` strings are shown verbatim rather than an invented "done".
+/// A `need_device` answer raises the device picker (op=music_devices) and the
+/// chosen device retries the same play — never a dead end.
+///
+/// Catalyst rules respected: ONE enum-driven `.sheet(item:)` on the root view
+/// (track detail + device picker); playlist/show detail are NavigationStack
+/// pushes with a drawn back button; only the root reads `convo` (re-injected
+/// at both construction sites: ScarletTalkApp and SplitShell).
 
 // MARK: - Wire types
 
 /// One playable track, as the music ops return it (library `saved` /
-/// `recentlyPlayed`, playlist tracks, search tracks). `durationMs` is 0 when
-/// the source op doesn't carry it (library `saved`).
+/// `recentlyPlayed`, playlist tracks, search tracks, For-You top tracks).
+/// `durationMs` is 0 when the source op doesn't carry it (library `saved`).
 struct MusicTrackItem: Identifiable, Equatable {
     let id: String
     let uri: String
@@ -45,12 +59,57 @@ struct MusicAlbumItem: Identifiable, Equatable {
     let image: String?
 }
 
-/// A search artist — tap plays the artist context.
+/// A search artist or a For-You top artist — tap plays the artist context.
 struct MusicArtistItem: Identifiable, Equatable {
     let id: String
     let uri: String
     let name: String
     let image: String?
+}
+
+/// One album/single from `music_foryou.freshFromArtists` / `newReleases`.
+struct MusicReleaseItem: Identifiable, Equatable {
+    let id: String
+    let uri: String
+    let name: String
+    let artist: String
+    let image: String?
+    let releaseDate: String
+}
+
+/// One podcast subscription from `music_podcasts.shows`.
+struct MusicShowItem: Identifiable, Equatable {
+    let id: String
+    let uri: String
+    let name: String
+    let publisher: String
+    let image: String?
+    let totalEpisodes: Int
+    let blurb: String
+}
+
+/// One episode (saved rail or a show's list). `progressMs` is nil when the
+/// resume scope isn't granted yet — the progress bar renders only when the
+/// value is actually present (honest optionality).
+struct MusicEpisodeItem: Identifiable, Equatable {
+    let id: String
+    let uri: String
+    let title: String
+    let show: String
+    let image: String?
+    let durationMs: Int
+    let releaseDate: String
+    let progressMs: Int?
+    let fullyPlayed: Bool
+    let blurb: String
+}
+
+/// One Spotify Connect device from `op=music_devices`.
+struct MusicDeviceItem: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let type: String
+    let isActive: Bool
 }
 
 /// "Up next" row from `music_state.queue`. The queue can legally repeat a
@@ -105,12 +164,48 @@ enum MusicPlaylistFetch {
     case failed(String)
 }
 
+/// `op=music_show&id=` result: refreshed show header + its episodes.
+enum MusicShowFetch {
+    case loaded(MusicShowItem?, [MusicEpisodeItem])
+    case failed(String)
+}
+
+enum MusicDevicesFetch {
+    case loaded([MusicDeviceItem])
+    case failed(String)
+}
+
+/// The play that hit `need_device` — carried into the device picker so the
+/// chosen device retries the exact same uri.
+struct MusicPendingPlay: Identifiable, Equatable {
+    let uri: String
+    let label: String
+    var id: String { uri }
+}
+
+/// The ONE sheet this tab ever presents (Catalyst allows a single `.sheet`
+/// per view — enum-driven, like LibraryView's LibrarySheet). Lives on the
+/// model so pushed screens (playlist/show detail) can raise it too.
+enum MusicSheet: Identifiable {
+    case track(MusicTrackItem)
+    case devices(MusicPendingPlay)
+
+    var id: String {
+        switch self {
+        case .track(let t): return "track-\(t.id)"
+        case .devices(let p): return "devices-\(p.id)"
+        }
+    }
+}
+
 // MARK: - Palette
 
-/// Scarlet rose on the silk background — the Music accent, matching the web
-/// app's tint. File-scoped so nothing leaks into sibling views.
+/// Spotify's own dark design language inside this tab: near-black surfaces
+/// and #1DB954 green for play buttons / active states. File-scoped so nothing
+/// leaks into sibling views.
 private enum MusicStyle {
-    static let rose = Color(red: 1, green: 0.35, blue: 0.42)
+    /// Spotify green #1DB954.
+    static let green = Color(red: 29.0 / 255.0, green: 185.0 / 255.0, blue: 84.0 / 255.0)
     static let surface = Color.white.opacity(0.08)
     static let stroke = Color.white.opacity(0.12)
     static let secondary = Color.white.opacity(0.62)
@@ -121,6 +216,32 @@ private enum MusicStyle {
 private func musicDuration(_ ms: Int) -> String {
     let s = max(0, ms / 1000)
     return "\(s / 60):" + String(format: "%02d", s % 60)
+}
+
+/// "54 min" from milliseconds — the podcast-episode form Spotify uses.
+private func musicMinutes(_ ms: Int) -> String {
+    let m = Int((Double(max(0, ms)) / 60_000.0).rounded())
+    return m > 0 ? "\(m) min" : musicDuration(ms)
+}
+
+/// "2026-08-01" → "Aug 1, 2026"; anything unparseable passes through.
+private enum MusicReleaseDate {
+    static let wire: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f
+    }()
+    static let display: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d, yyyy"
+        return f
+    }()
+
+    static func label(_ raw: String) -> String {
+        guard let d = wire.date(from: raw) else { return raw }
+        return display.string(from: d)
+    }
 }
 
 // MARK: - Model
@@ -135,6 +256,22 @@ final class MusicModel: ObservableObject {
     @Published var libraryNote = ""
     @Published var loadingLibrary = false
     @Published var errorText = ""
+
+    // For You (op=music_foryou)
+    @Published var topTracks: [MusicTrackItem] = []
+    @Published var topArtists: [MusicArtistItem] = []
+    @Published var freshReleases: [MusicReleaseItem] = []
+    @Published var newReleases: [MusicReleaseItem] = []
+    @Published var forYouNote = ""
+    @Published var forYouError = ""
+    @Published var loadingForYou = false
+
+    // Podcasts (op=music_podcasts)
+    @Published var shows: [MusicShowItem] = []
+    @Published var savedEpisodes: [MusicEpisodeItem] = []
+    @Published var podcastsNote = ""
+    @Published var podcastsError = ""
+    @Published var loadingPodcasts = false
 
     // Live player (op=music_state, polled only while the screen is visible)
     @Published var player: MusicPlayerState?
@@ -155,15 +292,17 @@ final class MusicModel: ObservableObject {
     /// own words, auto-cleared. Rendered by the dock and the track sheet.
     @Published var toast = ""
 
-    /// The track sheet's subject. Lives on the model so the pushed playlist
-    /// screen can raise the ONE sheet owned by MusicView (Catalyst rule:
-    /// a single `.sheet` per view).
-    @Published var detail: MusicTrackItem?
+    /// The ONE sheet (track detail / device picker). On the model so the
+    /// pushed playlist and show screens can raise it (Catalyst rule: a single
+    /// `.sheet` per view, owned by the root MusicView).
+    @Published var activeSheet: MusicSheet?
 
     private var pollTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var toastTask: Task<Void, Never>?
     private var libraryGeneration = 0
+    private var forYouGeneration = 0
+    private var podcastsGeneration = 0
     private var searchGeneration = 0
 
     // MARK: Library
@@ -179,8 +318,7 @@ final class MusicModel: ObservableObject {
         let generation = libraryGeneration
         defer { if generation == libraryGeneration { loadingLibrary = false } }
         do {
-            let data = try await Self.request("op=music_library", method: "GET")
-            let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            let obj = try await Self.getWithRetry("op=music_library")
             guard generation == libraryGeneration else { return }
             let newPlaylists = Self.dedup(((obj["playlists"] as? [[String: Any]]) ?? [])
                 .compactMap { Self.playlist(from: $0) })
@@ -197,6 +335,91 @@ final class MusicModel: ObservableObject {
         } catch {
             guard generation == libraryGeneration else { return }
             errorText = "Couldn't reach your music — check your connection."
+        }
+    }
+
+    // MARK: For You
+
+    func loadForYou() async {
+        guard TokenStore.token != nil else { return }
+        if topTracks.isEmpty && topArtists.isEmpty && freshReleases.isEmpty
+            && newReleases.isEmpty { loadingForYou = true }
+        forYouError = ""
+        forYouGeneration += 1
+        let generation = forYouGeneration
+        defer { if generation == forYouGeneration { loadingForYou = false } }
+        do {
+            let obj = try await Self.getWithRetry("op=music_foryou")
+            guard generation == forYouGeneration else { return }
+            if let err = obj["error"] as? String {
+                forYouError = err
+                return
+            }
+            let tracks = Self.dedup(((obj["topTracks"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.track(from: $0) })
+            let artists = Self.dedup(((obj["topArtists"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.artist(from: $0) })
+            let fresh = Self.dedup(((obj["freshFromArtists"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.release(from: $0) })
+            let releases = Self.dedup(((obj["newReleases"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.release(from: $0) })
+            withAnimation(.snappy) {
+                topTracks = tracks
+                topArtists = artists
+                freshReleases = fresh
+                newReleases = releases
+            }
+            forYouNote = (obj["note"] as? String) ?? ""
+        } catch {
+            guard generation == forYouGeneration else { return }
+            forYouError = "Couldn't load your Spotify picks — check your connection."
+        }
+    }
+
+    // MARK: Podcasts
+
+    func loadPodcasts() async {
+        guard TokenStore.token != nil else { return }
+        if shows.isEmpty && savedEpisodes.isEmpty { loadingPodcasts = true }
+        podcastsError = ""
+        podcastsGeneration += 1
+        let generation = podcastsGeneration
+        defer { if generation == podcastsGeneration { loadingPodcasts = false } }
+        do {
+            let obj = try await Self.getWithRetry("op=music_podcasts")
+            guard generation == podcastsGeneration else { return }
+            if let err = obj["error"] as? String {
+                podcastsError = err
+                return
+            }
+            let newShows = Self.dedup(((obj["shows"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.show(from: $0) })
+            let newEpisodes = Self.dedup(((obj["savedEpisodes"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.episode(from: $0) })
+            withAnimation(.snappy) {
+                shows = newShows
+                savedEpisodes = newEpisodes
+            }
+            podcastsNote = (obj["note"] as? String) ?? ""
+        } catch {
+            guard generation == podcastsGeneration else { return }
+            podcastsError = "Couldn't load your podcasts — check your connection."
+        }
+    }
+
+    /// One show's episodes (pushed show-detail screen). Newest first.
+    func fetchShow(id: String) async -> MusicShowFetch {
+        do {
+            let encoded = id.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? id
+            let obj = try await Self.getWithRetry("op=music_show&id=\(encoded)")
+            if let err = obj["error"] as? String { return .failed(err) }
+            let header = (obj["show"] as? [String: Any]).flatMap { Self.show(from: $0) }
+            let episodes = Self.dedup(((obj["episodes"] as? [[String: Any]]) ?? [])
+                .compactMap { Self.episode(from: $0) })
+                .sorted { $0.releaseDate > $1.releaseDate }
+            return .loaded(header, episodes)
+        } catch {
+            return .failed("Couldn't load this show — check your connection.")
         }
     }
 
@@ -269,28 +492,38 @@ final class MusicModel: ObservableObject {
 
     // MARK: Playback
 
-    /// Play a Spotify uri (track = one-off, playlist/album/artist = context).
-    /// The toast is the SERVER's verdict — including its "opening Spotify will
-    /// start it automatically" retry note and the fixed-device warning.
-    func play(uri: String, label: String) {
+    /// Play any Spotify uri (track/episode = one-off item; playlist / album /
+    /// artist / show = context). The toast is the SERVER's verdict — including
+    /// its retry notes. A `need_device` answer raises the device picker with
+    /// this exact play pending, so choosing a device finishes the job.
+    func play(uri: String, label: String, device: String? = nil) {
         Task {
             do {
+                var body: [String: Any] = ["uri": uri]
+                if let device, !device.isEmpty { body["device"] = device }
                 let data = try await Self.request("op=music_play", method: "POST",
-                                                  body: ["uri": uri])
+                                                  body: body)
                 let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
                 let note = obj["note"] as? String
                 if (obj["ok"] as? Bool) == true {
-                    let device = (obj["on_device"] as? String)
+                    let onDevice = (obj["on_device"] as? String)
                         ?? (obj["device"] as? String) ?? ""
-                    var line = device.isEmpty
+                    var line = onDevice.isEmpty
                         ? "Playing \(label)"
-                        : "Playing \(label) on \(device)"
+                        : "Playing \(label) on \(onDevice)"
                     if let note, !note.isEmpty { line += " — \(note)" }
                     showToast(line)
                 } else if let err = obj["error"] as? String {
-                    var line = err
-                    if let note, !note.isEmpty { line += " — \(note)" }
-                    showToast(line)
+                    if (obj["need_device"] as? Bool) == true {
+                        // No active Spotify device — the picker takes over and
+                        // retries this same play on whatever Ido chooses.
+                        showToast(err)
+                        activeSheet = .devices(MusicPendingPlay(uri: uri, label: label))
+                    } else {
+                        var line = err
+                        if let note, !note.isEmpty { line += " — \(note)" }
+                        showToast(line)
+                    }
                 } else {
                     showToast("Couldn't start playback — is Spotify open on a device?")
                 }
@@ -319,6 +552,31 @@ final class MusicModel: ObservableObject {
             }
             try? await Task.sleep(nanoseconds: 700_000_000)
             await refreshState()
+        }
+    }
+
+    /// Spotify Connect devices for the picker (op=music_devices).
+    func fetchDevices() async -> MusicDevicesFetch {
+        do {
+            let obj = try await Self.getWithRetry("op=music_devices")
+            if let err = obj["error"] as? String { return .failed(err) }
+            let raw = (obj["devices"] as? [[String: Any]]) ?? []
+            var seen = Set<String>()
+            let devices: [MusicDeviceItem] = raw.compactMap { d in
+                let name = (d["name"] as? String) ?? ""
+                guard !name.isEmpty else { return nil }
+                let id = (d["id"] as? String) ?? name
+                guard seen.insert(id).inserted else { return nil }
+                return MusicDeviceItem(
+                    id: id,
+                    name: name,
+                    type: (d["type"] as? String) ?? "",
+                    isActive: (d["is_active"] as? Bool) ?? (d["isActive"] as? Bool) ?? false
+                )
+            }
+            return .loaded(devices)
+        } catch {
+            return .failed("Couldn't list your Spotify devices — check your connection.")
         }
     }
 
@@ -496,6 +754,49 @@ final class MusicModel: ObservableObject {
         )
     }
 
+    private static func release(from m: [String: Any]) -> MusicReleaseItem? {
+        guard let id = m["id"] as? String, !id.isEmpty else { return nil }
+        return MusicReleaseItem(
+            id: id,
+            uri: (m["uri"] as? String) ?? "spotify:album:\(id)",
+            name: (m["name"] as? String) ?? "Release",
+            artist: (m["artist"] as? String) ?? "",
+            image: m["image"] as? String,
+            releaseDate: (m["releaseDate"] as? String) ?? ""
+        )
+    }
+
+    private static func show(from m: [String: Any]) -> MusicShowItem? {
+        guard let id = m["id"] as? String, !id.isEmpty else { return nil }
+        return MusicShowItem(
+            id: id,
+            uri: (m["uri"] as? String) ?? "spotify:show:\(id)",
+            name: (m["name"] as? String) ?? "Show",
+            publisher: (m["publisher"] as? String) ?? "",
+            image: m["image"] as? String,
+            totalEpisodes: (m["totalEpisodes"] as? Int) ?? 0,
+            blurb: (m["description"] as? String) ?? ""
+        )
+    }
+
+    private static func episode(from m: [String: Any]) -> MusicEpisodeItem? {
+        guard let id = m["id"] as? String, !id.isEmpty else { return nil }
+        return MusicEpisodeItem(
+            id: id,
+            uri: (m["uri"] as? String) ?? "spotify:episode:\(id)",
+            title: (m["title"] as? String) ?? "Episode",
+            show: (m["show"] as? String) ?? "",
+            image: m["image"] as? String,
+            durationMs: (m["durationMs"] as? Int) ?? (m["duration_ms"] as? Int) ?? 0,
+            releaseDate: (m["releaseDate"] as? String) ?? "",
+            // Present only when Spotify granted the resume scope — the row's
+            // progress bar renders only off a real value.
+            progressMs: (m["progressMs"] as? Int) ?? (m["progress_ms"] as? Int),
+            fullyPlayed: (m["fullyPlayed"] as? Bool) ?? false,
+            blurb: (m["description"] as? String) ?? ""
+        )
+    }
+
     /// Duplicate ids crash diffable lists at regular width — same class of
     /// crash already fixed in Chats/Inbox. Keep the first of any repeat.
     private static func dedup<Item: Identifiable>(_ items: [Item]) -> [Item] {
@@ -522,6 +823,25 @@ final class MusicModel: ObservableObject {
             throw URLError(.badServerResponse)
         }
         return data
+    }
+
+    /// GET with the house two-attempt retry (ChatsView pattern): flaky
+    /// hotel/roaming links drop single requests while the server is perfectly
+    /// healthy — one quiet pause, one more try, THEN the honest error.
+    private static func getWithRetry(_ query: String) async throws -> [String: Any] {
+        var lastError: Error = URLError(.unknown)
+        for attempt in 1...2 {
+            do {
+                let data = try await request(query, method: "GET")
+                return try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+            } catch {
+                lastError = error
+                if attempt == 1 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                }
+            }
+        }
+        throw lastError
     }
 }
 
@@ -556,68 +876,590 @@ private struct MusicArt: View {
     }
 }
 
+/// Round artist portrait (Spotify's artist form), honest mic placeholder.
+private struct MusicArtistPortrait: View {
+    let url: String?
+    var size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().fill(MusicStyle.surface)
+            Image(systemName: "music.mic")
+                .font(.system(size: size * 0.34))
+                .foregroundStyle(MusicStyle.tertiary)
+            if let u = url.flatMap({ URL(string: $0) }) {
+                AsyncImage(url: u) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFill()
+                    default:
+                        Color.clear
+                    }
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+    }
+}
+
+/// The Spotify-green circular play button (black glyph on green, the real
+/// app's exact affordance). One component, three sizes.
+private struct MusicPlayCircle: View {
+    var size: CGFloat = 52
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(MusicStyle.green)
+                Image(systemName: "play.fill")
+                    .font(.system(size: size * 0.38, weight: .bold))
+                    .foregroundStyle(.black)
+                    .offset(x: size * 0.03)
+            }
+            .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Play")
+    }
+}
+
+// MARK: - Segments (the Spotify information architecture)
+
+/// Top-level segments, mirroring the real app: Home ("For You"), Your
+/// Library, Podcasts (subscriptions), Search.
+private enum MusicSegment: String, CaseIterable, Identifiable {
+    case forYou
+    case library
+    case podcasts
+    case search
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .forYou: return "For You"
+        case .library: return "Library"
+        case .podcasts: return "Podcasts"
+        case .search: return "Search"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .forYou: return "house.fill"
+        case .library: return "books.vertical.fill"
+        case .podcasts: return "dot.radiowaves.left.and.right"
+        case .search: return "magnifyingglass"
+        }
+    }
+}
+
+/// Library filter chips (Spotify's Your Library filters). "Podcasts" is a
+/// jump to the Podcasts segment, so it never renders as selected here.
+private enum MusicLibraryFilter: String, CaseIterable, Identifiable {
+    case playlists
+    case liked
+    case podcasts
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .playlists: return "Playlists"
+        case .liked: return "Liked"
+        case .podcasts: return "Podcasts"
+        }
+    }
+}
+
+/// The segment-level ambient-focus line (house pattern: every screen reports
+/// what Ido is looking at).
+private func musicBrowsingFocus(_ segment: MusicSegment) -> String {
+    switch segment {
+    case .forYou:
+        return "[FOCUS] Ido is browsing Music — For You (his Spotify home: recently played, top tracks, fresh releases, top artists)."
+    case .library:
+        return "[FOCUS] Ido is browsing Music — his Spotify Library (playlists, liked songs)."
+    case .podcasts:
+        return "[FOCUS] Ido is browsing Music — his podcast subscriptions on Spotify."
+    case .search:
+        return "[FOCUS] Ido is searching Spotify inside the Music tab."
+    }
+}
+
 // MARK: - Root view
 
 struct MusicView: View {
     @StateObject private var model = MusicModel()
+    @EnvironmentObject private var convo: Conversation
+    @State private var segment: MusicSegment = .forYou
+    @State private var libraryFilter: MusicLibraryFilter = .playlists
 
     var body: some View {
         NavigationStack {
             ZStack {
-                ScarletBackground().ignoresSafeArea()
+                MusicBackdrop()
                 VStack(spacing: 0) {
-                    header
-                    searchField
+                    headerBar
+                    segmentSwitcher
                     content
                 }
             }
             .toolbar(.hidden, for: .navigationBar)
             // The dock (toast + now-playing bar) is part of the HOME screen's
-            // layout; a pushed playlist screen mounts its own, same anatomy.
+            // layout; pushed playlist/show screens mount their own, same
+            // anatomy (exactly where the previous MusicView kept it).
             .safeAreaInset(edge: .bottom) { MusicBottomDock(model: model) }
         }
-        // ONE sheet on this view (Catalyst rule) — the full track detail,
-        // raised from the dock, any row's context menu, or the playlist screen.
-        .sheet(item: $model.detail) { track in
-            MusicTrackDetailView(seed: track, model: model)
+        // ONE sheet on this view (Catalyst rule) — the full track detail or
+        // the device picker, raised from anywhere via model.activeSheet.
+        .sheet(item: $model.activeSheet) { sheet in
+            switch sheet {
+            case .track(let track):
+                MusicTrackDetailView(seed: track, model: model)
+            case .devices(let pending):
+                MusicDevicePickerView(pending: pending, model: model)
+            }
         }
         // Poll the live player only while the Music screen is actually up:
         // these fire on tab switch in/out; the poll task dies on disappear.
-        .onAppear { model.startPolling() }
+        .onAppear {
+            model.startPolling()
+            convo.setFocus(musicBrowsingFocus(segment))
+        }
         .onDisappear { model.stopPolling() }
+        .onChange(of: segment) { _, newSegment in
+            convo.setFocus(musicBrowsingFocus(newSegment))
+        }
         // .task re-runs on each tab selection → auto-refresh, like the inbox.
-        .task { await model.loadLibrary() }
+        .task { await loadAll() }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { await model.loadLibrary() }
+            Task { await loadAll() }
         }
         .preferredColorScheme(.dark)
     }
 
-    // MARK: header (house anatomy: big title, rose glyph)
+    /// The three GET ops load in parallel; each section fails independently
+    /// (its own error string) so one bad answer never blanks the others.
+    private func loadAll() async {
+        async let library: Void = model.loadLibrary()
+        async let forYou: Void = model.loadForYou()
+        async let podcasts: Void = model.loadPodcasts()
+        _ = await (library, forYou, podcasts)
+    }
 
-    private var header: some View {
+    // MARK: header (house anatomy: big heavy title + refresh, like Chats)
+
+    private var headerBar: some View {
         HStack(spacing: 12) {
-            ZStack {
-                Circle().fill(MusicStyle.rose.opacity(0.18))
-                Image(systemName: "music.note")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(MusicStyle.rose)
-            }
-            .frame(width: 36, height: 36)
             Text("Music")
-                .font(.system(size: 28, weight: .bold))
+                .font(.system(size: 34, weight: .heavy))
                 .foregroundStyle(.white)
             Spacer()
+            Button {
+                Task { await loadAll() }
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            .disabled(model.loadingLibrary || model.loadingForYou || model.loadingPodcasts)
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
     }
 
-    /// Search across tracks / playlists / albums / artists. The field itself
-    /// follows the typed text's direction (Hebrew queries read RTL) — per
-    /// control, never the whole screen.
+    // MARK: segment switcher (the house capsule idiom, Spotify-green accent)
+
+    private var segmentSwitcher: some View {
+        HStack(spacing: 4) {
+            ForEach(MusicSegment.allCases) { s in
+                segmentButton(s)
+            }
+        }
+        .padding(4)
+        .background(Capsule().fill(.white.opacity(0.06)))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
+    private func segmentButton(_ s: MusicSegment) -> some View {
+        Button {
+            withAnimation(.snappy) { segment = s }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: s.icon)
+                    .font(.system(size: 12, weight: .semibold))
+                Text(s.displayName)
+                    .font(.system(size: 14, weight: .semibold))
+            }
+            .foregroundStyle(segment == s ? MusicStyle.green : Color.white.opacity(0.55))
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity)
+            .background(
+                Capsule().fill(segment == s
+                    ? MusicStyle.green.opacity(0.18) : Color.clear)
+            )
+            .overlay(
+                Capsule().stroke(segment == s
+                    ? MusicStyle.green.opacity(0.45) : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: content
+
+    @ViewBuilder
+    private var content: some View {
+        switch segment {
+        case .forYou: forYouScreen
+        case .library: libraryScreen
+        case .podcasts: podcastsScreen
+        case .search: searchScreen
+        }
+    }
+
+    // MARK: For You (Spotify Home — horizontal rails)
+
+    private var forYouEmpty: Bool {
+        model.recent.isEmpty && model.topTracks.isEmpty && model.topArtists.isEmpty
+            && model.freshReleases.isEmpty && model.newReleases.isEmpty
+    }
+
+    @ViewBuilder
+    private var forYouScreen: some View {
+        if (model.loadingForYou || model.loadingLibrary) && forYouEmpty {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Loading your Spotify picks…")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if forYouEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text(emptyForYouLine)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                Button("Try again") { Task { await loadAll() } }
+                    .buttonStyle(.bordered)
+                    .tint(MusicStyle.green)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if !model.forYouError.isEmpty {
+                        noteLine(model.forYouError)
+                    } else if !model.forYouNote.isEmpty {
+                        noteLine(model.forYouNote)
+                    }
+                    if !model.recent.isEmpty {
+                        railHeader("Recently played")
+                        trackRail(model.recent)
+                    }
+                    if !model.topTracks.isEmpty {
+                        railHeader("Your top tracks")
+                        trackRail(model.topTracks)
+                    }
+                    if !model.freshReleases.isEmpty {
+                        railHeader("Fresh from your artists")
+                        releaseRail(model.freshReleases)
+                    }
+                    if !model.newReleases.isEmpty {
+                        railHeader("New releases")
+                        releaseRail(model.newReleases)
+                    }
+                    if !model.topArtists.isEmpty {
+                        railHeader("Your top artists")
+                        artistRail(model.topArtists)
+                    }
+                    Color.clear.frame(height: 12)
+                }
+            }
+            .refreshable {
+                await loadAll()
+                await model.refreshState()
+            }
+        }
+    }
+
+    private var emptyForYouLine: String {
+        if !model.forYouError.isEmpty { return model.forYouError }
+        if !model.forYouNote.isEmpty { return model.forYouNote }
+        if !model.errorText.isEmpty { return model.errorText }
+        return "No Spotify suggestions yet — play some music and this fills in."
+    }
+
+    // MARK: Library (Spotify Your Library — chips + rows)
+
+    private var libraryScreen: some View {
+        VStack(spacing: 0) {
+            libraryChips
+            switch libraryFilter {
+            case .playlists: playlistScreen
+            case .liked: likedScreen
+            case .podcasts:
+                // Never reached — the chip jumps straight to the Podcasts
+                // segment (see libraryChips) — but never a blank screen.
+                podcastsScreen
+            }
+        }
+    }
+
+    /// Spotify's filter chips: small capsules, the active one solid green
+    /// with black text (the real app's exact treatment).
+    private var libraryChips: some View {
+        HStack(spacing: 8) {
+            ForEach(MusicLibraryFilter.allCases) { f in
+                Button {
+                    if f == .podcasts {
+                        withAnimation(.snappy) { segment = .podcasts }
+                    } else {
+                        withAnimation(.snappy) { libraryFilter = f }
+                    }
+                } label: {
+                    Text(f.label)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(libraryFilter == f && f != .podcasts
+                            ? .black : .white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(
+                            Capsule().fill(libraryFilter == f && f != .podcasts
+                                ? MusicStyle.green : MusicStyle.surface)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var playlistScreen: some View {
+        if model.loadingLibrary && model.playlists.isEmpty {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Loading your playlists…")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.playlists.isEmpty && !model.errorText.isEmpty {
+            libraryErrorView(model.errorText)
+        } else if model.playlists.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "music.note.list")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text(model.libraryNote.isEmpty
+                     ? "No playlists yet, or Spotify isn't connected."
+                     : model.libraryNote)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if !model.errorText.isEmpty {
+                        noteLine(model.errorText)
+                    } else if !model.libraryNote.isEmpty {
+                        noteLine(model.libraryNote)
+                    }
+                    ForEach(model.playlists) { p in
+                        NavigationLink {
+                            MusicPlaylistDetailView(playlist: p, model: model)
+                        } label: {
+                            MusicPlaylistRow(playlist: p)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Color.clear.frame(height: 12)
+                }
+            }
+            .refreshable { await model.loadLibrary() }
+        }
+    }
+
+    @ViewBuilder
+    private var likedScreen: some View {
+        if model.loadingLibrary && model.saved.isEmpty {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Loading Liked Songs…")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.saved.isEmpty && !model.errorText.isEmpty {
+            libraryErrorView(model.errorText)
+        } else if model.saved.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "heart.fill")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text("No liked songs yet.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    likedHeader
+                    ForEach(model.saved) { t in
+                        MusicTrackRow(track: t, model: model)
+                    }
+                    Color.clear.frame(height: 12)
+                }
+            }
+            .refreshable { await model.loadLibrary() }
+        }
+    }
+
+    /// The Liked Songs header: Spotify's purple-gradient heart tile, count,
+    /// and a green Play-all (starts from the first liked track — liked songs
+    /// have no public context uri, so the first track leads the session).
+    private var likedHeader: some View {
+        HStack(spacing: 14) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(LinearGradient(
+                        colors: [Color(red: 0.27, green: 0.20, blue: 0.90),
+                                 Color(red: 0.68, green: 0.78, blue: 0.95)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: "heart.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 64, height: 64)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Liked Songs")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("Playlist • \(model.saved.count) songs")
+                    .font(.system(size: 13))
+                    .foregroundStyle(MusicStyle.secondary)
+            }
+            Spacer(minLength: 8)
+            MusicPlayCircle(size: 48) {
+                if let first = model.saved.first {
+                    model.play(uri: first.uri, label: "Liked Songs")
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+    }
+
+    private func libraryErrorView(_ message: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.title2).foregroundStyle(.secondary)
+            Text(message)
+                .font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Try again") { Task { await model.loadLibrary() } }
+                .buttonStyle(.bordered)
+                .tint(MusicStyle.green)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: Podcasts (subscriptions + saved-episodes rail)
+
+    @ViewBuilder
+    private var podcastsScreen: some View {
+        if model.loadingPodcasts && model.shows.isEmpty && model.savedEpisodes.isEmpty {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Loading your podcasts…")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if model.shows.isEmpty && model.savedEpisodes.isEmpty {
+            VStack(spacing: 12) {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text(emptyPodcastsLine)
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 32)
+                if !model.podcastsError.isEmpty {
+                    Button("Try again") { Task { await model.loadPodcasts() } }
+                        .buttonStyle(.bordered)
+                        .tint(MusicStyle.green)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if !model.podcastsError.isEmpty {
+                        noteLine(model.podcastsError)
+                    } else if !model.podcastsNote.isEmpty {
+                        noteLine(model.podcastsNote)
+                    }
+                    if !model.savedEpisodes.isEmpty {
+                        railHeader("Saved episodes")
+                        episodeRail(model.savedEpisodes)
+                    }
+                    if !model.shows.isEmpty {
+                        railHeader("Your shows")
+                        ForEach(model.shows) { s in
+                            NavigationLink {
+                                MusicShowDetailView(show: s, model: model)
+                            } label: {
+                                MusicShowRow(show: s)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    Color.clear.frame(height: 12)
+                }
+            }
+            .refreshable { await model.loadPodcasts() }
+        }
+    }
+
+    private var emptyPodcastsLine: String {
+        if !model.podcastsError.isEmpty { return model.podcastsError }
+        if !model.podcastsNote.isEmpty { return model.podcastsNote }
+        return "No podcast subscriptions yet — follow a show on Spotify and it appears here."
+    }
+
+    // MARK: Search (the existing debounced search, as its own segment)
+
+    private var searchScreen: some View {
+        VStack(spacing: 0) {
+            searchField
+            if isSearchMode {
+                searchResults
+            } else {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title2).foregroundStyle(.secondary)
+                    Text("Search Spotify — songs, artists, albums, playlists.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 32)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    /// The search field itself follows the typed text's direction (Hebrew
+    /// queries read RTL) — per control, never the whole screen.
     private var searchField: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
@@ -626,7 +1468,7 @@ struct MusicView: View {
             TextField("Search songs, artists, albums, playlists", text: $model.searchText)
                 .font(.system(size: 15))
                 .foregroundStyle(.white)
-                .tint(MusicStyle.rose)
+                .tint(MusicStyle.green)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .submitLabel(.search)
@@ -661,86 +1503,6 @@ struct MusicView: View {
         !model.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    // MARK: content
-
-    @ViewBuilder
-    private var content: some View {
-        if isSearchMode {
-            searchResults
-        } else {
-            library
-        }
-    }
-
-    @ViewBuilder
-    private var library: some View {
-        let empty = model.playlists.isEmpty && model.saved.isEmpty && model.recent.isEmpty
-        if model.loadingLibrary && empty {
-            VStack(spacing: 10) {
-                ProgressView()
-                Text("Loading your music…")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if empty && !model.errorText.isEmpty {
-            VStack(spacing: 12) {
-                Image(systemName: "wifi.exclamationmark")
-                    .font(.title2).foregroundStyle(.secondary)
-                Text(model.errorText)
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Button("Try again") { Task { await model.loadLibrary() } }
-                    .buttonStyle(.bordered)
-                    .tint(MusicStyle.rose)
-            }
-            .padding(32)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if empty {
-            VStack(spacing: 8) {
-                Image(systemName: "music.note.list")
-                    .font(.title2).foregroundStyle(.secondary)
-                Text(model.libraryNote.isEmpty
-                     ? "Your Spotify library is empty here, or Spotify isn't connected yet."
-                     : model.libraryNote)
-                    .font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 32)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if !model.errorText.isEmpty {
-                        noteLine(model.errorText)
-                    } else if !model.libraryNote.isEmpty {
-                        noteLine(model.libraryNote)
-                    }
-                    if !model.playlists.isEmpty {
-                        shelfLabel("Your Playlists")
-                        playlistRail(model.playlists)
-                    }
-                    if !model.saved.isEmpty {
-                        shelfLabel("Liked Songs")
-                        ForEach(model.saved.prefix(30)) { t in
-                            MusicTrackRow(track: t, model: model)
-                        }
-                    }
-                    if !model.recent.isEmpty {
-                        shelfLabel("Recently Played")
-                        ForEach(model.recent.prefix(30)) { t in
-                            MusicTrackRow(track: t, model: model)
-                        }
-                    }
-                    Color.clear.frame(height: 12)
-                }
-            }
-            .refreshable {
-                await model.loadLibrary()
-                await model.refreshState()
-            }
-        }
-    }
-
     @ViewBuilder
     private var searchResults: some View {
         let noResults = model.searchTracks.isEmpty && model.searchPlaylists.isEmpty
@@ -760,21 +1522,21 @@ struct MusicView: View {
                     noteLine("No results for “\(model.searchText.trimmingCharacters(in: .whitespacesAndNewlines))”.")
                 }
                 if !model.searchTracks.isEmpty {
-                    shelfLabel("Songs")
+                    railHeader("Songs")
                     ForEach(model.searchTracks) { t in
                         MusicTrackRow(track: t, model: model)
                     }
                 }
                 if !model.searchPlaylists.isEmpty {
-                    shelfLabel("Playlists")
+                    railHeader("Playlists")
                     playlistRail(model.searchPlaylists)
                 }
                 if !model.searchAlbums.isEmpty {
-                    shelfLabel("Albums")
+                    railHeader("Albums")
                     albumRail(model.searchAlbums)
                 }
                 if !model.searchArtists.isEmpty {
-                    shelfLabel("Artists")
+                    railHeader("Artists")
                     ForEach(model.searchArtists) { a in
                         MusicArtistRow(artist: a, model: model)
                     }
@@ -786,14 +1548,14 @@ struct MusicView: View {
 
     // MARK: shelf pieces
 
-    private func shelfLabel(_ text: String) -> some View {
-        Text(text.uppercased())
-            .font(.system(size: 12, weight: .semibold))
-            .kerning(0.5)
-            .foregroundStyle(MusicStyle.secondary)
+    /// Spotify's bold white section header.
+    private func railHeader(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 20, weight: .bold))
+            .foregroundStyle(.white)
             .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, 6)
+            .padding(.top, 18)
+            .padding(.bottom, 8)
     }
 
     private func noteLine(_ text: String) -> some View {
@@ -804,6 +1566,50 @@ struct MusicView: View {
             .padding(.vertical, 8)
     }
 
+    private func trackRail(_ items: [MusicTrackItem]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(items) { t in
+                    MusicTrackCard(track: t, model: model)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func releaseRail(_ items: [MusicReleaseItem]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(items) { r in
+                    MusicReleaseCard(release: r, model: model)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func artistRail(_ items: [MusicArtistItem]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 16) {
+                ForEach(items) { a in
+                    MusicArtistCard(artist: a, model: model)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    private func episodeRail(_ items: [MusicEpisodeItem]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: 12) {
+                ForEach(items) { e in
+                    MusicEpisodeCard(episode: e, model: model)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
     private func playlistRail(_ items: [MusicPlaylistItem]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .top, spacing: 12) {
@@ -812,13 +1618,13 @@ struct MusicView: View {
                         MusicPlaylistDetailView(playlist: p, model: model)
                     } label: {
                         VStack(alignment: .leading, spacing: 5) {
-                            MusicArt(url: p.image, size: 120, corner: 10)
+                            MusicArt(url: p.image, size: 120, corner: 6)
                             Text(p.name)
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .lineLimit(2)
                                 .multilineTextAlignment(p.name.readingAlignment)
-                            Text(p.count > 0 ? "\(p.count) tracks" : (p.owner ?? ""))
+                            Text(p.count > 0 ? "\(p.count) songs" : (p.owner ?? ""))
                                 .font(.system(size: 11))
                                 .foregroundStyle(MusicStyle.secondary)
                                 .lineLimit(1)
@@ -840,7 +1646,7 @@ struct MusicView: View {
                         model.play(uri: a.uri, label: a.name)
                     } label: {
                         VStack(alignment: .leading, spacing: 5) {
-                            MusicArt(url: a.image, size: 120, corner: 10)
+                            MusicArt(url: a.image, size: 120, corner: 6)
                             Text(a.name)
                                 .font(.system(size: 13, weight: .semibold))
                                 .foregroundStyle(.white)
@@ -861,7 +1667,147 @@ struct MusicView: View {
     }
 }
 
-// MARK: - Track / artist rows
+// MARK: - Backdrop
+
+/// Near-black Spotify-style ground over the house silk — the tab keeps the
+/// app's dark design underneath but reads as the real Spotify surface.
+private struct MusicBackdrop: View {
+    var body: some View {
+        ZStack {
+            ScarletBackground()
+            Color.black.opacity(0.45)
+        }
+        .ignoresSafeArea()
+    }
+}
+
+// MARK: - Cards (For You rails)
+
+/// Square track card: tap plays; long-press offers Play + Details.
+private struct MusicTrackCard: View {
+    let track: MusicTrackItem
+    @ObservedObject var model: MusicModel
+
+    var body: some View {
+        Button {
+            model.play(uri: track.uri, label: track.title)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                MusicArt(url: track.image, size: 120, corner: 6)
+                Text(track.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(track.title.readingAlignment)
+                Text(track.artist)
+                    .font(.system(size: 11))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 120, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                model.play(uri: track.uri, label: track.title)
+            } label: {
+                Label("Play", systemImage: "play.fill")
+            }
+            Button {
+                model.activeSheet = .track(track)
+            } label: {
+                Label("Track details", systemImage: "info.circle")
+            }
+        }
+    }
+}
+
+/// Album/single card (Fresh from your artists / New releases): tap plays the
+/// whole release as a context.
+private struct MusicReleaseCard: View {
+    let release: MusicReleaseItem
+    @ObservedObject var model: MusicModel
+
+    var body: some View {
+        Button {
+            model.play(uri: release.uri, label: release.name)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                MusicArt(url: release.image, size: 120, corner: 6)
+                Text(release.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(release.name.readingAlignment)
+                Text(releaseSubtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 120, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var releaseSubtitle: String {
+        if release.artist.isEmpty { return MusicReleaseDate.label(release.releaseDate) }
+        if release.releaseDate.isEmpty { return release.artist }
+        return "\(release.artist) · \(MusicReleaseDate.label(release.releaseDate))"
+    }
+}
+
+/// Round artist card (Spotify's artist form): portrait + centered name;
+/// tap plays the artist context.
+private struct MusicArtistCard: View {
+    let artist: MusicArtistItem
+    @ObservedObject var model: MusicModel
+
+    var body: some View {
+        Button {
+            model.play(uri: artist.uri, label: artist.name)
+        } label: {
+            VStack(spacing: 6) {
+                MusicArtistPortrait(url: artist.image, size: 96)
+                Text(artist.name)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(width: 104)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Saved-episode card for the Podcasts rail: tap plays the episode.
+private struct MusicEpisodeCard: View {
+    let episode: MusicEpisodeItem
+    @ObservedObject var model: MusicModel
+
+    var body: some View {
+        Button {
+            model.play(uri: episode.uri, label: episode.title)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                MusicArt(url: episode.image, size: 120, corner: 8)
+                Text(episode.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .multilineTextAlignment(episode.title.readingAlignment)
+                Text(episode.show)
+                    .font(.system(size: 11))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(1)
+            }
+            .frame(width: 120, alignment: .leading)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Rows
 
 /// One track row: art, title/artist, duration. Tap plays (the web behavior);
 /// long-press offers Play + Details (Details raises the shared sheet).
@@ -904,11 +1850,174 @@ private struct MusicTrackRow: View {
                 Label("Play", systemImage: "play.fill")
             }
             Button {
-                model.detail = track
+                model.activeSheet = .track(track)
             } label: {
                 Label("Track details", systemImage: "info.circle")
             }
         }
+    }
+}
+
+/// One playlist row (Spotify's Your Library form): square art, name,
+/// "Playlist • N songs".
+private struct MusicPlaylistRow: View {
+    let playlist: MusicPlaylistItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            MusicArt(url: playlist.image, size: 56, corner: 4)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(playlist.name)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .multilineTextAlignment(playlist.name.readingAlignment)
+                Text(subtitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    private var subtitle: String {
+        if playlist.count > 0 { return "Playlist • \(playlist.count) songs" }
+        if let owner = playlist.owner, !owner.isEmpty { return "Playlist • \(owner)" }
+        return "Playlist"
+    }
+}
+
+/// One subscription row: show artwork, name, publisher, N episodes.
+private struct MusicShowRow: View {
+    let show: MusicShowItem
+
+    var body: some View {
+        HStack(spacing: 12) {
+            MusicArt(url: show.image, size: 56, corner: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(show.name)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .multilineTextAlignment(show.name.readingAlignment)
+                Text(subtitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+
+    private var subtitle: String {
+        var parts: [String] = []
+        if !show.publisher.isEmpty { parts.append(show.publisher) }
+        if show.totalEpisodes > 0 { parts.append("\(show.totalEpisodes) episodes") }
+        return parts.isEmpty ? "Podcast" : parts.joined(separator: " • ")
+    }
+}
+
+/// One episode row (show detail / anywhere episodes list vertically):
+/// title, date • duration, description snippet, a small green play circle,
+/// a thin progress bar when Spotify reports a resume point, and a "Played"
+/// state when the episode is finished.
+private struct MusicEpisodeRow: View {
+    let episode: MusicEpisodeItem
+    @ObservedObject var model: MusicModel
+
+    var body: some View {
+        Button {
+            model.play(uri: episode.uri, label: episode.title)
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                MusicArt(url: episode.image, size: 56, corner: 8)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(episode.title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+                        .multilineTextAlignment(episode.title.readingAlignment)
+                    if !episode.blurb.isEmpty {
+                        Text(episode.blurb)
+                            .font(.system(size: 12))
+                            .foregroundStyle(MusicStyle.secondary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(episode.blurb.readingAlignment)
+                    }
+                    metaLine
+                    // Resume-point bar: rendered ONLY when Spotify actually
+                    // sent progressMs (scope may not be granted yet).
+                    if let progress = episode.progressMs,
+                       episode.durationMs > 0, !episode.fullyPlayed {
+                        ProgressView(value: min(1, max(0, Double(progress) / Double(episode.durationMs))))
+                            .progressViewStyle(.linear)
+                            .tint(MusicStyle.green)
+                            .scaleEffect(x: 1, y: 0.5, anchor: .center)
+                            .frame(maxWidth: 180)
+                            .padding(.top, 2)
+                    }
+                }
+                Spacer(minLength: 8)
+                MusicPlayCircle(size: 34) {
+                    model.play(uri: episode.uri, label: episode.title)
+                }
+                .padding(.top, 10)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var metaLine: some View {
+        HStack(spacing: 5) {
+            if episode.fullyPlayed {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(MusicStyle.green)
+                Text("Played")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(MusicStyle.green)
+                if !episode.releaseDate.isEmpty {
+                    Text("• \(MusicReleaseDate.label(episode.releaseDate))")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MusicStyle.tertiary)
+                }
+            } else {
+                Text(plainMeta)
+                    .font(.system(size: 12))
+                    .foregroundStyle(MusicStyle.tertiary)
+            }
+        }
+    }
+
+    private var plainMeta: String {
+        var parts: [String] = []
+        if !episode.releaseDate.isEmpty { parts.append(MusicReleaseDate.label(episode.releaseDate)) }
+        if episode.durationMs > 0 {
+            if let progress = episode.progressMs, progress > 0 {
+                let left = max(0, episode.durationMs - progress)
+                parts.append("\(musicMinutes(left)) left")
+            } else {
+                parts.append(musicMinutes(episode.durationMs))
+            }
+        }
+        return parts.joined(separator: " • ")
     }
 }
 
@@ -922,24 +2031,7 @@ private struct MusicArtistRow: View {
             model.play(uri: artist.uri, label: artist.name)
         } label: {
             HStack(spacing: 10) {
-                ZStack {
-                    Circle().fill(MusicStyle.surface)
-                    Image(systemName: "music.mic")
-                        .font(.system(size: 16))
-                        .foregroundStyle(MusicStyle.tertiary)
-                    if let u = artist.image.flatMap({ URL(string: $0) }) {
-                        AsyncImage(url: u) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            default:
-                                Color.clear
-                            }
-                        }
-                    }
-                }
-                .frame(width: 44, height: 44)
-                .clipShape(Circle())
+                MusicArtistPortrait(url: artist.image, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(artist.name)
                         .font(.system(size: 15, weight: .medium))
@@ -964,9 +2056,10 @@ private struct MusicArtistRow: View {
 
 // MARK: - Bottom dock (toast + now-playing bar)
 
-/// The screen's status ribbon: the toast (the backend's honest verdicts) above
-/// the now-playing bar. Mounted by both the home screen and the playlist
-/// screen so a play started anywhere answers where Ido is looking.
+/// The screen's status ribbon: the toast (the backend's honest verdicts)
+/// above the now-playing bar. Mounted by the home screen AND the pushed
+/// playlist/show screens so a play started anywhere answers where Ido is
+/// looking — exactly the placement the previous MusicView had.
 private struct MusicBottomDock: View {
     @ObservedObject var model: MusicModel
 
@@ -999,7 +2092,7 @@ private struct MusicBottomDock: View {
             if p.durationMs > 0 {
                 ProgressView(value: min(1, max(0, Double(p.progressMs) / Double(p.durationMs))))
                     .progressViewStyle(.linear)
-                    .tint(MusicStyle.rose)
+                    .tint(MusicStyle.green)
                     .scaleEffect(x: 1, y: 0.6, anchor: .center)
                     .padding(.horizontal, 10)
                     .padding(.top, 6)
@@ -1028,7 +2121,7 @@ private struct MusicBottomDock: View {
                 Button { model.control(p.isPlaying ? "pause" : "resume") } label: {
                     Image(systemName: p.isPlaying ? "pause.fill" : "play.fill")
                         .font(.system(size: 20))
-                        .foregroundStyle(MusicStyle.rose)
+                        .foregroundStyle(MusicStyle.green)
                         .frame(width: 34, height: 34)
                 }
                 .buttonStyle(.plain)
@@ -1050,7 +2143,7 @@ private struct MusicBottomDock: View {
         .contentShape(Rectangle())
         // Tap anywhere outside the buttons → the full track sheet (the
         // "tap now-playing → full track view" parity item).
-        .onTapGesture { model.detail = t }
+        .onTapGesture { model.activeSheet = .track(t) }
     }
 }
 
@@ -1074,7 +2167,7 @@ private struct MusicPlaylistDetailView: View {
 
     var body: some View {
         ZStack {
-            ScarletBackground().ignoresSafeArea()
+            MusicBackdrop()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     header
@@ -1091,7 +2184,7 @@ private struct MusicPlaylistDetailView: View {
                                 .font(.callout).foregroundStyle(.secondary)
                             Button("Try again") { Task { await load() } }
                                 .buttonStyle(.bordered)
-                                .tint(MusicStyle.rose)
+                                .tint(MusicStyle.green)
                         }
                         .padding(16)
                     case .loaded:
@@ -1114,7 +2207,7 @@ private struct MusicPlaylistDetailView: View {
                                              : "Show more (\(tracks.count) of \(total))")
                                             .font(.system(size: 14, weight: .semibold))
                                     }
-                                    .foregroundStyle(MusicStyle.rose)
+                                    .foregroundStyle(MusicStyle.green)
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 12)
                                 }
@@ -1133,6 +2226,8 @@ private struct MusicPlaylistDetailView: View {
         .task { await load() }
     }
 
+    /// Spotify's playlist header: big artwork, bold name, count, and the
+    /// green circular Play (the playlist uri as a context).
     private var header: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Explicit way back — Mac Catalyst has no edge-swipe and the root
@@ -1141,36 +2236,26 @@ private struct MusicPlaylistDetailView: View {
                 HStack(spacing: 3) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 15, weight: .semibold))
-                    Text("Music").font(.subheadline.weight(.semibold))
+                    Text("Library").font(.subheadline.weight(.semibold))
                 }
-                .foregroundStyle(MusicStyle.rose)
+                .foregroundStyle(MusicStyle.green)
             }
             .buttonStyle(.plain)
-            HStack(alignment: .top, spacing: 14) {
-                MusicArt(url: playlist.image, size: 96, corner: 12)
+            HStack(alignment: .bottom, spacing: 14) {
+                MusicArt(url: playlist.image, size: 128, corner: 8)
+                    .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(playlist.name)
-                        .font(.system(size: 20, weight: .bold))
+                        .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(3)
                         .multilineTextAlignment(playlist.name.readingAlignment)
                     Text(trackCountLine)
                         .font(.system(size: 12))
                         .foregroundStyle(MusicStyle.secondary)
-                    Button {
+                    MusicPlayCircle(size: 52) {
                         model.play(uri: playlist.uri, label: playlist.name)
-                    } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "play.fill")
-                            Text("Play")
-                        }
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 8)
-                        .background(Capsule().fill(MusicStyle.rose))
                     }
-                    .buttonStyle(.plain)
                 }
                 Spacer(minLength: 0)
             }
@@ -1182,7 +2267,8 @@ private struct MusicPlaylistDetailView: View {
 
     private var trackCountLine: String {
         let n = total > 0 ? total : playlist.count
-        return n > 0 ? "\(n) tracks" : (playlist.owner ?? "")
+        if n > 0 { return "Playlist • \(n) songs" }
+        return playlist.owner.map { "Playlist • \($0)" } ?? "Playlist"
     }
 
     @MainActor
@@ -1214,6 +2300,287 @@ private struct MusicPlaylistDetailView: View {
             nextOffset = page.nextOffset
         case .failed(let message):
             model.showToast(message)
+        }
+    }
+}
+
+// MARK: - Show detail (pushed)
+
+/// One podcast's page: header (artwork, name, publisher, episode count, green
+/// Play for the whole show) + the episode list, newest first.
+private struct MusicShowDetailView: View {
+    let show: MusicShowItem
+    @ObservedObject var model: MusicModel
+    @Environment(\.dismiss) private var dismiss
+
+    private enum LoadState {
+        case loading
+        case failed(String)
+        case loaded
+    }
+    @State private var state: LoadState = .loading
+    @State private var episodes: [MusicEpisodeItem] = []
+    /// Refreshed header from music_show (falls back to the row's seed).
+    @State private var freshShow: MusicShowItem?
+
+    var body: some View {
+        ZStack {
+            MusicBackdrop()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    header
+                    switch state {
+                    case .loading:
+                        HStack(spacing: 8) {
+                            ProgressView()
+                            Text("Loading episodes…").font(.footnote).foregroundStyle(.secondary)
+                        }
+                        .padding(16)
+                    case .failed(let message):
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(message)
+                                .font(.callout).foregroundStyle(.secondary)
+                            Button("Try again") { Task { await load() } }
+                                .buttonStyle(.bordered)
+                                .tint(MusicStyle.green)
+                        }
+                        .padding(16)
+                    case .loaded:
+                        if episodes.isEmpty {
+                            Text("No episodes found for this show.")
+                                .font(.callout).foregroundStyle(.secondary)
+                                .padding(16)
+                        } else {
+                            Text("Episodes")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 16)
+                                .padding(.top, 14)
+                                .padding(.bottom, 4)
+                            ForEach(episodes) { e in
+                                MusicEpisodeRow(episode: e, model: model)
+                            }
+                        }
+                    }
+                    Color.clear.frame(height: 12)
+                }
+            }
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        // Same dock as home: plays started here answer here.
+        .safeAreaInset(edge: .bottom) { MusicBottomDock(model: model) }
+        .task { await load() }
+    }
+
+    private var current: MusicShowItem { freshShow ?? show }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Explicit way back (Catalyst has no edge-swipe; the exit is drawn).
+            Button { dismiss() } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Podcasts").font(.subheadline.weight(.semibold))
+                }
+                .foregroundStyle(MusicStyle.green)
+            }
+            .buttonStyle(.plain)
+            HStack(alignment: .bottom, spacing: 14) {
+                MusicArt(url: current.image, size: 128, corner: 12)
+                    .shadow(color: .black.opacity(0.5), radius: 18, y: 8)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(current.name)
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(3)
+                        .multilineTextAlignment(current.name.readingAlignment)
+                    Text(headerMeta)
+                        .font(.system(size: 12))
+                        .foregroundStyle(MusicStyle.secondary)
+                        .lineLimit(2)
+                    MusicPlayCircle(size: 52) {
+                        model.play(uri: current.uri, label: current.name)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            if !current.blurb.isEmpty {
+                Text(current.blurb)
+                    .font(.system(size: 13))
+                    .foregroundStyle(MusicStyle.secondary)
+                    .lineLimit(3)
+                    .multilineTextAlignment(current.blurb.readingAlignment)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+    }
+
+    private var headerMeta: String {
+        var parts: [String] = []
+        if !current.publisher.isEmpty { parts.append(current.publisher) }
+        if current.totalEpisodes > 0 { parts.append("\(current.totalEpisodes) episodes") }
+        return parts.isEmpty ? "Podcast" : parts.joined(separator: " • ")
+    }
+
+    @MainActor
+    private func load() async {
+        state = .loading
+        switch await model.fetchShow(id: show.id) {
+        case .loaded(let header, let fetched):
+            freshShow = header
+            episodes = fetched
+            state = .loaded
+        case .failed(let message):
+            state = .failed(message)
+        }
+    }
+}
+
+// MARK: - Device picker (sheet)
+
+/// Raised when music_play answers `need_device`: lists the Spotify Connect
+/// devices and retries the SAME pending play on whichever one Ido taps —
+/// the no-active-device answer is a fork in the road, never a dead end.
+private struct MusicDevicePickerView: View {
+    let pending: MusicPendingPlay
+    @ObservedObject var model: MusicModel
+    @Environment(\.dismiss) private var dismiss
+
+    private enum LoadState {
+        case loading
+        case failed(String)
+        case loaded([MusicDeviceItem])
+    }
+    @State private var state: LoadState = .loading
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            MusicBackdrop()
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Play on…")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("\"\(pending.label)\" needs a Spotify device. Pick one:")
+                        .font(.system(size: 13))
+                        .foregroundStyle(MusicStyle.secondary)
+                        .lineLimit(2)
+                }
+                .padding(.top, 48)
+                switch state {
+                case .loading:
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Finding your Spotify devices…")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                case .failed(let message):
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(message)
+                            .font(.callout).foregroundStyle(.secondary)
+                        Button("Try again") { Task { await load() } }
+                            .buttonStyle(.bordered)
+                            .tint(MusicStyle.green)
+                    }
+                case .loaded(let devices):
+                    if devices.isEmpty {
+                        Text("No Spotify devices are online. Open Spotify on your phone, Mac, or a speaker and try again.")
+                            .font(.callout).foregroundStyle(.secondary)
+                        Button("Refresh") { Task { await load() } }
+                            .buttonStyle(.bordered)
+                            .tint(MusicStyle.green)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: 4) {
+                                ForEach(devices) { d in
+                                    deviceRow(d)
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 20)
+            // Guaranteed exit (sheet gestures can be flaky on Catalyst).
+            Button { dismiss() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Color.black.opacity(0.5)))
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 12)
+            .padding(.leading, 12)
+            .accessibilityLabel("Close device picker")
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .preferredColorScheme(.dark)
+        .task { await load() }
+    }
+
+    private func deviceRow(_ d: MusicDeviceItem) -> some View {
+        Button {
+            // Retry the same play, aimed at the chosen device; the dock's
+            // toast reports the server's verdict.
+            model.play(uri: pending.uri, label: pending.label, device: d.name)
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: deviceGlyph(d.type))
+                    .font(.system(size: 18))
+                    .foregroundStyle(d.isActive ? MusicStyle.green : .white)
+                    .frame(width: 30)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(d.name)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(d.isActive ? "Active now" : d.type.capitalized)
+                        .font(.system(size: 12))
+                        .foregroundStyle(d.isActive ? MusicStyle.green : MusicStyle.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "play.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(MusicStyle.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 12).fill(MusicStyle.surface))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func deviceGlyph(_ type: String) -> String {
+        switch type.lowercased() {
+        case "computer": return "laptopcomputer"
+        case "smartphone": return "iphone"
+        case "speaker": return "hifispeaker.fill"
+        case "tv": return "tv"
+        case "tablet": return "ipad"
+        default: return "hifispeaker"
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        state = .loading
+        switch await model.fetchDevices() {
+        case .loaded(let devices):
+            // Active device first, then alphabetical — the likely tap on top.
+            state = .loaded(devices.sorted {
+                if $0.isActive != $1.isActive { return $0.isActive }
+                return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            })
+        case .failed(let message):
+            state = .failed(message)
         }
     }
 }
@@ -1266,10 +2633,10 @@ private struct MusicTrackDetailView: View {
                                 Text("Play")
                             }
                             .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.black)
                             .padding(.horizontal, 34)
                             .padding(.vertical, 11)
-                            .background(Capsule().fill(MusicStyle.rose))
+                            .background(Capsule().fill(MusicStyle.green))
                         }
                         .buttonStyle(.plain)
                     }
@@ -1385,7 +2752,7 @@ private struct MusicTrackDetailView: View {
                 VStack(spacing: 3) {
                     ProgressView(value: min(1, max(0, Double(p.progressMs) / Double(p.durationMs))))
                         .progressViewStyle(.linear)
-                        .tint(MusicStyle.rose)
+                        .tint(MusicStyle.green)
                     HStack {
                         Text(musicDuration(p.progressMs))
                         Spacer()
@@ -1407,7 +2774,7 @@ private struct MusicTrackDetailView: View {
                 Button { model.control(p.isPlaying ? "pause" : "resume") } label: {
                     Image(systemName: p.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                         .font(.system(size: 62))
-                        .foregroundStyle(MusicStyle.rose)
+                        .foregroundStyle(MusicStyle.green)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(p.isPlaying ? "Pause" : "Play")
