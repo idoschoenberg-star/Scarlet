@@ -311,8 +311,27 @@ struct LibraryView: View {
                 case .video(let item):
                     WAVideoView(item: item)
                 case .file(let file):
-                    QuickLookPreview(url: file.url)
-                        .ignoresSafeArea()
+                    // InboxView's attachment-viewer pattern: the document
+                    // scroll swallows the swipe-down gesture, so a floating ✕
+                    // must always be visible and always work.
+                    ZStack(alignment: .topLeading) {
+                        QuickLookPreview(url: file.url)
+                            .ignoresSafeArea()
+                        Button {
+                            activeSheet = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 30, height: 30)
+                                .background(Circle().fill(Color.black.opacity(0.5)))
+                        }
+                        .padding(.top, 12)
+                        .padding(.leading, 12)
+                        .accessibilityLabel("Close document")
+                    }
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
                 case .web(let item):
                     LibraryWebSheet(item: item)
                         .preferredColorScheme(.dark)
