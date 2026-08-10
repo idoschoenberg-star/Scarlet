@@ -35,6 +35,8 @@ struct SplitShell: View {
         case inbox
         case calendar
         case chats
+        case photos
+        case music
         case library
         case health
         case desk
@@ -48,6 +50,8 @@ struct SplitShell: View {
             case .inbox: return "Inbox"
             case .calendar: return "Calendar"
             case .chats: return "Chats"
+            case .photos: return "Photos"
+            case .music: return "Music"
             case .library: return "Library"
             case .health: return "Health"
             case .desk: return "Desk"
@@ -62,6 +66,8 @@ struct SplitShell: View {
             case .inbox: return "envelope.fill"
             case .calendar: return "calendar"
             case .chats: return "bubble.left.and.bubble.right.fill"
+            case .photos: return "photo.on.rectangle"
+            case .music: return "music.note"
             case .library: return "books.vertical.fill"
             case .health: return "heart.fill"
             case .desk: return "checklist"
@@ -76,10 +82,12 @@ struct SplitShell: View {
             case .inbox: return "2"
             case .calendar: return "3"
             case .chats: return "4"
-            case .library: return "5"
-            case .health: return "6"
-            case .desk: return "7"
-            case .settings: return "8"
+            case .photos: return "5"
+            case .music: return "6"
+            case .library: return "7"
+            case .health: return "8"
+            case .desk: return "9"
+            case .settings: return "0"
             }
         }
     }
@@ -101,7 +109,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .library, .health, .desk]
+        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk]
     }
 
     var body: some View {
@@ -246,6 +254,14 @@ struct SplitShell: View {
         case .chats:
             // Self-contained NavigationStack (channel lists + pushed threads).
             ChatsView()
+                .environmentObject(convo)
+        case .photos:
+            // Self-contained (grid + lightbox + forward sheet).
+            PhotosView()
+                .environmentObject(convo)
+        case .music:
+            // Self-contained (library shelves, search, now-playing).
+            MusicView()
                 .environmentObject(convo)
         case .library:
             // Self-contained NavigationStack (shelves + viewers).
