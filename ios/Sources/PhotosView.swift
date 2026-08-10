@@ -26,6 +26,8 @@ private struct GalleryPhoto: Identifiable {
     /// Caption with the web app's leading "📷 " marker stripped.
     let caption: String
     let url: URL
+    /// The heart, exactly like iPhone Photos (server: gallery_favorite_at).
+    var isFavorite: Bool
 }
 
 // MARK: - Model
@@ -122,6 +124,27 @@ private final class PhotosModel: ObservableObject {
         }
     }
 
+    /// The heart: flips locally first (Apple's instant fill), mirrors to the
+    /// server, and honestly flips back if the server refuses.
+    func toggleFavorite(_ photo: GalleryPhoto) {
+        guard let idx = photos.firstIndex(where: { $0.id == photo.id }) else { return }
+        let newValue = !photos[idx].isFavorite
+        photos[idx].isFavorite = newValue
+        Task {
+            do {
+                let data = try await ChatsAPI.request(
+                    "op=gallery_favorite", method: "POST",
+                    body: ["id": photo.id, "on": newValue])
+                let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
+            } catch {
+                if let i = photos.firstIndex(where: { $0.id == photo.id }) {
+                    photos[i].isFavorite = !newValue
+                }
+            }
+        }
+    }
+
     /// Dedup + append, keeping the `before` cursor at the oldest raw value.
     private func merge(_ fetched: [GalleryPhoto], into current: [GalleryPhoto]) -> [GalleryPhoto] {
         var out = current
@@ -162,7 +185,8 @@ private final class PhotosModel: ObservableObject {
                 createdAtRaw: createdRaw,
                 createdAt: MailDates.parse(createdRaw),
                 caption: caption,
-                url: url
+                url: url,
+                isFavorite: (p["gallery_favorite_at"] as? String) != nil
             )
         }
     }
@@ -234,14 +258,92 @@ struct PhotosView: View {
         }
     }
 
-    // MARK: header (big heavy title + refresh, like ChatsView / LibraryView)
+    // MARK: Apple-Photos library state
+
+    /// The library zoom levels, exactly like iPhone Photos' bottom switcher.
+    private enum LibraryZoom: String, CaseIterable {
+        case years = "Years", months = "Months", all = "All"
+    }
+    @State private var zoom: LibraryZoom = .all
+    /// Pinch-to-zoom grid density (Apple's 3↔5 columns on the phone).
+    @State private var gridColumns = 3
+    /// The heart filter — Apple's Favorites album as a header toggle.
+    @State private var favoritesOnly = false
+    /// Month the user tapped in Months view — All scrolls to it on switch.
+    @State private var scrollTargetMonth: String?
+
+    private var visiblePhotos: [GalleryPhoto] {
+        favoritesOnly ? model.photos.filter(\.isFavorite) : model.photos
+    }
+
+    /// One calendar month of photos, newest month first (server order kept).
+    private struct MonthSection: Identifiable {
+        let id: String       // "2026-08"
+        let title: String    // "August 2026"
+        let photos: [GalleryPhoto]
+    }
+
+    private var monthSections: [MonthSection] {
+        var order: [String] = []
+        var titles: [String: String] = [:]
+        var buckets: [String: [GalleryPhoto]] = [:]
+        let fmt = DateFormatter()
+        fmt.dateFormat = "MMMM yyyy"
+        let keyFmt = DateFormatter()
+        keyFmt.dateFormat = "yyyy-MM"
+        for p in visiblePhotos {
+            let d = p.createdAt ?? .distantPast
+            let key = d == .distantPast ? "earlier" : keyFmt.string(from: d)
+            if buckets[key] == nil {
+                order.append(key)
+                titles[key] = d == .distantPast ? "Earlier" : fmt.string(from: d)
+            }
+            buckets[key, default: []].append(p)
+        }
+        return order.map { MonthSection(id: $0, title: titles[$0] ?? $0, photos: buckets[$0] ?? []) }
+    }
+
+    /// One year of photos for the Years wall.
+    private struct YearSection: Identifiable {
+        let id: String       // "2026"
+        let cover: GalleryPhoto
+        let count: Int
+    }
+
+    private var yearSections: [YearSection] {
+        var order: [String] = []
+        var covers: [String: GalleryPhoto] = [:]
+        var counts: [String: Int] = [:]
+        let keyFmt = DateFormatter()
+        keyFmt.dateFormat = "yyyy"
+        for p in visiblePhotos {
+            guard let d = p.createdAt else { continue }
+            let key = keyFmt.string(from: d)
+            if covers[key] == nil { order.append(key); covers[key] = p }
+            counts[key, default: 0] += 1
+        }
+        return order.compactMap { y in
+            guard let c = covers[y] else { return nil }
+            return YearSection(id: y, cover: c, count: counts[y] ?? 0)
+        }
+    }
+
+    // MARK: header (big heavy title + heart filter + refresh)
 
     private var headerBar: some View {
         HStack(spacing: 12) {
-            Text("Photos")
+            Text(favoritesOnly ? "Favorites" : "Photos")
                 .font(.system(size: 34, weight: .heavy))
                 .foregroundStyle(.white)
             Spacer()
+            Button {
+                withAnimation(.snappy) { favoritesOnly.toggle() }
+            } label: {
+                Image(systemName: favoritesOnly ? "heart.fill" : "heart")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(favoritesOnly ? scarletRose : .white)
+            }
+            .accessibilityLabel("Favorites")
             Button {
                 Task { await model.load() }
             } label: {
@@ -254,6 +356,30 @@ struct PhotosView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    /// Apple Photos' floating bottom switcher: Years · Months · All.
+    private var zoomSwitcher: some View {
+        HStack(spacing: 0) {
+            ForEach(LibraryZoom.allCases, id: \.self) { z in
+                Button {
+                    withAnimation(.snappy) { zoom = z }
+                } label: {
+                    Text(z.rawValue)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(zoom == z ? .black : .white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
+                        .background(
+                            Capsule().fill(zoom == z ? Color.white : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(3)
+        .background(Capsule().fill(.ultraThinMaterial))
+        .environment(\.colorScheme, .dark)
     }
 
     // MARK: content
@@ -291,43 +417,180 @@ struct PhotosView: View {
             .padding(32)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            photoGrid
+            library
         }
     }
 
-    // MARK: grid (Apple-Photos look: square thumbs, hairline gutters)
+    // MARK: the library (Apple Photos anatomy: zoomable Years/Months/All)
 
-    private var photoGrid: some View {
-        ScrollView {
-            if !model.errorText.isEmpty {
-                Text(model.errorText)
-                    .font(.footnote)
-                    .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 4)
-            }
-            LazyVGrid(
-                columns: [GridItem(.adaptive(minimum: 110, maximum: 220), spacing: 2)],
-                spacing: 2
-            ) {
-                ForEach(model.photos) { photo in
-                    thumb(photo)
-                        .onAppear {
-                            // Endless scroll: nearing the tail fetches the
-                            // next `before` page (web app's scroll sentinel).
-                            if photo.id == model.photos.last?.id {
-                                Task { await model.loadMore() }
-                            }
-                        }
+    private var library: some View {
+        ZStack(alignment: .bottom) {
+            Group {
+                switch zoom {
+                case .all: allGrid
+                case .months: monthsWall
+                case .years: yearsWall
                 }
             }
-            if model.loadingMore {
-                ProgressView()
-                    .padding(.vertical, 16)
+            zoomSwitcher
+                .padding(.bottom, 10)
+        }
+    }
+
+    /// ALL — the dense square grid: hairline gutters, sticky month headers,
+    /// pinch to change density (Apple's 3↔5 columns).
+    private var allGrid: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                if !model.errorText.isEmpty {
+                    Text(model.errorText)
+                        .font(.footnote)
+                        .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 4)
+                }
+                LazyVStack(spacing: 2, pinnedViews: [.sectionHeaders]) {
+                    ForEach(monthSections) { section in
+                        Section {
+                            LazyVGrid(
+                                columns: Array(repeating: GridItem(.flexible(), spacing: 2),
+                                               count: gridColumns),
+                                spacing: 2
+                            ) {
+                                ForEach(section.photos) { photo in
+                                    thumb(photo)
+                                        .onAppear {
+                                            if photo.id == model.photos.last?.id {
+                                                Task { await model.loadMore() }
+                                            }
+                                        }
+                                }
+                            }
+                        } header: {
+                            Text(section.title)
+                                .font(.system(size: 15, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial)
+                                .environment(\.colorScheme, .dark)
+                        }
+                        .id(section.id)
+                    }
+                }
+                if model.loadingMore {
+                    ProgressView().padding(.vertical, 16)
+                }
+                Color.clear.frame(height: 54) // room for the floating switcher
+            }
+            .refreshable { await model.load() }
+            // Pinch anywhere on the grid = density change, like Apple Photos.
+            .simultaneousGesture(
+                MagnificationGesture()
+                    .onEnded { scale in
+                        withAnimation(.snappy) {
+                            if scale > 1.2 { gridColumns = max(1, gridColumns - 2) }
+                            else if scale < 0.8 { gridColumns = min(7, gridColumns + 2) }
+                        }
+                    }
+            )
+            .onAppear {
+                if let target = scrollTargetMonth {
+                    scrollTargetMonth = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        withAnimation { proxy.scrollTo(target, anchor: .top) }
+                    }
+                }
             }
         }
+    }
+
+    /// MONTHS — cover cards, Apple's month wall: big rounded photo, month
+    /// name overlaid bottom-left, count chip. Tap jumps into All at that month.
+    private var monthsWall: some View {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                ForEach(monthSections) { section in
+                    if let cover = section.photos.first {
+                        Button {
+                            scrollTargetMonth = section.id
+                            withAnimation(.snappy) { zoom = .all }
+                        } label: {
+                            coverCard(photo: cover,
+                                      title: section.title,
+                                      subtitle: "\(section.photos.count) photo\(section.photos.count == 1 ? "" : "s")",
+                                      height: 210)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Color.clear.frame(height: 54)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 4)
+        }
         .refreshable { await model.load() }
+    }
+
+    /// YEARS — Apple's year wall: one tall card per year. Tap opens Months.
+    private var yearsWall: some View {
+        ScrollView {
+            LazyVStack(spacing: 14) {
+                ForEach(yearSections) { year in
+                    Button {
+                        withAnimation(.snappy) { zoom = .months }
+                    } label: {
+                        coverCard(photo: year.cover,
+                                  title: year.id,
+                                  subtitle: "\(year.count) photo\(year.count == 1 ? "" : "s")",
+                                  height: 250)
+                    }
+                    .buttonStyle(.plain)
+                }
+                Color.clear.frame(height: 54)
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 4)
+        }
+        .refreshable { await model.load() }
+    }
+
+    /// The shared Months/Years cover-card anatomy: photo fills a rounded
+    /// card, a soft gradient carries the white title bottom-left.
+    private func coverCard(photo: GalleryPhoto, title: String,
+                           subtitle: String, height: CGFloat) -> some View {
+        Color.white.opacity(0.06)
+            .overlay(
+                AsyncImage(url: photo.url) { phase in
+                    if let image = phase.image {
+                        image.resizable().scaledToFill()
+                    } else {
+                        Color.white.opacity(0.06)
+                    }
+                }
+            )
+            .frame(height: height)
+            .frame(maxWidth: .infinity)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(alignment: .bottomLeading) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 22, weight: .bold))
+                    Text(subtitle)
+                        .font(.system(size: 13, weight: .medium))
+                        .opacity(0.85)
+                }
+                .foregroundStyle(.white)
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    LinearGradient(colors: [.clear, .black.opacity(0.55)],
+                                   startPoint: .top, endPoint: .bottom)
+                )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 16))
     }
 
     private func thumb(_ photo: GalleryPhoto) -> some View {
@@ -351,10 +614,26 @@ struct PhotosView: View {
                 )
                 .aspectRatio(1, contentMode: .fit)
                 .clipped()
+                // Apple's tell: a tiny white heart in the corner of favorites.
+                .overlay(alignment: .bottomLeading) {
+                    if photo.isFavorite {
+                        Image(systemName: "heart.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .shadow(color: .black.opacity(0.6), radius: 2)
+                            .padding(5)
+                    }
+                }
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .contextMenu {
+            Button {
+                model.toggleFavorite(photo)
+            } label: {
+                Label(photo.isFavorite ? "Unfavorite" : "Favorite",
+                      systemImage: photo.isFavorite ? "heart.slash" : "heart")
+            }
             Button {
                 forwardPhoto = photo
             } label: {
@@ -495,7 +774,17 @@ private struct PhotoLightboxView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            if current != nil {
+            if let photo = current {
+                // The heart, exactly where Apple puts a photo's actions.
+                Button {
+                    model.toggleFavorite(photo)
+                } label: {
+                    Image(systemName: photo.isFavorite ? "heart.fill" : "heart")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(photo.isFavorite ? scarletRose : .white)
+                        .frame(width: 40, height: 40)
+                        .background(Circle().fill(.white.opacity(0.14)))
+                }
                 Button {
                     forwardPhoto = current
                 } label: {
