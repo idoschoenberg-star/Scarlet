@@ -668,7 +668,13 @@ final class Conversation: ObservableObject {
                 rebuildPlayback()
             }
         case "audio":
-            noteSignsOfLife()
+            // Deliberately NOT signs-of-life for the reply watchdog: trailing
+            // audio chunks of her PREVIOUS sentence ("are you still there?")
+            // keep streaming after a typed turn is sent, and treating them as
+            // "the reply started" disarmed the watchdog while the server never
+            // actually answered — the typed question then vanished silently
+            // (the 2026-08-10 dead end). Only semantic reply markers —
+            // agent_response and client_tool_call — stand the watchdog down.
             if let a = ev["audio_event"] as? [String: Any], let b64 = a["audio_base_64"] as? String {
                 playPCM(base64: b64)
             }
