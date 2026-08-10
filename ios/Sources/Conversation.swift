@@ -727,6 +727,18 @@ final class Conversation: ObservableObject {
                 NotificationCenter.default.post(name: .scarletVoiceDraftIntent, object: intent)
             }
         }
+        // MUSIC ACK GUARANTEE (Ido 2026-08-10): the instant a music tool call
+        // arrives — before any network round-trip — the phone acknowledges in
+        // feel and sight: a light haptic tap + live status. Her spoken ack
+        // rides the voice channel; this cue fires even when the room is loud.
+        let musicTools: Set<String> = ["play_music", "music_control", "start_radio",
+                                       "create_playlist", "whats_playing"]
+        if musicTools.contains(name) {
+            Task { @MainActor in
+                status = "🎵 On the music…"
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
+        }
         Task {
             var out = "{}"
             do {
@@ -754,6 +766,27 @@ final class Conversation: ObservableObject {
                     // Carry the id so the shell records it and the backstop poll
                     // won't re-open the same draft after it's dismissed.
                     NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
+                }
+            }
+            // Music result → the VISUAL confirmation names the device (the
+            // speaker-specificity rule): a transcript line the moment the
+            // server answers, mirroring what she says aloud.
+            if musicTools.contains(name),
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                Task { @MainActor in
+                    if let dev = obj["on_device"] as? String {
+                        transcript.append(Line(text: "🎵 Playing on \(dev)", fromHer: true))
+                        status = "Playing on \(dev)"
+                    } else if let err = obj["error"] as? String {
+                        transcript.append(Line(text: "🎵 \(err)", fromHer: true))
+                        status = "Listening…"
+                    } else if obj["retrying"] as? Bool == true {
+                        transcript.append(Line(text: "🎵 Open Spotify once — it will start by itself", fromHer: true))
+                        status = "Listening…"
+                    } else {
+                        status = "Listening…"
+                    }
                 }
             }
             // "Call Phyllis" → the server resolved the number; the call is
