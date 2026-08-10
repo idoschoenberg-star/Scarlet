@@ -375,6 +375,14 @@ struct SignalsListView: View {
         }
     }
 
+    /// The Focused/Other split (Ido 2026-08-10 — the Outlook-Focused
+    /// equivalent across every channel): 'junk'-bucket chatter — big WhatsApp
+    /// groups, low-value blasts — collapses into Other and never masquerades
+    /// as needing attention.
+    private var focusedItems: [SignalItem] { model.items.filter { $0.bucket != "junk" } }
+    private var otherItems: [SignalItem] { model.items.filter { $0.bucket == "junk" } }
+    @State private var otherExpanded = false
+
     private var list: some View {
         List {
             if !model.errorText.isEmpty {
@@ -383,33 +391,56 @@ struct SignalsListView: View {
                     .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                     .listRowBackground(Color.clear)
             }
-            ForEach(model.items) { item in
-                SignalRow(item: item)
-                    .contentShape(Rectangle())
-                    // Tap = react: open the reply draft bound to this item
-                    // (non-draftable sources — e.g. calendar pushes — have
-                    // nothing to reply to; their tap is a no-op).
-                    .onTapGesture { replyTapped(item) }
+            Section {
+                ForEach(focusedItems) { item in
+                    signalRow(item)
+                }
+            } header: {
+                HStack(spacing: 8) {
+                    Text("FOCUSED")
+                        .font(.system(size: 12, weight: .semibold))
+                        .kerning(0.5)
+                        .foregroundStyle(.white.opacity(0.7))
+                    let newCount = focusedItems.filter { !$0.read }.count
+                    if newCount > 0 {
+                        Text("\(newCount) new")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(OutlookStyle.accentBlue))
+                    }
+                    Spacer()
+                }
+            }
+            if !otherItems.isEmpty {
+                Section {
+                    Button {
+                        withAnimation { otherExpanded.toggle() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("OTHER — LARGE GROUPS & FEEDS")
+                                .font(.system(size: 12, weight: .semibold))
+                                .kerning(0.5)
+                            Text("\(otherItems.count)")
+                                .font(.system(size: 11, weight: .semibold))
+                            Spacer()
+                            Image(systemName: otherExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(.white.opacity(0.45))
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
                     .listRowBackground(Color.clear)
-                    .listRowSeparatorTint(.white.opacity(0.12))
-                    // Apple Mail's swipes: trailing full-swipe archives…
-                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                        Button {
-                            model.archive(item)
-                        } label: {
-                            Label("Archive", systemImage: "archivebox.fill")
+                    .listRowSeparator(.hidden)
+                    if otherExpanded {
+                        ForEach(otherItems) { item in
+                            signalRow(item)
+                                .opacity(0.75)
                         }
-                        .tint(OutlookStyle.archiveGreen)
                     }
-                    // …leading files it for later (a reminder, not a cleanup).
-                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                        Button {
-                            model.later(item)
-                        } label: {
-                            Label("Later", systemImage: "clock.fill")
-                        }
-                        .tint(OutlookStyle.flagOrange)
-                    }
+                }
             }
         }
         .listStyle(.plain)
@@ -418,6 +449,37 @@ struct SignalsListView: View {
             await model.load()
             await InboxCounts.shared.refresh()
         }
+    }
+
+    /// One row with the shared tap + swipe behavior (identical in both
+    /// sections — the approve-loop consistency rule).
+    private func signalRow(_ item: SignalItem) -> some View {
+        SignalRow(item: item)
+            .contentShape(Rectangle())
+            // Tap = react: open the reply draft bound to this item
+            // (non-draftable sources — e.g. calendar pushes — have
+            // nothing to reply to; their tap is a no-op).
+            .onTapGesture { replyTapped(item) }
+            .listRowBackground(Color.clear)
+            .listRowSeparatorTint(.white.opacity(0.12))
+            // Apple Mail's swipes: trailing full-swipe archives…
+            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                Button {
+                    model.archive(item)
+                } label: {
+                    Label("Archive", systemImage: "archivebox.fill")
+                }
+                .tint(OutlookStyle.archiveGreen)
+            }
+            // …leading files it for later (a reminder, not a cleanup).
+            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                Button {
+                    model.later(item)
+                } label: {
+                    Label("Later", systemImage: "clock.fill")
+                }
+                .tint(OutlookStyle.flagOrange)
+            }
     }
 
     private func replyTapped(_ item: SignalItem) {
