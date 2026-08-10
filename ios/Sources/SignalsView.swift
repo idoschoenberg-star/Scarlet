@@ -200,13 +200,18 @@ final class SignalsModel: ObservableObject {
             // in Chats/Inbox), so keep only the first of each id.
             var seen = Set<String>()
             let fetched: [SignalItem] = ((obj["events"] as? [[String: Any]]) ?? []).compactMap { e in
-                guard let id = e["id"] as? String, !id.isEmpty else { return nil }
+                // inbound_events.id is a BIGINT — JSON delivers it as a
+                // NUMBER, and an `as? String` cast alone silently dropped
+                // EVERY row (the "All clear" lie under a 99+ badge).
+                guard let id = (e["id"] as? String) ?? (e["id"] as? NSNumber)?.stringValue,
+                      !id.isEmpty else { return nil }
                 guard seen.insert(id).inserted else { return nil }
                 let source = (e["source"] as? String) ?? ""
-                // news_breaking is a push, never a message (spec rule) —
-                // op=inbox_counts already excludes it, so the list must too
-                // or the numbers and the rows would tell different stories.
-                guard source != "news_breaking" else { return nil }
+                // news_breaking is a push, never a message (spec rule), and
+                // calendar events live on the Calendar page — op=inbox_counts
+                // excludes both, so the list must too or the numbers and the
+                // rows would tell different stories.
+                guard source != "news_breaking", source != "outlook_calendar" else { return nil }
                 return SignalItem(
                     id: id,
                     source: source,
