@@ -756,19 +756,37 @@ final class Conversation: ObservableObject {
                     NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
                 }
             }
-            // "Call Phyllis" → the server resolved the number; open the call
-            // NOW: tel: raises iOS's one-tap Call confirm (Apple's floor, and
-            // Ido's approve loop); wa.me / tg: open the person with the call
-            // button one tap away. Scheme allowlist so a server bug can never
-            // open an arbitrary URL.
+            // "Call Phyllis" → the server resolved the number; the call is
+            // cued in EVERY modality (Ido 2026-08-10): she says it (persona),
+            // the phone taps a success haptic (audio-felt), the transcript +
+            // status line show it (visual) — then the call opens. tel: raises
+            // iOS's one-tap Call confirm (Apple's floor, and Ido's approve
+            // loop); wa.me / tg: open the person, call button one tap away.
+            // Scheme allowlist so a server bug can never open arbitrary URLs.
             if name == "start_call",
                let data = out.data(using: .utf8),
-               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let urlStr = obj["url"] as? String,
-               let url = URL(string: urlStr),
-               ["tel", "https", "tg"].contains(url.scheme ?? "") {
-                Task { @MainActor in
-                    UIApplication.shared.open(url)
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let urlStr = obj["url"] as? String,
+                   let url = URL(string: urlStr),
+                   ["tel", "https", "tg"].contains(url.scheme ?? "") {
+                    let label = (obj["label"] as? String) ?? (obj["number"] as? String) ?? "…"
+                    let channel = (obj["channel"] as? String) ?? "phone"
+                    let channelName = channel == "whatsapp" ? "WhatsApp"
+                        : channel == "telegram" ? "Telegram" : "phone"
+                    Task { @MainActor in
+                        transcript.append(Line(
+                            text: "📞 Calling \(label) — \(channelName)"
+                                + (channel == "phone" ? " · tap Call to confirm" : " · call button is at the top"),
+                            fromHer: true))
+                        status = "Calling \(label)…"
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        UIApplication.shared.open(url)
+                    }
+                } else if let err = obj["error"] as? String {
+                    // The failure is cued visually too — never a silent shrug.
+                    Task { @MainActor in
+                        transcript.append(Line(text: "📞 Couldn't place the call — \(err)", fromHer: true))
+                    }
                 }
             }
         }
