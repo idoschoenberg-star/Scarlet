@@ -495,17 +495,29 @@ final class ChatListModel: ObservableObject {
         let generation = loadGeneration
         defer { if generation == loadGeneration { loading = false } }
         let want = channel
-        do {
-            let data = try await ChatsAPI.request(want.listQuery, method: "GET")
-            let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            let fetched = Self.parseChats(obj, channel: want)
-            guard generation == loadGeneration, want == channel else { return }
-            withAnimation(.snappy) { chats = fetched }
-            updatedAt = Date()
-            ChatsDiskCache.shared.storeList(want, chats: fetched)
-        } catch {
-            guard generation == loadGeneration, want == channel else { return }
-            errorText = "Couldn't reach \(want.displayName) — check your connection."
+        // Two attempts, one quiet pause between them: flaky hotel/roaming
+        // links drop single requests while the server is perfectly healthy
+        // (verified: every wa_chats the server ever saw answered 200) — a
+        // lone dropped packet must not paint an error over good cached rows.
+        for attempt in 1...2 {
+            do {
+                let data = try await ChatsAPI.request(want.listQuery, method: "GET")
+                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
+                let fetched = Self.parseChats(obj, channel: want)
+                guard generation == loadGeneration, want == channel else { return }
+                withAnimation(.snappy) { chats = fetched }
+                updatedAt = Date()
+                ChatsDiskCache.shared.storeList(want, chats: fetched)
+                return
+            } catch {
+                guard generation == loadGeneration, want == channel else { return }
+                if attempt == 1 {
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard generation == loadGeneration, want == channel else { return }
+                    continue
+                }
+                errorText = "Couldn't reach \(want.displayName) — check your connection."
+            }
         }
     }
 
@@ -851,14 +863,17 @@ struct ChatsView: View {
             .onAppear {
                 convo.setFocus(showingAll ? Self.allNewFocus
                                           : chatsBrowsingFocus(model.channel))
+                markMirrorsSeen()
             }
             .onChange(of: model.channel) { _, newChannel in
                 convo.setFocus(chatsBrowsingFocus(newChannel))
+                markMirrorsSeen()
             }
             .onChange(of: showingAll) { _, nowAll in
                 convo.setFocus(nowAll ? Self.allNewFocus
                                       : chatsBrowsingFocus(model.channel))
                 if nowAll { Task { await signals.load() } }
+                markMirrorsSeen()
             }
         }
         // .task re-runs every time this tab is selected → refresh on appear
@@ -867,6 +882,30 @@ struct ChatsView: View {
         .task {
             await signals.load()
             await model.load()
+            markMirrorsSeen()
+        }
+    }
+
+    /// Seen-on-view for the READ-ONLY mirrors: looking at a channel's list
+    /// (or the All list) is how "new" gets consumed for WhatsApp / iMessage /
+    /// Teams — their true read state lives in the phone's own apps, so
+    /// anything else inflates forever (the 989-badge bug). Mail is never
+    /// marked here: Outlook/Gmail keep per-item read-on-open, like Apple
+    /// Mail. Server-idempotent, so over-calling is harmless.
+    private func markMirrorsSeen() {
+        let sources: [String]
+        if showingAll {
+            sources = ["whatsapp", "imessage", "teams"]
+        } else {
+            switch model.channel {
+            case .teams: sources = ["teams"]
+            case .whatsapp: sources = ["whatsapp"]
+            case .imessage: sources = ["imessage"]
+            }
+        }
+        Task {
+            _ = try? await ChatsAPI.request("op=inbox_seen", method: "POST",
+                                            body: ["sources": sources])
             await InboxCounts.shared.refresh()
         }
     }
