@@ -495,11 +495,12 @@ final class ChatListModel: ObservableObject {
         let generation = loadGeneration
         defer { if generation == loadGeneration { loading = false } }
         let want = channel
-        // Two attempts, one quiet pause between them: flaky hotel/roaming
-        // links drop single requests while the server is perfectly healthy
-        // (verified: every wa_chats the server ever saw answered 200) — a
-        // lone dropped packet must not paint an error over good cached rows.
-        for attempt in 1...2 {
+        // Three attempts, growing pauses: on hotel/roaming links the SERVER
+        // answers 200 but the body gets dropped in transit (verified again in
+        // edge logs 2026-08-10 — Ido's exact taps logged 200 while the app
+        // saw nothing). Persistence wins there; the error, when it stays,
+        // names WHAT failed so the next report is actionable.
+        for attempt in 1...3 {
             do {
                 let data = try await ChatsAPI.request(want.listQuery, method: "GET")
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -511,12 +512,14 @@ final class ChatListModel: ObservableObject {
                 return
             } catch {
                 guard generation == loadGeneration, want == channel else { return }
-                if attempt == 1 {
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_500_000_000)
                     guard generation == loadGeneration, want == channel else { return }
                     continue
                 }
-                errorText = "Couldn't reach \(want.displayName) — check your connection."
+                errorText = error is URLError
+                    ? "The network dropped \(want.displayName)'s update — the mirror itself is live. Showing the last good list; pull down to retry."
+                    : "\(want.displayName)'s update arrived garbled — showing the last good list. Pull down to retry."
             }
         }
     }
