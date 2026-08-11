@@ -105,10 +105,10 @@ targets:
         # Real-time HealthKit observer wake-ups while backgrounded — the
         # data-doctrine path (enableBackgroundDelivery .immediate).
         com.apple.developer.healthkit.background-delivery: true
-        # CarPlay — voice-based conversational category (iOS 26.4). Kept OUT of
-        # the build until Apple grants it (request at developer.apple.com/contact/
-        # carplay/) AND the CI "ScarletTalk AppStore" profile is regenerated to
-        # carry it — otherwise codesign fails "profile doesn't include the
-        # entitlement". Same discipline as the deliberately-absent Siri
-        # entitlement above. Uncomment only after the grant + profile refresh:
-        # com.apple.developer.carplay-voice-based-conversation: true
+        # CarPlay — voice-based conversational category (iOS 26.4). Apple
+        # granted the entitlement 2026-08-04 and the capability was enabled on
+        # the App ID 2026-08-11; sigh's force:true regeneration includes it in
+        # the profile automatically each run. If codesign ever fails "profile
+        # doesn't include the entitlement", the App ID capability got dropped —
+        # re-check it in the portal before touching this line.
+        com.apple.developer.carplay-voice-based-conversation: true
