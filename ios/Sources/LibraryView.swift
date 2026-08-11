@@ -474,19 +474,42 @@ struct LibraryView: View {
                     .listRowBackground(Color.clear)
             }
             ForEach(model.items) { item in
-                Button {
-                    open(item)
-                } label: {
-                    LibraryRow(item: item, downloading: downloadingID == item.id)
-                }
-                .buttonStyle(.plain)
-                .listRowBackground(Color.clear)
-                .listRowSeparatorTint(.white.opacity(0.12))
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    swipeButtons(item)
-                }
-                .contextMenu {
-                    menuButtons(item)
+                if model.shelf == .library {
+                    // Archive here looks and feels EXACTLY like archiving in
+                    // the Amwell inbox — the app-wide OutlookArchiveSwipe
+                    // (full-bleed green bar, 45% commit, row flies off).
+                    OutlookArchiveSwipe(
+                        baseBackground: Color.clear,
+                        onArchive: { model.setArchived(item, archived: true) }
+                    ) {
+                        Button {
+                            open(item)
+                        } label: {
+                            LibraryRow(item: item, downloading: downloadingID == item.id)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .listRowSeparatorTint(.white.opacity(0.12))
+                    .contextMenu {
+                        menuButtons(item)
+                    }
+                } else {
+                    // Archived shelf: restore/delete are not "archive" — they
+                    // keep the system swipe.
+                    Button {
+                        open(item)
+                    } label: {
+                        LibraryRow(item: item, downloading: downloadingID == item.id)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparatorTint(.white.opacity(0.12))
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        swipeButtons(item)
+                    }
+                    .contextMenu {
+                        menuButtons(item)
+                    }
                 }
             }
         }

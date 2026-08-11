@@ -459,32 +459,31 @@ struct SignalsListView: View {
     /// One row with the shared tap + swipe behavior (identical in both
     /// sections — the approve-loop consistency rule).
     private func signalRow(_ item: SignalItem) -> some View {
-        SignalRow(item: item)
-            .contentShape(Rectangle())
-            // Tap = react: open the reply draft bound to this item
-            // (non-draftable sources — e.g. calendar pushes — have
-            // nothing to reply to; their tap is a no-op).
-            .onTapGesture { replyTapped(item) }
-            .listRowBackground(Color.clear)
-            .listRowSeparatorTint(.white.opacity(0.12))
-            // Apple Mail's swipes: trailing full-swipe archives…
-            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                Button {
-                    model.archive(item)
-                } label: {
-                    Label("Archive", systemImage: "archivebox.fill")
-                }
-                .tint(OutlookStyle.archiveGreen)
+        // Archive is the SAME gesture as the Amwell inbox everywhere
+        // (OutlookArchiveSwipe): full-bleed green bar, glyph pops at the 45%
+        // commit, row flies off. The consistency rule — one look per action.
+        OutlookArchiveSwipe(
+            baseBackground: Color.clear,
+            onArchive: { model.archive(item) }
+        ) {
+            SignalRow(item: item)
+                .contentShape(Rectangle())
+                // Tap = react: open the reply draft bound to this item
+                // (non-draftable sources — e.g. calendar pushes — have
+                // nothing to reply to; their tap is a no-op).
+                .onTapGesture { replyTapped(item) }
+        }
+        .listRowSeparatorTint(.white.opacity(0.12))
+        // Leading files it for later (a reminder, not a cleanup) — stays on
+        // the system swipe, exactly like the inbox's leading flag/read.
+        .swipeActions(edge: .leading, allowsFullSwipe: false) {
+            Button {
+                model.later(item)
+            } label: {
+                Label("Later", systemImage: "clock.fill")
             }
-            // …leading files it for later (a reminder, not a cleanup).
-            .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                Button {
-                    model.later(item)
-                } label: {
-                    Label("Later", systemImage: "clock.fill")
-                }
-                .tint(OutlookStyle.flagOrange)
-            }
+            .tint(OutlookStyle.flagOrange)
+        }
     }
 
     private func replyTapped(_ item: SignalItem) {
