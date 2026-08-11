@@ -162,9 +162,33 @@ final class Conversation: ObservableObject {
     private var pendingBuffers = 0
     private var speechTailUntil = Date.distantPast
 
+    /// True while the CURRENT output route runs Apple's echo canceller
+    /// (voiceChat/videoChat voice-processing I/O): built-in speaker, earpiece,
+    /// wired headphones, USB, or an HFP headset with its own AEC. On these
+    /// routes the mic can stream WHILE she speaks — her own voice is cancelled
+    /// before it reaches the server, so Ido can barge in mid-sentence and is
+    /// never talking into a dead mic. Cached (route queries are not free on
+    /// the per-buffer path) and refreshed on every route change.
+    private var routeAEC = true
+
+    private func refreshRouteAEC() {
+        let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let aecPorts: Set<AVAudioSession.Port> = [
+            .builtInSpeaker, .builtInReceiver, .headphones, .usbAudio, .bluetoothHFP,
+        ]
+        routeAEC = !outs.isEmpty && outs.allSatisfy { aecPorts.contains($0.portType) }
+    }
+
     /// True while sending mic audio would loop her own voice back to her.
+    /// The 2026-08-11 reliability round: this used to gate the mic for the
+    /// ENTIRE duration of her every answer (she streams faster than realtime,
+    /// so the whole reply sat in pendingBuffers) — Ido spoke into a dead mic
+    /// whenever she was talking, the "hit and miss, mostly miss" root cause.
+    /// Now the half-duplex gate applies ONLY to routes without echo
+    /// cancellation (car audio, Bluetooth A2DP); AEC routes are full-duplex.
     private var echoRisk: Bool {
         if chatMode || !speakerOn { return false }   // her voice is silent
+        if routeAEC { return false }                 // AEC eats her voice — full duplex
         return pendingBuffers > 0 || Date() < speechTailUntil
     }
 
@@ -179,6 +203,7 @@ final class Conversation: ObservableObject {
         // A stale interrupted flag from a previous session would silently drop
         // every audio buffer of this one — a fresh start reclaims the session.
         interrupted = false
+        endedByUser = false
         self.token = token
         wantLive = true
         state = .connecting
@@ -187,7 +212,13 @@ final class Conversation: ObservableObject {
         observeInterruptions()
     }
 
+    /// True only when IDO hung up (End button). Distinguishes his explicit
+    /// choice from a give-up (network died, reconnects exhausted): a give-up
+    /// self-heals on the next foreground, an explicit End stays ended.
+    private var endedByUser = false
+
     func end() {
+        endedByUser = true
         wantLive = false
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
@@ -220,7 +251,13 @@ final class Conversation: ObservableObject {
         bgTask = .invalid
     }
 
-    func toggleMic() { micOn.toggle(); status = micOn ? "Listening…" : "Mic off — tap Mic to talk" }
+    func toggleMic() {
+        micOn.toggle()
+        // Unmuting must open her ears NOW — a stale speech-tail gate from
+        // before the mute would swallow his first words after unmute.
+        if micOn { speechTailUntil = .distantPast }
+        status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+    }
     func toggleSpeaker() { speakerOn.toggle(); player.volume = speakerOn ? 1 : 0 }
 
     /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
@@ -688,11 +725,31 @@ final class Conversation: ObservableObject {
                let t = (x["user_transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
                 transcript.append(.init(text: t, fromHer: false))
+                // THE ≤2s ACK (Ido 2026-08-11): the instant the server heard
+                // him, he knows it — his words appear as a bubble, the status
+                // flips, and the phone taps. Never again "did she get that?".
+                status = "Got it — on it…"
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // A SPOKEN turn the server heard gets the same always-answer
                 // guarantee as a typed one: if no reply ever starts, the
                 // watchdog requeues this text on the rebuilt session.
                 awaitingReplyText = t
                 armReplyWatchdog()
+            }
+        case "agent_response_correction":
+            // She was interrupted mid-sentence: the server sends what she
+            // ACTUALLY got to say. The text box must be the exact replica of
+            // her spoken words (Ido 2026-08-11) — replace, never leave words
+            // she never voiced.
+            if let x = ev["agent_response_correction_event"] as? [String: Any],
+               let t = ((x["corrected_agent_response"] as? String) ?? "")
+                   .trimmingCharacters(in: .whitespacesAndNewlines) as String?,
+               let idx = transcript.lastIndex(where: { $0.fromHer }) {
+                if t.isEmpty {
+                    transcript.remove(at: idx)   // cut off before a word landed
+                } else {
+                    transcript[idx] = .init(text: t, fromHer: true)
+                }
             }
         case "interruption":
             flushPlayback()
@@ -834,6 +891,7 @@ final class Conversation: ObservableObject {
         try s.setActive(true)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
+        refreshRouteAEC()
     }
 
     /// Apply the user's saved input choice (RME/USB interface, headset, …)
@@ -1034,6 +1092,18 @@ final class Conversation: ObservableObject {
                 self.levelSmoothed = next
                 self.inputLevel = next
                 MicSettings.shared.level = next
+                // Live "I hear you" cue: real speech energy while she listens
+                // flips the status instantly — sub-second visible proof his
+                // voice is reaching her, long before the server's transcript.
+                // Only ever swaps between these two exact strings, so it can
+                // never stomp a richer status (tool acks, reconnects, …).
+                if self.micOn, self.state == .listening {
+                    if next > 0.30, self.status == "Listening…" {
+                        self.status = "Hearing you…"
+                    } else if next < 0.06, self.status == "Hearing you…" {
+                        self.status = "Listening…"
+                    }
+                }
                 // Half-duplex: her ears open only when her voice isn't in the
                 // room. Kills echo barge-in AND echo phantom turns at the root.
                 guard self.micOn, !self.echoRisk else { return }
@@ -1260,6 +1330,9 @@ final class Conversation: ObservableObject {
                     }
                     self.routeToSpeakerIfReceiver()
                 }
+                // Full-duplex vs half-duplex is a property of the ROUTE — keep
+                // the cached AEC verdict in step with every change.
+                self.refreshRouteAEC()
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
                 self.evaluateDrivingMode()
@@ -1292,6 +1365,15 @@ final class Conversation: ObservableObject {
                     self.interrupted = false
                     try? self.startAudioSession()
                     self.rebuildAudioGraph()
+                }
+                // SELF-HEAL (Ido 2026-08-11): a session that GAVE UP (reconnects
+                // exhausted on dead hotel Wi-Fi, a failed mint) left him talking
+                // to a dead app unless he noticed the small status line. If he
+                // didn't end it himself, opening the app IS the intent to talk —
+                // bring her back automatically.
+                if !self.wantLive, !self.endedByUser, self.hasAutoStarted,
+                   self.state == .idle {
+                    self.start(token: TokenStore.token ?? "")
                 }
             }
         }
