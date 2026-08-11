@@ -918,12 +918,26 @@ final class Conversation: ObservableObject {
             switchToBackupEngine("connection kept failing")
         }
         // Give up after a bounded number of tries so a truly dead network ends in
-        // an actionable state, not an eternal spinner.
+        // an actionable state, not an eternal spinner. VOICE-ONLY (2026-08-11
+        // audit): walking with the phone locked, ~57s of bad network used to
+        // end the session in total silence — he kept talking to a corpse. Now
+        // the give-up (a) keeps a LONG-TAIL retry alive every 60s while the
+        // app still wants a session, so a network handoff that recovers
+        // brings her back by itself, and (b) will announce the recovery
+        // (connect() greets a resumed session).
         if reconnectAttempts >= maxReconnectAttempts {
-            status = "Couldn't reconnect — tap Start to try again."
-            state = .idle; wantLive = false
-            reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
-            reconnectAttempts = 0
+            status = "Connection lost — retrying in the background…"
+            state = .connecting
+            reconnectTask?.cancel(); reconnecting = false
+            reconnectAttempts = maxReconnectAttempts // hold the ladder at max
+            reconnectTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard let self, self.wantLive, !Task.isCancelled else { return }
+                await MainActor.run {
+                    self.reconnectAttempts = 3 // re-enter the ladder mid-way
+                    self.scheduleReconnect(reason: "long-tail retry after network loss")
+                }
+            }
             return
         }
         reconnecting = true
@@ -1260,6 +1274,18 @@ final class Conversation: ObservableObject {
     private static let musicTools: Set<String> = ["play_music", "music_control", "start_radio",
                                                   "create_playlist", "whats_playing", "fm_radio"]
 
+    /// Cap a tool result for the model's context — but never SILENTLY
+    /// (2026-08-11 voice-only audit: a busy sweep's payload was cut mid-JSON
+    /// and the model answered from half the data without knowing). The sweep
+    /// gets a higher ceiling — its items are the only way to act on messages
+    /// — and any cut is MARKED so she says so instead of inventing.
+    private func cappedToolResult(_ name: String, _ out: String) -> String {
+        let cap = name == "inbox_overview" ? 24_000 : 12_000
+        guard out.count > cap else { return out }
+        return String(out.prefix(cap))
+            + "\n…[RESULT TRUNCATED at \(cap) chars — data beyond this point was cut; say so honestly if something seems missing and fetch a narrower page instead of guessing]"
+    }
+
     /// The authorized tool proxy round-trip (realtime-session → agent-tools).
     private func performToolHTTP(name: String, params: [String: Any]) async -> String {
         do {
@@ -1292,7 +1318,7 @@ final class Conversation: ObservableObject {
             // REST of the conversation — 30k results made hour-long dialogues
             // slower and slower until replies timed out entirely.
             send(["type": "client_tool_result", "tool_call_id": callId,
-                  "result": String(out.prefix(12000)), "is_error": false])
+                  "result": cappedToolResult(name, out), "is_error": false])
             postToolCues(name: name, out: out)
         }
     }
@@ -1305,7 +1331,7 @@ final class Conversation: ObservableObject {
             let out = await performToolHTTP(name: name, params: params)
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
-                           "output": String(out.prefix(12000))]])
+                           "output": cappedToolResult(name, out)]])
             // Same one-active-response gate as user turns: if Ido spoke while
             // the tool HTTP ran, semantic VAD already created a response — an
             // unconditional create here collides (the 225 error bursts) and
@@ -1399,19 +1425,38 @@ final class Conversation: ObservableObject {
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 if let urlStr = obj["url"] as? String,
                    let url = URL(string: urlStr),
-                   ["tel", "https", "tg"].contains(url.scheme ?? "") {
+                   ["tel", "https", "tg", "facetime-audio"].contains(url.scheme ?? "") {
                     let label = (obj["label"] as? String) ?? (obj["number"] as? String) ?? "…"
                     let channel = (obj["channel"] as? String) ?? "phone"
                     let channelName = channel == "whatsapp" ? "WhatsApp"
-                        : channel == "telegram" ? "Telegram" : "phone"
+                        : channel == "telegram" ? "Telegram"
+                        : channel == "facetime" ? "FaceTime audio"
+                        : channel == "teams" ? "Teams" : "phone"
                     Task { @MainActor in
                         transcript.append(Line(
                             text: "📞 Calling \(label) — \(channelName)"
-                                + (channel == "phone" ? " · tap Call to confirm" : " · call button is at the top"),
+                                + (channel == "phone" ? " · tap Call to confirm" : ""),
                             fromHer: true))
                         status = "Calling \(label)…"
                         UINotificationFeedbackGenerator().notificationOccurred(.success)
-                        UIApplication.shared.open(url)
+                        // NEVER a silent drop (2026-08-11 voice-only audit):
+                        // under CarPlay with a locked phone, open() can fail —
+                        // detect it and TELL him, in his ears, what to do.
+                        UIApplication.shared.open(url, options: [:]) { [weak self] opened in
+                            guard !opened else { return }
+                            Task { @MainActor in
+                                guard let self else { return }
+                                self.transcript.append(Line(
+                                    text: "📞 The \(channelName) call to \(label) couldn't open — the phone may be locked. Unlock it, or say 'call on phone' for a cellular dial through the car.",
+                                    fromHer: true))
+                                self.status = "Call didn't open"
+                                self.send(["type": "conversation.item.create",
+                                           "item": ["type": "message", "role": "user",
+                                                    "content": [["type": "input_text",
+                                                                 "text": "[SYSTEM] The \(channelName) call to \(label) FAILED to open (phone locked). Tell Ido honestly in one sentence and offer the cellular fallback."]]]])
+                                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+                            }
+                        }
                     }
                 } else if let err = obj["error"] as? String {
                     // The failure is cued visually too — never a silent shrug.
@@ -1817,6 +1862,10 @@ final class Conversation: ObservableObject {
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
         pendingBuffers += 1
+        // Her voice DUCKS the radio (2026-08-11 voice-only audit: both used
+        // to play at full volume simultaneously); the last buffer's drain
+        // restores the music.
+        RadioPlayer.shared.duck(true)
         player.scheduleBuffer(buf) { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
@@ -1827,6 +1876,7 @@ final class Conversation: ObservableObject {
                     // Short grace so the room's reverb tail can't reach the
                     // mic as a phantom user turn.
                     self.speechTailUntil = Date().addingTimeInterval(0.35)
+                    RadioPlayer.shared.duck(false)
                     if self.state == .speaking {
                         self.state = .listening
                         if self.micOn { self.status = "Listening…" }
@@ -1840,6 +1890,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        RadioPlayer.shared.duck(false)
         // Only her-speaking transitions back to listening. Forcing .listening
         // from ANY state let an interruption during a reconnect fake a live
         // session (nil socket, "Listening…" status) — or resurrect End-state

@@ -57,6 +57,13 @@ final class RadioPlayer: ObservableObject {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
+    /// Scarlet's voice ducks the radio and the last drained buffer restores
+    /// it — the two must never fight at full volume (voice-only audit).
+    func duck(_ on: Bool) {
+        guard playing else { return }
+        player?.volume = on ? 0.15 : 1.0
+    }
+
     /// Apply an fm_radio tool result (the voice lane) — the server resolved
     /// the station; this side only acts.
     func apply(toolResult: [String: Any]) {
