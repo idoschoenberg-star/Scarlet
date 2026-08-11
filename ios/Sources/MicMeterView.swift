@@ -80,8 +80,10 @@ final class MicSettings: ObservableObject {
     func refreshInputs() {
         let s = AVAudioSession.sharedInstance()
         if s.category != .playAndRecord {
+            // A2DP only, never HFP — same rule as Conversation.outputOptions:
+            // the phone-call codec must never be able to claim the route.
             try? s.setCategory(.playAndRecord, mode: .voiceChat,
-                               options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+                               options: [.defaultToSpeaker, .allowBluetoothA2DP])
         }
         availableInputs = s.availableInputs ?? []
         if activeInputName == nil {

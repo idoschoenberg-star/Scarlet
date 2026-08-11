@@ -416,18 +416,20 @@ final class Conversation: ObservableObject {
     /// change can't re-trigger itself through its own route notification.
     private var lastAppliedCar: Bool?
 
-    /// Category options for the chosen output. SPEAKER MEANS SPEAKER
-    /// (2026-08-11, "her voice is very very thin / the speaker does not work
-    /// as a speaker at all"): in loudspeaker mode Bluetooth is EXCLUDED —
-    /// with .allowBluetooth set, any paired headset/Mac/BT speaker silently
-    /// steals the route over HFP, the narrowband phone-call codec that makes
-    /// her sound paper-thin, and overrideOutputAudioPort cannot pull audio
-    /// back off Bluetooth, so the Output button looked dead. Earpiece mode
-    /// and any car route keep Bluetooth fully available (AirPods/CarPlay).
+    /// Category options for the chosen output. The thin-voice culprit was
+    /// HFP — the narrowband phone-call codec .allowBluetooth invites, which
+    /// any paired headset/Mac silently claims, while overrideOutputAudioPort
+    /// cannot pull audio back off Bluetooth (2026-08-11, "her voice is very
+    /// very thin"). Banning ALL Bluetooth was the first fix and broke real
+    /// life: a Bluetooth-A2DP car stereo lost the audio to the iPhone
+    /// ("why does car music play on my iPhone?"). The precise rule: never
+    /// HFP, always A2DP — full-quality Bluetooth (cars, AirPods) keeps
+    /// priority, the phone-call codec can never grab the route, and with no
+    /// Bluetooth device around .defaultToSpeaker lands on the loudspeaker.
     private func outputOptions(car: Bool) -> AVAudioSession.CategoryOptions {
-        if loudspeaker && !car { return [.defaultToSpeaker] }
-        let bt: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
-        return loudspeaker ? bt.union(.defaultToSpeaker) : bt
+        let base: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+        _ = car // car routes need no extra options; CarPlay rides its own port
+        return loudspeaker ? base.union(.defaultToSpeaker) : base
     }
 
     private func applyOutputRoute() {
@@ -1256,7 +1258,7 @@ final class Conversation: ObservableObject {
     }
 
     private static let musicTools: Set<String> = ["play_music", "music_control", "start_radio",
-                                                  "create_playlist", "whats_playing"]
+                                                  "create_playlist", "whats_playing", "fm_radio"]
 
     /// The authorized tool proxy round-trip (realtime-session → agent-tools).
     private func performToolHTTP(name: String, params: [String: Any]) async -> String {
@@ -1333,10 +1335,31 @@ final class Conversation: ObservableObject {
                     NotificationCenter.default.post(name: .scarletVoiceDraftStarted, object: draftId)
                 }
             }
+            // FM radio result → the server resolved the station; the PHONE is
+            // the player. Start/pause/stop the stream and mirror it visually,
+            // exactly like the Spotify confirmations below.
+            if name == "fm_radio",
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                Task { @MainActor in
+                    if (obj["ok"] as? Bool) == true {
+                        RadioPlayer.shared.apply(toolResult: obj)
+                        if let st = obj["station"] as? [String: Any],
+                           let nm = (st["name_he"] as? String) ?? (st["name"] as? String) {
+                            transcript.append(Line(text: "📻 \(nm) — live", fromHer: true))
+                            status = "Radio: \(nm)"
+                        } else if let action = obj["action"] as? String, action != "list" {
+                            status = "Listening…"
+                        }
+                    } else if let err = obj["error"] as? String {
+                        transcript.append(Line(text: "📻 \(err)", fromHer: true))
+                    }
+                }
+            }
             // Music result → the VISUAL confirmation names the device (the
             // speaker-specificity rule): a transcript line the moment the
             // server answers, mirroring what she says aloud.
-            if Self.musicTools.contains(name),
+            if Self.musicTools.contains(name), name != "fm_radio",
                let data = out.data(using: .utf8),
                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 Task { @MainActor in
