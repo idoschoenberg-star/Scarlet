@@ -379,6 +379,22 @@ final class Conversation: ObservableObject {
         speakerWasOnBeforeChat = speakerOn   // explicit choice survives chat mode
     }
 
+    /// TAP-TO-INTERRUPT (Ido 2026-08-11): the orb is the stop button while
+    /// she speaks — one tap cancels the generation, flushes every queued
+    /// audio buffer, and returns to listening, so an urgent question never
+    /// waits out a long story. Works from the phone even while CarPlay runs
+    /// (one shared session); the car screen itself cannot take touches under
+    /// Apple's voice-conversation template.
+    func stopSpeaking() {
+        guard state == .speaking || pendingBuffers > 0 || responseActive else { return }
+        if engine == .openai, responseActive {
+            send(["type": "response.cancel"])
+        }
+        flushPlayback()
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if micOn { status = "Listening…" }
+    }
+
     /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
     /// "no override" still mean loudspeaker, so the category itself must flip
     /// too. AirPods/CarPlay keep priority either way.

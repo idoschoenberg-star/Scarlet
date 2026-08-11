@@ -46,11 +46,15 @@ struct TalkView: View {
                     ? max(0, (convo.inputLevel - 0.14) / 0.86) : 0)
                 .frame(width: orbSize, height: orbSize)
                 .animation(.easeInOut(duration: 0.25), value: typeFocused)
-                // The orb IS the Scarlet button: tapping it while idle wakes her.
+                // The orb IS the Scarlet button: tapping it while idle wakes
+                // her; tapping it while she SPEAKS cuts her off (urgent
+                // question beats a long story — Ido 2026-08-11).
                 .onTapGesture {
                     if convo.state == .idle {
                         convo.hasAutoStarted = true
                         convo.start(token: TokenStore.token ?? "")
+                    } else {
+                        convo.stopSpeaking()
                     }
                 }
 
