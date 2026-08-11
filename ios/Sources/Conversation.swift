@@ -1365,8 +1365,18 @@ final class Conversation: ObservableObject {
 
     private func startAudioSession() throws {
         let s = AVAudioSession.sharedInstance()
-        try s.setCategory(.playAndRecord, mode: .voiceChat,
-                          options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP])
+        // Honor the loudspeaker default HERE too (2026-08-11: "her voice is
+        // low — probably in iPhone mode"). This runs on every session start
+        // and every audio-graph rebuild, and it used to hardcode .voiceChat —
+        // Apple's EARPIECE tuning, which keeps even loudspeaker output at
+        // quiet-call level — silently undoing the speakerphone tuning until
+        // Ido toggled Output twice. Same conditional as applyOutputRoute():
+        // .videoChat = full speakerphone loudness with echo control intact;
+        // .voiceChat only when he explicitly chose the private earpiece.
+        try s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
+                          options: loudspeaker
+                              ? [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+                              : [.allowBluetooth, .allowBluetoothA2DP])
         try s.setActive(true)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
