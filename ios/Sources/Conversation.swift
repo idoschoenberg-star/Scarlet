@@ -39,6 +39,11 @@ final class Conversation: ObservableObject {
     private var needsResponseAfterDone = false
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// Tool calls already executed this session (by call_id) — execution is
+    /// deliberately triggered from TWO independent server events
+    /// (function_call_arguments.done AND output_item.done), so a single
+    /// missed event can never silently lose a tool call. This set dedupes.
+    private var handledToolCalls = Set<String>()
     /// The capture sample rate the CURRENT engine expects (OAI 24k; EL 16k).
     private var captureRate: Double = 24000
 
@@ -716,10 +721,13 @@ final class Conversation: ObservableObject {
             }
             // Connected: a real socket is up. Clear the backoff counter and
             // stale send accounting from the previous socket's corpse.
+            connectedAt = Date()   // BEFORE the beacon, so session_secs is sane
             clientLog("connected", "attempt=\(reconnectAttempts)")
             reconnectAttempts = 0
             audioSendsInFlight = 0
-            connectedAt = Date()
+            handledToolCalls.removeAll()
+            responseActive = false
+            needsResponseAfterDone = false
             let task = wsSession.webSocketTask(with: socketRequest)
             ws = task
             task.resume()
@@ -1078,9 +1086,30 @@ final class Conversation: ObservableObject {
             if responseActive { needsResponseAfterDone = true }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
-            runToolOpenAI(name: ev["name"] as? String ?? "",
-                          callId: ev["call_id"] as? String ?? "",
+            let toolName = ev["name"] as? String ?? ""
+            let callId = ev["call_id"] as? String ?? ""
+            guard !callId.isEmpty, !handledToolCalls.contains(callId) else { break }
+            handledToolCalls.insert(callId)
+            clientLog("tool-call", toolName.isEmpty ? "MISSING-NAME" : toolName)
+            runToolOpenAI(name: toolName,
+                          callId: callId,
                           argsJSON: ev["arguments"] as? String ?? "{}")
+        case "response.output_item.done":
+            // Redundant tool-call trigger: the completed output item carries
+            // the FULL function call (name, call_id, arguments). If the
+            // arguments.done event was ever missed or malformed, this one
+            // still executes the tool — she can never silently skip a call.
+            if let item = ev["item"] as? [String: Any],
+               (item["type"] as? String) == "function_call" {
+                let callId = item["call_id"] as? String ?? ""
+                guard !callId.isEmpty, !handledToolCalls.contains(callId) else { break }
+                handledToolCalls.insert(callId)
+                noteSignsOfLife()
+                clientLog("tool-call-fallback", item["name"] as? String ?? "MISSING-NAME")
+                runToolOpenAI(name: item["name"] as? String ?? "",
+                              callId: callId,
+                              argsJSON: item["arguments"] as? String ?? "{}")
+            }
         case "error":
             let eobj = ev["error"] as? [String: Any]
             let code = (eobj?["code"] as? String) ?? ""
@@ -1136,9 +1165,16 @@ final class Conversation: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code < 200 || code > 299 {
+                clientLog("tool-http", "\(name) status=\(code)")
+            }
             return String(data: data, encoding: .utf8) ?? "{}"
-        } catch { return "{\"error\":\"tool failed\"}" }
+        } catch {
+            clientLog("tool-http", "\(name) failed: " + String(String(describing: error).prefix(100)))
+            return "{\"error\":\"tool failed\"}"
+        }
     }
 
     /// ElevenLabs client_tool_call entry.
