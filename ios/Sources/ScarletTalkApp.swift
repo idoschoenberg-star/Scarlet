@@ -169,6 +169,9 @@ struct RootView: View {
             if phase == .active {
                 Task { await recoverActiveDraft() }
                 Task { await InboxCounts.shared.refresh() }
+                // Fresh GPS fix to the backend so "here" answers (where am I,
+                // weather, directions) are minutes old, never a stale share.
+                LocationReporter.shared.report()
             }
             FlightRecorder.note(screen: "phase:\(phase)")
         }

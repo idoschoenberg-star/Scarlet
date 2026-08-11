@@ -287,6 +287,9 @@ final class Conversation: ObservableObject {
         wantLive = true
         state = .connecting
         status = "Waking her up…"   // don't leave the stale "Ended." line up during connect
+        // A live call is the moment "here" questions happen — refresh the
+        // backend's location fix so her answers are about where he IS.
+        LocationReporter.shared.report()
         Task { await connect() }
         observeInterruptions()
     }
