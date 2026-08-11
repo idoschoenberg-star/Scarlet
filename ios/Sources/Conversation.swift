@@ -45,6 +45,34 @@ final class Conversation: ObservableObject {
     private var needsResponseAfterDone = false
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// MECHANICAL language mirroring (2026-08-11, build 230: English in,
+    /// Hebrew out — persona instructions alone do not hold in long real
+    /// sessions). The app DETECTS the language of every transcribed/typed
+    /// utterance and, whenever it changes, pins the session with a system
+    /// context item ("Ido is speaking ENGLISH — reply only in English…").
+    /// Recent conversation items outweigh 36k-char instructions, so the pin
+    /// wins where prose lost. nil until his first utterance each session.
+    private var pinnedLanguage: String?
+
+    /// Detect the utterance's language by script: any Hebrew letter → "he",
+    /// else any letter at all → "en", else nil (numbers/noise pin nothing).
+    private func detectLanguage(_ text: String) -> String? {
+        if text.unicodeScalars.contains(where: { (0x0590...0x05FF).contains($0.value) }) { return "he" }
+        if text.rangeOfCharacter(from: .letters) != nil { return "en" }
+        return nil
+    }
+
+    /// Re-pin the session's reply language when his utterance's language
+    /// differs from the current pin. Sent as a non-interrupting system item —
+    /// it lands in context BEFORE the next response is generated.
+    private func pinLanguage(from utterance: String) {
+        guard engine == .openai, let lang = detectLanguage(utterance), lang != pinnedLanguage else { return }
+        pinnedLanguage = lang
+        sendContext(lang == "he"
+            ? "[LANGUAGE] עידו מדבר עכשיו עברית. ענה אך ורק בעברית עד שהוא עובר שפה. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
+            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. (News items are still read in their original language.)")
+    }
+
     /// Tool calls already executed this session (by call_id) — execution is
     /// deliberately triggered from TWO independent server events
     /// (function_call_arguments.done AND output_item.done), so a single
@@ -429,6 +457,7 @@ final class Conversation: ObservableObject {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         transcript.append(.init(text: t, fromHer: false))
+        pinLanguage(from: t)   // typed words mirror the same as spoken ones
         deliverUserMessage(t)
     }
 
@@ -737,6 +766,7 @@ final class Conversation: ObservableObject {
             handledToolCalls.removeAll()
             responseActive = false
             needsResponseAfterDone = false
+            pinnedLanguage = nil   // fresh session — re-pin from his first words
             let task = wsSession.webSocketTask(with: socketRequest)
             ws = task
             task.resume()
@@ -1063,6 +1093,9 @@ final class Conversation: ObservableObject {
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
                 transcript.append(.init(text: t, fromHer: false))
+                // Mirror his language mechanically: detect what he ACTUALLY
+                // spoke and pin the session to it the moment it changes.
+                pinLanguage(from: t)
                 status = "Got it — on it…"
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // Transcription is ASYNC and routinely lands AFTER the reply.
