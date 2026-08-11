@@ -41,7 +41,8 @@ struct TalkView: View {
 
             // The orb shrinks the moment the keyboard is up, so her written
             // reply always has room — the whole point of "answering silently".
-            Orb(active: convo.state == .speaking)
+            Orb(active: convo.state == .speaking,
+                userLevel: convo.micOn && convo.state == .listening ? convo.inputLevel : 0)
                 .frame(width: orbSize, height: orbSize)
                 .animation(.easeInOut(duration: 0.25), value: typeFocused)
                 // The orb IS the Scarlet button: tapping it while idle wakes her.
@@ -51,6 +52,15 @@ struct TalkView: View {
                         convo.start(token: TokenStore.token ?? "")
                     }
                 }
+
+            // Wispr-Flow-style capture wave (Ido 2026-08-11): a strip of bars
+            // dancing with the REAL captured signal — inputLevel is the RMS of
+            // the audio actually leaving the mic, so motion here is ground
+            // truth that his voice is being registered, even spoken very
+            // softly. Flat amber = mic muted, at a glance.
+            if convo.state != .idle && !convo.chatMode {
+                VoiceWave(level: convo.inputLevel, muted: !convo.micOn)
+            }
 
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
@@ -173,18 +183,65 @@ struct TalkView: View {
 
 struct Orb: View {
     var active: Bool
+    /// Live mic energy (0…1) while she's listening — the orb visibly reacts
+    /// to IDO's voice, not just her own speech: glow and a subtle swell track
+    /// what the mic is capturing in real time.
+    var userLevel: Float = 0
     @State private var breathe = false
     var body: some View {
+        let lift = CGFloat(min(1, max(0, userLevel)))
         Circle()
             .fill(RadialGradient(colors: [Color(red: 1, green: 0.3, blue: 0.41),
                                           Color(red: 0.27, green: 0.03, blue: 0.10)],
                                  center: .init(x: 0.35, y: 0.3), startRadius: 8, endRadius: 160))
-            .shadow(color: Color(red: 1, green: 0.3, blue: 0.41).opacity(active ? 0.6 : 0.3),
-                    radius: active ? 40 : 22)
-            .scaleEffect(breathe ? 1.05 : 1.0)
+            .shadow(color: Color(red: 1, green: 0.3, blue: 0.41)
+                        .opacity(active ? 0.6 : 0.3 + 0.4 * lift),
+                    radius: (active ? 40 : 22) + lift * 26)
+            .scaleEffect((breathe ? 1.05 : 1.0) + lift * 0.06)
             .animation(.easeInOut(duration: active ? 0.6 : 2.2).repeatForever(autoreverses: true),
                        value: breathe)
+            .animation(.linear(duration: 0.08), value: lift)
             .onAppear { breathe = true }
+    }
+}
+
+/// The Wispr-Flow-style live capture wave: ~36 slim bars whose heights follow
+/// the mic's real captured level, sample by sample. A perceptual curve lifts
+/// whispers into clearly visible motion — if the wave moves, the voice IS
+/// being captured; if the mic is muted the strip collapses to a flat amber
+/// line (the app-wide "changed state" color).
+struct VoiceWave: View {
+    var level: Float
+    var muted: Bool
+    static let barCount = 36
+    @State private var history: [CGFloat] = Array(repeating: 0, count: VoiceWave.barCount)
+    private static let scarlet = Color(red: 1, green: 0.35, blue: 0.42)
+    private static let amber = Color(red: 0.96, green: 0.62, blue: 0.22)
+
+    var body: some View {
+        HStack(spacing: 3) {
+            ForEach(0..<Self.barCount, id: \.self) { i in
+                Capsule()
+                    .fill(muted ? Self.amber.opacity(0.85)
+                                : Self.scarlet.opacity(0.35 + 0.65 * history[i]))
+                    .frame(width: 3, height: 3 + (muted ? 0 : history[i] * 30))
+            }
+        }
+        .frame(height: 34)
+        .animation(.linear(duration: 0.05), value: history)
+        .onChange(of: level) { _, new in
+            guard !muted else { return }
+            // pow 0.55 is the sensitivity: -50 dB (a soft murmur) still swings
+            // the bars a third of the way — he can whisper and SEE the capture.
+            let v = CGFloat(min(1, max(0, new)))
+            var h = history
+            h.removeFirst()
+            h.append(pow(v, 0.55))
+            history = h
+        }
+        .onChange(of: muted) { _, m in
+            if m { history = Array(repeating: 0, count: Self.barCount) }
+        }
     }
 }
 
