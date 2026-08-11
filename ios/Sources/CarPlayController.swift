@@ -88,6 +88,8 @@ final class CarPlayController {
         let convo = Conversation.shared
         convo.$state.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
         convo.$micOn.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
+        // Status drives the listening↔thinking distinction on the car screen.
+        convo.$status.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
     }
 
     /// Map the engine state to a voice-control state + the head unit's now-playing.
@@ -97,18 +99,30 @@ final class CarPlayController {
         let v: VState
         switch convo.state {
         case .idle:
-            v = .connecting
             // The car has no Start button — eyes-free means a session that
             // gave up (dead cell spot, reconnects exhausted) must come back BY
             // ITSELF while the car surface is up. Debounced; start() is a
-            // no-op unless truly idle.
-            if Date().timeIntervalSince(lastAutoStart) > 5, let t = TokenStore.token {
+            // no-op unless truly idle. But an End IDO PRESSED is sacred — the
+            // car never resurrects a session he explicitly hung up on.
+            if !convo.endedByUser, Date().timeIntervalSince(lastAutoStart) > 5,
+               let t = TokenStore.token {
                 lastAutoStart = Date()
                 convo.hasAutoStarted = true
+                startedSession = true   // the car owns this revival — end it on disconnect
                 convo.start(token: t)
+                v = .connecting
+            } else {
+                // Truthful idle: ended (or unable to start) is "mic off", not
+                // an eternal fake "Connecting…".
+                v = .muted
             }
         case .connecting: v = .connecting
-        case .listening:  v = convo.micOn ? .listening : .muted
+        case .listening:
+            // "Thinking" between his speech ending and her reply starting —
+            // the status strings are the live turn markers.
+            if !convo.micOn { v = .muted }
+            else if convo.status == "Thinking…" || convo.status == "Got it — on it…" { v = .thinking }
+            else { v = .listening }
         case .speaking:   v = .speaking
         }
         voiceTemplate.activateVoiceControlState(withIdentifier: v.rawValue)

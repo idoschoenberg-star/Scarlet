@@ -17,13 +17,18 @@ final class SettingsModel: ObservableObject {
     @Published var note = ""
     private var player: AVPlayer?
 
+    /// The chosen OpenAI Realtime voice lives on-device and rides to the
+    /// server as ?voice= at every session mint — no server round-trip to set.
+    static let voiceKey = "scarlet.openaiVoice"
+
     func load() async {
         loading = true
         defer { loading = false }
         do {
             let data = try await call("voices=1", method: "GET")
             let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-            currentId = (obj["current"] as? String) ?? currentId
+            currentId = UserDefaults.standard.string(forKey: Self.voiceKey)
+                ?? (obj["current"] as? String) ?? currentId
             var seenV = Set<String>()
             voices = ((obj["voices"] as? [[String: Any]]) ?? []).compactMap { v in
                 guard let id = v["id"] as? String else { return nil }
@@ -33,27 +38,18 @@ final class SettingsModel: ObservableObject {
                 return VoiceOption(id: id, name: (v["name"] as? String) ?? id,
                                    desc: v["desc"] as? String, preview: v["preview"] as? String)
             }
-            if voices.isEmpty { note = "No voices came back — is the Premium engine set up?" }
+            if voices.isEmpty { note = "No voices came back — check your connection and reopen Settings." }
         } catch {
             note = "Couldn't load voices. Check your connection and reopen Settings."
         }
     }
 
     func select(_ v: VoiceOption) {
-        let previous = currentId
+        // Local truth: the pick is saved on-device and attached to every
+        // session mint (?voice=) — nothing to fail server-side.
         currentId = v.id
+        UserDefaults.standard.set(v.id, forKey: Self.voiceKey)
         note = "Voice set to \(v.name) — she'll use it from the next conversation."
-        Task {
-            do {
-                _ = try await call("setvoice=\(v.id.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? v.id)", method: "POST")
-            } catch {
-                // Don't claim success the server didn't confirm — revert the
-                // checkmark and say so, instead of silently snapping back on the
-                // next open.
-                currentId = previous
-                note = "Couldn't set \(v.name) — check your connection and try again."
-            }
-        }
     }
 
     func preview(_ v: VoiceOption) {
@@ -63,7 +59,7 @@ final class SettingsModel: ObservableObject {
     }
 
     private func call(_ q: String, method: String) async throws -> Data {
-        var req = URLRequest(url: URL(string: AppConfig.elevenURL.absoluteString + "?v=2&" + q)!)
+        var req = URLRequest(url: URL(string: AppConfig.realtimeURL.absoluteString + "?v=2&" + q)!)
         req.httpMethod = method
         req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
         let (d, resp) = try await URLSession.shared.data(for: req)

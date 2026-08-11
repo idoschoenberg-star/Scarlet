@@ -17,19 +17,30 @@ final class Conversation: ObservableObject {
 
     enum State { case idle, connecting, listening, speaking }
 
-    /// The two voice engines (Ido 2026-08-11, the bulletproof mandate):
-    /// ElevenLabs is the premium default — Vesper, the audition-picked
-    /// character voice. OpenAI Realtime is the always-there backup — same
-    /// persona and the same ~59 tools (realtime-session carries the full
-    /// brain), Marin voice, semantic turn detection. The app fails over
-    /// AUTOMATICALLY on a quota 402, a mid-session quota kill, or repeated
-    /// connect failures, and returns to premium on the next fresh session.
+    /// THE voice engine is OpenAI Realtime (Ido 2026-08-11: "Dump 11 Labs.
+    /// Just use OpenAI and make it a super reliable platform."). One vendor,
+    /// one pipe, the ChatGPT-class voice he picked, semantic turn detection,
+    /// the full persona + ~59 tools configured server-side in
+    /// realtime-session. The ElevenLabs branch below is retained as DORMANT
+    /// code only — `engine` never leaves .openai (switchToBackupEngine guards
+    /// on .eleven and so never fires).
     enum Engine: String { case eleven, openai }
-    @Published private(set) var engine: Engine = .eleven
+    @Published private(set) var engine: Engine = .openai
     /// Set once a failover happened this session — prevents ping-ponging.
     private var engineFellBack = false
-    /// The capture sample rate the CURRENT engine expects (EL 16k, OAI 24k).
-    private var captureRate: Double = 16000
+
+    // OpenAI per-turn bookkeeping. Two GA facts shape the always-answer logic:
+    // input transcription is an ASYNC side channel that routinely lands AFTER
+    // the reply, and only ONE response can be active at a time.
+    private var responseActive = false
+    /// A turn (speech or text) landed while a response was active — with
+    /// interrupt_response=false the server may drop it unanswered, so ask for
+    /// a response explicitly the moment the active one finishes.
+    private var needsResponseAfterDone = false
+    private var lastSpeechStoppedAt = Date.distantPast
+    private var lastResponseCreatedAt = Date.distantPast
+    /// The capture sample rate the CURRENT engine expects (OAI 24k; EL 16k).
+    private var captureRate: Double = 24000
 
     /// One-way, once-per-session switch to the backup engine.
     private func switchToBackupEngine(_ why: String) {
@@ -75,7 +86,7 @@ final class Conversation: ObservableObject {
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
     private var token = ""
-    private var outputRate: Double = 16000
+    private var outputRate: Double = 24000   // OpenAI Realtime speaks 24 kHz PCM16
 
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
@@ -167,7 +178,7 @@ final class Conversation: ObservableObject {
     // contract for that notification is to discard and recreate them (see the
     // reset observer). Still exactly ONE live instance at any moment — the
     // singleton invariant holds.
-    private var engine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
     private var converter: AVAudioConverter?
     private var playFormat: AVAudioFormat?
@@ -254,13 +265,13 @@ final class Conversation: ObservableObject {
         // every audio buffer of this one — a fresh start reclaims the session.
         interrupted = false
         endedByUser = false
-        // Every fresh session tries the premium voice first; the 402 fast-fail
-        // makes a still-exhausted quota cost one HTTP round-trip, not a call.
-        if engine != .eleven {
-            engine = .eleven
-            if captureRate != 16000 { captureRate = 16000; stopAudio() }
-        }
+        // OpenAI is the one and only engine — no per-session engine reset.
         engineFellBack = false
+        responseActive = false
+        needsResponseAfterDone = false
+        // A restart mid-thread (self-heal, CarPlay revival) must continue the
+        // conversation, not greet like a stranger — same as the reconnect path.
+        resumedSession = !transcript.isEmpty
         self.token = token
         wantLive = true
         state = .connecting
@@ -271,8 +282,9 @@ final class Conversation: ObservableObject {
 
     /// True only when IDO hung up (End button). Distinguishes his explicit
     /// choice from a give-up (network died, reconnects exhausted): a give-up
-    /// self-heals on the next foreground, an explicit End stays ended.
-    private var endedByUser = false
+    /// self-heals on the next foreground, an explicit End stays ended —
+    /// readable so CarPlay's self-restart also respects his End.
+    private(set) var endedByUser = false
 
     func end() {
         endedByUser = true
@@ -313,9 +325,17 @@ final class Conversation: ObservableObject {
         // Unmuting must open her ears NOW — a stale speech-tail gate from
         // before the mute would swallow his first words after unmute.
         if micOn { speechTailUntil = .distantPast }
+        // An EXPLICIT toggle overrides any typing/chat-mode snapshot: leaving
+        // those modes must restore what Ido chose, never clobber it back.
+        micWasOnBeforeTyping = micOn
+        micWasOnBeforeChat = micOn
         status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
     }
-    func toggleSpeaker() { speakerOn.toggle(); player.volume = speakerOn ? 1 : 0 }
+    func toggleSpeaker() {
+        speakerOn.toggle()
+        player.volume = speakerOn ? 1 : 0
+        speakerWasOnBeforeChat = speakerOn   // explicit choice survives chat mode
+    }
 
     /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
     /// "no override" still mean loudspeaker, so the category itself must flip
@@ -437,7 +457,7 @@ final class Conversation: ObservableObject {
     /// checked (not discarded), and the reply watchdog arms. Either failure
     /// path requeues the text and rebuilds the socket, so the question is
     /// re-asked on the fresh session instead of vanishing.
-    private func sendUserMessage(_ text: String) {
+    private func sendUserMessage(_ text: String, createResponse: Bool = true) {
         awaitingReplyText = text
         armReplyWatchdog()
         let payload: [String: Any] = engine == .eleven
@@ -450,10 +470,16 @@ final class Conversation: ObservableObject {
         ws?.send(.string(s)) { [weak self] error in
             guard error != nil else {
                 // OpenAI: a message item doesn't answer itself — ask for the
-                // response only after the item landed on the socket.
+                // response after the item lands. Only ONE response may be
+                // active at a time, so while one runs the request is deferred
+                // to that response's done event instead of erroring out.
                 Task { @MainActor in
-                    guard let self, self.engine == .openai else { return }
-                    self.send(["type": "response.create"])
+                    guard let self, self.engine == .openai, createResponse else { return }
+                    if self.responseActive {
+                        self.needsResponseAfterDone = true
+                    } else {
+                        self.send(["type": "response.create"])
+                    }
                 }
                 return
             }
@@ -486,11 +512,15 @@ final class Conversation: ObservableObject {
     }
 
     private func replyWatchdogFired() {
-        guard wantLive, let text = awaitingReplyText else { return }
-        awaitingReplyText = nil
+        guard wantLive else { return }
         // Total silence for the whole window — the session is stalled or the
-        // socket is dead. Hold the question and rebuild; connect() re-asks it.
-        pendingOutbound.insert(text, at: 0)
+        // socket is dead. Hold the question when its text is known (a spoken
+        // turn's watchdog can be armed before its transcript arrives — then
+        // there is nothing to requeue, only a rebuild) and reconnect.
+        if let text = awaitingReplyText, !text.isEmpty {
+            pendingOutbound.insert(text, at: 0)
+        }
+        awaitingReplyText = nil
         status = "Stalled — reconnecting…"
         scheduleReconnect(reason: "reply-watchdog-stall")
     }
@@ -510,7 +540,12 @@ final class Conversation: ObservableObject {
         guard !pendingOutbound.isEmpty else { return }
         let queued = pendingOutbound
         pendingOutbound.removeAll()
-        for text in queued { sendUserMessage(text) }
+        // One response answers ALL queued turns (it reads the full
+        // conversation) — per-message creates would collide on the
+        // one-active-response rule and orphan the extras.
+        for (i, text) in queued.enumerated() {
+            sendUserMessage(text, createResponse: i == queued.count - 1)
+        }
     }
 
     /// Her most recent line — surfaced by the floating presence capsule.
@@ -615,18 +650,37 @@ final class Conversation: ObservableObject {
                 }
                 socketRequest = URLRequest(url: url)
             } else {
-                // Backup engine: OpenAI Realtime. realtime-session carries the
+                // THE engine: OpenAI Realtime. realtime-session carries the
                 // full brain server-side (persona, tools, semantic VAD) — the
                 // mint returns an ephemeral client secret for the GA socket.
-                var req = URLRequest(url: AppConfig.realtimeURL)
+                // The Settings-chosen voice rides along (?voice=), Marin when
+                // unset — Ido's recorded pick.
+                var mintURL = AppConfig.realtimeURL
+                if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey),
+                   !v.isEmpty,
+                   let u = URL(string: AppConfig.realtimeURL.absoluteString + "?voice=" + v) {
+                    mintURL = u
+                }
+                var req = URLRequest(url: mintURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
-                let (data, _) = try await URLSession.shared.data(for: req)
-                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
                       let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
-                    status = "Couldn't start — try again."; state = .idle; wantLive = false
-                    pendingOutbound.removeAll()
+                    // A bad token is terminal; everything else (cold start,
+                    // 429, 5xx, malformed body) is TRANSIENT — retry through
+                    // the normal backoff and KEEP the queued text. Hard-idling
+                    // here destroyed the very question the always-answer
+                    // machinery was holding.
+                    if httpStatus == 401 || httpStatus == 403 {
+                        status = "Couldn't start — sign in again from Settings."
+                        state = .idle; wantLive = false
+                        pendingOutbound.removeAll()
+                        return
+                    }
+                    if wantLive { scheduleReconnect(reason: "mint-failed-\(httpStatus)") }
                     return
                 }
                 var wsReq = URLRequest(url: url)
@@ -672,7 +726,7 @@ final class Conversation: ObservableObject {
             if engine == .eleven {
                 send(["type": "conversation_initiation_client_data"])
             }
-            listen()
+            listen(task)
             state = .listening
             status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
             // A fresh socket knows nothing about the screen — replay the
@@ -707,19 +761,22 @@ final class Conversation: ObservableObject {
         }
     }
 
-    private func listen() {
-        ws?.receive { [weak self] result in
+    /// The receive loop is BOUND TO ONE SOCKET: the task is captured and every
+    /// action re-checks `self.ws === task` on the main actor. Without this, a
+    /// dead socket's late failure callback could tear down its healthy
+    /// replacement, and the re-arm could attach a SECOND receive loop to the
+    /// new socket — two loops splitting events destroys ordering.
+    private func listen(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let err):
                 // The server's close reason is the only honest diagnosis of a
-                // kill — read it BEFORE rebuilding. An out-of-quota close
-                // (ElevenLabs: "This request exceeds your quota limit.") makes
-                // reconnecting pointless: every retry dies the same way, the
-                // build-218/219 "rotating listening/reconnecting" loop. Stop,
-                // say the truth, and leave text mode usable.
-                let closeReason = self.ws?.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                // kill — read it BEFORE rebuilding (safe: closeReason on the
+                // captured task, not the mutable self.ws).
+                let closeReason = task.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 Task { @MainActor in
+                    guard self.ws === task else { return }   // a ghost's failure — ignore
                     // A quota kill mid-session: the premium voice is spent.
                     // Fall over to the backup engine LIVE — the conversation
                     // continues on the other voice instead of dying.
@@ -736,9 +793,12 @@ final class Conversation: ObservableObject {
                 if case .string(let text) = msg,
                    let data = text.data(using: .utf8),
                    let ev = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    Task { @MainActor in self.handle(ev) }
+                    Task { @MainActor in
+                        guard self.ws === task else { return }   // stale socket's leftovers
+                        self.handle(ev)
+                    }
                 }
-                self.listen()
+                self.listen(task)   // re-arm on the SAME socket, never self.ws
             }
         }
     }
@@ -788,8 +848,13 @@ final class Conversation: ObservableObject {
         let delay = min(30.0, 0.9 * pow(2.0, Double(attempt)))
         reconnectTask = Task {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            if wantLive, !Task.isCancelled { await connect() }
+            // Clear the single-flight flag BEFORE connect(): if connect()
+            // throws it calls scheduleReconnect itself, and with the flag
+            // still up that call was swallowed — the loop silently died and
+            // the app sat in "Reconnecting…" forever (the one-failed-retry
+            // dead end).
             reconnecting = false
+            if wantLive, !Task.isCancelled { await connect() }
         }
     }
 
@@ -814,10 +879,11 @@ final class Conversation: ObservableObject {
     /// often died without any callback ever firing.
     private func pingNow() {
         guard wantLive, state == .listening || state == .speaking, let ws else { return }
-        ws.sendPing { [weak self] error in
+        let task = ws   // bind the verdict to THIS socket, not whatever ws is later
+        task.sendPing { [weak self] error in
             guard error != nil else { return }
             Task { @MainActor in
-                guard let self, self.wantLive else { return }
+                guard let self, self.wantLive, self.ws === task else { return }
                 self.scheduleReconnect(reason: "ping-failed")
             }
         }
@@ -946,8 +1012,29 @@ final class Conversation: ObservableObject {
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
         case "response.created":
             // The reply is being generated — semantic sign of life.
+            responseActive = true
+            lastResponseCreatedAt = Date()
             noteSignsOfLife()
+        case "response.done":
+            responseActive = false
+            let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
+            if rstatus != "completed" && rstatus != "cancelled" {
+                // Failed/incomplete response: the always-answer net catches it
+                // here — the watchdog was already disarmed by response.created.
+                clientLog("response-failed", rstatus)
+                if let q = awaitingReplyText, !q.isEmpty {
+                    awaitingReplyText = nil
+                    pendingOutbound.insert(q, at: 0)
+                }
+                flushPendingOutbound()
+            }
+            // A turn that arrived while this response ran gets its answer now.
+            if needsResponseAfterDone {
+                needsResponseAfterDone = false
+                send(["type": "response.create"])
+            }
         case "response.output_audio_transcript.done", "response.audio_transcript.done":
+            noteSignsOfLife()
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
         case "conversation.item.input_audio_transcription.completed":
@@ -956,22 +1043,52 @@ final class Conversation: ObservableObject {
                 transcript.append(.init(text: t, fromHer: false))
                 status = "Got it — on it…"
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                awaitingReplyText = t
-                armReplyWatchdog()
+                // Transcription is ASYNC and routinely lands AFTER the reply.
+                // Arming the watchdog here regardless tore down a healthy
+                // session 25s after every quiet turn (the phantom-stall trap).
+                // Only treat this as an unanswered turn when no response has
+                // started since the speech ended; otherwise just record it.
+                if lastResponseCreatedAt < lastSpeechStoppedAt {
+                    awaitingReplyText = t
+                    armReplyWatchdog()
+                } else if awaitingReplyText != nil, awaitingReplyText!.isEmpty {
+                    awaitingReplyText = t   // give the armed placeholder its text
+                }
             }
+        case "conversation.item.input_audio_transcription.failed":
+            clientLog("transcription-failed",
+                      String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
             // Server-side truth that his voice is registering — instant cue.
             if state == .listening, micOn { status = "Hearing you…" }
         case "input_audio_buffer.speech_stopped":
+            lastSpeechStoppedAt = Date()
+            // A reply is now DUE — arm the stall net immediately (with an
+            // empty placeholder; the async transcript fills it in). Speech
+            // that landed while a response was active would otherwise be
+            // dropped by the server — defer a response.create to its done.
+            if responseActive {
+                needsResponseAfterDone = true
+            } else {
+                awaitingReplyText = ""
+                armReplyWatchdog()
+            }
             if state == .listening { status = "Thinking…" }
+        case "input_audio_buffer.committed":
+            if responseActive { needsResponseAfterDone = true }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
             runToolOpenAI(name: ev["name"] as? String ?? "",
                           callId: ev["call_id"] as? String ?? "",
                           argsJSON: ev["arguments"] as? String ?? "{}")
         case "error":
-            let msg = ((ev["error"] as? [String: Any])?["message"] as? String) ?? "unknown"
-            clientLog("openai-error", String(msg.prefix(200)))
+            let eobj = ev["error"] as? [String: Any]
+            let code = (eobj?["code"] as? String) ?? ""
+            let msg = (eobj?["message"] as? String) ?? "unknown"
+            // A create that collided with an active response is recoverable:
+            // re-ask the moment the active one finishes.
+            if code.contains("active_response") { needsResponseAfterDone = true }
+            clientLog("openai-error", String((code + " " + msg).prefix(200)))
         default: break
         }
     }
@@ -1188,12 +1305,12 @@ final class Conversation: ObservableObject {
     /// sure the engine is running.
     private func ensureAudio() throws {
         if audioReady {
-            if !engine.isRunning { try engine.start() }
+            if !audioEngine.isRunning { try audioEngine.start() }
             return
         }
         try startAudioSession()
 
-        let input = engine.inputNode
+        let input = audioEngine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
         // While another app owns the audio session (an interruption in
         // progress, e.g. Spotify mid-handoff) the input node can report a dead
@@ -1227,11 +1344,11 @@ final class Conversation: ObservableObject {
         // Guard the attach so the graph can be torn down and rebuilt (on an
         // audio device/format change) without re-attaching an already-attached
         // node — which AVAudioEngine traps on.
-        if player.engine == nil { engine.attach(player) }
+        if player.engine == nil { audioEngine.attach(player) }
         // Player speaks standard Float32 — mixer connections in exotic formats
         // are exactly the kind of thing AVAudioEngine throws exceptions over.
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
-        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
+        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
 
         input.removeTap(onBus: 0)   // never stack taps — a second install crashes
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
@@ -1353,9 +1470,12 @@ final class Conversation: ObservableObject {
                         self.status = "Listening…"
                     }
                 }
-                // Half-duplex: her ears open only when her voice isn't in the
-                // room. Kills echo barge-in AND echo phantom turns at the root.
-                guard self.micOn, !self.echoRisk else { return }
+                // Half-duplex + state truth: stream only when the mic is
+                // GENUINELY delivering to a live session (micStreaming folds
+                // in mic, echo gate, and session state) — during .connecting
+                // the old guard kept "sending" into a nil socket, inflating
+                // the in-flight count until every buffer looked dropped.
+                guard self.micStreaming else { return }
                 // Backpressure: never queue unbounded audio into a slow socket.
                 guard self.audioSendsInFlight < 24 else {
                     self.droppedChunks += 1
@@ -1364,9 +1484,9 @@ final class Conversation: ObservableObject {
                 self.sendAudio(data.base64EncodedString())
             }
         }
-        engine.prepare()
-        try engine.start()
-        engine.mainMixerNode.outputVolume = 1.0
+        audioEngine.prepare()
+        try audioEngine.start()
+        audioEngine.mainMixerNode.outputVolume = 1.0
         audioReady = true
     }
 
@@ -1408,9 +1528,9 @@ final class Conversation: ObservableObject {
         // playback bookkeeping the same way flushPlayback()/stopAudio() do.
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
-        engine.disconnectNodeOutput(player)
+        audioEngine.disconnectNodeOutput(player)
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
-        engine.connect(player, to: engine.mainMixerNode, format: playFormat)
+        audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
     }
 
     private func playPCM(base64: String) {
@@ -1430,14 +1550,14 @@ final class Conversation: ObservableObject {
             let samples = raw.bindMemory(to: Int16.self)
             for i in 0..<Int(frames) { ch[0][i] = Float(samples[i]) / 32768.0 }
         }
-        if !engine.isRunning { try? engine.start() }
+        if !audioEngine.isRunning { try? audioEngine.start() }
         // THE crash the "Spotify started mid-call" report traced to: if that
         // start FAILED (another app holds the session — `try?` swallows the
         // error), player.play() against a non-running engine raises
         // 'required condition is false: _engine->IsRunning()' — an NSException,
         // not a throw. Never drive the player unless the engine truly runs;
         // dropping the buffer degrades to text, which recovery undoes.
-        guard engine.isRunning else { return }
+        guard audioEngine.isRunning else { return }
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
@@ -1465,13 +1585,19 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
-        state = .listening
-        if micOn { status = "Listening…" }
+        // Only her-speaking transitions back to listening. Forcing .listening
+        // from ANY state let an interruption during a reconnect fake a live
+        // session (nil socket, "Listening…" status) — or resurrect End-state
+        // UI from idle.
+        if state == .speaking {
+            state = .listening
+            if micOn { status = "Listening…" }
+        }
     }
 
     private func stopAudio() {
         guard audioReady else { return }
-        engine.inputNode.removeTap(onBus: 0)
+        audioEngine.inputNode.removeTap(onBus: 0)
         // Clear the converter under the lock: the tap is removed, but a callback
         // already dispatched can still be running: snapshotting nil (or the still-
         // live old converter it captured) is safe; a torn read is not.
@@ -1481,7 +1607,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
-        engine.stop()
+        audioEngine.stop()
         audioReady = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -1512,7 +1638,13 @@ final class Conversation: ObservableObject {
                     // transcript, and reconnect logic are all untouched.
                     self.interrupted = true
                     self.flushPlayback()
-                    self.engine.pause()
+                    // Stop the model's generation too — otherwise deltas keep
+                    // streaming into the torn-down audio path and she "resumes"
+                    // a half-heard answer when audio comes back.
+                    if self.engine == .openai, self.responseActive {
+                        self.send(["type": "response.cancel"])
+                    }
+                    self.audioEngine.pause()
                     if self.wantLive {
                         self.status = "Sound paused — another app is playing. Still here in text."
                     }
@@ -1526,8 +1658,12 @@ final class Conversation: ObservableObject {
                     // a session we can't reclaim leaves audio paused (the next
                     // route change retries), never crashed.
                     self.interrupted = false
+                    // Only reclaim the mic for a LIVE session — an ended app
+                    // re-grabbing .playAndRecord (orange mic dot) whenever a
+                    // phone call finishes is a privacy-feel bug.
+                    guard self.wantLive else { break }
                     try? self.startAudioSession()
-                    if self.wantLive { self.rebuildAudioGraph() }
+                    self.rebuildAudioGraph()
                 default: break
                 }
             }
@@ -1548,7 +1684,7 @@ final class Conversation: ObservableObject {
                 os_unfair_lock_unlock(self.audioStateLock)
                 self.pendingBuffers = 0
                 self.speechTailUntil = Date.distantPast
-                self.engine = AVAudioEngine()
+                self.audioEngine = AVAudioEngine()
                 self.player = AVAudioPlayerNode()
                 self.player.volume = self.speakerOn ? 1 : 0
                 self.audioReady = false
@@ -1579,8 +1715,8 @@ final class Conversation: ObservableObject {
                         // Audio stayed down after a failed recovery (dead input
                         // format at .ended) — fresh hardware truth, try again.
                         self.rebuildAudioGraph()
-                    } else if !self.engine.isRunning {
-                        try? self.engine.start()
+                    } else if !self.audioEngine.isRunning {
+                        try? self.audioEngine.start()
                     }
                     self.routeToSpeakerIfReceiver()
                 }
