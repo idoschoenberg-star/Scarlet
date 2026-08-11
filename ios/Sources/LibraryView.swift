@@ -178,6 +178,40 @@ final class LibraryModel: ObservableObject {
         }
     }
 
+    /// Multi-select archive/restore: all selected rows leave the shelf at
+    /// once; the per-item calls run concurrently and any failure reloads the
+    /// truth with an honest count. Same optimistic discipline as setArchived.
+    func setArchivedMany(_ ids: Set<String>, archived: Bool) {
+        let targets = items.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        items.removeAll { ids.contains($0.id) }
+        Task {
+            var failedCount = 0
+            await withTaskGroup(of: Bool.self) { group in
+                for t in targets {
+                    group.addTask {
+                        do {
+                            let data = try await Self.request([
+                                "op": "artifact_archive",
+                                "id": t.id,
+                                "archived": archived,
+                            ])
+                            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                            return (obj?["ok"] as? Bool) == true
+                        } catch { return false }
+                    }
+                }
+                for await ok in group where !ok { failedCount += 1 }
+            }
+            if failedCount > 0 {
+                errorText = archived
+                    ? "Couldn't archive \(failedCount) of \(targets.count) items — refreshed the shelf."
+                    : "Couldn't restore \(failedCount) of \(targets.count) items — refreshed the shelf."
+                await load()
+            }
+        }
+    }
+
     /// Permanent delete (Archived shelf only, after the confirmation dialog).
     /// Optimistic removal; a failure reloads the truth.
     func delete(_ item: LibraryItem) {
@@ -275,6 +309,10 @@ struct LibraryView: View {
     /// Archived-shelf delete flow: candidate + dialog visibility.
     @State private var deleteCandidate: LibraryItem?
     @State private var confirmingDelete = false
+    /// Multi-select mode (Select in the header): checkmark rows + one-tap
+    /// "Archive n" / "Restore n" bar at the bottom.
+    @State private var selecting = false
+    @State private var selectedIDs: Set<String> = []
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -287,10 +325,15 @@ struct LibraryView: View {
             }
             .background(ScarletBackground().ignoresSafeArea())
             // Scarlet lives at the bottom of the list screen, part of its
-            // layout — same pattern as ChatsView / InboxView.
+            // layout — same pattern as ChatsView / InboxView. In select mode
+            // the bar becomes the one-tap bulk action.
             .safeAreaInset(edge: .bottom) {
-                ScarletPresenceView(convo: convo)
-                    .padding(.vertical, 6)
+                if selecting {
+                    selectionBar
+                } else {
+                    ScarletPresenceView(convo: convo)
+                        .padding(.vertical, 6)
+                }
             }
             .toolbar(.hidden, for: .navigationBar)
             // Ambient focus: the shelf reports itself on appearance, after
@@ -301,6 +344,10 @@ struct LibraryView: View {
             }
             .onChange(of: model.shelf) { _, _ in
                 convo.setFocus(browsingFocus)
+                // A selection never survives a shelf switch — the ids would
+                // silently act on the OTHER shelf's rows.
+                selecting = false
+                selectedIDs = []
             }
             // ONE sheet for every viewer kind (see LibrarySheet).
             .reportsModalPresence(activeSheet != nil)
@@ -371,6 +418,20 @@ struct LibraryView: View {
                 .font(.system(size: 34, weight: .heavy))
                 .foregroundStyle(.white)
             Spacer()
+            // Multi-select: one tap into select mode, checkmark the rows,
+            // one tap on the bottom bar archives them all together.
+            if !model.items.isEmpty {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        selecting.toggle()
+                        if !selecting { selectedIDs.removeAll() }
+                    }
+                } label: {
+                    Text(selecting ? "Done" : "Select")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(selecting ? scarletRose : .white)
+                }
+            }
             Button {
                 Task { await model.load() }
             } label: {
@@ -383,6 +444,49 @@ struct LibraryView: View {
         .padding(.horizontal, 16)
         .padding(.top, 8)
         .padding(.bottom, 6)
+    }
+
+    // MARK: multi-select (bulk archive/restore)
+
+    private func toggleSelection(_ item: LibraryItem) {
+        if selectedIDs.contains(item.id) { selectedIDs.remove(item.id) } else { selectedIDs.insert(item.id) }
+    }
+
+    private var selectionBar: some View {
+        HStack(spacing: 12) {
+            Button(selectedIDs.count == model.items.count ? "Deselect All" : "Select All") {
+                if selectedIDs.count == model.items.count {
+                    selectedIDs.removeAll()
+                } else {
+                    selectedIDs = Set(model.items.map(\.id))
+                }
+            }
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Button {
+                let ids = selectedIDs
+                selecting = false
+                selectedIDs = []
+                model.setArchivedMany(ids, archived: model.shelf == .library)
+            } label: {
+                Label(
+                    model.shelf == .library
+                        ? "Archive\(selectedIDs.isEmpty ? "" : " \(selectedIDs.count)")"
+                        : "Restore\(selectedIDs.isEmpty ? "" : " \(selectedIDs.count)")",
+                    systemImage: model.shelf == .library ? "archivebox.fill" : "arrow.uturn.backward"
+                )
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(selectedIDs.isEmpty ? Color.white.opacity(0.12) : scarletRose))
+            }
+            .disabled(selectedIDs.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
     }
 
     // MARK: shelf switcher (two-segment capsule, ChatsView's channelSwitcher)
@@ -474,7 +578,23 @@ struct LibraryView: View {
                     .listRowBackground(Color.clear)
             }
             ForEach(model.items) { item in
-                if model.shelf == .library {
+                if selecting {
+                    // Select mode: the whole row toggles its checkmark; swipes
+                    // and viewers stand down until Done.
+                    Button {
+                        toggleSelection(item)
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: selectedIDs.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 22))
+                                .foregroundStyle(selectedIDs.contains(item.id) ? scarletRose : .white.opacity(0.35))
+                            LibraryRow(item: item, downloading: false)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.clear)
+                    .listRowSeparatorTint(.white.opacity(0.12))
+                } else if model.shelf == .library {
                     // Archive here looks and feels EXACTLY like archiving in
                     // the Amwell inbox — the app-wide OutlookArchiveSwipe
                     // (full-bleed green bar, 45% commit, row flies off).
