@@ -125,6 +125,13 @@ final class DraftModel: ObservableObject {
     /// Client-side moment the window started writing — drives the on-card timer.
     @Published var writingStartedAt: Date?
     private var pendingCompose: [String: Any]?
+    /// One silent second chance: a compose whose request never reached the
+    /// server (transient network drop) is re-issued once before any error is
+    /// shown. Reset on every fresh compose.
+    private var composeRetried = false
+    /// Guards against the original request landing AFTER a retry was issued —
+    /// only the newest compose's response may adopt a draft.
+    private var composeSeq = 0
     /// Set when the sheet closed before compose returned a draft_id — the
     /// in-flight compose reads it and dismisses the draft it just created.
     private var dismissRequested = false
@@ -385,8 +392,11 @@ final class DraftModel: ObservableObject {
 
     // MARK: compose + polling
 
-    private func compose(_ body: [String: Any]) {
+    private func compose(_ body: [String: Any], isRetry: Bool = false) {
         pendingCompose = body
+        if !isRetry { composeRetried = false }
+        composeSeq += 1
+        let seq = composeSeq
         errorText = ""
         phase = .writing
         writingStartedAt = Date()
@@ -397,6 +407,10 @@ final class DraftModel: ObservableObject {
         Task {
             do {
                 let data = try await Self.request("op=draft_compose", method: "POST", body: body)
+                // A retry superseded this request while it was in flight — only
+                // the newest compose may adopt a draft; the poll follows the
+                // server's active row either way.
+                guard seq == composeSeq else { return }
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let id = obj?["draft_id"] as? String else { throw URLError(.badServerResponse) }
                 draftId = id
@@ -412,6 +426,16 @@ final class DraftModel: ObservableObject {
                 }
                 // The poll flips to .ready when the streamed body completes.
             } catch {
+                guard seq == composeSeq else { return }
+                // A transient network drop (LTE handoff, tunnel) can swallow
+                // the request before it reaches the server. Give it one silent
+                // second chance before bothering him with an error.
+                if !composeRetried, draftId == nil, !dismissRequested {
+                    composeRetried = true
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    if draftId == nil, !dismissRequested { compose(body, isRetry: true) }
+                    return
+                }
                 errorText = "Scarlet couldn't start this draft."
                 phase = .idle
             }
@@ -478,6 +502,15 @@ final class DraftModel: ObservableObject {
                 writingSince = Date()
             } else if Date().timeIntervalSince(writingSince!) > 20 {
                 writingSince = nil
+                // The request likely never reached the server (transient
+                // network drop). If this window started the compose itself,
+                // re-issue it once silently — no row ever landed, so a retry
+                // cannot duplicate a draft. Only then surface the error.
+                if let body = pendingCompose, !composeRetried, draftId == nil {
+                    composeRetried = true
+                    compose(body, isRetry: true)
+                    return
+                }
                 errorText = "Scarlet didn't get this draft started — close and try again."
                 phase = .idle
                 return
