@@ -612,8 +612,28 @@ final class Conversation: ObservableObject {
             guard let self else { return }
             switch result {
             case .failure(let err):
+                // The server's close reason is the only honest diagnosis of a
+                // kill — read it BEFORE rebuilding. An out-of-quota close
+                // (ElevenLabs: "This request exceeds your quota limit.") makes
+                // reconnecting pointless: every retry dies the same way, the
+                // build-218/219 "rotating listening/reconnecting" loop. Stop,
+                // say the truth, and leave text mode usable.
+                let closeReason = self.ws?.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 Task { @MainActor in
-                    self.scheduleReconnect(reason: "ws-receive: " + String(String(describing: err).prefix(120)))
+                    if closeReason.lowercased().contains("quota") {
+                        self.clientLog("quota-exhausted", closeReason)
+                        self.wantLive = false
+                        self.reconnectTask?.cancel(); self.reconnectTask = nil; self.reconnecting = false
+                        self.replyWatchdog?.cancel(); self.replyWatchdog = nil; self.awaitingReplyText = nil
+                        self.livenessTask?.cancel(); self.livenessTask = nil
+                        self.ws?.cancel(with: .goingAway, reason: nil); self.ws = nil
+                        self.stopAudio()
+                        self.state = .idle
+                        self.status = "Voice is out of ElevenLabs credits — it renews with the monthly reset. Typing to Scarlet still works everywhere else in the app."
+                        return
+                    }
+                    self.scheduleReconnect(reason: "ws-receive: " + String(String(describing: err).prefix(120))
+                        + (closeReason.isEmpty ? "" : " | close: " + String(closeReason.prefix(80))))
                 }
             case .success(let msg):
                 if case .string(let text) = msg,
