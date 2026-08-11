@@ -94,6 +94,37 @@ final class Conversation: ObservableObject {
     private let replyWatchdogSeconds: UInt64 = 25
     private var livenessTask: Task<Void, Never>?
 
+    // Transport visibility (2026-08-11 death-loop hunt): every reconnect and
+    // its REASON is beaconed to the backend so the loop's cause is readable
+    // from server logs instead of guessed. Fire-and-forget; never blocks.
+    private var connectedAt = Date.distantPast
+    private func clientLog(_ kind: String, _ detail: String) {
+        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+        comps.queryItems = (comps.queryItems ?? []) + [URLQueryItem(name: "op", value: "clientlog")]
+        guard let u = comps.url else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "kind": kind,
+            "detail": detail,
+            "session_secs": Int(Date().timeIntervalSince(connectedAt)),
+            "reconnects": reconnectAttempts,
+            "dropped_chunks": droppedChunks,
+            "transcript_lines": transcript.count,
+        ])
+        URLSession.shared.dataTask(with: req).resume()
+    }
+
+    // Audio send backpressure. On a weak uplink (hotel Wi-Fi) unchecked
+    // continuous audio sends queue inside the socket without bound until the
+    // transport collapses — prime death-loop fuel. Cap the in-flight sends at
+    // ~1s of audio; past it chunks are DROPPED (server VAD tolerates gaps far
+    // better than a dead socket) and the pressure is counted for the beacons.
+    private var audioSendsInFlight = 0
+    private var droppedChunks = 0
+
     /// Background-task assertion held while a live session is backgrounded.
     /// UIBackgroundModes:[audio] keeps the engine alive while audio plays, but
     /// this assertion bridges the quiet gaps (nobody speaking) so iOS doesn't
@@ -390,7 +421,7 @@ final class Conversation: ObservableObject {
                     self.awaitingReplyText = nil
                     self.replyWatchdog?.cancel(); self.replyWatchdog = nil
                 }
-                self.scheduleReconnect()
+                self.scheduleReconnect(reason: "user-message-send-failed")
             }
         }
     }
@@ -412,7 +443,7 @@ final class Conversation: ObservableObject {
         // socket is dead. Hold the question and rebuild; connect() re-asks it.
         pendingOutbound.insert(text, at: 0)
         status = "Stalled — reconnecting…"
-        scheduleReconnect()
+        scheduleReconnect(reason: "reply-watchdog-stall")
     }
 
     /// Her first response event for the outstanding turn — the reply is coming,
@@ -530,8 +561,12 @@ final class Conversation: ObservableObject {
             } catch {
                 // Interrupted: proceed without audio — the call lives in text.
             }
-            // Connected: a real socket is up. Clear the backoff counter.
+            // Connected: a real socket is up. Clear the backoff counter and
+            // stale send accounting from the previous socket's corpse.
+            clientLog("connected", "attempt=\(reconnectAttempts)")
             reconnectAttempts = 0
+            audioSendsInFlight = 0
+            connectedAt = Date()
             let task = wsSession.webSocketTask(with: url)
             ws = task
             task.resume()
@@ -566,7 +601,9 @@ final class Conversation: ObservableObject {
             // dictated, or shared while she was asleep/connecting. Exactly once.
             flushPendingOutbound()
         } catch {
-            if wantLive { scheduleReconnect() } else { status = "Couldn't connect — tap to retry."; state = .idle }
+            if wantLive {
+                scheduleReconnect(reason: "connect-error: " + String(String(describing: error).prefix(120)))
+            } else { status = "Couldn't connect — tap to retry."; state = .idle }
         }
     }
 
@@ -574,8 +611,10 @@ final class Conversation: ObservableObject {
         ws?.receive { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure:
-                Task { @MainActor in self.scheduleReconnect() }
+            case .failure(let err):
+                Task { @MainActor in
+                    self.scheduleReconnect(reason: "ws-receive: " + String(String(describing: err).prefix(120)))
+                }
             case .success(let msg):
                 if case .string(let text) = msg,
                    let data = text.data(using: .utf8),
@@ -589,8 +628,9 @@ final class Conversation: ObservableObject {
 
     /// Silent auto-reconnect, native edition of the web app's transport-drop
     /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
-    private func scheduleReconnect() {
+    private func scheduleReconnect(reason: String = "unspecified") {
         guard wantLive, !reconnecting else { return }
+        clientLog("reconnect", reason)
         // Give up after a bounded number of tries so a truly dead network ends in
         // an actionable state, not an eternal spinner.
         if reconnectAttempts >= maxReconnectAttempts {
@@ -655,7 +695,7 @@ final class Conversation: ObservableObject {
             guard error != nil else { return }
             Task { @MainActor in
                 guard let self, self.wantLive else { return }
-                self.scheduleReconnect()
+                self.scheduleReconnect(reason: "ping-failed")
             }
         }
     }
@@ -680,6 +720,24 @@ final class Conversation: ObservableObject {
         guard let d = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: d, encoding: .utf8) else { return }
         ws?.send(.string(s)) { _ in }
+    }
+
+    /// Audio chunk send with in-flight accounting — the completion is the only
+    /// truth about whether the socket is draining. Pairs with the backpressure
+    /// guard at the call site.
+    private func sendAudio(_ b64: String) {
+        audioSendsInFlight += 1
+        guard let d = try? JSONSerialization.data(withJSONObject: ["user_audio_chunk": b64]),
+              let s = String(data: d, encoding: .utf8) else {
+            audioSendsInFlight -= 1
+            return
+        }
+        ws?.send(.string(s)) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.audioSendsInFlight = max(0, self.audioSendsInFlight - 1)
+            }
+        }
     }
 
     // MARK: protocol
@@ -1096,7 +1154,12 @@ final class Conversation: ObservableObject {
                 // Half-duplex: her ears open only when her voice isn't in the
                 // room. Kills echo barge-in AND echo phantom turns at the root.
                 guard self.micOn, !self.echoRisk else { return }
-                self.send(["user_audio_chunk": data.base64EncodedString()])
+                // Backpressure: never queue unbounded audio into a slow socket.
+                guard self.audioSendsInFlight < 24 else {
+                    self.droppedChunks += 1
+                    return
+                }
+                self.sendAudio(data.base64EncodedString())
             }
         }
         engine.prepare()

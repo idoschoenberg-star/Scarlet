@@ -231,21 +231,60 @@ struct VoiceWave: View {
     private let ticker = Timer.publish(every: 1.0 / 24.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        HStack(spacing: 3) {
-            ForEach(0..<Self.barCount, id: \.self) { i in
-                Capsule()
-                    .fill(muted ? Self.amber.opacity(0.85)
-                                : Self.scarlet.opacity(connecting ? 0.25 : 0.35 + 0.65 * history[i]))
-                    .frame(width: 3, height: 3 + history[i] * 30)
+        Canvas { ctx, size in
+            let n = Self.barCount
+            let midY = size.height / 2
+            let step = size.width / CGFloat(n - 1)
+            let color: Color = muted ? Self.amber : Self.scarlet
+            // Neighbor smoothing (1-2-1 kernel) → the wave reads organic.
+            var amp = [CGFloat](repeating: 0, count: n)
+            for i in 0..<n {
+                let a = history[max(0, i - 1)], b = history[i], c = history[min(n - 1, i + 1)]
+                amp[i] = (a + 2 * b + c) / 4 * (midY - 2)
+            }
+            let speaking = (amp.max() ?? 0) > 1.2 && !muted && !connecting
+            if speaking {
+                // Wispr's active state: a smooth symmetric waveform whose
+                // amplitude follows the captured voice, point by point.
+                var wave = Path()
+                wave.move(to: CGPoint(x: 0, y: midY - amp[0]))
+                for i in 1..<n {
+                    let x = CGFloat(i) * step
+                    let prevX = CGFloat(i - 1) * step
+                    wave.addQuadCurve(
+                        to: CGPoint(x: x, y: midY - amp[i]),
+                        control: CGPoint(x: (x + prevX) / 2, y: midY - (amp[i - 1] + amp[i]) / 2))
+                }
+                for i in stride(from: n - 1, through: 0, by: -1) {
+                    let x = CGFloat(i) * step
+                    let prevX = CGFloat(min(n - 1, i + 1)) * step
+                    wave.addQuadCurve(
+                        to: CGPoint(x: x, y: midY + amp[i]),
+                        control: CGPoint(x: (x + prevX) / 2,
+                                         y: midY + (amp[min(n - 1, i + 1)] + amp[i]) / 2))
+                }
+                wave.closeSubpath()
+                ctx.fill(wave, with: .color(color.opacity(0.9)))
+            } else {
+                // Wispr's rest state: a quiet dotted line. Amber dots = muted;
+                // dimmed dots = reconnecting (not capturing right now).
+                let dotOpacity = muted ? 0.85 : (connecting ? 0.25 : 0.5)
+                for i in stride(from: 0, to: n, by: 2) {
+                    let x = CGFloat(i) * step
+                    let r: CGFloat = 1.6
+                    ctx.fill(
+                        Path(ellipseIn: CGRect(x: x - r, y: midY - r, width: r * 2, height: r * 2)),
+                        with: .color(color.opacity(dotOpacity)))
+                }
             }
         }
-        .frame(height: 34)
+        .frame(height: 36)
         .onReceive(ticker) { _ in
             var v: CGFloat = 0
             if streaming && !muted {
-                // Display noise floor at ~-52 dB: the room's hum stays flat,
-                // speech — even soft — rises. pow 0.6 lifts whispers into
-                // clearly visible motion.
+                // Display noise floor at ~-52 dB: the room's hum stays a
+                // dotted line, speech — even soft — becomes the wave. pow 0.6
+                // lifts whispers into clearly visible motion.
                 let raw = CGFloat(min(1, max(0, level)))
                 let gated = raw < 0.14 ? 0 : (raw - 0.14) / 0.86
                 v = pow(gated, 0.6)
