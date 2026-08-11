@@ -1370,7 +1370,17 @@ final class Conversation: ObservableObject {
                         transcript.append(Line(text: "🎵 \(err)", fromHer: true))
                         status = "Listening…"
                     } else if obj["retrying"] as? Bool == true {
-                        transcript.append(Line(text: "🎵 Open Spotify once — it will start by itself", fromHer: true))
+                        // The server armed a ~24s watcher that starts playback
+                        // the moment a Spotify device appears — so WAKE the
+                        // Spotify app ourselves instead of asking Ido to. It
+                        // foregrounds briefly, registers as a device, and the
+                        // music starts on this phone by itself.
+                        if let spotify = URL(string: "spotify:") {
+                            UIApplication.shared.open(spotify)
+                            transcript.append(Line(text: "🎵 Waking Spotify — starting on this phone…", fromHer: true))
+                        } else {
+                            transcript.append(Line(text: "🎵 Open Spotify once — it will start by itself", fromHer: true))
+                        }
                         status = "Listening…"
                     } else {
                         status = "Listening…"
