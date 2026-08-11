@@ -33,9 +33,15 @@ final class Conversation: ObservableObject {
     // input transcription is an ASYNC side channel that routinely lands AFTER
     // the reply, and only ONE response can be active at a time.
     private var responseActive = false
-    /// A turn (speech or text) landed while a response was active — with
-    /// interrupt_response=false the server may drop it unanswered, so ask for
-    /// a response explicitly the moment the active one finishes.
+    /// A turn (speech or text) or a tool result landed while a response was
+    /// active — with interrupt_response=false the server may drop it
+    /// unanswered, so ask for a response explicitly the moment the active one
+    /// finishes. CRITICAL INVARIANT (the build-225 double-answer bug): any
+    /// response.created CLEARS this flag, because a new response reads the
+    /// FULL conversation and therefore covers every input that preceded it.
+    /// Without that clear, a create that collided with a VAD-created response
+    /// queued a SECOND, input-less response at done — she re-answered the
+    /// same question unprompted, often drifting into the other language.
     private var needsResponseAfterDone = false
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
@@ -1019,8 +1025,12 @@ final class Conversation: ObservableObject {
         case "response.output_audio.delta", "response.audio.delta":
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
         case "response.created":
-            // The reply is being generated — semantic sign of life.
+            // The reply is being generated — semantic sign of life. It reads
+            // the full conversation, so every input that landed before this
+            // moment is covered by it — a deferred create would only make her
+            // re-answer the same thing (the 225 double-answer/translation bug).
             responseActive = true
+            needsResponseAfterDone = false
             lastResponseCreatedAt = Date()
             noteSignsOfLife()
         case "response.done":
@@ -1039,6 +1049,7 @@ final class Conversation: ObservableObject {
             // A turn that arrived while this response ran gets its answer now.
             if needsResponseAfterDone {
                 needsResponseAfterDone = false
+                clientLog("deferred-response", "create-after-done")
                 send(["type": "response.create"])
             }
         case "response.output_audio_transcript.done", "response.audio_transcript.done":
@@ -1203,7 +1214,15 @@ final class Conversation: ObservableObject {
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
                            "output": String(out.prefix(12000))]])
-            send(["type": "response.create"])
+            // Same one-active-response gate as user turns: if Ido spoke while
+            // the tool HTTP ran, semantic VAD already created a response — an
+            // unconditional create here collides (the 225 error bursts) and
+            // the deferral then re-answered the turn twice. Defer instead.
+            if responseActive {
+                needsResponseAfterDone = true
+            } else {
+                send(["type": "response.create"])
+            }
             postToolCues(name: name, out: out)
         }
     }
@@ -1513,7 +1532,13 @@ final class Conversation: ObservableObject {
                 // the in-flight count until every buffer looked dropped.
                 guard self.micStreaming else { return }
                 // Backpressure: never queue unbounded audio into a slow socket.
-                guard self.audioSendsInFlight < 24 else {
+                // 96 in-flight (~10s) rides out real network jitter — the old
+                // 24 punched holes in the MIDDLE of his sentences on a slow
+                // patch (19 drops in the 225 session = ~2s of his words gone),
+                // which the server heard as garbled speech it couldn't answer.
+                // A socket genuinely stalled longer than this is dead anyway —
+                // the reply watchdog rebuilds it.
+                guard self.audioSendsInFlight < 96 else {
                     self.droppedChunks += 1
                     return
                 }
