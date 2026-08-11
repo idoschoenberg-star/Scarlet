@@ -615,7 +615,7 @@ final class Conversation: ObservableObject {
     /// screen.
     private func announceDrivingMode() {
         guard state == .listening || state == .speaking else { return }
-        sendContext("[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action.")
+        sendContext("[DRIVING MODE] Ido is now in the car, connected over the car's speakers and microphone — hands-free AND eyes-free. He cannot look at or touch the screen. Speak everything aloud: never say \"look at your screen\", \"tap\", or \"see below\". Read results out loud ONE item at a time, keep each turn short, and wait for his voice before continuing. Confirm out loud before taking any action. In the car the draft-window rules INVERT: read every draft FULLY aloud, take his revisions by voice, and send only on his spoken approval — never say \"it's on your screen\" while he's driving.")
     }
 
     /// CarPlay scene connected — treat as authoritative eyes-free driving even
@@ -1300,7 +1300,65 @@ final class Conversation: ObservableObject {
                     }
                 }
             }
+            // "Take me to…" → the server's navigate_to resolved the place and
+            // returned an Apple Maps driving link ({ok, name, address,
+            // maps_url, google_url}). Open it directly: in the car this hands
+            // off to CarPlay's own Maps with live traffic; on the phone it
+            // opens driving directions. Same discipline as start_call —
+            // transcript + status + haptic cue, and a scheme/host allowlist
+            // (only Apple Maps) so a server bug can never open arbitrary URLs.
+            if name == "navigate_to",
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                if let err = obj["error"] as? String {
+                    Task { @MainActor in
+                        transcript.append(Line(text: "🧭 Couldn't start navigation — \(err)", fromHer: true))
+                    }
+                } else {
+                    let label = ((obj["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }) ?? "your destination"
+                    var dest: URL?
+                    for key in ["maps_url", "url"] {
+                        if let s = obj[key] as? String, let u = URL(string: s),
+                           Self.isAllowedMapsURL(u) { dest = u; break }
+                    }
+                    if dest == nil {
+                        // Defensive: no usable link — build the daddr URL from
+                        // whatever coordinates/name the result did carry.
+                        var daddr: String?
+                        if let lat = obj["lat"] as? Double, let lng = obj["lng"] as? Double {
+                            daddr = "\(lat),\(lng)"
+                        } else if let q = (obj["name"] as? String)?
+                            .addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed), !q.isEmpty {
+                            daddr = q
+                        }
+                        if let d = daddr { dest = URL(string: "https://maps.apple.com/?daddr=\(d)&dirflg=d") }
+                    }
+                    if let url = dest {
+                        Task { @MainActor in
+                            transcript.append(Line(text: "🧭 Navigating to \(label) — opening Apple Maps", fromHer: true))
+                            status = "Navigating to \(label)…"
+                            UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            UIApplication.shared.open(url)
+                        }
+                    } else {
+                        Task { @MainActor in
+                            transcript.append(Line(text: "🧭 Couldn't start navigation — no destination in the result", fromHer: true))
+                        }
+                    }
+                }
+            }
         }
+    }
+
+    /// Navigation results may only open Apple Maps: the maps:// scheme, or an
+    /// http(s) link whose host is maps.apple.com. Everything else is dropped.
+    private static func isAllowedMapsURL(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == "maps" { return true }
+        if scheme == "http" || scheme == "https" {
+            return url.host?.lowercased() == "maps.apple.com"
+        }
+        return false
     }
 
     // MARK: audio session + capture + playback

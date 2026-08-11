@@ -25,7 +25,7 @@ final class CarPlayController {
 
     // Exactly five voice-control states (Apple caps at 5). Identifiers are
     // stable strings we activate from Conversation.state / micOn.
-    private enum VState: String { case connecting, listening, thinking, speaking, muted }
+    fileprivate enum VState: String { case connecting, listening, thinking, speaking, muted }
 
     /// Debounce for the in-car self-restart (below): one attempt per 5s, so a
     /// hard failure (mic permission revoked) can't spin a start loop.
@@ -33,13 +33,13 @@ final class CarPlayController {
 
     private lazy var voiceTemplate: CPVoiceControlTemplate = {
         let states: [CPVoiceControlState] = [
-            state(.connecting, "Connecting…",       "hourglass"),
-            state(.listening,  "Listening…",        "waveform"),
-            state(.thinking,   "Thinking…",         "ellipsis"),
-            state(.speaking,   "Scarlet",           "speaker.wave.2.fill"),
+            state(.connecting, "Connecting…"),
+            state(.listening,  "Listening…"),
+            state(.thinking,   "Thinking…"),
+            state(.speaking,   "Scarlet"),
             // A muted mic cannot HEAR "unmute" — never instruct the driver to
             // speak to a deaf session; the phone's Mic button is the way back.
-            state(.muted,      "Mic off — tap Mic on your phone", "mic.slash.fill"),
+            state(.muted,      "Mic off — tap Mic on your phone"),
         ]
         return CPVoiceControlTemplate(voiceControlStates: states)
     }()
@@ -131,11 +131,13 @@ final class CarPlayController {
 
     // MARK: helpers
 
-    private func state(_ s: VState, _ title: String, _ symbol: String) -> CPVoiceControlState {
+    private func state(_ s: VState, _ title: String) -> CPVoiceControlState {
+        // The car screen shows the same living orb as the phone — rendered at
+        // runtime (no assets), animated per state, static amber when muted.
         CPVoiceControlState(identifier: s.rawValue,
                             titleVariants: [title],
-                            image: UIImage(systemName: symbol),
-                            repeats: true)
+                            image: CarPlayOrbArt.image(for: s),
+                            repeats: s != .muted)
     }
 
     private func showSignInNotice() {
@@ -157,5 +159,117 @@ final class CarPlayController {
 
     private func clearNowPlaying() {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+}
+
+// MARK: - Orb art
+
+/// Runtime-rendered CarPlay orb — the same deep wine/scarlet radial orb the
+/// phone's TalkView shows (highlight `(1, 0.3, 0.41)` upper-left → deep wine
+/// `(0.27, 0.03, 0.10)` → near-black edge), drawn with UIGraphicsImageRenderer
+/// so no asset files ship. Animated states are 8–12 frames on a full sine
+/// cycle, so the loop is seamless when `CPVoiceControlState` repeats them:
+///   connecting — dim, slow pulse;  listening — full brightness, gentle
+///   breathing;  thinking — brightness shimmer;  speaking — brighter, wider
+///   halo pulse;  muted — amber-tinted single static frame.
+fileprivate enum CarPlayOrbArt {
+
+    /// Canvas side in points. The orb disc fills ~68% of it; the rest is halo.
+    private static let side: CGFloat = 168
+
+    static func image(for state: CarPlayController.VState) -> UIImage {
+        switch state {
+        case .connecting:
+            // Dim, slow pulse: brightness and halo swell gently together.
+            return animated(frames: 10, duration: 3.0) { p in
+                frame(brightness: 0.50 + 0.10 * p, scale: 1.0 + 0.02 * p, halo: 0.18 + 0.10 * p)
+            }
+        case .listening:
+            // Full brightness, gentle breathing (scale 1.0 → 1.06).
+            return animated(frames: 12, duration: 2.6) { p in
+                frame(brightness: 1.0, scale: 1.0 + 0.06 * p, halo: 0.35 + 0.08 * p)
+            }
+        case .thinking:
+            // Brightness shimmer at steady size.
+            return animated(frames: 10, duration: 1.4) { p in
+                frame(brightness: 0.82 + 0.26 * p, scale: 1.0, halo: 0.30 + 0.06 * p)
+            }
+        case .speaking:
+            // Brighter, with a wider halo pulse.
+            return animated(frames: 12, duration: 1.1) { p in
+                frame(brightness: 1.0 + 0.12 * p, scale: 1.0 + 0.03 * p,
+                      halo: 0.45 + 0.30 * p, haloSpread: 0.12 * p)
+            }
+        case .muted:
+            // Amber-tinted, static — matches the phone's amber "muted" accent.
+            return frame(brightness: 0.9, scale: 1.0, halo: 0.22, amber: true)
+        }
+    }
+
+    /// Frames follow sin(2πt) mapped to 0…1, so frame N wraps back to frame 0.
+    private static func animated(frames n: Int, duration: TimeInterval,
+                                 _ make: (CGFloat) -> UIImage) -> UIImage {
+        let imgs = (0..<n).map { i -> UIImage in
+            let phase = CGFloat(i) / CGFloat(n) * 2 * .pi
+            return make((sin(phase) + 1) / 2)   // 0…1, seamless loop
+        }
+        return UIImage.animatedImage(with: imgs, duration: duration) ?? imgs[0]
+    }
+
+    /// One orb frame: soft outer glow, then the gradient disc. `brightness`
+    /// scales the disc colors, `scale` breathes the disc, `halo` is glow
+    /// opacity, `haloSpread` widens the glow's reach.
+    private static func frame(brightness: CGFloat, scale: CGFloat, halo: CGFloat,
+                              haloSpread: CGFloat = 0, amber: Bool = false) -> UIImage {
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 2
+        fmt.opaque = false
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: fmt)
+        return renderer.image { ctx in
+            let cg = ctx.cgContext
+            let center = CGPoint(x: side / 2, y: side / 2)
+            let radius = side * 0.34 * scale
+
+            // TalkView's palette (amber variant for muted, like the Mic button).
+            let hi:   (CGFloat, CGFloat, CGFloat) = amber ? (0.96, 0.62, 0.22) : (1.00, 0.30, 0.41)
+            let mid:  (CGFloat, CGFloat, CGFloat) = amber ? (0.34, 0.19, 0.05) : (0.27, 0.03, 0.10)
+            let edge: (CGFloat, CGFloat, CGFloat) = amber ? (0.06, 0.04, 0.01) : (0.05, 0.01, 0.02)
+            func c(_ t: (CGFloat, CGFloat, CGFloat), _ b: CGFloat, alpha: CGFloat = 1) -> CGColor {
+                UIColor(red: min(1, t.0 * b), green: min(1, t.1 * b), blue: min(1, t.2 * b),
+                        alpha: alpha).cgColor
+            }
+            let space = CGColorSpaceCreateDeviceRGB()
+
+            // Soft outer glow: highlight color fading to clear past the rim.
+            if let glow = CGGradient(colorsSpace: space,
+                                     colors: [c(hi, brightness, alpha: min(1, halo)),
+                                              c(hi, brightness, alpha: 0)] as CFArray,
+                                     locations: [0, 1]) {
+                cg.drawRadialGradient(glow,
+                                      startCenter: center, startRadius: radius * 0.55,
+                                      endCenter: center,
+                                      endRadius: radius * (1.45 + haloSpread) + side * 0.06,
+                                      options: [])
+            }
+
+            // The disc: radial gradient with the light hitting upper-left.
+            let orbRect = CGRect(x: center.x - radius, y: center.y - radius,
+                                 width: radius * 2, height: radius * 2)
+            cg.saveGState()
+            cg.addEllipse(in: orbRect)
+            cg.clip()
+            let light = CGPoint(x: orbRect.minX + orbRect.width * 0.35,
+                                y: orbRect.minY + orbRect.height * 0.30)
+            if let disc = CGGradient(colorsSpace: space,
+                                     colors: [c(hi, brightness), c(mid, brightness),
+                                              c(edge, 1)] as CFArray,
+                                     locations: [0, 0.55, 1]) {
+                cg.drawRadialGradient(disc,
+                                      startCenter: light, startRadius: radius * 0.05,
+                                      endCenter: light, endRadius: radius * 1.35,
+                                      options: .drawsAfterEndLocation)
+            }
+            cg.restoreGState()
+        }
     }
 }
