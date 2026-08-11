@@ -27,13 +27,19 @@ final class CarPlayController {
     // stable strings we activate from Conversation.state / micOn.
     private enum VState: String { case connecting, listening, thinking, speaking, muted }
 
+    /// Debounce for the in-car self-restart (below): one attempt per 5s, so a
+    /// hard failure (mic permission revoked) can't spin a start loop.
+    private var lastAutoStart = Date.distantPast
+
     private lazy var voiceTemplate: CPVoiceControlTemplate = {
         let states: [CPVoiceControlState] = [
             state(.connecting, "Connecting…",       "hourglass"),
             state(.listening,  "Listening…",        "waveform"),
             state(.thinking,   "Thinking…",         "ellipsis"),
             state(.speaking,   "Scarlet",           "speaker.wave.2.fill"),
-            state(.muted,      "Mic off — say \"unmute\"", "mic.slash.fill"),
+            // A muted mic cannot HEAR "unmute" — never instruct the driver to
+            // speak to a deaf session; the phone's Mic button is the way back.
+            state(.muted,      "Mic off — tap Mic on your phone", "mic.slash.fill"),
         ]
         return CPVoiceControlTemplate(voiceControlStates: states)
     }()
@@ -90,7 +96,17 @@ final class CarPlayController {
         let convo = Conversation.shared
         let v: VState
         switch convo.state {
-        case .idle:       v = .connecting   // brief; the session auto-restarts in the car
+        case .idle:
+            v = .connecting
+            // The car has no Start button — eyes-free means a session that
+            // gave up (dead cell spot, reconnects exhausted) must come back BY
+            // ITSELF while the car surface is up. Debounced; start() is a
+            // no-op unless truly idle.
+            if Date().timeIntervalSince(lastAutoStart) > 5, let t = TokenStore.token {
+                lastAutoStart = Date()
+                convo.hasAutoStarted = true
+                convo.start(token: t)
+            }
         case .connecting: v = .connecting
         case .listening:  v = convo.micOn ? .listening : .muted
         case .speaking:   v = .speaking

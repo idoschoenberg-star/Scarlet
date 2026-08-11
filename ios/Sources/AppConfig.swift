@@ -6,6 +6,7 @@ enum AppConfig {
     static let apiBase = "https://zstkwjgtushnyegxkqeg.supabase.co/functions/v1"
     static var unlockURL: URL   { URL(string: "\(apiBase)/app-api?op=unlock")! }
     static var elevenURL: URL   { URL(string: "\(apiBase)/eleven-session")! }
+    static var realtimeURL: URL { URL(string: "\(apiBase)/realtime-session")! }
     static var appAPIURL: URL   { URL(string: "\(apiBase)/app-api?v=2")! }
     static let fullAppURL = URL(string: "https://raw.githack.com/idoschoenberg-star/Scarlet/main/index.html")!
     static func toolURL(_ name: String) -> URL {
