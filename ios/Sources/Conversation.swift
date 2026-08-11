@@ -395,31 +395,69 @@ final class Conversation: ObservableObject {
         if micOn { status = "Listening…" }
     }
 
-    /// Loudspeaker ⇄ earpiece. The .defaultToSpeaker category option makes
-    /// "no override" still mean loudspeaker, so the category itself must flip
-    /// too. AirPods/CarPlay keep priority either way.
+    /// Loudspeaker ⇄ earpiece/headset. The .defaultToSpeaker category option
+    /// makes "no override" still mean loudspeaker, so the category itself must
+    /// flip too. Speaker mode means the PHONE's speaker (CarPlay excepted);
+    /// earpiece mode is where AirPods/Bluetooth take priority.
     func toggleLoudspeaker() {
         loudspeaker.toggle()
         applyOutputRoute()
     }
 
+    /// True when CarPlay owns (or can own) the audio route — never fight the car.
+    private var onCarRoute: Bool {
+        let s = AVAudioSession.sharedInstance()
+        return s.currentRoute.outputs.contains { $0.portType == .carAudio }
+            || (s.availableInputs ?? []).contains { $0.portType == .carAudio }
+    }
+
+    /// The car-ness the session category was last configured for — route
+    /// changes re-apply the category only on a car transition, so a category
+    /// change can't re-trigger itself through its own route notification.
+    private var lastAppliedCar: Bool?
+
+    /// Category options for the chosen output. SPEAKER MEANS SPEAKER
+    /// (2026-08-11, "her voice is very very thin / the speaker does not work
+    /// as a speaker at all"): in loudspeaker mode Bluetooth is EXCLUDED —
+    /// with .allowBluetooth set, any paired headset/Mac/BT speaker silently
+    /// steals the route over HFP, the narrowband phone-call codec that makes
+    /// her sound paper-thin, and overrideOutputAudioPort cannot pull audio
+    /// back off Bluetooth, so the Output button looked dead. Earpiece mode
+    /// and any car route keep Bluetooth fully available (AirPods/CarPlay).
+    private func outputOptions(car: Bool) -> AVAudioSession.CategoryOptions {
+        if loudspeaker && !car { return [.defaultToSpeaker] }
+        let bt: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+        return loudspeaker ? bt.union(.defaultToSpeaker) : bt
+    }
+
     private func applyOutputRoute() {
         let s = AVAudioSession.sharedInstance()
-        let phoneIsOutput = s.currentRoute.outputs.allSatisfy {
-            $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
-        }
-        let base: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
+        let car = onCarRoute
         // .voiceChat is tuned for the EARPIECE and keeps loudspeaker output
         // quiet-call level; .videoChat is the speakerphone tuning — full
         // loudspeaker loudness with echo control intact. Keep Apple's AEC on
         // EVERYWHERE including the Mac: turning it off (a pro-interface capture
         // experiment) let her loudspeaker voice loop back and truncate her.
         try? s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
-                           options: loudspeaker ? base.union(.defaultToSpeaker) : base)
+                           options: outputOptions(car: car))
         try? s.setActive(true)
+        lastAppliedCar = car
+        // Evaluate the route AFTER the category change — dropping Bluetooth
+        // just moved the route back to the phone, and that's when the
+        // receiver→speaker override matters. Wired headphones stay untouched.
+        let phoneIsOutput = s.currentRoute.outputs.allSatisfy {
+            $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
+        }
         if phoneIsOutput {
             try? s.overrideOutputAudioPort(loudspeaker ? .speaker : .none)
         }
+    }
+
+    /// Route changed (car connected/disconnected): re-apply the category only
+    /// when car-ness actually flipped, so speaker mode frees the route for
+    /// CarPlay and reclaims the phone speaker when he leaves the car.
+    private func reapplyRouteForCarTransition() {
+        if onCarRoute != lastAppliedCar { applyOutputRoute() }
     }
 
     // MARK: chat mode
@@ -1422,11 +1460,14 @@ final class Conversation: ObservableObject {
         // Ido toggled Output twice. Same conditional as applyOutputRoute():
         // .videoChat = full speakerphone loudness with echo control intact;
         // .voiceChat only when he explicitly chose the private earpiece.
+        // outputOptions() carries the SPEAKER-MEANS-SPEAKER rule: loudspeaker
+        // mode excludes Bluetooth so a paired headset can't hijack the route
+        // over the thin HFP phone-call codec.
+        let car = onCarRoute
         try s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
-                          options: loudspeaker
-                              ? [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
-                              : [.allowBluetooth, .allowBluetoothA2DP])
+                          options: outputOptions(car: car))
         try s.setActive(true)
+        lastAppliedCar = car
         applyPreferredInput()
         routeToSpeakerIfReceiver()
     }
@@ -1900,6 +1941,12 @@ final class Conversation: ObservableObject {
                         try? self.audioEngine.start()
                     }
                     self.routeToSpeakerIfReceiver()
+                    // Entering/leaving CarPlay changes which category options
+                    // are right (speaker mode frees the route for the car,
+                    // reclaims the phone speaker on exit). Guarded to fire
+                    // only on an actual car transition so the category change
+                    // can't re-trigger itself through this same notification.
+                    self.reapplyRouteForCarTransition()
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
