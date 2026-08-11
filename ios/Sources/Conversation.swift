@@ -162,35 +162,25 @@ final class Conversation: ObservableObject {
     private var pendingBuffers = 0
     private var speechTailUntil = Date.distantPast
 
-    /// True while the CURRENT output route runs Apple's echo canceller
-    /// (voiceChat/videoChat voice-processing I/O): built-in speaker, earpiece,
-    /// wired headphones, USB, or an HFP headset with its own AEC. On these
-    /// routes the mic can stream WHILE she speaks — her own voice is cancelled
-    /// before it reaches the server, so Ido can barge in mid-sentence and is
-    /// never talking into a dead mic. Cached (route queries are not free on
-    /// the per-buffer path) and refreshed on every route change.
-    private var routeAEC = true
-
-    private func refreshRouteAEC() {
-        let outs = AVAudioSession.sharedInstance().currentRoute.outputs
-        let aecPorts: Set<AVAudioSession.Port> = [
-            .builtInSpeaker, .builtInReceiver, .headphones, .usbAudio, .bluetoothHFP,
-        ]
-        routeAEC = !outs.isEmpty && outs.allSatisfy { aecPorts.contains($0.portType) }
-    }
-
     /// True while sending mic audio would loop her own voice back to her.
-    /// The 2026-08-11 reliability round: this used to gate the mic for the
-    /// ENTIRE duration of her every answer (she streams faster than realtime,
-    /// so the whole reply sat in pendingBuffers) — Ido spoke into a dead mic
-    /// whenever she was talking, the "hit and miss, mostly miss" root cause.
-    /// Now the half-duplex gate applies ONLY to routes without echo
-    /// cancellation (car audio, Bluetooth A2DP); AEC routes are full-duplex.
+    /// HALF-DUPLEX ON EVERY ROUTE — deliberately. The 2026-08-11 full-duplex
+    /// experiment (stream through the session's AEC while she speaks, for
+    /// barge-in) put build 218 into a listening↔reconnecting death loop: the
+    /// raw AVAudioEngine input tap is NOT voice-processed, so her loudspeaker
+    /// voice fed straight back as "user speech", tripping interruptions and
+    /// phantom turns until sessions collapsed. Do not re-open this gate
+    /// without true voice-processing I/O (inputNode.setVoiceProcessingEnabled)
+    /// proven on-device first.
     private var echoRisk: Bool {
         if chatMode || !speakerOn { return false }   // her voice is silent
-        if routeAEC { return false }                 // AEC eats her voice — full duplex
         return pendingBuffers > 0 || Date() < speechTailUntil
     }
+
+    /// True while the mic is genuinely delivering Ido's voice to the server —
+    /// what the capture wave visualizes. NOT true while her own playback
+    /// gates the mic (echoRisk), so her loudspeaker voice never masquerades
+    /// as "your voice is being captured".
+    var micStreaming: Bool { micOn && !echoRisk && (state == .listening || state == .speaking) }
 
     // MARK: lifecycle
 
@@ -891,7 +881,6 @@ final class Conversation: ObservableObject {
         try s.setActive(true)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
-        refreshRouteAEC()
     }
 
     /// Apply the user's saved input choice (RME/USB interface, headset, …)
@@ -1330,9 +1319,6 @@ final class Conversation: ObservableObject {
                     }
                     self.routeToSpeakerIfReceiver()
                 }
-                // Full-duplex vs half-duplex is a property of the ROUTE — keep
-                // the cached AEC verdict in step with every change.
-                self.refreshRouteAEC()
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
                 self.evaluateDrivingMode()

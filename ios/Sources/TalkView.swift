@@ -42,7 +42,8 @@ struct TalkView: View {
             // The orb shrinks the moment the keyboard is up, so her written
             // reply always has room — the whole point of "answering silently".
             Orb(active: convo.state == .speaking,
-                userLevel: convo.micOn && convo.state == .listening ? convo.inputLevel : 0)
+                userLevel: convo.micStreaming && convo.state == .listening
+                    ? max(0, (convo.inputLevel - 0.14) / 0.86) : 0)
                 .frame(width: orbSize, height: orbSize)
                 .animation(.easeInOut(duration: 0.25), value: typeFocused)
                 // The orb IS the Scarlet button: tapping it while idle wakes her.
@@ -54,12 +55,14 @@ struct TalkView: View {
                 }
 
             // Wispr-Flow-style capture wave (Ido 2026-08-11): a strip of bars
-            // dancing with the REAL captured signal — inputLevel is the RMS of
-            // the audio actually leaving the mic, so motion here is ground
-            // truth that his voice is being registered, even spoken very
-            // softly. Flat amber = mic muted, at a glance.
+            // dancing with the REAL captured signal — motion is ground truth
+            // that his voice is being registered, silence is a FLAT line.
+            // Flat amber = mic muted; dimmed = reconnecting (not capturing).
             if convo.state != .idle && !convo.chatMode {
-                VoiceWave(level: convo.inputLevel, muted: !convo.micOn)
+                VoiceWave(level: convo.inputLevel,
+                          streaming: convo.micStreaming,
+                          muted: !convo.micOn,
+                          connecting: convo.state == .connecting)
             }
 
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
@@ -205,42 +208,52 @@ struct Orb: View {
     }
 }
 
-/// The Wispr-Flow-style live capture wave: ~36 slim bars whose heights follow
-/// the mic's real captured level, sample by sample. A perceptual curve lifts
-/// whispers into clearly visible motion — if the wave moves, the voice IS
-/// being captured; if the mic is muted the strip collapses to a flat amber
-/// line (the app-wide "changed state" color).
+/// The Wispr-Flow-style live capture wave, v2 (the build-218 version froze:
+/// it advanced only when the level VALUE changed, so a dead audio path left
+/// bars stuck mid-height, and room noise kept "silence" visibly wavy).
+/// Now a 24 fps ticker drives the strip unconditionally:
+///  - silence and room hum sit BELOW a display noise floor → truly flat line;
+///  - real speech (even soft) rises above it → visible motion, boosted by a
+///    perceptual curve so a quiet murmur still swings the bars;
+///  - motion renders ONLY while the mic is genuinely streaming to the server
+///    (`streaming`), so her own loudspeaker voice or a dead session can never
+///    fake "your voice is being captured";
+///  - muted = flat amber; reconnecting = dimmed flat.
 struct VoiceWave: View {
     var level: Float
+    var streaming: Bool
     var muted: Bool
+    var connecting: Bool
     static let barCount = 36
     @State private var history: [CGFloat] = Array(repeating: 0, count: VoiceWave.barCount)
     private static let scarlet = Color(red: 1, green: 0.35, blue: 0.42)
     private static let amber = Color(red: 0.96, green: 0.62, blue: 0.22)
+    private let ticker = Timer.publish(every: 1.0 / 24.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 3) {
             ForEach(0..<Self.barCount, id: \.self) { i in
                 Capsule()
                     .fill(muted ? Self.amber.opacity(0.85)
-                                : Self.scarlet.opacity(0.35 + 0.65 * history[i]))
-                    .frame(width: 3, height: 3 + (muted ? 0 : history[i] * 30))
+                                : Self.scarlet.opacity(connecting ? 0.25 : 0.35 + 0.65 * history[i]))
+                    .frame(width: 3, height: 3 + history[i] * 30)
             }
         }
         .frame(height: 34)
-        .animation(.linear(duration: 0.05), value: history)
-        .onChange(of: level) { _, new in
-            guard !muted else { return }
-            // pow 0.55 is the sensitivity: -50 dB (a soft murmur) still swings
-            // the bars a third of the way — he can whisper and SEE the capture.
-            let v = CGFloat(min(1, max(0, new)))
+        .onReceive(ticker) { _ in
+            var v: CGFloat = 0
+            if streaming && !muted {
+                // Display noise floor at ~-52 dB: the room's hum stays flat,
+                // speech — even soft — rises. pow 0.6 lifts whispers into
+                // clearly visible motion.
+                let raw = CGFloat(min(1, max(0, level)))
+                let gated = raw < 0.14 ? 0 : (raw - 0.14) / 0.86
+                v = pow(gated, 0.6)
+            }
             var h = history
             h.removeFirst()
-            h.append(pow(v, 0.55))
+            h.append(v)
             history = h
-        }
-        .onChange(of: muted) { _, m in
-            if m { history = Array(repeating: 0, count: Self.barCount) }
         }
     }
 }
