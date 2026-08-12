@@ -78,14 +78,20 @@ final class WatchConversation {
     /// each fast failure burned one of the few reconnect attempts and the app
     /// died in ~15s without ever having had a network path. Both sessions now
     /// WAIT for connectivity instead of failing on a not-yet-ready link.
-    private static func patientSession() -> URLSession {
+    /// resourceTimeout applies to the WHOLE task lifetime — right for the
+    /// quick mint POST, FATAL for the WebSocket (2026-08-12, build 245: the
+    /// 25s cap CANCELLED the live socket every ~25s — beacons showed -999
+    /// "cancelled" on a metronome — so she connected, then died mid-turn
+    /// before ever answering). The socket session waits for connectivity but
+    /// lives as long as the call does.
+    private static func patientSession(resourceTimeout: TimeInterval?) -> URLSession {
         let c = URLSessionConfiguration.default
         c.waitsForConnectivity = true
-        c.timeoutIntervalForResource = 25
+        if let t = resourceTimeout { c.timeoutIntervalForResource = t }
         return URLSession(configuration: c)
     }
-    private let wsSession = WatchConversation.patientSession()
-    private let mintSession = WatchConversation.patientSession()
+    private let wsSession = WatchConversation.patientSession(resourceTimeout: nil)
+    private let mintSession = WatchConversation.patientSession(resourceTimeout: 25)
     private var wantLive = false
     private var endedByUser = false
     private var reconnectAttempts = 0
