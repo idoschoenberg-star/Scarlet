@@ -1234,10 +1234,17 @@ struct DraftView: View {
         }
     }
 
+    /// The placeholder never promises "Speak" while nobody is listening —
+    /// with her ears cold it says exactly what to do instead (tap the mic).
     private var inputPlaceholder: String {
-        model.draft == nil
-            ? "Speak or type what Scarlet should write…"
-            : "Speak or type your changes…"
+        if micIsHot {
+            return model.draft == nil
+                ? "Speak or type what Scarlet should write…"
+                : "Speak or type your changes…"
+        }
+        return model.draft == nil
+            ? "Type here — or tap the mic to speak…"
+            : "Type your change — or tap the mic to speak…"
     }
 
     private var canSendInput: Bool {
@@ -1270,9 +1277,13 @@ struct DraftView: View {
 
     // MARK: mic (the sheet's ONE voice affordance)
 
-    /// Her ears are hot: mic open and not in text-only chat mode.
+    /// Her ears are hot: a LIVE session with the mic open and not in text-only
+    /// chat mode. `state` matters (2026-08-12, the Kulm revision bug): with the
+    /// call idle the old check still showed a hot mic, Ido spoke his revision
+    /// into dead air and nothing anywhere told him — the sheet promised
+    /// "Speak…" while nobody was listening.
     private var micIsHot: Bool {
-        convo.micOn && !convo.chatMode
+        convo.micOn && !convo.chatMode && convo.state != .idle
     }
 
     private var micButton: some View {
