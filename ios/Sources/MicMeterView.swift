@@ -80,9 +80,12 @@ final class MicSettings: ObservableObject {
     func refreshInputs() {
         let s = AVAudioSession.sharedInstance()
         if s.category != .playAndRecord {
-            // A2DP only, never HFP — same rule as Conversation.outputOptions:
-            // the phone-call codec must never be able to claim the route.
-            try? s.setCategory(.playAndRecord, mode: .voiceChat,
+            // A2DP only, never HFP — same rule as Conversation.outputOptions.
+            // Mode .default, NOT .voiceChat: this enumeration path must never
+            // install a quieter session policy than the conversation's
+            // (2026-08-12 faint-loudspeaker root cause — voice-processing
+            // modes ride the lower-ceiling call volume domain).
+            try? s.setCategory(.playAndRecord, mode: .default,
                                options: [.defaultToSpeaker, .allowBluetoothA2DP])
         }
         availableInputs = s.availableInputs ?? []

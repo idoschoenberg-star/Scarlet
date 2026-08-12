@@ -153,6 +153,21 @@ PY
   fi
 fi
 
+# 6) Faint-loudspeaker regression guard (2026-08-12, root-caused): loudspeaker
+#    must ride the MEDIA volume domain. .voiceChat/.videoChat are both
+#    voice-processing modes with a lower call-volume ceiling — any return of
+#    a mode keyed to `loudspeaker ?` reintroduces the bug that bit three times.
+if grep -n 'loudspeaker ? \.videoChat\|loudspeaker ? \.voiceChat' "$SRC/Conversation.swift" | grep -q .; then
+  fatal "loudspeaker path uses a voice-processing mode — the faint-speaker bug is back (see sessionMode())."
+else
+  ok "loudspeaker rides the media volume domain (sessionMode policy)"
+fi
+if grep -q 'mode: \.voiceChat' "$SRC/MicMeterView.swift"; then
+  fatal "MicMeterView installs .voiceChat — divergent session policy (faint-speaker regression)."
+else
+  ok "no divergent session policy in MicMeterView"
+fi
+
 echo "────────────────────────────────"
 if [ "$fail" -ne 0 ]; then
   echo "Pre-flight FAILED — not shipping this build."

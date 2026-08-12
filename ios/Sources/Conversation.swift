@@ -517,18 +517,35 @@ final class Conversation: ObservableObject {
         return loudspeaker ? base.union(.defaultToSpeaker) : base
     }
 
+    /// THE single session policy (root-caused 2026-08-12, "still faint on full
+    /// speaker"): .voiceChat AND .videoChat are BOTH voice-processing modes —
+    /// they reserve AEC headroom, apply call AGC, and ride the CALL volume
+    /// domain, whose ceiling sits well below the media domain at the same
+    /// hardware-button position. That is why the .videoChat fix helped but
+    /// left her quieter than Spotify. Loudspeaker now uses .default — true
+    /// media loudness. Safe because the mic is gated half-duplex client-side
+    /// (echoRisk): frames are never TRANSMITTED while any of her buffers is
+    /// undrained, so hardware AEC is dispensable (build-218 evidence: the raw
+    /// AVAudioEngine tap was never voice-processed anyway). The car keeps
+    /// .videoChat — the cabin mic needs iOS's capture tuning — and the
+    /// private earpiece keeps .voiceChat by explicit choice.
+    private func sessionMode(car: Bool) -> AVAudioSession.Mode {
+        if car { return .videoChat }
+        return loudspeaker ? .default : .voiceChat
+    }
+
+    private func applySessionCategory(car: Bool) throws {
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(.playAndRecord, mode: sessionMode(car: car),
+                          options: outputOptions(car: car))
+        try s.setActive(true)
+        lastAppliedCar = car
+    }
+
     private func applyOutputRoute() {
         let s = AVAudioSession.sharedInstance()
         let car = onCarRoute
-        // .voiceChat is tuned for the EARPIECE and keeps loudspeaker output
-        // quiet-call level; .videoChat is the speakerphone tuning — full
-        // loudspeaker loudness with echo control intact. Keep Apple's AEC on
-        // EVERYWHERE including the Mac: turning it off (a pro-interface capture
-        // experiment) let her loudspeaker voice loop back and truncate her.
-        try? s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
-                           options: outputOptions(car: car))
-        try? s.setActive(true)
-        lastAppliedCar = car
+        try? applySessionCategory(car: car)
         // Evaluate the route AFTER the category change — dropping Bluetooth
         // just moved the route back to the phone, and that's when the
         // receiver→speaker override matters. Wired headphones stay untouched.
@@ -538,6 +555,7 @@ final class Conversation: ObservableObject {
         if phoneIsOutput {
             try? s.overrideOutputAudioPort(loudspeaker ? .speaker : .none)
         }
+        logAudioState("route-applied")
     }
 
     /// Route changed (car connected/disconnected): re-apply the category only
@@ -1614,25 +1632,14 @@ final class Conversation: ObservableObject {
     // MARK: audio session + capture + playback
 
     private func startAudioSession() throws {
-        let s = AVAudioSession.sharedInstance()
-        // Honor the loudspeaker default HERE too (2026-08-11: "her voice is
-        // low — probably in iPhone mode"). This runs on every session start
-        // and every audio-graph rebuild, and it used to hardcode .voiceChat —
-        // Apple's EARPIECE tuning, which keeps even loudspeaker output at
-        // quiet-call level — silently undoing the speakerphone tuning until
-        // Ido toggled Output twice. Same conditional as applyOutputRoute():
-        // .videoChat = full speakerphone loudness with echo control intact;
-        // .voiceChat only when he explicitly chose the private earpiece.
-        // outputOptions() carries the SPEAKER-MEANS-SPEAKER rule: loudspeaker
-        // mode excludes Bluetooth so a paired headset can't hijack the route
-        // over the thin HFP phone-call codec.
-        let car = onCarRoute
-        try s.setCategory(.playAndRecord, mode: loudspeaker ? .videoChat : .voiceChat,
-                          options: outputOptions(car: car))
-        try s.setActive(true)
-        lastAppliedCar = car
+        // ONE session policy for every path (applySessionCategory) — this used
+        // to duplicate the setCategory call, and duplicated policies are how
+        // the loudspeaker went quiet twice. Runs on session start and every
+        // audio-graph rebuild.
+        try applySessionCategory(car: onCarRoute)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
+        logAudioState("session-start")
     }
 
     /// Apply the user's saved input choice (RME/USB interface, headset, …)
@@ -1678,6 +1685,23 @@ final class Conversation: ObservableObject {
         if s.currentRoute.outputs.contains(where: { $0.portType == .builtInReceiver }) {
             try? s.overrideOutputAudioPort(.speaker)
         }
+    }
+
+    /// Everything that decides loudness, in one beacon — the next "she's
+    /// faint" report arrives with the actual state instead of a guess.
+    /// sysVol is the load-bearing field: it reads the system slider of the
+    /// ACTIVE volume domain, so it directly separates "call-volume ceiling"
+    /// from "quiet stream" from "wrong route".
+    private func logAudioState(_ why: String) {
+        let s = AVAudioSession.sharedInstance()
+        let outs = s.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: "+")
+        let ins = s.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: "+")
+        clientLog("audio-state",
+            "\(why) route=\(outs) in=\(ins) mode=\(s.mode.rawValue) "
+          + "sysVol=\(String(format: "%.2f", s.outputVolume)) "
+          + "loudspeaker=\(loudspeaker) speakerOn=\(speakerOn) "
+          + "playerVol=\(player.volume) mixVol=\(audioEngine.mainMixerNode.outputVolume) "
+          + "engineRunning=\(audioEngine.isRunning) pending=\(pendingBuffers)")
     }
 
     /// Idempotent: builds the audio graph exactly once; later calls just make
@@ -1871,7 +1895,10 @@ final class Conversation: ObservableObject {
         }
         audioEngine.prepare()
         try audioEngine.start()
+        // Re-assert the WHOLE gain chain on every build — a rebuilt graph that
+        // silently inherited a 0 player volume is a "she's faint/silent" bug.
         audioEngine.mainMixerNode.outputVolume = 1.0
+        player.volume = speakerOn ? 1 : 0
         audioReady = true
     }
 
@@ -1916,6 +1943,10 @@ final class Conversation: ObservableObject {
         audioEngine.disconnectNodeOutput(player)
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
+        // Same gain-chain re-assertion as ensureAudio — this path used to
+        // rebuild the player leg without it.
+        player.volume = speakerOn ? 1 : 0
+        audioEngine.mainMixerNode.outputVolume = 1.0
     }
 
     private func playPCM(base64: String) {
@@ -1958,9 +1989,11 @@ final class Conversation: ObservableObject {
                 // first buffer's completion used to flip state mid-sentence.
                 self.pendingBuffers = max(0, self.pendingBuffers - 1)
                 if self.pendingBuffers == 0 {
-                    // Short grace so the room's reverb tail can't reach the
-                    // mic as a phantom user turn.
-                    self.speechTailUntil = Date().addingTimeInterval(0.35)
+                    // Grace so the room's reverb tail can't reach the mic as a
+                    // phantom user turn. 0.6s (was 0.35): loudspeaker now runs
+                    // WITHOUT a voice-processing mode, so this client gate is
+                    // the only echo protection — the wider tail is its price.
+                    self.speechTailUntil = Date().addingTimeInterval(0.6)
                     RadioPlayer.shared.duck(false)
                     if self.state == .speaking {
                         self.state = .listening
@@ -2110,12 +2143,14 @@ final class Conversation: ObservableObject {
                         try? self.audioEngine.start()
                     }
                     self.routeToSpeakerIfReceiver()
-                    // Entering/leaving CarPlay changes which category options
-                    // are right (speaker mode frees the route for the car,
-                    // reclaims the phone speaker on exit). Guarded to fire
-                    // only on an actual car transition so the category change
-                    // can't re-trigger itself through this same notification.
-                    self.reapplyRouteForCarTransition()
+                    // Re-apply the FULL session policy on every route change,
+                    // not just car transitions: unplugging headphones or an
+                    // AirPod dropping mid-session used to leave whatever mode
+                    // the old route had. applySessionCategory is idempotent —
+                    // setCategory with identical parameters emits no route
+                    // change, so this cannot re-trigger itself.
+                    self.applyOutputRoute()
+                    self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
                 // announce only on the transition INTO a car.
