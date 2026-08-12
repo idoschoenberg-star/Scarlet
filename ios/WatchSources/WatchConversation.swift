@@ -30,12 +30,19 @@ private final class TapState: @unchecked Sendable {
     // bugs the wrist can't distinguish without these numbers.
     private var frames = 0
     private var peak: Int16 = 0
+    // Raw-tap accounting (2026-08-12, "frames=58 peak=0"): `taps`/`rawPeak`
+    // are measured on the UNCONVERTED buffer before the gate — so the beacon
+    // can tell "mic delivers silence" (rawPeak≈0) from "converter zeroes it"
+    // (rawPeak>0, peak=0) from "gate never opened" (taps>0, frames=0).
+    private var taps = 0
+    private var rawPeak: Float = 0
     func set(converter c: AVAudioConverter?) { lock.lock(); converter = c; lock.unlock() }
     func set(gate g: Bool) { lock.lock(); gate = g; lock.unlock() }
     func note(peak p: Int16) { lock.lock(); frames += 1; if p > peak { peak = p }; lock.unlock() }
-    func audioStats() -> (frames: Int, peak: Int16) {
+    func note(raw p: Float) { lock.lock(); taps += 1; if p > rawPeak { rawPeak = p }; lock.unlock() }
+    func audioStats() -> (frames: Int, peak: Int16, taps: Int, rawPeak: Float) {
         lock.lock(); defer { lock.unlock() }
-        return (frames, peak)
+        return (frames, peak, taps, rawPeak)
     }
     func snapshot() -> (AVAudioConverter?, Bool) {
         lock.lock(); defer { lock.unlock() }
@@ -215,11 +222,16 @@ final class WatchConversation {
                 return
             }
             guard wantLive else { return }
-            do { try ensureAudio() } catch {
+            do { try await ensureAudio() } catch {
+                beacon("watch-audio-fail", String(describing: error).prefix(120).description + " " + routeSummary())
                 status = "Mic unavailable — try again"
                 state = .idle; wantLive = false
                 return
             }
+            // Route truth at session start: prove which ports the session
+            // actually holds BEFORE any audio flows (next build's logs read
+            // the verdict directly — in=[NONE] or hwIn=0 means dead input).
+            beacon("watch-route", routeSummary())
             var wsReq = URLRequest(url: url)
             wsReq.setValue("Bearer " + secret, forHTTPHeaderField: "Authorization")
             let task = wsSession.webSocketTask(with: wsReq)
@@ -237,7 +249,11 @@ final class WatchConversation {
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
                 guard let self, self.ws != nil else { return }
                 let stats = self.tapState.audioStats()
-                self.beacon("watch-audio", "frames=\(stats.frames) peak=\(stats.peak) armed=\(self.micArmed) mode=\(self.mode.rawValue)")
+                self.beacon("watch-audio",
+                            "frames=\(stats.frames) peak=\(stats.peak) taps=\(stats.taps) "
+                            + "rawPeak=\(String(format: "%.4f", stats.rawPeak)) "
+                            + "armed=\(self.micArmed) mode=\(self.mode.rawValue) "
+                            + self.routeSummary())
             }
             // Continuous mode listens from the first breath; tapToTalk waits
             // for the tap that arms the turn.
@@ -454,20 +470,55 @@ final class WatchConversation {
 
     // MARK: - audio
 
-    private func ensureAudio() throws {
+    /// One-line route + format truth for beacons: the ports the session
+    /// actually holds, the session sample rate, and the INPUT hardware format
+    /// — the one that reads 0 Hz when the mic side of the route is dead.
+    private func routeSummary() -> String {
+        let s = AVAudioSession.sharedInstance()
+        let ins = s.currentRoute.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: "+")
+        let outs = s.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: "+")
+        let hw = audioEngine.inputNode.inputFormat(forBus: 0)
+        return "in=[\(ins.isEmpty ? "NONE" : ins)] out=[\(outs.isEmpty ? "NONE" : outs)] "
+             + "sr=\(Int(s.sampleRate)) hwIn=\(Int(hw.sampleRate))x\(hw.channelCount)"
+    }
+
+    private func ensureAudio() async throws {
         if audioReady {
             if !audioEngine.isRunning { try audioEngine.start() }
             return
         }
         let session = AVAudioSession.sharedInstance()
-        // .allowBluetoothA2DP so AirPods get the full-band codec — the same
-        // never-HFP rule the phone enforces.
-        try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothA2DP])
-        try session.setActive(true)
+        // Mode .default, NOT .voiceChat (2026-08-12, wrist streams pure
+        // zeros — "frames=58 peak=0"): .voiceChat is a VoIP mode that
+        // restricts allowable routes and engages voice-processing DSP; its
+        // own documented side effect (.allowBluetooth / HFP) doesn't even
+        // EXIST on watchOS, and voice-processed input is the classic way a
+        // tap runs at full rate while delivering silence. Echo is already
+        // handled client-side by the half-duplex gate (syncGate), the same
+        // argument the phone makes for its loudspeaker .default path.
+        // .allowBluetoothA2DP stays — output-only, keeps AirPods full-band.
+        try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothA2DP])
+        // watchOS activation is the ASYNC, watch-only API (WWDC19-716 /
+        // AVAudioSession.h): activation on the watch is "a relatively time
+        // consuming operation" and may need to bring a route up; the async
+        // form reports the real outcome instead of returning early success.
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            session.activate(options: []) { activated, error in
+                if activated { cont.resume() }
+                else { cont.resume(throwing: error ?? NSError(domain: "ScarletWatchAudio", code: 2)) }
+            }
+        }
 
         let input = audioEngine.inputNode
-        let inFormat = input.outputFormat(forBus: 0)
+        // The HARDWARE side of the input node (2026-08-12): outputFormat(
+        // forBus:) can report a healthy-looking default while the input
+        // hardware is dead — exactly the geometry of a tap that "works" and
+        // delivers zeros. inputFormat(forBus:) is the format that tells the
+        // truth (0 Hz when the mic side never came up), and it's the format
+        // Apple's watch recording code taps with.
+        let inFormat = input.inputFormat(forBus: 0)
         guard inFormat.sampleRate > 0, inFormat.channelCount > 0 else {
+            beacon("watch-audio-noinput", routeSummary())
             throw NSError(domain: "ScarletWatchAudio", code: 1)
         }
         let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: wireRate,
@@ -483,6 +534,15 @@ final class WatchConversation {
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
             // Audio thread: everything it reads comes from the lock-guarded
             // snapshot; the send hops to the main actor with plain Data.
+            // RAW peak first — before gate and converter — so the beacon can
+            // separate a silent mic from a silent converter from a shut gate.
+            var rp: Float = 0
+            if let f = buffer.floatChannelData?[0] {
+                let n = Int(buffer.frameLength)
+                var i = 0
+                while i < n { let v = abs(f[i]); if v > rp { rp = v }; i += 32 }
+            }
+            tapState.note(raw: rp)
             let (converter, gate) = tapState.snapshot()
             guard gate, let converter,
                   let data = Self.convertToWire(buffer, converter: converter) else { return }

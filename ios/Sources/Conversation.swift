@@ -60,6 +60,27 @@ final class Conversation: ObservableObject {
     private var needsResponseAfterDone = false
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// Server-VAD is mid-utterance: speech_started arrived, speech_stopped
+    /// hasn't. If the echo gate closes the mic NOW (her audio starts playing),
+    /// the server is left holding a chopped fragment with no end — semantic
+    /// VAD dangles, and when the gate reopens the tail commits as a garbage
+    /// turn that gets a wrong answer (2026-08-12 root-cause finding #1). The
+    /// gate-close path uses this flag to discard the fragment instead.
+    private var serverHearsSpeech = false
+    /// Truncation bookkeeping (2026-08-12 root-cause finding #4): when local
+    /// playback is flushed (barge-in, Stop, interruption), the server still
+    /// believes every unplayed word was HEARD — its context and his screen
+    /// contain speech that never reached his ears, and later answers build on
+    /// it ("she gives different answers"). Track the current assistant audio
+    /// item and how much of it actually played, so the flush can tell the
+    /// server the truth with conversation.item.truncate.
+    private var currentAssistantItemId: String?
+    private var drainedAudioFrames = 0
+    /// One free retry for a failed/incomplete response when there is no
+    /// queued text to re-send (finding #5): the spoken turn is still in the
+    /// conversation, so a bare response.create recovers it. Reset on every
+    /// response.created; the single-shot guard prevents a failure loop.
+    private var failedResponseRetried = false
     /// MECHANICAL language mirroring (2026-08-11, build 230: English in,
     /// Hebrew out — persona instructions alone do not hold in long real
     /// sessions). The app DETECTS the language of every transcribed/typed
@@ -329,9 +350,23 @@ final class Conversation: ObservableObject {
 
     private func refreshSealedEarRoute() {
         let outs = AVAudioSession.sharedInstance().currentRoute.outputs
-        sealedEarRoute = !outs.isEmpty && outs.allSatisfy {
-            $0.portType == .headphones || $0.portType == .bluetoothHFP
-                || $0.portType == .builtInReceiver || $0.portType == .bluetoothLE
+        sealedEarRoute = !outs.isEmpty && outs.allSatisfy { out in
+            if out.portType == .headphones || out.portType == .bluetoothHFP
+                || out.portType == .builtInReceiver || out.portType == .bluetoothLE { return true }
+            // AirPods in THIS app run A2DP output + built-in phone mic (HFP is
+            // deliberately banned for quality) — so the HFP check above never
+            // matched and the sealed path was dead on the one route it was
+            // built for (2026-08-12 root-cause finding #3). A2DP alone can't
+            // be trusted (car stereos and BT speakers are A2DP too — build-218
+            // lesson), so gate on the product NAME: only known ear-worn
+            // devices count, anything unrecognized stays safely half-duplex.
+            if out.portType == .bluetoothA2DP {
+                let n = out.portName.lowercased()
+                return n.contains("airpods") || n.contains("buds")
+                    || n.contains("powerbeats") || n.contains("beats fit")
+                    || n.contains("beats studio buds") || n.contains("earbuds")
+            }
+            return false
         }
     }
 
@@ -1283,6 +1318,10 @@ final class Conversation: ObservableObject {
     private func handleOpenAI(_ ev: [String: Any]) {
         switch ev["type"] as? String {
         case "response.output_audio.delta", "response.audio.delta":
+            if let id = ev["item_id"] as? String, id != currentAssistantItemId {
+                currentAssistantItemId = id
+                drainedAudioFrames = 0
+            }
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
         case "response.created":
             // The reply is being generated — semantic sign of life. It reads
@@ -1292,6 +1331,7 @@ final class Conversation: ObservableObject {
             responseActive = true
             needsResponseAfterDone = false
             lastResponseCreatedAt = Date()
+            failedResponseRetried = false
             noteSignsOfLife()
         case "response.done":
             responseActive = false
@@ -1311,8 +1351,17 @@ final class Conversation: ObservableObject {
                 if let q = awaitingReplyText, !q.isEmpty {
                     awaitingReplyText = nil
                     pendingOutbound.insert(q, at: 0)
+                    flushPendingOutbound()
+                } else if !failedResponseRetried {
+                    // Spoken turn with no re-sendable text (finding #5): his
+                    // committed audio is still in the conversation — one bare
+                    // response.create answers it instead of going silent.
+                    failedResponseRetried = true
+                    clientLog("response-failed-retry", "bare create for spoken turn")
+                    send(["type": "response.create"])
+                } else {
+                    flushPendingOutbound()
                 }
-                flushPendingOutbound()
             }
             // A turn that arrived while this response ran gets its answer now.
             if needsResponseAfterDone {
@@ -1349,18 +1398,21 @@ final class Conversation: ObservableObject {
             clientLog("transcription-failed",
                       String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
+            serverHearsSpeech = true
             // Server-side truth that his voice is registering — instant cue.
             // On sealed-ear (full-duplex) routes this can fire WHILE she is
-            // speaking: that is Ido interrupting her. The server truncates
-            // its response on its own (interrupt_response) — cut the locally
-            // queued audio too, so she stops in his ear the moment he speaks
-            // instead of finishing every buffered sentence.
+            // speaking: that is Ido interrupting her. The server no longer
+            // truncates on its own (interrupt_response=false after the
+            // 2026-08-12 disaster) — cut the locally queued audio AND tell
+            // the server what was actually heard (flushPlayback truncates),
+            // so she stops in his ear the moment he speaks.
             if pendingBuffers > 0, sealedEarRoute {
                 flushPlayback()
                 clientLog("barge-in", "speech_started during playback — cut her audio")
             }
             if state == .listening, micOn { status = "Hearing you…" }
         case "input_audio_buffer.speech_stopped":
+            serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
             // A reply is now DUE — arm the stall net immediately (with an
             // empty placeholder; the async transcript fills it in). Speech
@@ -1374,6 +1426,7 @@ final class Conversation: ObservableObject {
             }
             if state == .listening { status = "Thinking…" }
         case "input_audio_buffer.committed":
+            serverHearsSpeech = false
             if responseActive { needsResponseAfterDone = true }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
@@ -2050,6 +2103,18 @@ final class Conversation: ObservableObject {
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
+        // The echo gate is about to close (her audio starts). If server-VAD is
+        // mid-HIS-utterance right now — the race window between his speech
+        // registering and her first buffer — the audio stream simply stops
+        // from the server's view: VAD dangles, and the reopened gate later
+        // commits a chopped tail that gets a wrong answer (2026-08-12 root
+        // cause #1). Discard the fragment instead: he repeats naturally once
+        // she finishes, which is honest half-duplex — garbage turns are not.
+        if pendingBuffers == 0, serverHearsSpeech, !sealedEarRoute {
+            serverHearsSpeech = false
+            send(["type": "input_audio_buffer.clear"])
+            clientLog("gate-close-clear", "discarded mid-utterance fragment at gate close")
+        }
         pendingBuffers += 1
         // Her voice DUCKS the radio (2026-08-11 voice-only audit: both used
         // to play at full volume simultaneously); the last buffer's drain
@@ -2061,6 +2126,7 @@ final class Conversation: ObservableObject {
                 // She's done only when the LAST queued buffer drains — the
                 // first buffer's completion used to flip state mid-sentence.
                 self.pendingBuffers = max(0, self.pendingBuffers - 1)
+                self.drainedAudioFrames += Int(frames)   // audio he actually heard
                 if self.pendingBuffers == 0 {
                     // Grace so the room's reverb tail can't reach the mic as a
                     // phantom user turn. 0.6s (was 0.35): loudspeaker now runs
@@ -2078,6 +2144,17 @@ final class Conversation: ObservableObject {
     }
 
     private func flushPlayback() {
+        // Tell the server how much he ACTUALLY heard before the cut (root
+        // cause #4, "she gives different answers"): without truncate, her
+        // context keeps every unplayed word as if spoken, and later replies
+        // build on things that never reached his ears. 24kHz mono wire rate.
+        if let itemId = currentAssistantItemId, pendingBuffers > 0 {
+            let heardMs = max(0, drainedAudioFrames * 1000 / 24000)
+            send(["type": "conversation.item.truncate",
+                  "item_id": itemId, "content_index": 0, "audio_end_ms": heardMs])
+            clientLog("truncate", "item=\(itemId) heard=\(heardMs)ms")
+            currentAssistantItemId = nil
+        }
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
