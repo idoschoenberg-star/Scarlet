@@ -2520,20 +2520,23 @@ private struct MusicDevicePickerView: View {
                             .tint(MusicStyle.green)
                     }
                 case .loaded(let devices):
-                    if devices.isEmpty {
-                        Text("No Spotify devices are online. Open Spotify on your phone, Mac, or a speaker and try again.")
-                            .font(.callout).foregroundStyle(.secondary)
-                        Button("Refresh") { Task { await load() } }
-                            .buttonStyle(.bordered)
-                            .tint(MusicStyle.green)
-                    } else {
-                        ScrollView {
-                            VStack(spacing: 4) {
-                                ForEach(devices) { d in
-                                    deviceRow(d)
-                                }
+                    // "This iPhone" is ALWAYS offered, pinned first — even
+                    // when Spotify's device list is empty (2026-08-12: the
+                    // phone in Ido's hand was the one place he couldn't
+                    // play, because a cold Spotify app isn't a Connect
+                    // device until something wakes it).
+                    ScrollView {
+                        VStack(spacing: 4) {
+                            thisPhoneRow(alreadyListed:
+                                devices.contains { $0.type.lowercased() == "smartphone" })
+                            ForEach(devices.filter { $0.type.lowercased() != "smartphone" }) { d in
+                                deviceRow(d)
                             }
                         }
+                    }
+                    if devices.isEmpty {
+                        Text("No other Spotify devices are online right now.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     }
                 }
                 Spacer(minLength: 0)
@@ -2556,6 +2559,51 @@ private struct MusicDevicePickerView: View {
         .presentationDragIndicator(.visible)
         .preferredColorScheme(.dark)
         .task { await load() }
+    }
+
+    /// The pinned "This iPhone" row. If Spotify already reports a smartphone,
+    /// the play goes straight there; otherwise the server WAITS (~12s) for the
+    /// phone to register while we wake the local Spotify app via its URL
+    /// scheme — Spotify comes to the foreground for a moment and the music
+    /// starts on the phone itself.
+    private func thisPhoneRow(alreadyListed: Bool) -> some View {
+        Button {
+            model.play(uri: pending.uri, label: pending.label, device: "This iPhone")
+            if !alreadyListed {
+                // Let the request leave first, then wake Spotify so it
+                // registers as a Connect device for the server's wait.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    if let u = URL(string: "spotify:") {
+                        UIApplication.shared.open(u, options: [:], completionHandler: nil)
+                    }
+                }
+            }
+            dismiss()
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "iphone")
+                    .font(.system(size: 18))
+                    .foregroundStyle(MusicStyle.green)
+                    .frame(width: 30)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("This iPhone")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                    Text(alreadyListed ? "Ready" : "Opens Spotify for a moment")
+                        .font(.system(size: 12))
+                        .foregroundStyle(MusicStyle.secondary)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "play.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(MusicStyle.tertiary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(RoundedRectangle(cornerRadius: 12).fill(MusicStyle.surface))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private func deviceRow(_ d: MusicDeviceItem) -> some View {
