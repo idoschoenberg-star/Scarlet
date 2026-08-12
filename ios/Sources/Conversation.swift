@@ -288,17 +288,41 @@ final class Conversation: ObservableObject {
     private var speechTailUntil = Date.distantPast
 
     /// True while sending mic audio would loop her own voice back to her.
-    /// HALF-DUPLEX ON EVERY ROUTE — deliberately. The 2026-08-11 full-duplex
-    /// experiment (stream through the session's AEC while she speaks, for
-    /// barge-in) put build 218 into a listening↔reconnecting death loop: the
-    /// raw AVAudioEngine input tap is NOT voice-processed, so her loudspeaker
-    /// voice fed straight back as "user speech", tripping interruptions and
-    /// phantom turns until sessions collapsed. Do not re-open this gate
-    /// without true voice-processing I/O (inputNode.setVoiceProcessingEnabled)
-    /// proven on-device first.
+    /// HALF-DUPLEX ON EVERY OPEN-AIR ROUTE — deliberately. The 2026-08-11
+    /// full-duplex experiment (stream through the session's AEC while she
+    /// speaks, for barge-in) put build 218 into a listening↔reconnecting death
+    /// loop: the raw AVAudioEngine input tap is NOT voice-processed, so her
+    /// loudspeaker voice fed straight back as "user speech", tripping
+    /// interruptions and phantom turns until sessions collapsed. Do not
+    /// re-open the LOUDSPEAKER gate without true voice-processing I/O
+    /// (inputNode.setVoiceProcessingEnabled) proven on-device first.
+    /// Sealed-ear routes are the exception — see sealedEarRoute.
     private var echoRisk: Bool {
         if chatMode || !speakerOn { return false }   // her voice is silent
+        if sealedEarRoute { return false }           // her voice can't reach the mic
         return pendingBuffers > 0 || Date() < speechTailUntil
+    }
+
+    /// True when EVERY live output is sealed in/against Ido's ear — wired
+    /// headphones, a Bluetooth headset (AirPods run the HFP hands-free
+    /// profile while our mic is live), or the call earpiece. On these routes
+    /// her voice physically cannot reach the microphone, so full duplex is
+    /// safe and Ido can interrupt her just by speaking (2026-08-12: "she
+    /// starts talking and then she stops listening to me" — the gate was
+    /// closed even on AirPods). Loudspeaker, Bluetooth SPEAKERS (A2DP
+    /// playback-only), car and USB audio are NOT sealed — those stay
+    /// half-duplex per the build-218 lesson above.
+    /// CACHED — echoRisk is read per mic buffer and by SwiftUI every frame;
+    /// querying the session's currentRoute that often is waste. Refreshed on
+    /// session start and on every route change (the only times it can flip).
+    private var sealedEarRoute = false
+
+    private func refreshSealedEarRoute() {
+        let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        sealedEarRoute = !outs.isEmpty && outs.allSatisfy {
+            $0.portType == .headphones || $0.portType == .bluetoothHFP
+                || $0.portType == .builtInReceiver || $0.portType == .bluetoothLE
+        }
     }
 
     /// True while the mic is genuinely delivering Ido's voice to the server —
@@ -565,6 +589,7 @@ final class Conversation: ObservableObject {
                 try? s.overrideOutputAudioPort(.none)
             }
         }
+        refreshSealedEarRoute()
         logAudioState("route-applied")
     }
 
@@ -1252,6 +1277,14 @@ final class Conversation: ObservableObject {
         case "response.done":
             responseActive = false
             let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
+            if rstatus == "cancelled" {
+                // Cancelled = Ido cut her off (barge-in or Stop). Semantic VAD
+                // creates the response for his NEW turn itself (create_response
+                // is on) — a deferred create here would race that one and then
+                // re-fire input-less at ITS done: the 225 double-answer bug in
+                // a new coat. Drop the deferral; his next turn answers itself.
+                needsResponseAfterDone = false
+            }
             if rstatus != "completed" && rstatus != "cancelled" {
                 // Failed/incomplete response: the always-answer net catches it
                 // here — the watchdog was already disarmed by response.created.
@@ -1298,6 +1331,15 @@ final class Conversation: ObservableObject {
                       String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
             // Server-side truth that his voice is registering — instant cue.
+            // On sealed-ear (full-duplex) routes this can fire WHILE she is
+            // speaking: that is Ido interrupting her. The server truncates
+            // its response on its own (interrupt_response) — cut the locally
+            // queued audio too, so she stops in his ear the moment he speaks
+            // instead of finishing every buffered sentence.
+            if pendingBuffers > 0, sealedEarRoute {
+                flushPlayback()
+                clientLog("barge-in", "speech_started during playback — cut her audio")
+            }
             if state == .listening, micOn { status = "Hearing you…" }
         case "input_audio_buffer.speech_stopped":
             lastSpeechStoppedAt = Date()
@@ -1649,6 +1691,7 @@ final class Conversation: ObservableObject {
         try applySessionCategory(car: onCarRoute)
         applyPreferredInput()
         routeToSpeakerIfReceiver()
+        refreshSealedEarRoute()
         logAudioState("session-start")
     }
 
@@ -1711,7 +1754,8 @@ final class Conversation: ObservableObject {
           + "sysVol=\(String(format: "%.2f", s.outputVolume)) "
           + "loudspeaker=\(loudspeaker) speakerOn=\(speakerOn) "
           + "playerVol=\(player.volume) mixVol=\(audioEngine.mainMixerNode.outputVolume) "
-          + "engineRunning=\(audioEngine.isRunning) pending=\(pendingBuffers)")
+          + "engineRunning=\(audioEngine.isRunning) pending=\(pendingBuffers) "
+          + "sealed=\(sealedEarRoute)")
     }
 
     /// Idempotent: builds the audio graph exactly once; later calls just make
@@ -2163,6 +2207,7 @@ final class Conversation: ObservableObject {
                         || self.onCarRoute != self.lastAppliedCar {
                         self.applyOutputRoute()
                     }
+                    self.refreshSealedEarRoute()
                     self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
