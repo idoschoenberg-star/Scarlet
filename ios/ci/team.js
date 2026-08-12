@@ -29,6 +29,19 @@ function api(method, path, body) {
     if (!seed) { console.error("bundleId create failed:", c.s, c.b.slice(0, 500)); process.exit(1); }
   }
 
+  // The watch app signs with its own App ID (watchOS App IDs ride the IOS
+  // platform in this API). Idempotent: exists → left alone.
+  const WATCH = BUNDLE + ".watchkitapp";
+  const wg = await api("GET", "/v1/bundleIds?filter[identifier]=" + encodeURIComponent(WATCH) + "&limit=1");
+  let haveWatch = false;
+  try { const j = JSON.parse(wg.b); haveWatch = !!(j.data && j.data.find((b) => b.attributes.identifier === WATCH)); } catch (e) {}
+  if (!haveWatch) {
+    const c = await api("POST", "/v1/bundleIds",
+      { data: { type: "bundleIds", attributes: { identifier: WATCH, name: "ScarletWatch", platform: "IOS" } } });
+    if (c.s >= 300) { console.error("watch bundleId create failed:", c.s, c.b.slice(0, 500)); process.exit(1); }
+    console.error("created watch bundle id", WATCH);
+  }
+
   // Revoke leftover distribution certs from previous ephemeral runners: their
   // private keys died with the runner, and the account caps distribution certs,
   // so without this the pipeline bricks itself after a couple of runs.
@@ -47,7 +60,8 @@ function api(method, path, body) {
   try {
     const j = JSON.parse(profs.b);
     for (const p of (j.data || [])) {
-      if ((p.attributes.name || "").startsWith("ScarletTalk AppStore")) {
+      if ((p.attributes.name || "").startsWith("ScarletTalk AppStore") ||
+          (p.attributes.name || "").startsWith("ScarletWatch AppStore")) {
         const d = await api("DELETE", "/v1/profiles/" + p.id);
         console.error("deleted stale profile", p.attributes.name, "->", d.s);
       }

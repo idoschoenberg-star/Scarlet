@@ -4,6 +4,7 @@ options:
   bundleIdPrefix: com.idoschoenberg
   deploymentTarget:
     iOS: "17.0"
+    watchOS: "10.0"
   createIntermediateGroups: true
 
 settings:
@@ -24,6 +25,11 @@ targets:
   ScarletTalk:
     type: application
     platform: iOS
+    dependencies:
+      # Embeds the watch app into the iPhone build (Embed Watch Content) so
+      # one TestFlight upload carries both; the watch app still declares
+      # WKRunsIndependentlyOfCompanionApp and runs standalone on cellular.
+      - target: ScarletWatch
     sources:
       - path: Sources
     settings:
@@ -112,3 +118,39 @@ targets:
         # doesn't include the entitlement", the App ID capability got dropped —
         # re-check it in the portal before touching this line.
         com.apple.developer.carplay-voice-based-conversation: true
+
+  # Scarlet on the wrist — same server brain, one-orb UI. Standalone on
+  # cellular (leave the phone at home); the token arrives from the iPhone
+  # over WatchConnectivity, or via one-time code entry.
+  ScarletWatch:
+    type: application
+    platform: watchOS
+    sources:
+      - path: WatchSources
+      # Shared endpoints + Keychain token store — one source of truth with
+      # the phone app (Foundation + Security only, watch-safe).
+      - path: Sources/AppConfig.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.idoschoenberg.scarlettalk.watchkitapp
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        "CODE_SIGN_IDENTITY[sdk=watchos*]": "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "ScarletWatch AppStore"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "4"
+    info:
+      path: WatchSources/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Scarlet
+        CFBundleIconName: AppIcon
+        WKApplication: true
+        # The whole point: works with the iPhone left at home.
+        WKRunsIndependentlyOfCompanionApp: true
+        WKCompanionAppBundleIdentifier: com.idoschoenberg.scarlettalk
+        # Keeps her voice playing when the wrist drops mid-answer.
+        UIBackgroundModes: [audio]
+        NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        ITSAppUsesNonExemptEncryption: false

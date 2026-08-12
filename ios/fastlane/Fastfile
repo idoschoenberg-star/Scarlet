@@ -2,9 +2,14 @@ default_platform(:ios)
 
 BUNDLE_ID = "com.idoschoenberg.scarlettalk"
 PROFILE_NAME = "ScarletTalk AppStore"
+# The embedded (but independently runnable) watch app signs with its own
+# App ID + profile; team.js ensures the bundle id exists and clears stale
+# profiles before this lane runs.
+WATCH_BUNDLE_ID = "com.idoschoenberg.scarlettalk.watchkitapp"
+WATCH_PROFILE_NAME = "ScarletWatch AppStore"
 
 platform :ios do
-  desc "Build Scarlet Talk and push to TestFlight"
+  desc "Build Scarlet Talk (+ watch app) and push to TestFlight"
   lane :beta do
     # CI keychain — the distribution cert's private key lives here for the run.
     setup_ci
@@ -63,23 +68,45 @@ platform :ios do
       ignore_profiles_with_different_name: true,
       force: true
     )
-
-    # Use the name the profile ACTUALLY got — sigh appends a suffix if the
-    # requested name is taken by a stale profile.
     profile_name = lane_context[SharedValues::SIGH_NAME] || PROFILE_NAME
+
+    get_provisioning_profile(
+      api_key: key,
+      app_identifier: WATCH_BUNDLE_ID,
+      provisioning_name: WATCH_PROFILE_NAME,
+      ignore_profiles_with_different_name: true,
+      force: true
+    )
+    watch_profile_name = lane_context[SharedValues::SIGH_NAME] || WATCH_PROFILE_NAME
+
+    # The archive signs each target by the PROVISIONING_PROFILE_SPECIFIER in
+    # project.yml — canonical names only. team.js deletes stale same-named
+    # profiles every run precisely so sigh can recreate these exact names; if
+    # a rename still slipped through, fail HERE with the real story instead of
+    # a cryptic codesign error mid-archive.
+    if profile_name != PROFILE_NAME || watch_profile_name != WATCH_PROFILE_NAME
+      UI.user_error!("Provisioning profile name drifted (got '#{profile_name}' / " \
+                     "'#{watch_profile_name}') — stale profiles squatting on the canonical " \
+                     "names; team.js cleanup should have removed them. Re-run the workflow.")
+    end
 
     build_app(
       project: "ScarletTalk.xcodeproj",
       scheme: "ScarletTalk",
       export_method: "app-store",
+      # NOTE: no global PROVISIONING_PROFILE_SPECIFIER here — phone and watch
+      # targets each carry their own in project.yml, and a global xcarg would
+      # stamp the phone profile onto the watch target and fail its codesign.
       xcargs: "DEVELOPMENT_TEAM=#{ENV['DEVELOPMENT_TEAM']} " \
               "CURRENT_PROJECT_VERSION=#{ENV.fetch('BUILD_NUMBER', '2')} CODE_SIGN_STYLE=Manual " \
-              "CODE_SIGN_IDENTITY=#{'Apple Distribution'.shellescape} " \
-              "PROVISIONING_PROFILE_SPECIFIER=#{profile_name.shellescape}",
+              "CODE_SIGN_IDENTITY=#{'Apple Distribution'.shellescape}",
       export_options: {
         signingStyle: "manual",
         teamID: ENV["DEVELOPMENT_TEAM"],
-        provisioningProfiles: { BUNDLE_ID => profile_name }
+        provisioningProfiles: {
+          BUNDLE_ID => profile_name,
+          WATCH_BUNDLE_ID => watch_profile_name
+        }
       }
     )
 

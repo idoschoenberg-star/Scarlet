@@ -10,6 +10,8 @@ struct ScarletTalkApp: App {
         // Install the crash black-box before anything else can die, so the
         // faulting stack is captured and reported on the next launch.
         FlightRecorder.installCrashHandlers()
+        // Hand the device token to a paired Apple Watch (no-op without one).
+        PhoneWatchBridge.shared.start()
     }
 
     var body: some Scene {
