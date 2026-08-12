@@ -317,6 +317,15 @@ final class Conversation: ObservableObject {
     // and she starts answering herself — the freeze/derail after long dialogs.
     private var pendingBuffers = 0
     private var speechTailUntil = Date.distantPast
+    /// When all currently queued playback MUST have finished (sum of scheduled
+    /// buffer durations). The health tick force-clears a wedged gate: a buffer
+    /// completion that never fires (route change mid-play, engine hiccup)
+    /// leaves pendingBuffers > 0 forever — mic shut, session looks alive, she
+    /// never hears him again. Found on the watch (build 252 "one round then
+    /// silent death"); the phone/CarPlay engine shares the same structure, so
+    /// it gets the same failsafe BEFORE it burns a car ride.
+    private var playbackDeadline = Date.distantPast
+    private var gateHealthTask: Task<Void, Never>?
 
     /// True while sending mic audio would loop her own voice back to her.
     /// HALF-DUPLEX ON EVERY OPEN-AIR ROUTE — deliberately. The 2026-08-11
@@ -404,8 +413,43 @@ final class Conversation: ObservableObject {
         LocationReporter.shared.report()
         Task { await connect() }
         observeInterruptions()
-        startSignalsWatch()
+        // Live message ANNOUNCEMENTS are OFF (Ido 2026-08-12: "I don't need
+        // her to announce new emails while we're talking… that's just a
+        // distraction"). The signals poll no longer runs; arrivals stay in
+        // the Signals page and badges. The incoming-CALL ring announcement
+        // stays — a ringing phone he can't hear is a different animal.
         startCallWatch()
+        startGateHealthWatch()
+    }
+
+    /// The gate-wedge failsafe + heartbeat telemetry (see playbackDeadline).
+    private func startGateHealthWatch() {
+        gateHealthTask?.cancel()
+        gateHealthTask = Task { @MainActor [weak self] in
+            var tick = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard let self, self.wantLive, !Task.isCancelled else { return }
+                tick += 1
+                if self.pendingBuffers > 0, Date() > self.playbackDeadline.addingTimeInterval(3) {
+                    self.clientLog("gate-stuck",
+                                   "pending=\(self.pendingBuffers) — force-cleared, mic reopened")
+                    self.pendingBuffers = 0
+                    self.speechTailUntil = .distantPast
+                    if self.state == .speaking {
+                        self.state = .listening
+                        if self.micOn { self.status = "Listening…" }
+                    }
+                }
+                // Every 30s: one heartbeat line so a dead session names its
+                // own state in the logs instead of dying invisibly.
+                if tick % 3 == 0 {
+                    self.clientLog("session-health",
+                                   "state=\(self.state) micOn=\(self.micOn) streaming=\(self.micStreaming) "
+                                   + "pending=\(self.pendingBuffers) responseActive=\(self.responseActive)")
+                }
+            }
+        }
     }
 
     // MARK: live announcements (2026-08-11: "announce incoming messages/calls")
@@ -487,6 +531,7 @@ final class Conversation: ObservableObject {
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
         signalsTask?.cancel(); signalsTask = nil
+        gateHealthTask?.cancel(); gateHealthTask = nil
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
         livenessTask?.cancel(); livenessTask = nil
@@ -2070,6 +2115,7 @@ final class Conversation: ObservableObject {
         // playback bookkeeping the same way flushPlayback()/stopAudio() do.
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        playbackDeadline = .distantPast
         audioEngine.disconnectNodeOutput(player)
         playFormat = AVAudioFormat(standardFormatWithSampleRate: outputRate, channels: 1)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
@@ -2120,6 +2166,7 @@ final class Conversation: ObservableObject {
             clientLog("gate-close-clear", "discarded mid-utterance fragment at gate close")
         }
         pendingBuffers += 1
+        playbackDeadline = max(playbackDeadline, Date()).addingTimeInterval(Double(frames) / 24000.0)
         // Her voice DUCKS the radio (2026-08-11 voice-only audit: both used
         // to play at full volume simultaneously); the last buffer's drain
         // restores the music.
@@ -2162,6 +2209,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        playbackDeadline = .distantPast
         RadioPlayer.shared.duck(false)
         // Only her-speaking transitions back to listening. Forcing .listening
         // from ANY state let an interruption during a reconnect fake a live
@@ -2185,6 +2233,7 @@ final class Conversation: ObservableObject {
         player.stop()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
+        playbackDeadline = .distantPast
         audioEngine.stop()
         audioReady = false
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)

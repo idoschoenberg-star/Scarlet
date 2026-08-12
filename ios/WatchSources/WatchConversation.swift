@@ -119,6 +119,11 @@ final class WatchConversation {
     /// the watch speaker can't feed her own voice back into the turn.
     private var pendingBuffers = 0
     private var speechTailUntil = Date.distantPast
+    /// When all currently queued playback MUST have finished (sum of buffer
+    /// durations). The health tick uses it to break a wedged gate — see the
+    /// playPCM comment (build-252 one-round silent death).
+    private var playbackDeadline = Date.distantPast
+    private var healthTask: Task<Void, Never>?
 
     private var playbackActive: Bool { pendingBuffers > 0 || Date() < speechTailUntil }
 
@@ -254,6 +259,35 @@ final class WatchConversation {
                             + "rawPeak=\(String(format: "%.4f", stats.rawPeak)) "
                             + "armed=\(self.micArmed) mode=\(self.mode.rawValue) "
                             + self.routeSummary())
+            }
+            // Session health tick (build-252 "one round then silent death"):
+            // every 10s, break a wedged echo gate — pendingBuffers stuck > 0
+            // past the moment all queued audio must have finished means a
+            // buffer completion was dropped; without this the mic stays shut
+            // forever while the session looks alive. Every third tick also
+            // beacons live state so any future wrist death names itself.
+            healthTask?.cancel()
+            healthTask = Task { @MainActor [weak self] in
+                var tick = 0
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    guard let self, self.ws != nil, !Task.isCancelled else { return }
+                    tick += 1
+                    if self.pendingBuffers > 0, Date() > self.playbackDeadline.addingTimeInterval(3) {
+                        self.beacon("watch-gate-stuck",
+                                    "pending=\(self.pendingBuffers) — force-cleared, mic reopened")
+                        self.pendingBuffers = 0
+                        self.speechTailUntil = .distantPast
+                        if self.state == .speaking { self.state = .listening; self.status = self.micArmed ? "Listening…" : "Tap to talk" }
+                        self.syncGate()
+                    }
+                    if tick % 3 == 0 {
+                        let stats = self.tapState.audioStats()
+                        self.beacon("watch-health",
+                                    "state=\(self.state) armed=\(self.micArmed) pending=\(self.pendingBuffers) "
+                                    + "frames=\(stats.frames) peak=\(stats.peak)")
+                    }
+                }
             }
             // Continuous mode listens from the first breath; tapToTalk waits
             // for the tap that arms the turn.
@@ -602,6 +636,14 @@ final class WatchConversation {
             }
         }
         pendingBuffers += 1
+        // Time-based failsafe bookkeeping (2026-08-12, build 252 "one round
+        // then silent death"): the gate reopens on buffer COMPLETIONS, and a
+        // completion that never fires (engine hiccup, route change mid-play)
+        // wedges pendingBuffers > 0 forever — mic shut, session looks alive,
+        // she never hears him again. Track when all queued audio MUST have
+        // finished playing; the health tick force-clears a wedged gate.
+        let dur = Double(frames) / wireRate
+        playbackDeadline = max(playbackDeadline, Date()).addingTimeInterval(dur)
         syncGate()
         player.scheduleBuffer(buffer) { [weak self] in
             Task { @MainActor in
@@ -629,6 +671,8 @@ final class WatchConversation {
         tapState.set(converter: nil)
         tapState.set(gate: false)
         pendingBuffers = 0
+        playbackDeadline = .distantPast
+        healthTask?.cancel(); healthTask = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
