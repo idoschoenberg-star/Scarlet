@@ -1,8 +1,23 @@
 import Foundation
 import AVFoundation
+import CallKit // CXCallObserver — announce an incoming cellular call by voice
 import Combine
 import UIKit   // background-task assertion so the car session survives a locked screen
 import os      // os_unfair_lock — guards the state the audio-render thread reads
+
+/// Tiny CXCallObserver delegate: fires once per NEW incoming ring (not on
+/// connect/end), forwarding to the live conversation on the main actor.
+final class CallWatchDelegate: NSObject, CXCallObserverDelegate {
+    private let onIncoming: () -> Void
+    private var announced = Set<UUID>()
+    init(onIncoming: @escaping () -> Void) { self.onIncoming = onIncoming }
+    func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        guard !call.isOutgoing, !call.hasConnected, !call.hasEnded,
+              !announced.contains(call.uuid) else { return }
+        announced.insert(call.uuid)
+        onIncoming()
+    }
+}
 
 /// Native ElevenLabs conversational client. Same protocol the web app speaks,
 /// but over a real AVAudioSession so the conversation never stalls: it keeps
@@ -320,6 +335,75 @@ final class Conversation: ObservableObject {
         LocationReporter.shared.report()
         Task { await connect() }
         observeInterruptions()
+        startSignalsWatch()
+        startCallWatch()
+    }
+
+    // MARK: live announcements (2026-08-11: "announce incoming messages/calls")
+
+    /// While a session is live, poll for NEW focused arrivals (WhatsApp,
+    /// iMessage, Teams, mail) and let her announce them in ONE short sentence
+    /// — only when she's idle-listening, never over him or herself.
+    private var signalsTask: Task<Void, Never>?
+    private var lastSignalCheck = ISO8601DateFormatter().string(from: Date())
+
+    private func startSignalsWatch() {
+        signalsTask?.cancel()
+        lastSignalCheck = ISO8601DateFormatter().string(from: Date())
+        signalsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+                guard let self, self.wantLive else { return }
+                // Quiet moments only: mid-answer or mid-speech, skip the tick —
+                // arrivals are re-fetched next round (since doesn't advance
+                // until a poll actually runs).
+                guard self.state == .listening, !self.responseActive, self.speakerOn else { continue }
+                let since = self.lastSignalCheck
+                let out = await self.performToolHTTP(name: "signals_since", params: ["since": since])
+                guard let data = out.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let now = obj["now"] as? String else { continue }
+                self.lastSignalCheck = now
+                let signals = (obj["signals"] as? [[String: Any]]) ?? []
+                guard !signals.isEmpty, self.state == .listening, !self.responseActive else { continue }
+                let lines = signals.prefix(4).map { s -> String in
+                    let src = (s["source"] as? String) ?? "?"
+                    let sender = (s["sender"] as? String) ?? "?"
+                    let preview = (s["preview"] as? String) ?? ""
+                    return "\(src) from \(sender): \(preview)"
+                }.joined(separator: " | ")
+                self.send(["type": "conversation.item.create",
+                           "item": ["type": "message", "role": "user",
+                                    "content": [["type": "input_text",
+                                                 "text": "[SYSTEM] New message(s) arrived: \(lines). Announce per the LIVE ANNOUNCEMENTS rule — one short sentence, then wait."]]]])
+                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+            }
+        }
+    }
+
+    /// Incoming CELLULAR call: iOS never exposes the caller to apps, but the
+    /// RINGING is knowable — she says so instead of being talked over by a
+    /// ringtone he can't see (walking, CarPlay).
+    private var callObserver: CXCallObserver?
+    private var callWatchDelegate: CallWatchDelegate?
+
+    private func startCallWatch() {
+        guard callObserver == nil else { return }
+        let observer = CXCallObserver()
+        let delegate = CallWatchDelegate { [weak self] in
+            Task { @MainActor in
+                guard let self, self.wantLive else { return }
+                self.transcript.append(Line(text: "📞 Incoming phone call", fromHer: true))
+                self.send(["type": "conversation.item.create",
+                           "item": ["type": "message", "role": "user",
+                                    "content": [["type": "input_text",
+                                                 "text": "[SYSTEM] An incoming cellular call is RINGING on his iPhone right now (iOS hides who from). Tell him in three or four words, immediately."]]]])
+                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+            }
+        }
+        observer.setDelegate(delegate, queue: nil)
+        callObserver = observer
+        callWatchDelegate = delegate
     }
 
     /// True only when IDO hung up (End button). Distinguishes his explicit
@@ -333,6 +417,7 @@ final class Conversation: ObservableObject {
         wantLive = false
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
+        signalsTask?.cancel(); signalsTask = nil
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
         livenessTask?.cancel(); livenessTask = nil
