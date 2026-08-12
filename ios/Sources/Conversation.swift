@@ -69,11 +69,21 @@ final class Conversation: ObservableObject {
     /// wins where prose lost. nil until his first utterance each session.
     private var pinnedLanguage: String?
 
-    /// Detect the utterance's language by script: any Hebrew letter → "he",
-    /// else any letter at all → "en", else nil (numbers/noise pin nothing).
+    /// Detect the utterance's language by script. Hebrew letters → "he".
+    /// ARABIC script ALSO → "he" (2026-08-12: the transcriber sometimes
+    /// mis-writes his Hebrew in Arabic script — Ido never speaks Arabic, so
+    /// Arabic glyphs are misread Hebrew; the old any-letter→"en" rule pinned
+    /// English from them and she answered his Hebrew in English repeatedly,
+    /// apologizing and doing it again). English now needs REAL evidence —
+    /// two ASCII words — so a garbled scrap pins nothing and the previous
+    /// pin stands.
     private func detectLanguage(_ text: String) -> String? {
-        if text.unicodeScalars.contains(where: { (0x0590...0x05FF).contains($0.value) }) { return "he" }
-        if text.rangeOfCharacter(from: .letters) != nil { return "en" }
+        let scalars = text.unicodeScalars
+        if scalars.contains(where: { (0x0590...0x05FF).contains($0.value) }) { return "he" }
+        if scalars.contains(where: { (0x0600...0x06FF).contains($0.value) }) { return "he" }
+        let asciiWords = text.split(whereSeparator: { !$0.isLetter })
+            .filter { w in w.count >= 2 && w.allSatisfy { $0.isASCII } }
+        if asciiWords.count >= 2 { return "en" }
         return nil
     }
 
