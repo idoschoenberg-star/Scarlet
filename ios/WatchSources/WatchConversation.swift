@@ -23,8 +23,20 @@ private final class TapState: @unchecked Sendable {
     private let lock = NSLock()
     private var converter: AVAudioConverter?
     private var gate = false
+    // Audio-flow accounting (2026-08-12, "green mic but she never answers"):
+    // frames actually sent + the loudest sample seen. peak≈0 with frames>0
+    // means the mic is delivering SILENCE (permission / hardware), while
+    // frames==0 means the gate/converter never let audio out — two different
+    // bugs the wrist can't distinguish without these numbers.
+    private var frames = 0
+    private var peak: Int16 = 0
     func set(converter c: AVAudioConverter?) { lock.lock(); converter = c; lock.unlock() }
     func set(gate g: Bool) { lock.lock(); gate = g; lock.unlock() }
+    func note(peak p: Int16) { lock.lock(); frames += 1; if p > peak { peak = p }; lock.unlock() }
+    func audioStats() -> (frames: Int, peak: Int16) {
+        lock.lock(); defer { lock.unlock() }
+        return (frames, peak)
+    }
     func snapshot() -> (AVAudioConverter?, Bool) {
         lock.lock(); defer { lock.unlock() }
         return (converter, gate)
@@ -113,7 +125,22 @@ final class WatchConversation {
         wantLive = true
         state = .connecting
         status = "Waking her up…"
-        Task { await connect(token: token) }
+        // EXPLICIT mic permission (2026-08-12, "green mic but she never
+        // answers"): watchOS permission is separate from the iPhone's, and
+        // nothing here ever requested it — without the grant the tap can
+        // deliver pure silence, which looks exactly like listening. Ask
+        // first (instant no-op once granted), fail loudly on denial.
+        AVAudioApplication.requestRecordPermission { granted in
+            Task { @MainActor in
+                guard granted else {
+                    self.beacon("watch-mic-denied", "")
+                    self.status = "Allow the microphone in Settings → Privacy"
+                    self.state = .idle; self.wantLive = false
+                    return
+                }
+                await self.connect(token: token)
+            }
+        }
     }
 
     func end() {
@@ -199,6 +226,13 @@ final class WatchConversation {
             needsResponseAfterDone = false
             state = .listening
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
+            // Audio-flow verdict 8s in: did real sound leave the wrist?
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard let self, self.ws != nil else { return }
+                let stats = self.tapState.audioStats()
+                self.beacon("watch-audio", "frames=\(stats.frames) peak=\(stats.peak) armed=\(self.micArmed) mode=\(self.mode.rawValue)")
+            }
             // Continuous mode listens from the first breath; tapToTalk waits
             // for the tap that arms the turn.
             micArmed = mode == .continuous
@@ -446,6 +480,15 @@ final class WatchConversation {
             let (converter, gate) = tapState.snapshot()
             guard gate, let converter,
                   let data = Self.convertToWire(buffer, converter: converter) else { return }
+            // Cheap peak over the wire samples — the audio-flow beacon's raw
+            // material. ~0 peak with frames flowing = the mic is silent.
+            var p: Int16 = 0
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                let s = raw.bindMemory(to: Int16.self)
+                var i = 0
+                while i < s.count { let v = s[i].magnitude; if Int16(clamping: v) > p { p = Int16(clamping: v) }; i += 32 }
+            }
+            tapState.note(peak: p)
             Task { @MainActor [weak self] in
                 guard let self, self.ws != nil else { return }
                 self.send(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()])
