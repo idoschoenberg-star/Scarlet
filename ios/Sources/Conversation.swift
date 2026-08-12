@@ -536,7 +536,16 @@ final class Conversation: ObservableObject {
     /// priority, the phone-call codec can never grab the route, and with no
     /// Bluetooth device around .defaultToSpeaker lands on the loudspeaker.
     private func outputOptions(car: Bool) -> AVAudioSession.CategoryOptions {
-        let base: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP]
+        // .duckOthers (2026-08-12, "when Spotify plays she can't hear me"):
+        // without a mixing option, Spotify's playback fires an audio-session
+        // INTERRUPTION that pauses our engine — for continuous music the
+        // interruption never ends, so Scarlet went permanently deaf while a
+        // song played. Ducking makes the sessions coexist: Spotify keeps
+        // playing (lowered while the call is live), the mic keeps capturing,
+        // and phone calls/Siri still interrupt as before. Honest limit: on
+        // the LOUDSPEAKER the mic also hears the music, so recognition is
+        // best with the music ducked or on headphones.
+        let base: AVAudioSession.CategoryOptions = [.allowBluetoothA2DP, .duckOthers]
         _ = car // car routes need no extra options; CarPlay rides its own port
         return loudspeaker ? base.union(.defaultToSpeaker) : base
     }
