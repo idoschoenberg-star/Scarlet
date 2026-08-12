@@ -349,6 +349,13 @@ final class WatchConversation {
         case "response.done":
             responseActive = false
             state = .listening
+            // A conversation stays a conversation (Ido 2026-08-12: "I talk,
+            // she answers, then when I talk again I don't get any answer") —
+            // the old tap-per-turn design disarmed the mic at response.created
+            // and never re-armed it, so every session died after one round.
+            // Re-arm after every answer, exactly like the phone behaves; the
+            // orb tap is the mute/stop, not a per-turn ritual.
+            if wantLive, !endedByUser { micArmed = true }
             status = micArmed ? "Listening…" : "Tap to talk"
             syncGate()
             if needsResponseAfterDone {
