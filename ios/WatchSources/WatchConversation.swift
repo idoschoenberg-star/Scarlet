@@ -111,6 +111,15 @@ final class WatchConversation {
 
     private let audioEngine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    /// WRIST-DOWN SURVIVAL (2026-08-12, beacons: watch-ws-fail POSIX 89
+    /// "Operation canceled" 35s-2.5min after every connect — watchOS SUSPENDS
+    /// the app when the screen dims, killing the socket mid-conversation;
+    /// every session died after one or two rounds). Background-audio keeps a
+    /// watch app alive only while audio is actively RENDERING, so this second
+    /// player loops silence at zero volume for the whole session. It never
+    /// touches pendingBuffers, so the echo gate is unaffected.
+    private let keepAlivePlayer = AVAudioPlayerNode()
+    private var keepAliveTask: Task<Void, Never>?
     private var audioReady = false
     private let tapState = TapState()
     private var playFormat: AVAudioFormat?
@@ -569,6 +578,9 @@ final class WatchConversation {
         if player.engine == nil { audioEngine.attach(player) }
         playFormat = AVAudioFormat(standardFormatWithSampleRate: wireRate, channels: 1)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
+        if keepAlivePlayer.engine == nil { audioEngine.attach(keepAlivePlayer) }
+        audioEngine.connect(keepAlivePlayer, to: audioEngine.mainMixerNode, format: playFormat)
+        keepAlivePlayer.volume = 0   // renders (keeps the app alive), never heard
 
         input.removeTap(onBus: 0)
         let tapState = self.tapState
@@ -604,6 +616,31 @@ final class WatchConversation {
         try audioEngine.start()
         audioReady = true
         syncGate()
+        startKeepAlive()
+    }
+
+    /// Loop 0.5s silent buffers on the muted keep-alive player so the audio
+    /// engine renders CONTINUOUSLY — the condition for watchOS background
+    /// audio to keep the app (and its WebSocket) alive through wrist-down.
+    /// Scheduled two-ahead so a late tick can't leave a rendering gap.
+    private func startKeepAlive() {
+        keepAliveTask?.cancel()
+        guard let fmt = playFormat,
+              let silent = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(wireRate / 2)) else { return }
+        silent.frameLength = AVAudioFrameCount(wireRate / 2)   // zero-filled by allocation
+        keepAlivePlayer.scheduleBuffer(silent, completionHandler: nil)
+        keepAlivePlayer.scheduleBuffer(silent, completionHandler: nil)
+        if !keepAlivePlayer.isPlaying { keepAlivePlayer.play() }
+        keepAliveTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                guard let self, self.audioReady, !Task.isCancelled else { return }
+                if self.audioEngine.isRunning {
+                    self.keepAlivePlayer.scheduleBuffer(silent, completionHandler: nil)
+                    if !self.keepAlivePlayer.isPlaying { self.keepAlivePlayer.play() }
+                }
+            }
+        }
     }
 
     private nonisolated static func convertToWire(_ buffer: AVAudioPCMBuffer,
@@ -673,6 +710,8 @@ final class WatchConversation {
         pendingBuffers = 0
         playbackDeadline = .distantPast
         healthTask?.cancel(); healthTask = nil
+        keepAliveTask?.cancel(); keepAliveTask = nil
+        keepAlivePlayer.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 }
