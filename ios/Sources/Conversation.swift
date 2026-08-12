@@ -441,6 +441,14 @@ final class Conversation: ObservableObject {
                         if self.micOn { self.status = "Listening…" }
                     }
                 }
+                // A typing pause that outlives any real typing is a leaked
+                // focus event holding her ears shut — restore them.
+                if let t = self.typingPausedAt, Date() > t.addingTimeInterval(90), !self.chatMode {
+                    self.clientLog("typing-pause-expired", "auto-restoring ears after 90s")
+                    self.typingPausedAt = nil
+                    self.micOn = true
+                    self.status = "Listening…"
+                }
                 // Every 30s: one heartbeat line so a dead session names its
                 // own state in the logs instead of dying invisibly.
                 if tick % 3 == 0 {
@@ -730,14 +738,26 @@ final class Conversation: ObservableObject {
     // Dictation etiquette: while Ido types/dictates into the text row, her
     // live ears close — otherwise Wispr's spoken dictation reaches the mic
     // and she answers before he presses send.
+    //
+    // HARDENED (2026-08-12, heartbeat evidence: micOn=false for MINUTES while
+    // state=listening — "she stops hearing me" on the phone): three screens
+    // drive this from focus events, and focus bouncing between two fields ran
+    // beginTyping twice — the second snapshot saved micOn=false, so the
+    // restore restored DEAF, permanently and silently. The snapshot is now
+    // taken only by the FIRST begin of a pause, and the session health tick
+    // force-expires any typing pause older than 90s (a leaked focus event,
+    // not a person still typing).
     private var micWasOnBeforeTyping = true
+    private var typingPausedAt: Date?
     func beginTyping() {
-        micWasOnBeforeTyping = micOn
+        if typingPausedAt == nil { micWasOnBeforeTyping = micOn }
+        typingPausedAt = Date()
         micOn = false
         status = "Typing — mic paused. Tap Type again to talk."
     }
     func endTyping() {
         guard !chatMode else { return }   // chat mode keeps her ears closed
+        typingPausedAt = nil
         micOn = micWasOnBeforeTyping
         if micOn { status = "Listening…" }
     }
