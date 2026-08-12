@@ -60,7 +60,20 @@ final class WatchConversation {
     // MARK: - session plumbing
 
     private var ws: URLSessionWebSocketTask?
-    private let wsSession = URLSession(configuration: .default)
+    /// WATCH NETWORKING IS NOT PHONE NETWORKING (2026-08-12, "Reconnecting…"
+    /// loop on the wrist): at wrist-raise the transport (BT-to-phone / Wi-Fi /
+    /// LTE) is often still coming up, and a default session fails INSTANTLY —
+    /// each fast failure burned one of the few reconnect attempts and the app
+    /// died in ~15s without ever having had a network path. Both sessions now
+    /// WAIT for connectivity instead of failing on a not-yet-ready link.
+    private static func patientSession() -> URLSession {
+        let c = URLSessionConfiguration.default
+        c.waitsForConnectivity = true
+        c.timeoutIntervalForResource = 25
+        return URLSession(configuration: c)
+    }
+    private let wsSession = WatchConversation.patientSession()
+    private let mintSession = WatchConversation.patientSession()
     private var wantLive = false
     private var endedByUser = false
     private var reconnectAttempts = 0
@@ -153,7 +166,7 @@ final class WatchConversation {
             var req = URLRequest(url: AppConfig.realtimeURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await mintSession.data(for: req)
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
@@ -164,6 +177,7 @@ final class WatchConversation {
                     state = .idle; wantLive = false
                     return
                 }
+                beacon("watch-mint-fail", "http=\(httpStatus) attempt=\(reconnectAttempts)")
                 if wantLive { scheduleReconnect() }
                 return
             }
@@ -184,6 +198,7 @@ final class WatchConversation {
             responseActive = false
             needsResponseAfterDone = false
             state = .listening
+            beacon("watch-connected", "attempt=\(reconnectAttempts)")
             // Continuous mode listens from the first breath; tapToTalk waits
             // for the tap that arms the turn.
             micArmed = mode == .continuous
@@ -197,16 +212,36 @@ final class WatchConversation {
                 sendContext("[FOCUS] Connection renewed mid-conversation — CONTINUE, do not greet. Recent exchange:\n" + recent)
             }
         } catch {
+            beacon("watch-mint-error", String(describing: error).prefix(160).description)
             if wantLive { scheduleReconnect() } else { state = .idle; status = "Tap to talk" }
         }
     }
 
+    /// Fire-and-forget telemetry so a failing watch is DIAGNOSABLE from the
+    /// server logs (2026-08-12: the reconnect loop was invisible — no way to
+    /// tell a mint failure from a socket drop without the wrist in hand).
+    private func beacon(_ kind: String, _ detail: String) {
+        guard let base = URL(string: "\(AppConfig.apiBase)/app-api?v=2&op=clientlog") else { return }
+        var req = URLRequest(url: base)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["kind": kind, "detail": detail])
+        mintSession.dataTask(with: req).resume()
+    }
+
     private func scheduleReconnect() {
-        guard wantLive, reconnectAttempts < 4, let token = TokenStore.token else {
-            if wantLive { status = "Connection lost — tap to retry"; state = .idle; wantLive = false }
+        // 6 attempts with the delay capped at 8s (~31s of patience) — with
+        // waitsForConnectivity each attempt now genuinely waits for a link
+        // instead of failing instantly on a transport that isn't up yet.
+        guard wantLive, reconnectAttempts < 6, let token = TokenStore.token else {
+            if wantLive {
+                beacon("watch-gaveup", "attempts=\(reconnectAttempts)")
+                status = "Connection lost — tap to retry"; state = .idle; wantLive = false
+            }
             return
         }
-        let delay = UInt64(pow(2, Double(reconnectAttempts))) * 1_000_000_000
+        let delay = UInt64(min(8, pow(2, Double(reconnectAttempts)))) * 1_000_000_000
         reconnectAttempts += 1
         status = "Reconnecting…"
         state = .connecting
@@ -226,8 +261,9 @@ final class WatchConversation {
             Task { @MainActor in
                 guard self.ws === task else { return }
                 switch result {
-                case .failure:
+                case .failure(let err):
                     self.ws = nil
+                    self.beacon("watch-ws-fail", String(describing: err).prefix(160).description)
                     if self.wantLive { self.scheduleReconnect() }
                 case .success(let message):
                     if case .string(let text) = message,
