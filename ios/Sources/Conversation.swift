@@ -1569,6 +1569,10 @@ final class Conversation: ObservableObject {
                 send(["type": "response.create"])
             }
             postToolCues(name: name, out: out)
+            // Her 1Password ask just went through THIS device — surface the
+            // Face-ID approval card immediately instead of waiting for a poll
+            // (the card expires in ~3 minutes; every second of lag is felt).
+            if name == "request_secret" { SecretApprovalsModel.shared.refresh() }
         }
     }
 

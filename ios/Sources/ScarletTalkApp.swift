@@ -75,6 +75,11 @@ struct RootView: View {
             }
         }
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
+        // 1Password approval cards float at the ROOT so they appear over any
+        // tab, any pushed detail, and a live call alike — an overlay, not a
+        // sheet, per the Catalyst one-sheet rule and because a credential
+        // decision must never tear down what he's doing.
+        .overlay(alignment: .bottom) { SecretApprovalCardOverlay() }
         // The Scarlet Presence capsule is EMBEDDED inside each list screen
         // (safeAreaInset in InboxView / CalendarView / ChatsView), not
         // overlaid here — a pushed detail or a sheet structurally replaces
