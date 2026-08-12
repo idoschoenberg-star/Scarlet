@@ -84,6 +84,11 @@ final class DraftModel: ObservableObject {
         var instruction: String = ""
         /// When generation began — drives the on-card processing timer.
         var writingStartedAt: Date? = nil
+        /// The conversation this draft answers (server-gathered, oldest→newest)
+        /// — shown BELOW the draft so Ido can always re-read what he is
+        /// replying to, on every channel (2026-08-12: WhatsApp parity with
+        /// the original-email view under an email reply).
+        var context: String = ""
     }
 
     /// One autocomplete row, as `op=contactsearch` returns it — the server
@@ -562,10 +567,11 @@ final class DraftModel: ObservableObject {
             status: (d["status"] as? String) ?? "",
             outcome: (d["outcome"] as? String) ?? "",
             link: (d["link"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-            instruction: (d["instruction"] as? String) ?? ""
+            instruction: (d["instruction"] as? String) ?? "",
             // writingStartedAt is left client-side (the moment the window
             // opened) — more reliable than reparsing the server timestamp, and
             // it's only used to drive the on-card timer.
+            context: (d["context"] as? String) ?? ""
         )
     }
 
@@ -946,6 +952,7 @@ struct DraftView: View {
             writingCard
         } else if let draft = model.draft {
             draftCard(draft)
+            replyContextSection
         } else if model.phase == .writing {
             writingCard
         } else if !model.errorText.isEmpty {
@@ -1002,6 +1009,53 @@ struct DraftView: View {
         }
         .opacity(model.phase == .revising ? 0.55 : 1)
         .animation(.easeInOut(duration: 0.2), value: model.phase)
+    }
+
+    /// What this draft ANSWERS, always visible below the draft card — the
+    /// WhatsApp/iMessage/Teams messages or email being replied to, so Ido can
+    /// re-read the original at any moment (2026-08-12: parity with the
+    /// original-email view under an email reply; same loop on every channel).
+    /// Server-gathered thread first (voice-attached drafts have it), then the
+    /// thread the sheet was opened from, then the email seed line.
+    private var replyContextText: String {
+        if let c = model.draft?.context, !c.isEmpty { return c }
+        if let cs = channelSeed, !cs.contextLines.isEmpty { return cs.contextLines }
+        if let seed {
+            let line = seed.originalLine
+            if line.isEmpty { return "" }
+            return seed.fromName.isEmpty ? line : "\(seed.fromName): \(line)"
+        }
+        return ""
+    }
+
+    @ViewBuilder
+    private var replyContextSection: some View {
+        let ctx = replyContextText
+        if !ctx.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("REPLYING TO")
+                    .font(.system(size: 10, weight: .bold))
+                    .tracking(1.2)
+                    .foregroundStyle(.white.opacity(0.4))
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(ctx.components(separatedBy: "\n").enumerated()), id: \.offset) { _, line in
+                            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                                Color.clear.frame(height: 6)
+                            } else {
+                                paragraphLine(line, size: 13, weight: .regular,
+                                              color: Color.white.opacity(0.65))
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 150)
+            }
+            .padding(12)
+            .background(.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.07), lineWidth: 1))
+        }
     }
 
     /// One paragraph in ITS OWN direction — Hebrew right-aligned RTL, English
