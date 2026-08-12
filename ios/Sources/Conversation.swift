@@ -549,11 +549,21 @@ final class Conversation: ObservableObject {
         // Evaluate the route AFTER the category change — dropping Bluetooth
         // just moved the route back to the phone, and that's when the
         // receiver→speaker override matters. Wired headphones stay untouched.
-        let phoneIsOutput = s.currentRoute.outputs.allSatisfy {
+        // Override ONLY when the port is actually wrong (2026-08-12 noise
+        // regression): a redundant override emits its own route-change
+        // notification, the observer re-enters here, and the resulting
+        // override storm audibly stutters/clicks the output.
+        let outs = s.currentRoute.outputs
+        let phoneIsOutput = outs.allSatisfy {
             $0.portType == .builtInReceiver || $0.portType == .builtInSpeaker
         }
+        let onSpeaker = outs.contains { $0.portType == .builtInSpeaker }
         if phoneIsOutput {
-            try? s.overrideOutputAudioPort(loudspeaker ? .speaker : .none)
+            if loudspeaker && !onSpeaker {
+                try? s.overrideOutputAudioPort(.speaker)
+            } else if !loudspeaker && onSpeaker {
+                try? s.overrideOutputAudioPort(.none)
+            }
         }
         logAudioState("route-applied")
     }
@@ -2143,13 +2153,16 @@ final class Conversation: ObservableObject {
                         try? self.audioEngine.start()
                     }
                     self.routeToSpeakerIfReceiver()
-                    // Re-apply the FULL session policy on every route change,
-                    // not just car transitions: unplugging headphones or an
-                    // AirPod dropping mid-session used to leave whatever mode
-                    // the old route had. applySessionCategory is idempotent —
-                    // setCategory with identical parameters emits no route
-                    // change, so this cannot re-trigger itself.
-                    self.applyOutputRoute()
+                    // Re-apply the full session policy only when it is
+                    // actually STALE (mode drifted or car-ness flipped).
+                    // Unconditionally re-applying on every route change
+                    // (this morning's first cut) re-triggered notifications
+                    // through the port override and stuttered the audio.
+                    let s = AVAudioSession.sharedInstance()
+                    if s.mode != self.sessionMode(car: self.onCarRoute)
+                        || self.onCarRoute != self.lastAppliedCar {
+                        self.applyOutputRoute()
+                    }
                     self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
