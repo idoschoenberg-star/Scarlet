@@ -196,7 +196,10 @@ final class WorkoutManager: NSObject {
     /// The cumulative-distance quantity HealthKit fills for this activity, or
     /// nil for types where distance is meaningless (strength, yoga, HIIT…) —
     /// nil is what keeps distance/pace OUT of those results instead of zeros.
-    private static func distanceType(for activity: HKWorkoutActivityType) -> HKQuantityType? {
+    // nonisolated: pure type mapping, and the live-builder delegate calls it
+    // from HealthKit's own (non-main) queue — MainActor isolation there is a
+    // compile error, not just a hazard.
+    nonisolated private static func distanceType(for activity: HKWorkoutActivityType) -> HKQuantityType? {
         switch activity {
         case .walking, .running, .hiking: return HKQuantityType(.distanceWalkingRunning)
         case .cycling: return HKQuantityType(.distanceCycling)
