@@ -660,7 +660,13 @@ final class WatchConversation {
         let params = (try? JSONSerialization.jsonObject(with: Data(argsJSON.utf8))) as? [String: Any] ?? [:]
         status = "Working…"
         Task {
-            let out = await performToolHTTP(name: name, params: params)
+            // Workout tools are DEVICE-LOCAL: HKWorkoutSession only runs on
+            // watchOS, so these three never touch the HTTP proxy — the wrist
+            // IS the executor. Everything downstream (cap, output event, the
+            // one-active-response gate) is identical to the proxied path.
+            let out = WorkoutManager.toolNames.contains(name)
+                ? await WorkoutManager.shared.run(tool: name, params: params)
+                : await performToolHTTP(name: name, params: params)
             // The watch has less headroom than the phone — cap what rides back
             // into the model context so a fat inbox can't blow the session.
             let capped = out.count > 12000

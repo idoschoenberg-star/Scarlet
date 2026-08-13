@@ -98,9 +98,10 @@ targets:
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
         NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."
-        # Required by App Store validation whenever HealthKit is linked,
-        # even though Scarlet never writes health data.
-        NSHealthUpdateUsageDescription: "Scarlet does not write to your health data; this permission is declared only because Apple requires it for apps that connect to Health."
+        # Required by App Store validation whenever HealthKit is linked. The
+        # iPhone app itself still only reads — workouts started by voice are
+        # recorded and saved by the WATCH app (see the ScarletWatch target).
+        NSHealthUpdateUsageDescription: "The iPhone app does not write to your health data; workouts you start by voice are recorded and saved by Scarlet on your Apple Watch."
         ITSAppUsesNonExemptEncryption: false
     # XcodeGen GENERATES the entitlements file at this path from these
     # properties, same as Info.plist above.
@@ -152,5 +153,22 @@ targets:
         WKCompanionAppBundleIdentifier: com.idoschoenberg.scarlettalk
         # Keeps her voice playing when the wrist drops mid-answer.
         UIBackgroundModes: [audio]
+        # Keeps a voice-started workout session (WorkoutManager) running when
+        # the wrist drops — watchOS's workout background mode is WKBackground-
+        # Modes, separate from the audio mode above.
+        WKBackgroundModes: [workout-processing]
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        NSHealthShareUsageDescription: "Scarlet reads heart rate and calories to narrate your workout live."
+        # The watch app WRITES: a voice-started workout is recorded here and
+        # saved to Health so it counts toward the rings.
+        NSHealthUpdateUsageDescription: "Scarlet saves the workouts you start by voice to Health, including heart rate and calories."
         ITSAppUsesNonExemptEncryption: false
+    # Watch entitlements, generated like the phone's above. HealthKit here is
+    # NEW capability surface: the ScarletWatch App ID must have HealthKit
+    # enabled in the portal before CI's regenerated "ScarletWatch AppStore"
+    # profile can carry the entitlement — same failure signature as CarPlay
+    # ("profile doesn't include the entitlement") if it's missing.
+    entitlements:
+      path: WatchSources/ScarletWatch.entitlements
+      properties:
+        com.apple.developer.healthkit: true
