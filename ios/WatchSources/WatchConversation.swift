@@ -99,6 +99,10 @@ final class WatchConversation {
     }
     private let wsSession = WatchConversation.patientSession(resourceTimeout: nil)
     private let mintSession = WatchConversation.patientSession(resourceTimeout: 25)
+    /// Tool calls ride the same flaky wrist transport as the mint — a default
+    /// session fails instantly on a link that is still coming up, and she then
+    /// told him the DATA didn't exist. 30s: tools may legitimately be slow.
+    private let toolSession = WatchConversation.patientSession(resourceTimeout: 30)
     private var wantLive = false
     private var endedByUser = false
     private var reconnectAttempts = 0
@@ -106,6 +110,36 @@ final class WatchConversation {
     private var handledToolCalls = Set<String>()
     private var responseActive = false
     private var needsResponseAfterDone = false
+    // The always-answer net, ported from the phone: a wrist socket can die
+    // WITHOUT the receive callback ever firing (NAT timeout while the screen
+    // is down) — the app then sits in .listening against a corpse and his
+    // question vanishes into it. Three guards close it: a reply watchdog armed
+    // on every closed turn, a transport ping loop that detects the corpse
+    // even while nobody is talking, and checked completions on every
+    // conversation-level send.
+    private var replyWatchdog: Task<Void, Never>?
+    private let replyWatchdogSeconds: UInt64 = 25
+    private var lastSpeechStoppedAt = Date.distantPast
+    private var lastResponseCreatedAt = Date.distantPast
+    private var livenessTask: Task<Void, Never>?
+    /// One free retry for a failed/incomplete response: the spoken turn is
+    /// still in the conversation, so a bare response.create recovers it.
+    /// Reset on every response.created; single-shot so a server-side failure
+    /// can't loop.
+    private var failedResponseRetried = false
+    /// When the transcript last grew — the replay-on-reconnect freshness test.
+    private var lastLineAt = Date.distantPast
+    /// A tool result whose delivery the socket may have eaten: held until a
+    /// response covers it, re-injected as context on the rebuilt session so
+    /// the answer still happens. One slot — the watch runs one tool at a time.
+    private var pendingToolOutput: (name: String, output: String)?
+    // Backpressure, phone-proven: when the transport stalls, continuous audio
+    // sends queue inside the socket without bound until it collapses. Cap the
+    // in-flight sends (~0.5s of audio at the 2048-frame tap); past it chunks
+    // are DROPPED — server VAD tolerates gaps far better than a dead socket —
+    // and the pressure is counted for the beacons.
+    private var audioSendsInFlight = 0
+    private var droppedChunks = 0
 
     // MARK: - audio plumbing
 
@@ -174,6 +208,9 @@ final class WatchConversation {
         endedByUser = true
         wantLive = false
         reconnectTask?.cancel(); reconnectTask = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
+        livenessTask?.cancel(); livenessTask = nil
+        pendingToolOutput = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -206,9 +243,20 @@ final class WatchConversation {
     }
 
     /// Wrist-raise / app foreground: a session that died while the app was
-    /// suspended self-heals here — unless Ido explicitly ended it.
+    /// suspended self-heals here — unless Ido explicitly ended it. A socket
+    /// that LOOKS live gets probed instead of trusted: backgrounded sockets
+    /// die without any callback ever firing, and returning early on ws != nil
+    /// left him talking into the corpse until the next turn timed out.
     func appBecameActive() {
-        guard wantLive, !endedByUser, state == .idle || ws == nil else { return }
+        guard wantLive, !endedByUser else { return }
+        if ws != nil {
+            pingNow()
+            return
+        }
+        // No socket: whatever the ladder (or its 60s long tail) was waiting
+        // on, wrist-raise is intent NOW — restart from attempt zero rather
+        // than making him stare at a backoff timer.
+        reconnectTask?.cancel(); reconnectTask = nil
         state = .idle
         start()
     }
@@ -256,8 +304,13 @@ final class WatchConversation {
             handledToolCalls.removeAll()
             responseActive = false
             needsResponseAfterDone = false
+            failedResponseRetried = false
+            // Fresh socket, fresh accounting — stale in-flight counts from the
+            // previous socket's corpse would trip the backpressure cap forever.
+            audioSendsInFlight = 0
             state = .listening
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
+            startLivenessPings()
             // Audio-flow verdict 8s in: did real sound leave the wrist?
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
@@ -294,7 +347,7 @@ final class WatchConversation {
                         let stats = self.tapState.audioStats()
                         self.beacon("watch-health",
                                     "state=\(self.state) armed=\(self.micArmed) pending=\(self.pendingBuffers) "
-                                    + "frames=\(stats.frames) peak=\(stats.peak)")
+                                    + "frames=\(stats.frames) peak=\(stats.peak) dropped=\(self.droppedChunks)")
                     }
                 }
             }
@@ -304,11 +357,26 @@ final class WatchConversation {
             status = micArmed ? "Listening…" : "Tap to talk"
             syncGate()
             sendContext("[FOCUS] Ido is on his Apple Watch (small screen, walking or running, possibly loud surroundings). Keep every answer SHORT — one to three spoken sentences — unless he explicitly asks for depth. All tools work normally.")
-            if !transcript.isEmpty {
+            // Replay only a LIVE thread: after the watch sat dead for hours,
+            // "CONTINUE, do not greet" resurrected a long-finished topic at
+            // the next wrist-raise. Ten minutes of silence means the thread is
+            // over — start clean instead.
+            if !transcript.isEmpty, Date().timeIntervalSince(lastLineAt) < 600 {
                 let recent = transcript.suffix(4)
                     .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(160) }
                     .joined(separator: "\n")
                 sendContext("[FOCUS] Connection renewed mid-conversation — CONTINUE, do not greet. Recent exchange:\n" + recent)
+                // A tool result the old socket ate rides over: the rebuilt
+                // session has no memory of the call, so the result arrives as
+                // context and the create makes the answer finally happen.
+                if let pending = pendingToolOutput {
+                    pendingToolOutput = nil
+                    sendContext("[TOOL RESULT for your earlier \(pending.name) call]: " + pending.output)
+                    send(["type": "response.create"])
+                }
+            } else {
+                transcript.removeAll()
+                pendingToolOutput = nil
             }
         } catch {
             beacon("watch-mint-error", String(describing: error).prefix(160).description)
@@ -333,10 +401,34 @@ final class WatchConversation {
         // 6 attempts with the delay capped at 8s (~31s of patience) — with
         // waitsForConnectivity each attempt now genuinely waits for a link
         // instead of failing instantly on a transport that isn't up yet.
-        guard wantLive, reconnectAttempts < 6, let token = TokenStore.token else {
-            if wantLive {
-                beacon("watch-gaveup", "attempts=\(reconnectAttempts)")
-                status = "Connection lost — tap to retry"; state = .idle; wantLive = false
+        guard wantLive else { return }
+        guard let token = TokenStore.token else {
+            status = "Sign in again"; state = .idle; wantLive = false
+            return
+        }
+        // The rebuilt session starts clean: kill the corpse NOW so syncGate
+        // closes the mic, a late completion can't act on the old socket, and
+        // a watchdog armed against it can't fire mid-rebuild.
+        ws?.cancel(with: .goingAway, reason: nil)
+        ws = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
+        syncGate()
+        if reconnectAttempts >= 6 {
+            // Exhausted attempts must NOT go permanently dark (Ido: the watch
+            // works continuously, in endless loops). The old branch dropped
+            // wantLive and the wrist stayed dead until a manual tap he had no
+            // reason to make. Hold the want, tell the truth on screen, and
+            // re-enter the ladder every 60s — a network handoff that recovers
+            // brings her back by itself.
+            beacon("watch-gaveup", "attempts=\(reconnectAttempts) — long-tail retry in 60s")
+            status = "Connection lost — retrying…"
+            state = .connecting
+            reconnectTask?.cancel()
+            reconnectTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard let self, self.wantLive, !Task.isCancelled else { return }
+                self.reconnectAttempts = 0
+                self.scheduleReconnect()
             }
             return
         }
@@ -349,6 +441,68 @@ final class WatchConversation {
             try? await Task.sleep(nanoseconds: delay)
             guard let self, self.wantLive, !Task.isCancelled else { return }
             await self.connect(token: token)
+        }
+    }
+
+    // MARK: - always-answer net
+
+    /// Armed when his turn closes (speech_stopped / committed); disarmed by
+    /// her first sign of life (response.created, a finished transcript, a
+    /// tool call). Total silence for the window means the session is stalled
+    /// or the socket is a corpse — the context replay restores the thread on
+    /// the rebuilt socket, so tearing it down is cheaper than dead air.
+    private func armReplyWatchdog() {
+        replyWatchdog?.cancel()
+        replyWatchdog = Task { [weak self] in
+            guard let secs = self?.replyWatchdogSeconds else { return }
+            try? await Task.sleep(nanoseconds: secs * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.replyWatchdogFired()
+        }
+    }
+
+    private func replyWatchdogFired() {
+        guard wantLive, ws != nil else { return }
+        beacon("watch-reply-stall", "no response events \(replyWatchdogSeconds)s after his turn")
+        status = "Stalled — reconnecting…"
+        scheduleReconnect()   // tears the socket down itself
+    }
+
+    /// Her first response event for the outstanding turn — the reply is
+    /// coming, stand the watchdog down.
+    private func noteSignsOfLife() {
+        replyWatchdog?.cancel(); replyWatchdog = nil
+    }
+
+    /// Repeating transport-level ping. WebSocket pings ride below the Realtime
+    /// protocol, so they cost nothing in the conversation — but a socket the
+    /// network silently killed fails the pong, which is the ONLY timely signal
+    /// of a dead wrist link while nobody is talking. Single instance:
+    /// re-arming cancels the previous loop.
+    private func startLivenessPings() {
+        livenessTask?.cancel()
+        livenessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+                guard let self, !Task.isCancelled, self.wantLive else { return }
+                self.pingNow()
+            }
+        }
+    }
+
+    /// One transport ping; a failed pong means the socket is a corpse →
+    /// rebuild. Also called on wrist-raise, where a suspended socket has often
+    /// died without any callback ever firing.
+    private func pingNow() {
+        guard wantLive, let ws else { return }
+        let task = ws   // bind the verdict to THIS socket, not whatever ws is later
+        task.sendPing { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                guard let self, self.wantLive, self.ws === task else { return }
+                self.beacon("watch-ping-fail", String(describing: error).prefix(120).description)
+                self.scheduleReconnect()
+            }
         }
     }
 
@@ -380,6 +534,16 @@ final class WatchConversation {
         switch ev["type"] as? String ?? "" {
         case "response.created":
             responseActive = true
+            // A new response reads the FULL conversation — every input that
+            // landed before this moment is covered by it, so a surviving
+            // deferral would only make her re-answer the same thing (the
+            // build-225 double-answer bug). Same reason the held tool output
+            // is released: a response now exists to carry it.
+            needsResponseAfterDone = false
+            lastResponseCreatedAt = Date()
+            failedResponseRetried = false
+            pendingToolOutput = nil
+            noteSignsOfLife()
             state = .thinking
             if mode == .tapToTalk { micArmed = false }
             syncGate()
@@ -391,6 +555,24 @@ final class WatchConversation {
             }
         case "response.done":
             responseActive = false
+            let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
+            if rstatus == "cancelled" {
+                // Cancelled = Ido cut her off. Semantic VAD creates the
+                // response for his NEW turn itself — a deferred create here
+                // would race that one and re-fire input-less at ITS done: the
+                // build-225 double-answer bug in a new coat. Drop it.
+                needsResponseAfterDone = false
+            }
+            if rstatus != "completed" && rstatus != "cancelled" {
+                // Failed/incomplete response: his committed audio is still in
+                // the conversation — one bare response.create answers it
+                // instead of going silent.
+                beacon("watch-response-failed", rstatus)
+                if !failedResponseRetried {
+                    failedResponseRetried = true
+                    send(["type": "response.create"])
+                }
+            }
             state = .listening
             // A conversation stays a conversation (Ido 2026-08-12: "I talk,
             // she answers, then when I talk again I don't get any answer") —
@@ -406,6 +588,7 @@ final class WatchConversation {
                 send(["type": "response.create"])
             }
         case "response.output_audio_transcript.done", "response.audio_transcript.done":
+            noteSignsOfLife()
             if let text = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !text.isEmpty {
                 appendLine(text, fromHer: true)
@@ -414,17 +597,33 @@ final class WatchConversation {
             if let text = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !text.isEmpty {
                 appendLine(text, fromHer: false)
+                // Transcription is ASYNC and routinely lands AFTER the reply.
+                // Arming here unconditionally tore the phone's sessions down
+                // 25s after every quiet turn (the phantom-stall trap) — arm
+                // only when no response has started since the speech ended.
+                if lastResponseCreatedAt < lastSpeechStoppedAt { armReplyWatchdog() }
             }
         case "input_audio_buffer.speech_started":
             state = .listening
             status = "Hearing you…"
+        case "input_audio_buffer.speech_stopped":
+            lastSpeechStoppedAt = Date()
+            // A reply is now DUE — arm the stall net. Speech that landed while
+            // a response was active is dropped by the server: defer a create
+            // to its done instead of watching for a reply that was never
+            // going to exist.
+            if responseActive { needsResponseAfterDone = true } else { armReplyWatchdog() }
+            status = "Thinking…"
         case "input_audio_buffer.committed":
+            lastSpeechStoppedAt = Date()
+            if responseActive { needsResponseAfterDone = true } else { armReplyWatchdog() }
             state = .thinking
             status = "Thinking…"
         case "response.function_call_arguments.done":
             let callId = ev["call_id"] as? String ?? ""
             guard !callId.isEmpty, !handledToolCalls.contains(callId) else { break }
             handledToolCalls.insert(callId)
+            noteSignsOfLife()
             runTool(name: ev["name"] as? String ?? "",
                     callId: callId,
                     argsJSON: ev["arguments"] as? String ?? "{}")
@@ -436,6 +635,7 @@ final class WatchConversation {
                 let callId = item["call_id"] as? String ?? ""
                 guard !callId.isEmpty, !handledToolCalls.contains(callId) else { break }
                 handledToolCalls.insert(callId)
+                noteSignsOfLife()
                 runTool(name: item["name"] as? String ?? "",
                         callId: callId,
                         argsJSON: item["arguments"] as? String ?? "{}")
@@ -449,6 +649,7 @@ final class WatchConversation {
     }
 
     private func appendLine(_ text: String, fromHer: Bool) {
+        lastLineAt = Date()
         transcript.append(Line(text: text, fromHer: fromHer))
         if transcript.count > 30 { transcript.removeFirst(transcript.count - 30) }
     }
@@ -465,6 +666,9 @@ final class WatchConversation {
             let capped = out.count > 12000
                 ? String(out.prefix(12000)) + "\n[TRUNCATED — tell Ido there is more and offer to continue]"
                 : out
+            // Held until a response covers it: if the socket eats this send,
+            // connect() re-injects the result so the answer still happens.
+            pendingToolOutput = (name, capped)
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
                            "output": capped]])
@@ -474,17 +678,27 @@ final class WatchConversation {
     }
 
     private func performToolHTTP(name: String, params: [String: Any]) async -> String {
-        do {
-            var req = URLRequest(url: AppConfig.toolURL(name))
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
-            req.httpBody = try JSONSerialization.data(withJSONObject: params)
-            let (data, _) = try await URLSession.shared.data(for: req)
-            return String(data: data, encoding: .utf8) ?? "{}"
-        } catch {
-            return "{\"error\":\"tool failed\"}"
+        // A bare "tool failed" made her claim the DATA didn't exist — the
+        // inbox looked empty because the wrist link hiccuped. Patient session,
+        // one retry, and on real failure a result string that names the truth.
+        for attempt in 0...1 {
+            do {
+                var req = URLRequest(url: AppConfig.toolURL(name))
+                req.httpMethod = "POST"
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+                req.httpBody = try JSONSerialization.data(withJSONObject: params)
+                let (data, resp) = try await toolSession.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if (200..<300).contains(code) {
+                    return String(data: data, encoding: .utf8) ?? "{}"
+                }
+                beacon("watch-tool-http", "\(name) http=\(code) attempt=\(attempt)")
+            } catch {
+                beacon("watch-tool-http", "\(name) \(String(describing: error).prefix(120)) attempt=\(attempt)")
+            }
         }
+        return "{\"error\":\"network failed on the watch — tell him the lookup failed on the wrist connection and offer to retry\"}"
     }
 
     /// Watch-side effects for the handful of tools whose result is an action
@@ -505,11 +719,43 @@ final class WatchConversation {
 
     // MARK: - send
 
+    /// Conversation-level send with a CHECKED completion. A discarded send
+    /// error was the "answering silently" dead end: context items, tool
+    /// outputs, and response.creates vanished into a corpse and nothing
+    /// noticed. A failed send means the socket is dead — rebuild; the held
+    /// tool output (if any) rides over via connect().
     private func send(_ obj: [String: Any]) {
         guard let ws,
               let data = try? JSONSerialization.data(withJSONObject: obj),
               let text = String(data: data, encoding: .utf8) else { return }
-        ws.send(.string(text)) { _ in }
+        ws.send(.string(text)) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor in
+                guard let self, self.wantLive, self.ws === ws else { return }
+                self.beacon("watch-send-fail", String(describing: error).prefix(120).description)
+                self.scheduleReconnect()
+            }
+        }
+    }
+
+    /// Audio chunk send with in-flight accounting — the completion is the only
+    /// truth about whether the socket is draining. A failed audio chunk is NOT
+    /// a reconnect trigger (the ping loop and reply watchdog own that verdict);
+    /// it only releases its slot.
+    private func sendAudio(_ b64: String) {
+        audioSendsInFlight += 1
+        guard let ws,
+              let data = try? JSONSerialization.data(withJSONObject: ["type": "input_audio_buffer.append", "audio": b64]),
+              let text = String(data: data, encoding: .utf8) else {
+            audioSendsInFlight -= 1
+            return
+        }
+        ws.send(.string(text)) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.audioSendsInFlight = max(0, self.audioSendsInFlight - 1)
+            }
+        }
     }
 
     private func sendContext(_ text: String) {
@@ -610,7 +856,14 @@ final class WatchConversation {
             tapState.note(peak: p)
             Task { @MainActor [weak self] in
                 guard let self, self.ws != nil else { return }
-                self.send(["type": "input_audio_buffer.append", "audio": data.base64EncodedString()])
+                // Backpressure cap (~0.5s of audio): a socket that stopped
+                // draining gets gaps, not an unbounded queue that collapses
+                // the transport. Drops are counted into watch-health.
+                guard self.audioSendsInFlight < 12 else {
+                    self.droppedChunks += 1
+                    return
+                }
+                self.sendAudio(data.base64EncodedString())
             }
         }
         try audioEngine.start()
@@ -710,6 +963,9 @@ final class WatchConversation {
         pendingBuffers = 0
         playbackDeadline = .distantPast
         healthTask?.cancel(); healthTask = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
+        livenessTask?.cancel(); livenessTask = nil
+        audioSendsInFlight = 0
         keepAliveTask?.cancel(); keepAliveTask = nil
         keepAlivePlayer.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
