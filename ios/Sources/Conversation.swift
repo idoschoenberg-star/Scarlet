@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CallKit // CXCallObserver — announce an incoming cellular call by voice
 import Combine
+import HealthKit // startWatchApp — voice-initiated workouts launch on the WATCH
 import UIKit   // background-task assertion so the car session survives a locked screen
 import os      // os_unfair_lock — guards the state the audio-render thread reads
 
@@ -1598,6 +1599,84 @@ final class Conversation: ObservableObject {
         }
     }
 
+    // ── Voice-initiated workouts: DEVICE-LOCAL tools ──
+    // HKWorkoutSession exists only on watchOS, so the WATCH runs the workout
+    // (WatchSources/WorkoutManager.swift intercepts the same three names
+    // wrist-side). The phone's whole contribution is startWatchApp — launch
+    // the watch app carrying the workout configuration; live status and
+    // ending belong to the wrist. agent-tools keeps server cases for these
+    // names so a Telegram/web call still answers honestly — interception
+    // here is what makes a phone voice session start a real workout.
+
+    private static let workoutTools: Set<String> = ["start_workout", "end_workout", "workout_status"]
+
+    /// A store of our own: HKHealthStore instances are independent and cheap
+    /// (nothing double-installs, unlike the audio tap), and HealthSync's is
+    /// private to its read-only sync world.
+    private let workoutStore = HKHealthStore()
+
+    /// Routes device-local tools away from the HTTP proxy; everything else
+    /// is the normal authorized round-trip.
+    private func performTool(name: String, params: [String: Any]) async -> String {
+        Self.workoutTools.contains(name)
+            ? await performWorkoutTool(name: name, params: params)
+            : await performToolHTTP(name: name, params: params)
+    }
+
+    private func performWorkoutTool(name: String, params: [String: Any]) async -> String {
+        func json(_ obj: [String: Any]) -> String {
+            String(data: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8),
+                   encoding: .utf8) ?? "{}"
+        }
+        guard name == "start_workout" else {
+            // No phone-side handle exists for a session running on the watch
+            // (HKWorkoutSession state is not reachable across devices) — the
+            // honest answer beats a guessed one.
+            return json([
+                "ok": false,
+                "error": "the workout session runs on his Apple Watch — this phone can only START one",
+                "note": "Tell Ido status and ending happen from the wrist: raise the watch and ask there.",
+            ])
+        }
+        let raw = (params["type"] as? String ?? "other").lowercased()
+        let type = ["walking", "elliptical", "strength", "running", "other"].contains(raw) ? raw : "other"
+        let config = HKWorkoutConfiguration()
+        switch type {
+        case "walking":    config.activityType = .walking; config.locationType = .outdoor
+        case "elliptical": config.activityType = .elliptical; config.locationType = .indoor
+        case "strength":   config.activityType = .traditionalStrengthTraining; config.locationType = .indoor
+        case "running":    config.activityType = .running; config.locationType = .outdoor
+        default:           config.activityType = .other; config.locationType = .unknown
+        }
+        do {
+            // Completion-handler form wrapped by hand: the (Bool, Error?)
+            // pattern can complete (false, nil) — "the watch didn't confirm"
+            // — which a thrown-error-only path would report as success.
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                workoutStore.startWatchApp(with: config) { ok, error in
+                    if ok { cont.resume() }
+                    else {
+                        cont.resume(throwing: error ?? NSError(
+                            domain: "ScarletWorkout", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "the watch did not confirm the launch"]))
+                    }
+                }
+            }
+            clientLog("workout-start", "type=\(type) → watch launched")
+            return json([
+                "ok": true, "type": type,
+                "note": "watch app LAUNCHED with the \(type) workout — it starts on his wrist within a couple of seconds. Confirm in a few words; live numbers and ending happen from the watch.",
+            ])
+        } catch {
+            clientLog("workout-start", "type=\(type) failed: " + String(String(describing: error).prefix(120)))
+            return json([
+                "ok": false,
+                "error": "couldn't start the workout on his watch: \(error.localizedDescription)",
+                "note": "Say plainly the watch app isn't reachable (no paired watch, Scarlet not installed on it, or the watch is off) — he can start the workout from the watch directly.",
+            ])
+        }
+    }
+
     /// ElevenLabs client_tool_call entry.
     private func runTool(_ c: [String: Any]) {
         let name = c["tool_name"] as? String ?? ""
@@ -1605,7 +1684,7 @@ final class Conversation: ObservableObject {
         let params = c["parameters"] as? [String: Any] ?? [:]
         preToolCues(name: name, params: params)
         Task {
-            let out = await performToolHTTP(name: name, params: params)
+            let out = await performTool(name: name, params: params)
             // 12k cap: every tool result lives in the agent's context for the
             // REST of the conversation — 30k results made hour-long dialogues
             // slower and slower until replies timed out entirely.
@@ -1620,7 +1699,7 @@ final class Conversation: ObservableObject {
         let params = (try? JSONSerialization.jsonObject(with: Data(argsJSON.utf8))) as? [String: Any] ?? [:]
         preToolCues(name: name, params: params)
         Task {
-            let out = await performToolHTTP(name: name, params: params)
+            let out = await performTool(name: name, params: params)
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
                            "output": cappedToolResult(name, out)]])

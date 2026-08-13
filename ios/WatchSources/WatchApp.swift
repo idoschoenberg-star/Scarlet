@@ -1,8 +1,22 @@
+import HealthKit
 import SwiftUI
 import WatchKit
 
+/// Receives the workout configuration when the PHONE starts a workout via
+/// HKHealthStore.startWatchApp — watchOS launches this app and delivers the
+/// configuration here; the session itself always runs wrist-side in
+/// WorkoutManager (HKWorkoutSession does not exist on iOS).
+final class ScarletWatchAppDelegate: NSObject, WKApplicationDelegate {
+    func handle(_ workoutConfiguration: HKWorkoutConfiguration) {
+        Task { @MainActor in
+            await WorkoutManager.shared.start(configuration: workoutConfiguration)
+        }
+    }
+}
+
 @main
 struct ScarletWatchApp: App {
+    @WKApplicationDelegateAdaptor(ScarletWatchAppDelegate.self) private var delegate
     @Environment(\.scenePhase) private var scenePhase
     @State private var unlocked = TokenStore.token != nil
 
