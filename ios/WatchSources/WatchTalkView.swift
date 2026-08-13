@@ -5,6 +5,10 @@ import SwiftUI
 /// mode switch (tap-to-talk vs continuous) and End.
 struct WatchTalkView: View {
     @State private var convo = WatchConversation.shared
+    /// Auto-start is a LAUNCH behavior only: onAppear also fires on the way
+    /// back from Settings, and restarting there would resurrect a session he
+    /// explicitly ended.
+    @State private var didAutoStart = false
 
     private var orbColor: Color {
         switch convo.state {
@@ -50,6 +54,18 @@ struct WatchTalkView: View {
                     }
                 }
                 .padding(.horizontal, 4)
+            }
+            // ACTION BUTTON = LIVE SCARLET (Ido 2026-08-13, Ultra Action
+            // button → Shortcut → Open App): opening the app IS the intent to
+            // talk — connect immediately instead of demanding one more tap on
+            // a 108pt orb. Continuous mode is listening the moment the session
+            // is up; tapToTalk still waits for its arming tap by design.
+            // endedByUser inside start() guards nothing here — a fresh open is
+            // a fresh intent — and start() no-ops when a session already runs.
+            .onAppear {
+                guard !didAutoStart else { return }
+                didAutoStart = true
+                if convo.state == .idle { convo.start() }
             }
             .navigationTitle("Scarlet")
             .toolbar {
