@@ -661,9 +661,10 @@ final class WatchConversation {
         status = "Working…"
         Task {
             // Workout tools are DEVICE-LOCAL: HKWorkoutSession only runs on
-            // watchOS, so these three never touch the HTTP proxy — the wrist
-            // IS the executor. Everything downstream (cap, output event, the
-            // one-active-response gate) is identical to the proxied path.
+            // watchOS, so these five (start/status/pause/resume/end) never
+            // touch the HTTP proxy — the wrist IS the executor. Everything
+            // downstream (cap, output event, the one-active-response gate)
+            // is identical to the proxied path.
             let out = WorkoutManager.toolNames.contains(name)
                 ? await WorkoutManager.shared.run(tool: name, params: params)
                 : await performToolHTTP(name: name, params: params)

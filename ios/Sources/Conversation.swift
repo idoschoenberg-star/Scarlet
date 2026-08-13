@@ -1601,14 +1601,18 @@ final class Conversation: ObservableObject {
 
     // ── Voice-initiated workouts: DEVICE-LOCAL tools ──
     // HKWorkoutSession exists only on watchOS, so the WATCH runs the workout
-    // (WatchSources/WorkoutManager.swift intercepts the same three names
+    // (WatchSources/WorkoutManager.swift intercepts the same five names
     // wrist-side). The phone's whole contribution is startWatchApp — launch
-    // the watch app carrying the workout configuration; live status and
-    // ending belong to the wrist. agent-tools keeps server cases for these
-    // names so a Telegram/web call still answers honestly — interception
-    // here is what makes a phone voice session start a real workout.
+    // the watch app carrying the workout configuration; live status, pause,
+    // resume and ending belong to the wrist. agent-tools keeps server cases
+    // for these names so a Telegram/web call still answers honestly —
+    // interception here is what makes a phone voice session start a real
+    // workout.
 
-    private static let workoutTools: Set<String> = ["start_workout", "end_workout", "workout_status"]
+    private static let workoutTools: Set<String> = [
+        "start_workout", "end_workout", "workout_status",
+        "pause_workout", "resume_workout",
+    ]
 
     /// A store of our own: HKHealthStore instances are independent and cheap
     /// (nothing double-installs, unlike the audio tap), and HealthSync's is
@@ -1631,23 +1635,16 @@ final class Conversation: ObservableObject {
         guard name == "start_workout" else {
             // No phone-side handle exists for a session running on the watch
             // (HKWorkoutSession state is not reachable across devices) — the
-            // honest answer beats a guessed one.
+            // honest answer beats a guessed one. Covers workout_status,
+            // pause_workout, resume_workout and end_workout alike.
             return json([
                 "ok": false,
-                "error": "the workout session runs on his Apple Watch — this phone can only START one",
-                "note": "Tell Ido status and ending happen from the wrist: raise the watch and ask there.",
+                "error": "the workout session lives on his Apple Watch — this phone can only START one",
+                "note": "Tell Ido status, pause, resume and ending happen from the wrist: raise the watch and ask there.",
             ])
         }
-        let raw = (params["type"] as? String ?? "other").lowercased()
-        let type = ["walking", "elliptical", "strength", "running", "other"].contains(raw) ? raw : "other"
-        let config = HKWorkoutConfiguration()
-        switch type {
-        case "walking":    config.activityType = .walking; config.locationType = .outdoor
-        case "elliptical": config.activityType = .elliptical; config.locationType = .indoor
-        case "strength":   config.activityType = .traditionalStrengthTraining; config.locationType = .indoor
-        case "running":    config.activityType = .running; config.locationType = .outdoor
-        default:           config.activityType = .other; config.locationType = .unknown
-        }
+        let raw = params["type"] as? String ?? "other"
+        let (config, type, recognized) = Self.workoutConfiguration(for: raw)
         do {
             // Completion-handler form wrapped by hand: the (Bool, Error?)
             // pattern can complete (false, nil) — "the watch didn't confirm"
@@ -1662,11 +1659,18 @@ final class Conversation: ObservableObject {
                     }
                 }
             }
-            clientLog("workout-start", "type=\(type) → watch launched")
-            return json([
+            clientLog("workout-start", "type=\(type) recognized=\(recognized) → watch launched")
+            var out: [String: Any] = [
                 "ok": true, "type": type,
-                "note": "watch app LAUNCHED with the \(type) workout — it starts on his wrist within a couple of seconds. Confirm in a few words; live numbers and ending happen from the watch.",
-            ])
+                "note": "watch app LAUNCHED with the \(type) workout — it starts on his wrist within a couple of seconds. Confirm in a few words; live numbers, pause/resume and ending happen from the watch.",
+            ]
+            if !recognized {
+                // .other on the wire — echo his words so she can say what
+                // she started instead of a generic "workout".
+                out["requested"] = raw
+                out["note"] = "watch app LAUNCHED — no exact Workout-app match for '\(raw)', so it starts as a general workout (heart rate + calories still tracked). Say you started '\(raw)' as a general session."
+            }
+            return json(out)
         } catch {
             clientLog("workout-start", "type=\(type) failed: " + String(String(describing: error).prefix(120)))
             return json([
@@ -1675,6 +1679,58 @@ final class Conversation: ObservableObject {
                 "note": "Say plainly the watch app isn't reachable (no paired watch, Scarlet not installed on it, or the watch is off) — he can start the workout from the watch directly.",
             ])
         }
+    }
+
+    /// Free-form spoken name → (configuration, spoken-back name, recognized).
+    /// TWIN of the table in WatchSources/WorkoutManager.swift — it must map
+    /// to the SAME (activity, location) pairs, because the configuration
+    /// crosses to the wrist as bare HealthKit enums and the watch recovers
+    /// the name from ITS copy. Ordered specific-first; case-insensitive
+    /// substring match over his words.
+    private static func workoutConfiguration(for raw: String)
+        -> (config: HKWorkoutConfiguration, name: String, recognized: Bool) {
+        let rows: [(keys: [String], name: String,
+                    activity: HKWorkoutActivityType,
+                    location: HKWorkoutSessionLocationType,
+                    swim: HKWorkoutSwimmingLocationType?)] = [
+            (["treadmill", "indoor run"], "indoor run", .running, .indoor, nil),
+            (["indoor walk"], "indoor walk", .walking, .indoor, nil),
+            (["open water", "sea swim", "ocean swim"], "open-water swim", .swimming, .outdoor, .openWater),
+            (["swim", "pool", "שחייה", "שחיה"], "pool swim", .swimming, .indoor, .pool),
+            (["spin", "indoor cycl", "indoor bike", "indoor ride", "stationary bike", "exercise bike", "peloton"], "indoor cycling", .cycling, .indoor, nil),
+            (["kickbox"], "kickboxing", .kickboxing, .indoor, nil),
+            (["box"], "boxing", .boxing, .indoor, nil),
+            (["jump rope", "jumprope", "jump-rope", "skipping"], "jump rope", .jumpRope, .indoor, nil),
+            (["functional"], "functional strength", .functionalStrengthTraining, .indoor, nil),
+            (["strength", "weight", "lifting", "lift", "משקולות", "כוח"], "strength training", .traditionalStrengthTraining, .indoor, nil),
+            (["stair", "stepmill"], "stair climbing", .stairClimbing, .indoor, nil),
+            (["stepper", "step training", "step machine"], "stepper", .stepTraining, .indoor, nil),
+            (["elliptical", "cross trainer", "cross-trainer"], "elliptical", .elliptical, .indoor, nil),
+            (["rowing", "row", "erg"], "rowing", .rowing, .indoor, nil),
+            (["hiit", "high intensity", "high-intensity", "interval", "tabata"], "HIIT", .highIntensityIntervalTraining, .indoor, nil),
+            (["yoga", "יוגה"], "yoga", .yoga, .indoor, nil),
+            (["pilates", "פילאטיס"], "pilates", .pilates, .indoor, nil),
+            (["core", "abs"], "core training", .coreTraining, .indoor, nil),
+            (["cooldown", "cool down", "cool-down"], "cooldown", .cooldown, .indoor, nil),
+            (["stretch", "flexibility", "mobility"], "stretching", .flexibility, .indoor, nil),
+            (["danc", "zumba", "ריקוד"], "dance", .cardioDance, .indoor, nil),
+            (["hike", "hiking", "trail"], "hiking", .hiking, .outdoor, nil),
+            (["cycl", "bike", "biking", "ride", "אופניים"], "outdoor cycling", .cycling, .outdoor, nil),
+            (["run", "jog", "ריצה"], "outdoor run", .running, .outdoor, nil),
+            (["walk", "הליכה"], "outdoor walk", .walking, .outdoor, nil),
+        ]
+        let q = raw.lowercased()
+        let config = HKWorkoutConfiguration()
+        if let row = rows.first(where: { row in row.keys.contains(where: { q.contains($0) }) }) {
+            config.activityType = row.activity
+            config.locationType = row.location
+            if let s = row.swim { config.swimmingLocationType = s }
+            return (config, row.name, true)
+        }
+        config.activityType = .other
+        config.locationType = .unknown
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (config, trimmed.isEmpty ? "workout" : trimmed, false)
     }
 
     /// ElevenLabs client_tool_call entry.
