@@ -94,6 +94,20 @@ final class Conversation: ObservableObject {
     /// fragment, safe to discard. Older means he is genuinely mid-sentence,
     /// and clearing would eat his real words.
     private var lastSpeechStartedAt = Date.distantPast
+    /// DEAF-SERVER-EAR detector state (2026-08-13, QA harness runs
+    /// 8/12/14/15/16/18 against the production-identical session): a session
+    /// can be deaf on the SERVER side — socket open, every audio send
+    /// SUCCEEDING — while the server never emits a single
+    /// input_audio_buffer.*/transcription event. No existing net can fire:
+    /// the reply watchdog arms on speech_stopped (which never comes), and
+    /// the send-side guards key on failures/drops (which never happen).
+    /// Evidence pair instead: seconds of REAL SPEECH the open gate actually
+    /// delivered vs. when the server last acknowledged ANY input. Speech
+    /// accumulating with zero acknowledgment is impossible in a healthy
+    /// session — the gate-health tick reconnects on it. Both reset on
+    /// connect(); the ledger also zeroes on every server input event.
+    private var lastServerInputEventAt: Date?
+    private var loudSpeechSeconds: Double = 0
     /// Truncation bookkeeping (2026-08-12 root-cause finding #4): when local
     /// playback is flushed (barge-in, Stop, interruption), the server still
     /// believes every unplayed word was HEARD — its context and his screen
@@ -532,6 +546,27 @@ final class Conversation: ObservableObject {
                     }
                 } else {
                     deafTicks = 0
+                }
+                // DEAF SERVER EAR (2026-08-13, QA harness runs
+                // 8/12/14/15/16/18): socket open, audio sends SUCCEEDING, yet
+                // the server emits no input_audio_buffer.*/transcription
+                // events at all — no other net can fire (the reply watchdog
+                // needs speech_stopped; the send guards need failures). >10s
+                // of real speech through an open gate with no server input
+                // event in 15s — or ever on this socket — is impossible in a
+                // healthy session; only a rebuild restores the ear, the same
+                // path the reply watchdog takes. OpenAI-only: the dormant
+                // ElevenLabs stream has no input_audio_buffer events, so the
+                // detector would convict every healthy eleven session.
+                if self.engine == .openai, self.micOn, self.ws != nil,
+                   self.loudSpeechSeconds > 10,
+                   self.lastServerInputEventAt.map({ Date().timeIntervalSince($0) > 15 }) ?? true {
+                    let loud = self.loudSpeechSeconds
+                    self.loudSpeechSeconds = 0
+                    self.clientLog("deaf-session",
+                                   "loud=\(String(format: "%.1f", loud))s level=\(String(format: "%.2f", self.inputLevel)) serverInput="
+                                   + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
+                    self.scheduleReconnect(reason: "deaf-session")
                 }
                 // Every 30s: one heartbeat line so a dead session names its
                 // own state in the logs instead of dying invisibly.
@@ -994,6 +1029,14 @@ final class Conversation: ObservableObject {
         replyWatchdog?.cancel(); replyWatchdog = nil
     }
 
+    /// Server-side proof the EAR works — any input_audio_buffer.* or input-
+    /// transcription event. Stamps the deaf-session clock and zeroes the
+    /// loud-speech ledger: acknowledged speech is not evidence of deafness.
+    private func noteServerInputEvent() {
+        lastServerInputEventAt = Date()
+        loudSpeechSeconds = 0
+    }
+
     /// Send everything queued while the socket was down, exactly once, in order.
     /// Called from `connect()` after the socket is live and initial context has
     /// been replayed, so queued turns land after her focus/continuation setup.
@@ -1182,6 +1225,10 @@ final class Conversation: ObservableObject {
             reconnectAttempts = 0
             audioSendsInFlight = 0
             handledToolCalls.removeAll()
+            // A rebuilt session's EAR starts unproven: speech the OLD socket
+            // never acknowledged must not convict the new one seconds in.
+            lastServerInputEventAt = nil
+            loudSpeechSeconds = 0
             responseActive = false
             needsResponseAfterDone = false
             pinnedLanguage = nil   // fresh session — re-pin from his first words
@@ -1486,6 +1533,14 @@ final class Conversation: ObservableObject {
     /// The backup engine's event stream (OpenAI Realtime GA). Beta-era event
     /// names are handled alongside GA ones so an API-side rename can't mute her.
     private func handleOpenAI(_ ev: [String: Any]) {
+        // Server-ear heartbeat: ANY input-side event (speech start/stop,
+        // commit, transcription — even a failed one) is proof the server
+        // hears the mic. Matched by prefix, not per-case, so a server-side
+        // event rename or addition can't dodge the deaf-session detector.
+        if let t = ev["type"] as? String,
+           t.hasPrefix("input_audio_buffer.") || t.contains("input_audio_transcription") {
+            noteServerInputEvent()
+        }
         switch ev["type"] as? String {
         case "response.output_audio.delta", "response.audio.delta":
             if let id = ev["item_id"] as? String {
@@ -2311,6 +2366,10 @@ final class Conversation: ObservableObject {
             // fills the meter; raising the gain visibly raises it.
             let db = 20 * log10(max(instRMS, 1e-7))
             let norm = max(0, min(1, (db + 60) / 60))
+            // Wall-clock duration of this callback's audio, computed HERE so
+            // only a scalar (never the non-Sendable buffer) crosses into the
+            // main-actor hop — the deaf-session ledger accumulates it below.
+            let frameDur = Double(buffer.frameLength) / max(buffer.format.sampleRate, 1)
             Task { @MainActor in
                 // Meter FIRST — it reflects the real captured signal regardless
                 // of mic-mute/echo gating, so a flat meter is ground truth.
@@ -2337,6 +2396,15 @@ final class Conversation: ObservableObject {
                 // the old guard kept "sending" into a nil socket, inflating
                 // the in-flight count until every buffer looked dropped.
                 guard self.micStreaming else { return }
+                // Deaf-session ledger (QA runs 8/12/14/15/16/18): count REAL
+                // SPEECH the open gate is actually delivering. 0.30 is the
+                // same dB-mapped level the "Hearing you…" cue above already
+                // treats as speech (-42 dB RMS on the -60 dB-floor scale;
+                // silence idles under 0.06) — but on the INSTANTANEOUS norm,
+                // not the smoothed meter, so the meter's slow release can't
+                // inflate the count. Zeroed by any server input event; >10s
+                // surviving means the server heard NOTHING he said.
+                if norm > 0.30 { self.loudSpeechSeconds += frameDur }
                 // Backpressure: never queue unbounded audio into a slow socket.
                 // 96 in-flight (~10s) rides out real network jitter — the old
                 // 24 punched holes in the MIDDLE of his sentences on a slow

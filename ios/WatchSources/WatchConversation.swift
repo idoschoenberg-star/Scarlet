@@ -36,9 +36,27 @@ private final class TapState: @unchecked Sendable {
     // (rawPeak>0, peak=0) from "gate never opened" (taps>0, frames=0).
     private var taps = 0
     private var rawPeak: Float = 0
+    // Deaf-session ledger (2026-08-13, QA harness runs 8/12/14/15/16/18):
+    // cumulative seconds of REAL SPEECH that passed the OPEN gate — audio the
+    // server must have heard. 1500 on the int16 wire scale (~5% full scale):
+    // the beacons put observed real speech at peak=29822 and silence under
+    // 300, so 1500 sits 5× above the noise floor yet 20× below an utterance —
+    // breath and room rumble never accumulate, his voice always does. Zeroed
+    // by every server input event and every connect(); the health tick reads
+    // it as evidence against a server-side ear that emits nothing.
+    static let realSpeechPeak: Int16 = 1500
+    private var loudSpeech: Double = 0
     func set(converter c: AVAudioConverter?) { lock.lock(); converter = c; lock.unlock() }
     func set(gate g: Bool) { lock.lock(); gate = g; lock.unlock() }
-    func note(peak p: Int16) { lock.lock(); frames += 1; if p > peak { peak = p }; lock.unlock() }
+    func note(peak p: Int16, frameSeconds: Double) {
+        lock.lock()
+        frames += 1
+        if p > peak { peak = p }
+        if p > Self.realSpeechPeak { loudSpeech += frameSeconds }
+        lock.unlock()
+    }
+    func loudSpeechSeconds() -> Double { lock.lock(); defer { lock.unlock() }; return loudSpeech }
+    func resetLoudSpeech() { lock.lock(); loudSpeech = 0; lock.unlock() }
     func note(raw p: Float) { lock.lock(); taps += 1; if p > rawPeak { rawPeak = p }; lock.unlock() }
     func audioStats() -> (frames: Int, peak: Int16, taps: Int, rawPeak: Float) {
         lock.lock(); defer { lock.unlock() }
@@ -170,6 +188,15 @@ final class WatchConversation {
     private var lastHealthFrames = 0
     private var lastHealthDropped = 0
     private var sendStallTicks = 0
+    // DEAF-SERVER-EAR clock (2026-08-13, QA runs 8/12/14/15/16/18): every
+    // guard above keys off SEND-side failure — but a session can be deaf on
+    // the SERVER side with every send SUCCEEDING: socket open, chunks ACKed,
+    // yet zero input_audio_buffer.*/transcription events ever come back, so
+    // no watchdog here ever fires and he talks into a live-looking corpse
+    // forever. Stamped by ANY server input event (which also zeroes the tap's
+    // loud-speech ledger); nil since connect() + real speech accumulated =
+    // impossible in a healthy session → the health tick reconnects.
+    private var lastServerInputEventAt: Date?
     // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
     // connect used to reset state to .idle and start a SECOND connect — two
     // sockets raced, and the loser's failure path scheduled a reconnect that
@@ -439,6 +466,11 @@ final class WatchConversation {
             sendStallTicks = 0
             lastHealthFrames = tapState.audioStats().frames
             lastHealthDropped = droppedChunks
+            // A rebuilt session's EAR starts unproven: speech the OLD socket
+            // never acknowledged must not convict the new one seconds after
+            // it opens.
+            lastServerInputEventAt = nil
+            tapState.resetLoudSpeech()
             state = .listening
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
@@ -506,6 +538,23 @@ final class WatchConversation {
                     if self.sendStallTicks >= 2 {
                         self.sendStallTicks = 0
                         self.beacon("watch-sends-stalled", "dFrames=\(dFrames) dDropped=\(dDropped)")
+                        self.scheduleReconnect()
+                        continue
+                    }
+                    // (4) DEAF SERVER EAR (QA runs 8/12/14/15/16/18): none of
+                    //    the guards above can fire because every send SUCCEEDS
+                    //    — yet the server emits no input_audio_buffer.* or
+                    //    transcription event at all. >10s of real speech
+                    //    through an OPEN gate with no server input event in
+                    //    15s (or ever on this socket) is impossible in a
+                    //    healthy session; only a rebuild restores the ear.
+                    let loud = self.tapState.loudSpeechSeconds()
+                    if self.micArmed, self.wantLive, loud > 10,
+                       self.lastServerInputEventAt.map({ Date().timeIntervalSince($0) > 15 }) ?? true {
+                        self.tapState.resetLoudSpeech()
+                        self.beacon("watch-deaf-session",
+                                    "loud=\(String(format: "%.1f", loud))s peak=\(stats.peak) serverInput="
+                                    + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
                         self.scheduleReconnect()
                         continue
                     }
@@ -669,6 +718,14 @@ final class WatchConversation {
         replyWatchdog?.cancel(); replyWatchdog = nil
     }
 
+    /// Server-side proof the EAR works — any input_audio_buffer.* or input-
+    /// transcription event. Stamps the deaf-session clock and zeroes the
+    /// loud-speech ledger: acknowledged speech is not evidence of deafness.
+    private func noteServerInputEvent() {
+        lastServerInputEventAt = Date()
+        tapState.resetLoudSpeech()
+    }
+
     /// Repeating transport-level ping. WebSocket pings ride below the Realtime
     /// protocol, so they cost nothing in the conversation — but a socket the
     /// network silently killed fails the pong, which is the ONLY timely signal
@@ -745,7 +802,16 @@ final class WatchConversation {
     }
 
     private func handleEvent(_ ev: [String: Any]) {
-        switch ev["type"] as? String ?? "" {
+        let type = ev["type"] as? String ?? ""
+        // Server-ear heartbeat: ANY input-side event (speech start/stop,
+        // commit, transcription) is proof the server hears the wrist — stamp
+        // the clock and forgive the accumulated loud-speech evidence. Matched
+        // by prefix, not per-case, so a server-side event rename or addition
+        // can't dodge the deaf-session detector.
+        if type.hasPrefix("input_audio_buffer.") || type.contains("input_audio_transcription") {
+            noteServerInputEvent()
+        }
+        switch type {
         case "response.created":
             responseActive = true
             // A new response reads the FULL conversation — every input that
@@ -1102,6 +1168,7 @@ final class WatchConversation {
 
         input.removeTap(onBus: 0)
         let tapState = self.tapState
+        let wire = wireRate   // captured by value — the tap never touches self's state
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
             // Audio thread: everything it reads comes from the lock-guarded
             // snapshot; the send hops to the main actor with plain Data.
@@ -1125,7 +1192,11 @@ final class WatchConversation {
                 var i = 0
                 while i < s.count { let v = s[i].magnitude; if Int16(clamping: v) > p { p = Int16(clamping: v) }; i += 32 }
             }
-            tapState.note(peak: p)
+            // The gate guard above already passed, so this frame WAS offered
+            // for send — its wire duration (int16 samples / 24 kHz) feeds the
+            // deaf-session ledger when the peak says real speech. One Double
+            // add under the existing lock; nothing new runs per frame.
+            tapState.note(peak: p, frameSeconds: Double(data.count / 2) / wire)
             Task { @MainActor [weak self] in
                 guard let self, self.ws != nil else { return }
                 // Backpressure cap (~0.5s of audio): a socket that stopped
