@@ -70,6 +70,12 @@ final class WatchConversation {
     private(set) var transcript: [Line] = []
     /// v1 gate: true while the mic is genuinely streaming his voice.
     private(set) var micArmed = false
+    /// Explicit continuous-mode mute (2026-08-13): response.done auto re-arms
+    /// the mic so a conversation stays a conversation — but that re-arm was
+    /// silently overriding a deliberate mute tap seconds later. Set ONLY by
+    /// the continuous-mode mute tap; cleared by start() and any orb re-arm.
+    /// While true, response.done leaves the mic alone.
+    private var userMuted = false
 
     var mode: Mode {
         get { Mode(rawValue: UserDefaults.standard.string(forKey: "watch.mode") ?? "") ?? .tapToTalk }
@@ -98,7 +104,11 @@ final class WatchConversation {
         return URLSession(configuration: c)
     }
     private let wsSession = WatchConversation.patientSession(resourceTimeout: nil)
-    private let mintSession = WatchConversation.patientSession(resourceTimeout: 25)
+    /// 40s, not 25 (2026-08-13): the server mint can add whole seconds under
+    /// cold start, and this budget also absorbs waitsForConnectivity's radio
+    /// wake — a tighter cap cancelled legitimate mints on a slow LTE wake and
+    /// burned a reconnect attempt on a request that was about to succeed.
+    private let mintSession = WatchConversation.patientSession(resourceTimeout: 40)
     /// Tool calls ride the same flaky wrist transport as the mint — a default
     /// session fails instantly on a link that is still coming up, and she then
     /// told him the DATA didn't exist. 30s: tools may legitimately be slow.
@@ -140,11 +150,42 @@ final class WatchConversation {
     // and the pressure is counted for the beacons.
     private var audioSendsInFlight = 0
     private var droppedChunks = 0
+    // BLACK-HOLE DETECTION (2026-08-13, beacons: armed=true pending=0 with
+    // frames AND dropped climbing 1:1 for 4+ minutes): a NAT-dead socket
+    // ACCEPTS sends but completes none — audioSendsInFlight latches at the
+    // cap and every later chunk is dropped, while the liveness ping stays
+    // silent (sendPing's callback fires only on a pong OR a transport error;
+    // a black hole produces neither) and the reply watchdog never arms (it
+    // needs a server event). Three independent clocks convict the corpse:
+    //  - pendingPongSince: an outstanding ping whose pong is 6s overdue;
+    //  - oldestInFlightSince: an audio send whose completion is 8s overdue;
+    //  - lastHealthFrames/Dropped + sendStallTicks: two consecutive health
+    //    ticks in which ~every produced chunk died at the backpressure cap.
+    // Any one of them → scheduleReconnect() (never just free the slots — the
+    // socket is dead, only a rebuild answers him). All are bound to the
+    // current socket and reset in connect() so a rebuilt session starts clean.
+    private var pendingPongSince: Date?
+    private weak var pendingPongTask: URLSessionWebSocketTask?
+    private var oldestInFlightSince: Date?
+    private var lastHealthFrames = 0
+    private var lastHealthDropped = 0
+    private var sendStallTicks = 0
+    // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
+    // connect used to reset state to .idle and start a SECOND connect — two
+    // sockets raced, and the loser's failure path scheduled a reconnect that
+    // tore down the winner. The epoch stamps every connect; a stale await or
+    // stale failure path sees a newer epoch and stands down.
+    private var connectEpoch = 0
+    private var connectInFlight = false
 
     // MARK: - audio plumbing
 
-    private let audioEngine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // `var`, not `let` (2026-08-13): a mediaServicesWereReset orphans every
+    // audio object we hold — Apple's contract is to DISCARD the engine and
+    // players and build fresh ones; driving the orphans traps. The reset
+    // observer replaces all three.
+    private var audioEngine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     /// WRIST-DOWN SURVIVAL (2026-08-12, beacons: watch-ws-fail POSIX 89
     /// "Operation canceled" 35s-2.5min after every connect — watchOS SUSPENDS
     /// the app when the screen dims, killing the socket mid-conversation;
@@ -152,9 +193,15 @@ final class WatchConversation {
     /// watch app alive only while audio is actively RENDERING, so this second
     /// player loops silence at zero volume for the whole session. It never
     /// touches pendingBuffers, so the echo gate is unaffected.
-    private let keepAlivePlayer = AVAudioPlayerNode()
+    private var keepAlivePlayer = AVAudioPlayerNode()
     private var keepAliveTask: Task<Void, Never>?
     private var audioReady = false
+    /// True from interruption .began to .ended: watchOS has torn the audio
+    /// unit down and NOTHING may drive it — playPCM drops buffers (her words
+    /// still arrive as transcript), rebuilds and the keep-alive stand down.
+    /// The phone learned this the hard way ("Spotify started mid-call").
+    private var interrupted = false
+    private var observersInstalled = false
     private let tapState = TapState()
     private var playFormat: AVAudioFormat?
     private let wireRate: Double = 24000
@@ -183,6 +230,7 @@ final class WatchConversation {
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectAttempts = 0
         endedByUser = false
+        userMuted = false
         wantLive = true
         state = .connecting
         status = "Waking her up…"
@@ -222,8 +270,10 @@ final class WatchConversation {
         status = "Tap to talk"
     }
 
-    /// The orb tap. Idle → start a session. Live in tapToTalk → arm the mic
-    /// for one turn. Live in continuous → toggle a mute.
+    /// The orb tap. Idle → start a session. While she SPEAKS → stop her (the
+    /// phone's tap-to-interrupt, Ido 2026-08-11: an urgent question never
+    /// waits out a long story). Live in tapToTalk → ARM, idempotently. Live
+    /// in continuous → toggle a mute.
     func orbTapped() {
         switch state {
         case .idle:
@@ -231,11 +281,38 @@ final class WatchConversation {
         case .connecting:
             break
         default:
+            // STOP-HER first (2026-08-13): while her audio is queued/playing
+            // or a response is generating, the tap is the stop button —
+            // mirroring the phone's stopSpeaking. Cancel the generation,
+            // flush playback, reopen the mic. Without this, a tap mid-answer
+            // in tapToTalk DISARMED the mic — the opposite of his intent.
+            if state == .speaking || pendingBuffers > 0 || responseActive {
+                if responseActive { send(["type": "response.cancel"]) }
+                player.stop()   // fires completions; decrements are clamped at 0
+                pendingBuffers = 0
+                speechTailUntil = .distantPast
+                playbackDeadline = .distantPast
+                micArmed = true
+                userMuted = false
+                state = .listening
+                status = "Listening…"
+                syncGate()
+                return
+            }
             if mode == .tapToTalk {
-                micArmed.toggle()
-                status = micArmed ? "Listening…" : "Tap to talk"
+                // ARM, never toggle (2026-08-13): response.done already
+                // re-arms the mic, so a "ritual" tap before speaking used to
+                // MUTE an armed mic and his next words fell on the floor.
+                // Arming is idempotent; only End or a continuous-mode mute
+                // tap silences her ear.
+                micArmed = true
+                userMuted = false
+                status = "Listening…"
             } else {
                 micArmed.toggle()
+                // Track the explicit mute so response.done's auto re-arm
+                // can't silently override a deliberate "stop listening".
+                userMuted = !micArmed
                 status = micArmed ? "Listening…" : "Mic muted — tap to unmute"
             }
             syncGate()
@@ -248,11 +325,35 @@ final class WatchConversation {
     /// die without any callback ever firing, and returning early on ws != nil
     /// left him talking into the corpse until the next turn timed out.
     func appBecameActive() {
+        // SELF-HEAL, mirroring the phone (2026-08-13): a session that gave up
+        // (mint dead, audio failed mid-reconnect) dropped wantLive — and the
+        // wrist then stayed dark until a manual tap he had no reason to make.
+        // If he didn't end it himself, raising the wrist IS the intent to
+        // talk — bring her back automatically.
+        if !wantLive, !endedByUser, state == .idle {
+            start()
+            return
+        }
         guard wantLive, !endedByUser else { return }
+        // Audio died while we were away (an interruption whose .ended never
+        // reached a suspended app): coming to the foreground is the moment to
+        // reclaim it — re-ensure instead of talking into a dead engine.
+        if interrupted {
+            interrupted = false
+            audioReady = false
+            Task { @MainActor in
+                try? await self.ensureAudio()
+                self.syncGate()
+            }
+        }
         if ws != nil {
             pingNow()
             return
         }
+        // A connect is ALREADY in flight (mint POST awaiting): restarting it
+        // here spawned a second racing socket whose loser tore down the
+        // winner (2026-08-13). It has its own timeout budget — let it finish.
+        if connectInFlight { return }
         // No socket: whatever the ladder (or its 60s long tail) was waiting
         // on, wrist-raise is intent NOW — restart from attempt zero rather
         // than making him stare at a backoff timer.
@@ -264,11 +365,19 @@ final class WatchConversation {
     // MARK: - connect
 
     private func connect(token: String) async {
+        // Stamp this attempt: any await below is a window where a NEWER
+        // connect can start (wrist-raise, a watchdog) — the stale attempt
+        // must abandon, never schedule a reconnect that kills the winner.
+        connectEpoch += 1
+        let epoch = connectEpoch
+        connectInFlight = true
+        defer { if connectEpoch == epoch { connectInFlight = false } }
         do {
             var req = URLRequest(url: AppConfig.realtimeURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             let (data, resp) = try await mintSession.data(for: req)
+            guard connectEpoch == epoch else { return }
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
@@ -286,10 +395,24 @@ final class WatchConversation {
             guard wantLive else { return }
             do { try await ensureAudio() } catch {
                 beacon("watch-audio-fail", String(describing: error).prefix(120).description + " " + routeSummary())
-                status = "Mic unavailable — try again"
-                state = .idle; wantLive = false
+                guard connectEpoch == epoch else { return }
+                // A RECONNECT's audio failure is transient territory — the
+                // route is mid-handoff, the session mid-wake — and audio
+                // often recovers seconds later. Going permanently idle here
+                // (the old branch) meant a 1-second hiccup ended a live
+                // conversation for good. Keep the want and retry; permanent
+                // idle is reserved for first-start failure and explicit mic
+                // permission denial (handled in start()).
+                if reconnectAttempts > 0 {
+                    status = "Mic waking — retrying…"
+                    scheduleReconnect()
+                } else {
+                    status = "Mic unavailable — try again"
+                    state = .idle; wantLive = false
+                }
                 return
             }
+            guard connectEpoch == epoch, wantLive else { return }
             // Route truth at session start: prove which ports the session
             // actually holds BEFORE any audio flows (next build's logs read
             // the verdict directly — in=[NONE] or hwIn=0 means dead input).
@@ -306,8 +429,16 @@ final class WatchConversation {
             needsResponseAfterDone = false
             failedResponseRetried = false
             // Fresh socket, fresh accounting — stale in-flight counts from the
-            // previous socket's corpse would trip the backpressure cap forever.
+            // previous socket's corpse would trip the backpressure cap forever,
+            // and stale black-hole clocks would convict the NEW socket for the
+            // old one's silence.
             audioSendsInFlight = 0
+            oldestInFlightSince = nil
+            pendingPongSince = nil
+            pendingPongTask = nil
+            sendStallTicks = 0
+            lastHealthFrames = tapState.audioStats().frames
+            lastHealthDropped = droppedChunks
             state = .listening
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
@@ -335,6 +466,49 @@ final class WatchConversation {
                     try? await Task.sleep(nanoseconds: 10_000_000_000)
                     guard let self, self.ws != nil, !Task.isCancelled else { return }
                     tick += 1
+                    // BLACK-HOLE GUARDS (2026-08-13, the 4-minute deaf spell):
+                    // a NAT-dead socket produces NO callback anywhere — not on
+                    // sendPing, not on send completions, not on receive — so
+                    // every event-driven watchdog slept through it. These three
+                    // clocks are checked on wall time instead; any conviction
+                    // reconnects (never just frees slots — the socket is dead).
+                    // (1) A ping is outstanding and its pong is 6s overdue.
+                    if let since = self.pendingPongSince, self.pendingPongTask === self.ws,
+                       Date().timeIntervalSince(since) > 6 {
+                        self.beacon("watch-pong-timeout",
+                                    "no pong for \(Int(Date().timeIntervalSince(since)))s")
+                        self.scheduleReconnect()
+                        continue   // ws is nil now; next pass exits the loop
+                    }
+                    // (2) An audio send's completion is 8s overdue — the exact
+                    //    latched-at-the-cap geometry the beacons convicted.
+                    if self.audioSendsInFlight > 0, let t = self.oldestInFlightSince,
+                       Date().timeIntervalSince(t) > 8 {
+                        self.beacon("watch-send-timeout",
+                                    "inflight=\(self.audioSendsInFlight) age=\(Int(Date().timeIntervalSince(t)))s")
+                        self.scheduleReconnect()
+                        continue
+                    }
+                    // (3) The gate is open but ~every chunk this tick died at
+                    //    the backpressure cap — twice in a row is a stall, not
+                    //    a blip. (>20 frames/tick ≈ real audio flowing.)
+                    let stats = self.tapState.audioStats()
+                    let dFrames = stats.frames - self.lastHealthFrames
+                    let dDropped = self.droppedChunks - self.lastHealthDropped
+                    self.lastHealthFrames = stats.frames
+                    self.lastHealthDropped = self.droppedChunks
+                    if self.micArmed, self.wantLive, dFrames > 20,
+                       Double(dDropped) >= 0.9 * Double(dFrames) {
+                        self.sendStallTicks += 1
+                    } else {
+                        self.sendStallTicks = 0
+                    }
+                    if self.sendStallTicks >= 2 {
+                        self.sendStallTicks = 0
+                        self.beacon("watch-sends-stalled", "dFrames=\(dFrames) dDropped=\(dDropped)")
+                        self.scheduleReconnect()
+                        continue
+                    }
                     if self.pendingBuffers > 0, Date() > self.playbackDeadline.addingTimeInterval(3) {
                         self.beacon("watch-gate-stuck",
                                     "pending=\(self.pendingBuffers) — force-cleared, mic reopened")
@@ -362,10 +536,20 @@ final class WatchConversation {
             // the next wrist-raise. Ten minutes of silence means the thread is
             // over — start clean instead.
             if !transcript.isEmpty, Date().timeIntervalSince(lastLineAt) < 600 {
-                let recent = transcript.suffix(4)
-                    .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(160) }
-                    .joined(separator: "\n")
-                sendContext("[FOCUS] Connection renewed mid-conversation — CONTINUE, do not greet. Recent exchange:\n" + recent)
+                var context = "[FOCUS] Connection renewed mid-conversation — CONTINUE, do not greet. Recent exchange:\n"
+                    + transcript.suffix(4)
+                        .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(160) }
+                        .joined(separator: "\n")
+                // THE LOST QUESTION (2026-08-13): every watchdog/ping/stall
+                // reconnect lands here — and when the last transcript line is
+                // HIS, the reply died with the old socket. A bare CONTINUE
+                // left the model waiting politely for input it will never
+                // get; name the debt explicitly and force the answer.
+                let lastIsHis = transcript.last.map { !$0.fromHer } ?? false
+                if lastIsHis, let q = transcript.last?.text {
+                    context += "\nIdo's last words were: \"\(q.prefix(160))\" — his last question is still UNANSWERED; answer it now."
+                }
+                sendContext(context)
                 // A tool result the old socket ate rides over: the rebuilt
                 // session has no memory of the call, so the result arrives as
                 // context and the create makes the answer finally happen.
@@ -373,13 +557,24 @@ final class WatchConversation {
                     pendingToolOutput = nil
                     sendContext("[TOOL RESULT for your earlier \(pending.name) call]: " + pending.output)
                     send(["type": "response.create"])
+                } else if lastIsHis {
+                    // Same defer-on-busy rule as everywhere: a create against
+                    // an active response 400s and the answer is lost again.
+                    if responseActive { needsResponseAfterDone = true } else { send(["type": "response.create"]) }
                 }
             } else {
                 transcript.removeAll()
+                // Released even though the replay is skipped for staleness —
+                // a held slot surviving here would re-inject a long-dead tool
+                // result into some future session's first turn.
                 pendingToolOutput = nil
             }
         } catch {
             beacon("watch-mint-error", String(describing: error).prefix(160).description)
+            // A throw caused by a NEWER connect cancelling this one must not
+            // schedule a reconnect — that would tear down the winner's socket
+            // (the duplicate-connect race, 2026-08-13).
+            guard connectEpoch == epoch else { return }
             if wantLive { scheduleReconnect() } else { state = .idle; status = "Tap to talk" }
         }
     }
@@ -493,13 +688,32 @@ final class WatchConversation {
     /// One transport ping; a failed pong means the socket is a corpse →
     /// rebuild. Also called on wrist-raise, where a suspended socket has often
     /// died without any callback ever firing.
+    ///
+    /// PONG DEADLINE (2026-08-13, the 4-minute black hole): sendPing's
+    /// callback fires only on a pong OR a transport error — a NAT-dead socket
+    /// produces NEITHER, so this loop pinged the void forever while every
+    /// audio chunk died at the backpressure cap. Timestamp the outstanding
+    /// ping instead; the health tick convicts a pong 6s overdue. The
+    /// timestamp is bound to THIS task so a reconnect can't inherit it.
     private func pingNow() {
         guard wantLive, let ws else { return }
         let task = ws   // bind the verdict to THIS socket, not whatever ws is later
+        if pendingPongSince == nil {   // keep the OLDEST unanswered ping's clock
+            pendingPongSince = Date()
+            pendingPongTask = task
+        }
         task.sendPing { [weak self] error in
-            guard let error else { return }
             Task { @MainActor in
-                guard let self, self.wantLive, self.ws === task else { return }
+                guard let self else { return }
+                if error == nil {
+                    // Pong arrived — the socket drains; stand the clock down.
+                    if self.pendingPongTask === task {
+                        self.pendingPongSince = nil
+                        self.pendingPongTask = nil
+                    }
+                    return
+                }
+                guard self.wantLive, self.ws === task else { return }
                 self.beacon("watch-ping-fail", String(describing: error).prefix(120).description)
                 self.scheduleReconnect()
             }
@@ -579,9 +793,12 @@ final class WatchConversation {
             // the old tap-per-turn design disarmed the mic at response.created
             // and never re-armed it, so every session died after one round.
             // Re-arm after every answer, exactly like the phone behaves; the
-            // orb tap is the mute/stop, not a per-turn ritual.
-            if wantLive, !endedByUser { micArmed = true }
-            status = micArmed ? "Listening…" : "Tap to talk"
+            // orb tap is the mute/stop, not a per-turn ritual. EXCEPT when he
+            // explicitly muted (continuous-mode tap, 2026-08-13): the auto
+            // re-arm was silently overriding his deliberate "stop listening"
+            // one answer later.
+            if wantLive, !endedByUser, !userMuted { micArmed = true }
+            status = micArmed ? "Listening…" : (userMuted ? "Mic muted — tap to unmute" : "Tap to talk")
             syncGate()
             if needsResponseAfterDone {
                 needsResponseAfterDone = false
@@ -751,16 +968,24 @@ final class WatchConversation {
     /// it only releases its slot.
     private func sendAudio(_ b64: String) {
         audioSendsInFlight += 1
+        // Per-send deadline clock (2026-08-13 black hole): the count going
+        // 0→1 starts it, returning to 0 clears it. On a live socket sends
+        // complete in well under a second, so the count touches 0 constantly;
+        // 8s with the FIRST send still unacknowledged means the completions
+        // are never coming — the health tick reconnects on it.
+        if audioSendsInFlight == 1 { oldestInFlightSince = Date() }
         guard let ws,
               let data = try? JSONSerialization.data(withJSONObject: ["type": "input_audio_buffer.append", "audio": b64]),
               let text = String(data: data, encoding: .utf8) else {
             audioSendsInFlight -= 1
+            if audioSendsInFlight == 0 { oldestInFlightSince = nil }
             return
         }
         ws.send(.string(text)) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.audioSendsInFlight = max(0, self.audioSendsInFlight - 1)
+                if self.audioSendsInFlight == 0 { self.oldestInFlightSince = nil }
             }
         }
     }
@@ -786,9 +1011,28 @@ final class WatchConversation {
     }
 
     private func ensureAudio() async throws {
+        installAudioObservers()
+        // Mid-interruption there is nothing to ensure — another app owns the
+        // session and rebuildAudioGraph would silently stand down, leaving
+        // audioReady=true over no graph. Throw instead: connect()'s reconnect
+        // ladder retries, and .ended re-ensures the moment the session is ours.
+        guard !interrupted else { throw NSError(domain: "ScarletWatchAudio", code: 3) }
         if audioReady {
-            if !audioEngine.isRunning { try audioEngine.start() }
-            return
+            // Fast path is no longer a bare engine.start() (2026-08-13): after
+            // a suspension/interruption the SESSION is often deactivated, and
+            // starting the engine against it fails — the old path then threw,
+            // and a reconnect's connect() went permanently idle over a
+            // one-second hiccup. Re-activate first; on ANY fast-path failure
+            // fall through to the full rebuild instead of throwing — fresh
+            // hardware truth usually recovers what a bare start can't.
+            do {
+                try await activateAudioSession()
+                if !audioEngine.isRunning { try audioEngine.start() }
+                return
+            } catch {
+                beacon("watch-audio-fastpath", String(describing: error).prefix(120).description + " " + routeSummary())
+                audioReady = false
+            }
         }
         let session = AVAudioSession.sharedInstance()
         // Mode .default, NOT .voiceChat (2026-08-12, wrist streams pure
@@ -801,17 +1045,38 @@ final class WatchConversation {
         // argument the phone makes for its loudspeaker .default path.
         // .allowBluetoothA2DP stays — output-only, keeps AirPods full-band.
         try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothA2DP])
-        // watchOS activation is the ASYNC, watch-only API (WWDC19-716 /
-        // AVAudioSession.h): activation on the watch is "a relatively time
-        // consuming operation" and may need to bring a route up; the async
-        // form reports the real outcome instead of returning early success.
+        try await activateAudioSession()
+        try rebuildAudioGraph()
+        audioReady = true
+    }
+
+    /// watchOS activation is the ASYNC, watch-only API (WWDC19-716 /
+    /// AVAudioSession.h): activation on the watch is "a relatively time
+    /// consuming operation" and may need to bring a route up; the async
+    /// form reports the real outcome instead of returning early success.
+    private func activateAudioSession() async throws {
+        let session = AVAudioSession.sharedInstance()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             session.activate(options: []) { activated, error in
                 if activated { cont.resume() }
                 else { cont.resume(throwing: error ?? NSError(domain: "ScarletWatchAudio", code: 2)) }
             }
         }
+    }
 
+    /// (Re)build the whole capture/playback graph on the CURRENT hardware
+    /// formats. Split out of ensureAudio (2026-08-13) because route and
+    /// engine-configuration changes must rebuild too: a format change under a
+    /// LIVE tap is a hard native crash (the tap keeps handing the converter
+    /// buffers in a format it no longer accepts), so the tap is removed and
+    /// reinstalled with fresh inputFormat truth every time.
+    private func rebuildAudioGraph() throws {
+        // Never drive the audio unit while another app owns the session —
+        // the interruption's .ended (or the next foreground) is the resume
+        // signal, not whatever notification got us here.
+        guard !interrupted else { return }
+        audioEngine.stop()
+        player.stop()   // completions fire → pendingBuffers drains naturally
         let input = audioEngine.inputNode
         // The HARDWARE side of the input node (2026-08-12): outputFormat(
         // forBus:) can report a healthy-looking default while the input
@@ -874,9 +1139,113 @@ final class WatchConversation {
             }
         }
         try audioEngine.start()
-        audioReady = true
         syncGate()
         startKeepAlive()
+    }
+
+    /// Installed ONCE, at the first ensureAudio. The phone learned each of
+    /// these the hard way; the watch had inherited none of them (2026-08-13):
+    /// an interruption discards every scheduled buffer WITHOUT firing its
+    /// completion (echo gate wedged shut forever), a route/format change
+    /// under a live tap is an uncatchable native crash, and a media-services
+    /// reset orphans the engine objects outright. On a watch each of these
+    /// also stops background audio — and stopped background audio means
+    /// watchOS suspends the app and the socket dies with it.
+    private func installAudioObservers() {
+        guard !observersInstalled else { return }
+        observersInstalled = true
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                switch type {
+                case .began:
+                    // The audio unit is being torn down, discarding every
+                    // scheduled buffer WITHOUT its completion — pendingBuffers
+                    // would never decrement and the gate would stay shut while
+                    // the session looked alive. Mark the pipeline dead FIRST
+                    // (playPCM and the rebuilds check it), then zero the gate.
+                    self.interrupted = true
+                    self.player.stop()
+                    // Pause ourselves so engine state matches reality — the
+                    // system is tearing the unit down either way, and a
+                    // half-torn engine that still claims isRunning would let
+                    // the keep-alive loop schedule into the void.
+                    self.audioEngine.pause()
+                    self.pendingBuffers = 0
+                    self.speechTailUntil = .distantPast
+                    self.playbackDeadline = .distantPast
+                    if self.state == .speaking { self.state = .listening }
+                    self.syncGate()
+                case .ended:
+                    // The grabbing app may have changed the input format —
+                    // full re-ensure (session activate + graph rebuild on
+                    // fresh hardware truth), never a bare engine restart.
+                    self.interrupted = false
+                    guard self.wantLive else { break }
+                    self.audioReady = false
+                    do { try await self.ensureAudio() } catch {
+                        self.beacon("watch-audio-reensure", String(describing: error).prefix(120).description)
+                    }
+                    self.syncGate()
+                default: break
+                }
+            }
+        }
+        // Route or I/O-format change: rebuild on the NEW format. `object: nil`
+        // deliberately — a media-services reset replaces the engine instance,
+        // and an observer bound to the old one would go deaf forever.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.handleAudioPathChange("route-change") }
+        }
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name.AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.handleAudioPathChange("config-change") }
+        }
+        // mediaserverd died and restarted (rare, but aggressive session
+        // handoffs trigger it): every audio object we hold is an orphan —
+        // Apple's contract is to DISCARD the engine and players and build
+        // fresh ones; driving the orphans traps. Full teardown, re-ensure.
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.interrupted = false
+                self.keepAliveTask?.cancel(); self.keepAliveTask = nil
+                self.tapState.set(converter: nil)
+                self.tapState.set(gate: false)
+                self.pendingBuffers = 0
+                self.speechTailUntil = .distantPast
+                self.playbackDeadline = .distantPast
+                self.audioEngine = AVAudioEngine()
+                self.player = AVAudioPlayerNode()
+                self.keepAlivePlayer = AVAudioPlayerNode()
+                self.audioReady = false
+                guard self.wantLive else { return }
+                do { try await self.ensureAudio() } catch {
+                    self.beacon("watch-audio-reset-fail", String(describing: error).prefix(120).description)
+                }
+                self.syncGate()
+            }
+        }
+    }
+
+    /// The rebuild both change notifications funnel into. A failed rebuild
+    /// drops audioReady so the next re-ensure (foreground, keep-alive
+    /// escalation, interruption .ended) retries from the top instead of
+    /// fast-pathing onto a broken graph.
+    private func handleAudioPathChange(_ reason: String) {
+        guard wantLive, !interrupted, audioReady else { return }
+        do {
+            try rebuildAudioGraph()
+        } catch {
+            beacon("watch-audio-rebuild-fail", reason + " " + String(describing: error).prefix(100).description + " " + routeSummary())
+            audioReady = false
+        }
+        syncGate()
     }
 
     /// Loop 0.5s silent buffers on the muted keep-alive player so the audio
@@ -895,6 +1264,22 @@ final class WatchConversation {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 450_000_000)
                 guard let self, self.audioReady, !Task.isCancelled else { return }
+                if !self.audioEngine.isRunning, !self.interrupted {
+                    // A stopped engine SILENTLY ends background audio →
+                    // watchOS suspends the app → the socket dies (2026-08-13;
+                    // the old loop just skipped the schedule and let it
+                    // happen). Restart in place; if the engine won't start,
+                    // escalate to a full re-ensure instead of going quiet.
+                    try? self.audioEngine.start()
+                    if !self.audioEngine.isRunning {
+                        self.audioReady = false   // ends this loop; the rebuild starts a fresh one
+                        Task { @MainActor in
+                            try? await self.ensureAudio()
+                            self.syncGate()
+                        }
+                        return
+                    }
+                }
                 if self.audioEngine.isRunning {
                     self.keepAlivePlayer.scheduleBuffer(silent, completionHandler: nil)
                     if !self.keepAlivePlayer.isPlaying { self.keepAlivePlayer.play() }
@@ -921,6 +1306,11 @@ final class WatchConversation {
     }
 
     private func playPCM(_ pcm: Data) {
+        // Session stolen (interruption in progress): the audio unit is torn
+        // down — scheduling would pile up pendingBuffers whose completions
+        // never fire (gate wedged shut). Drop the buffers; her words still
+        // arrive as transcript text.
+        guard !interrupted else { return }
         guard audioReady, let playFormat else { return }
         let frames = pcm.count / 2
         guard frames > 0,
@@ -932,6 +1322,14 @@ final class WatchConversation {
                 for i in 0..<frames { out[i] = Float(int16[i]) / 32768 }
             }
         }
+        // THE crash the phone already guards against (2026-08-13, ported):
+        // scheduleBuffer/play against a non-running engine raises 'required
+        // condition is false: _engine->IsRunning()' — an NSException the
+        // Swift try can't catch; the app just quits. Start it if it stopped;
+        // if the start FAILS (another app holds the session — try? swallows
+        // it), DROP the buffer before any bookkeeping, degrading to text.
+        if !audioEngine.isRunning { try? audioEngine.start() }
+        guard audioEngine.isRunning else { return }
         pendingBuffers += 1
         // Time-based failsafe bookkeeping (2026-08-12, build 252 "one round
         // then silent death"): the gate reopens on buffer COMPLETIONS, and a
@@ -973,6 +1371,14 @@ final class WatchConversation {
         replyWatchdog?.cancel(); replyWatchdog = nil
         livenessTask?.cancel(); livenessTask = nil
         audioSendsInFlight = 0
+        // The black-hole clocks and interruption mark die with the session —
+        // a stale timestamp surviving into the next start() would convict a
+        // brand-new socket for this one's silence.
+        oldestInFlightSince = nil
+        pendingPongSince = nil
+        pendingPongTask = nil
+        sendStallTicks = 0
+        interrupted = false
         keepAliveTask?.cancel(); keepAliveTask = nil
         keepAlivePlayer.stop()
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)

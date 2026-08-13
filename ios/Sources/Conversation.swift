@@ -59,6 +59,26 @@ final class Conversation: ObservableObject {
     /// queued a SECOND, input-less response at done — she re-answered the
     /// same question unprompted, often drifting into the other language.
     private var needsResponseAfterDone = false
+    /// WHY the deferral exists. A cancelled response only invalidates a
+    /// VAD-SPEECH deferral — semantic VAD creates the response for his new
+    /// turn by itself, so the deferred create would just double-answer (the
+    /// 225 bug). An ITEM-BACKED deferral (typed turn, tool output, system
+    /// item) has NO VAD coming to answer it: dropping it on cancel left the
+    /// item permanently unanswered — she went silent on a typed question the
+    /// moment a barge-in cancelled the response it was queued behind.
+    private enum DeferredResponseReason { case vadSpeech, itemBacked }
+    private var deferredResponseReason: DeferredResponseReason = .vadSpeech
+    /// The ONLY way to set needsResponseAfterDone: records why, and never
+    /// downgrades a pending item-backed deferral to vad-speech — the stronger
+    /// reason must survive so a cancel can't discard the item's answer.
+    private func deferResponse(_ reason: DeferredResponseReason) {
+        if !needsResponseAfterDone {
+            deferredResponseReason = reason
+        } else if reason == .itemBacked {
+            deferredResponseReason = .itemBacked
+        }
+        needsResponseAfterDone = true
+    }
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
     /// Server-VAD is mid-utterance: speech_started arrived, speech_stopped
@@ -68,6 +88,12 @@ final class Conversation: ObservableObject {
     /// turn that gets a wrong answer (2026-08-12 root-cause finding #1). The
     /// gate-close path uses this flag to discard the fragment instead.
     private var serverHearsSpeech = false
+    /// When his CURRENT utterance began (input_audio_buffer.speech_started).
+    /// The gate-close branch reads the AGE: a start under 0.5s old is the
+    /// race window between his voice registering and her first buffer — a
+    /// fragment, safe to discard. Older means he is genuinely mid-sentence,
+    /// and clearing would eat his real words.
+    private var lastSpeechStartedAt = Date.distantPast
     /// Truncation bookkeeping (2026-08-12 root-cause finding #4): when local
     /// playback is flushed (barge-in, Stop, interruption), the server still
     /// believes every unplayed word was HEARD — its context and his screen
@@ -76,6 +102,11 @@ final class Conversation: ObservableObject {
     /// item and how much of it actually played, so the flush can tell the
     /// server the truth with conversation.item.truncate.
     private var currentAssistantItemId: String?
+    /// The item the last flush truncated. Its remaining audio deltas are
+    /// stragglers of an answer already cut in his ear — playing them would
+    /// resume her mid-garble seconds later (the AirPods barge-in half-fix).
+    /// playPCM's delta path drops them until a DIFFERENT item id appears.
+    private var truncatedItemId: String?
     private var drainedAudioFrames = 0
     /// One free retry for a failed/incomplete response when there is no
     /// queued text to re-send (finding #5): the spoken turn is still in the
@@ -327,6 +358,15 @@ final class Conversation: ObservableObject {
     /// it gets the same failsafe BEFORE it burns a car ride.
     private var playbackDeadline = Date.distantPast
     private var gateHealthTask: Task<Void, Never>?
+    /// Overlap hold (half-duplex routes): her first buffer arrived while HIS
+    /// established utterance was still running. Instead of clearing his words
+    /// off the server, she waits him out like a person — her decoded buffers
+    /// queue here UNPLAYED (the echo gate stays open, so his speech keeps
+    /// streaming) until speech_stopped/committed closes his turn, or the
+    /// hold timeout gives up and falls back to the old clear-and-play.
+    private var holdingForUserSpeech = false
+    private var heldPlaybackBuffers: [AVAudioPCMBuffer] = []
+    private var holdTimeoutTask: Task<Void, Never>?
 
     /// True while sending mic audio would loop her own voice back to her.
     /// HALF-DUPLEX ON EVERY OPEN-AIR ROUTE — deliberately. The 2026-08-11
@@ -428,34 +468,78 @@ final class Conversation: ObservableObject {
         gateHealthTask?.cancel()
         gateHealthTask = Task { @MainActor [weak self] in
             var tick = 0
+            var interruptedTicks = 0   // consecutive ticks the interruption latch has been up
+            var deafTicks = 0          // consecutive ticks of the silent-deafness signature
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard let self, self.wantLive, !Task.isCancelled else { return }
                 tick += 1
                 if self.pendingBuffers > 0, Date() > self.playbackDeadline.addingTimeInterval(3) {
                     self.clientLog("gate-stuck",
-                                   "pending=\(self.pendingBuffers) — force-cleared, mic reopened")
-                    self.pendingBuffers = 0
-                    self.speechTailUntil = .distantPast
-                    if self.state == .speaking {
-                        self.state = .listening
-                        if self.micOn { self.status = "Listening…" }
-                    }
+                                   "pending=\(self.pendingBuffers) — flushed, mic reopened")
+                    // A REAL flush, not raw counter resets: zeroing the
+                    // counters left the stalled buffers still scheduled on the
+                    // player — when it later unwedged they REPLAYED into the
+                    // now-open mic on loudspeaker and she answered her own
+                    // voice (phantom self-answers). flushPlayback stops the
+                    // player, truncates so the server knows what he actually
+                    // heard, and resets the same bookkeeping.
+                    self.flushPlayback()
+                }
+                // Interruption-latch rescue: iOS does NOT guarantee `.ended`
+                // (a declined call, some Siri paths) — and `.began` only
+                // PAUSED the engine, so audioReady stays true and the
+                // foreground !audioReady recovery never fires, while every
+                // other recovery path stands down behind `interrupted`. Two
+                // ticks of the latch with the other app's audio gone and the
+                // app active means nobody is coming to clear it — reclaim.
+                if self.interrupted { interruptedTicks += 1 } else { interruptedTicks = 0 }
+                if interruptedTicks > 1,
+                   !AVAudioSession.sharedInstance().isOtherAudioPlaying,
+                   UIApplication.shared.applicationState == .active {
+                    interruptedTicks = 0
+                    self.clientLog("gate-stuck-repaired", "reason=interrupted — no .ended ever arrived")
+                    self.interrupted = false
+                    try? self.startAudioSession()
+                    self.rebuildAudioGraph()
                 }
                 // A typing pause that outlives any real typing is a leaked
-                // focus event holding her ears shut — restore them.
+                // focus event holding her ears shut — restore what Ido had
+                // BEFORE the pause (an unconditional `true` here overrode an
+                // explicit mute he chose, the one silence that must stand).
                 if let t = self.typingPausedAt, Date() > t.addingTimeInterval(90), !self.chatMode {
                     self.clientLog("typing-pause-expired", "auto-restoring ears after 90s")
                     self.typingPausedAt = nil
-                    self.micOn = true
-                    self.status = "Listening…"
+                    self.micOn = self.micWasOnBeforeTyping
+                    if self.micOn { self.status = "Listening…" }
+                }
+                // Silent-deafness self-heal (2026-08-13 beacons: listening,
+                // micOn=false, streaming=false for 4+ minutes with NO gate, no
+                // typing pause, no chat mode, no explicit mute — some path
+                // dropped micOn and nothing owned restoring it). Two straight
+                // ticks of that exact signature is a leak, not a choice:
+                // reopen her ears and say so in the logs.
+                if self.state == .listening, !self.micOn, !self.responseActive,
+                   self.pendingBuffers == 0, self.typingPausedAt == nil,
+                   !self.chatMode, !self.userExplicitlyMuted {
+                    deafTicks += 1
+                    if deafTicks >= 2 {
+                        deafTicks = 0
+                        self.clientLog("gate-stuck-repaired", "reason=deaf-listening")
+                        self.micOn = true
+                        self.speechTailUntil = .distantPast   // same stale-tail clear as an unmute
+                        self.status = "Listening…"
+                    }
+                } else {
+                    deafTicks = 0
                 }
                 // Every 30s: one heartbeat line so a dead session names its
                 // own state in the logs instead of dying invisibly.
                 if tick % 3 == 0 {
                     self.clientLog("session-health",
                                    "state=\(self.state) micOn=\(self.micOn) streaming=\(self.micStreaming) "
-                                   + "pending=\(self.pendingBuffers) responseActive=\(self.responseActive)")
+                                   + "pending=\(self.pendingBuffers) responseActive=\(self.responseActive) "
+                                   + "interrupted=\(self.interrupted) engineRunning=\(self.audioEngine.isRunning)")
                 }
             }
         }
@@ -498,7 +582,7 @@ final class Conversation: ObservableObject {
                            "item": ["type": "message", "role": "user",
                                     "content": [["type": "input_text",
                                                  "text": "[SYSTEM] New message(s) arrived: \(lines). Announce per the LIVE ANNOUNCEMENTS rule — one short sentence, then wait."]]]])
-                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+                if self.responseActive { self.deferResponse(.itemBacked) } else { self.send(["type": "response.create"]) }
             }
         }
     }
@@ -520,7 +604,7 @@ final class Conversation: ObservableObject {
                            "item": ["type": "message", "role": "user",
                                     "content": [["type": "input_text",
                                                  "text": "[SYSTEM] An incoming cellular call is RINGING on his iPhone right now (iOS hides who from). Tell him in three or four words, immediately."]]]])
-                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+                if self.responseActive { self.deferResponse(.itemBacked) } else { self.send(["type": "response.create"]) }
             }
         }
         observer.setDelegate(delegate, queue: nil)
@@ -570,8 +654,15 @@ final class Conversation: ObservableObject {
         bgTask = .invalid
     }
 
+    /// True only while a mute Ido CHOSE (the Mic button) is standing. The
+    /// watchdog's deaf-listening self-heal keys off this: a false micOn with
+    /// this flag down is a leaked gate, with it up it's his decision — the
+    /// repair must never talk over a silence he asked for.
+    private var userExplicitlyMuted = false
+
     func toggleMic() {
         micOn.toggle()
+        userExplicitlyMuted = !micOn
         // Unmuting must open her ears NOW — a stale speech-tail gate from
         // before the mute would swallow his first words after unmute.
         if micOn { speechTailUntil = .distantPast }
@@ -720,7 +811,13 @@ final class Conversation: ObservableObject {
     func setChatMode(_ on: Bool) {
         guard on != chatMode else { return }
         if on {
-            micWasOnBeforeChat = micOn
+            // If a typing pause holds the mic shut RIGHT NOW, micOn=false is
+            // transient — snapshotting it would remember "deaf" and restore
+            // deaf on exit, permanently (the poisoned-snapshot variant of the
+            // 08-12 deafness). Snapshot what the mic WOULD be once typing
+            // ends, then clear the pause: the chat-mode gate owns the mic now.
+            micWasOnBeforeChat = typingPausedAt != nil ? micWasOnBeforeTyping : micOn
+            typingPausedAt = nil
             speakerWasOnBeforeChat = speakerOn
             micOn = false
             speakerOn = false
@@ -729,6 +826,9 @@ final class Conversation: ObservableObject {
             status = "Chat mode — type to Scarlet"
         } else {
             chatMode = false
+            // Any pause that accrued during chat mode is the chat gate's —
+            // a stale one left here would re-mute the restored mic later.
+            typingPausedAt = nil
             micOn = micWasOnBeforeChat
             speakerOn = speakerWasOnBeforeChat
             player.volume = speakerOn ? 1 : 0
@@ -757,8 +857,12 @@ final class Conversation: ObservableObject {
         status = "Typing — mic paused. Tap Type again to talk."
     }
     func endTyping() {
-        guard !chatMode else { return }   // chat mode keeps her ears closed
+        // The pause clears in EVERY mode. The old chat-mode early-return left
+        // a stale timestamp standing forever: the NEXT beginTyping read it as
+        // "same pause, keep the snapshot" (first-begin-wins) and later
+        // restored an ancient mic value — the poisoned-snapshot deafness.
         typingPausedAt = nil
+        guard !chatMode else { return }   // chat mode keeps her ears closed
         micOn = micWasOnBeforeTyping
         if micOn { status = "Listening…" }
     }
@@ -833,7 +937,7 @@ final class Conversation: ObservableObject {
                 Task { @MainActor in
                     guard let self, self.engine == .openai, createResponse else { return }
                     if self.responseActive {
-                        self.needsResponseAfterDone = true
+                        self.deferResponse(.itemBacked)   // a typed turn: only a create answers it
                     } else {
                         self.send(["type": "response.create"])
                     }
@@ -1384,9 +1488,17 @@ final class Conversation: ObservableObject {
     private func handleOpenAI(_ ev: [String: Any]) {
         switch ev["type"] as? String {
         case "response.output_audio.delta", "response.audio.delta":
-            if let id = ev["item_id"] as? String, id != currentAssistantItemId {
-                currentAssistantItemId = id
-                drainedAudioFrames = 0
+            if let id = ev["item_id"] as? String {
+                // Stragglers of an item the flush already truncated — they
+                // were in flight before the cancel landed at the server.
+                // Playing them resumes her cut answer garbled seconds after
+                // he barged in; drop them until a NEW item starts speaking.
+                if id == truncatedItemId { break }
+                truncatedItemId = nil
+                if id != currentAssistantItemId {
+                    currentAssistantItemId = id
+                    drainedAudioFrames = 0
+                }
             }
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
         case "response.created":
@@ -1402,12 +1514,15 @@ final class Conversation: ObservableObject {
         case "response.done":
             responseActive = false
             let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
-            if rstatus == "cancelled" {
+            if rstatus == "cancelled", deferredResponseReason == .vadSpeech {
                 // Cancelled = Ido cut her off (barge-in or Stop). Semantic VAD
                 // creates the response for his NEW turn itself (create_response
                 // is on) — a deferred create here would race that one and then
                 // re-fire input-less at ITS done: the 225 double-answer bug in
                 // a new coat. Drop the deferral; his next turn answers itself.
+                // ONLY for a vad-speech deferral, though: an ITEM-backed one
+                // (typed turn, tool output, system item) has no VAD turn coming
+                // to answer it — keep it, and the create below fires as usual.
                 needsResponseAfterDone = false
             }
             if rstatus != "completed" && rstatus != "cancelled" {
@@ -1465,14 +1580,22 @@ final class Conversation: ObservableObject {
                       String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
             serverHearsSpeech = true
+            lastSpeechStartedAt = Date()   // the gate-close branch keys on this age
             // Server-side truth that his voice is registering — instant cue.
             // On sealed-ear (full-duplex) routes this can fire WHILE she is
             // speaking: that is Ido interrupting her. The server no longer
             // truncates on its own (interrupt_response=false after the
             // 2026-08-12 disaster) — cut the locally queued audio AND tell
             // the server what was actually heard (flushPlayback truncates),
-            // so she stops in his ear the moment he speaks.
+            // so she stops in his ear the moment he speaks. Also cancel her
+            // GENERATION: flushing only the local queue left the still-
+            // streaming deltas to resume her garbled mid-answer. This is a
+            // CLIENT-initiated cancel on a route where the mic never gates —
+            // his utterance always completes and semantic VAD closes the turn
+            // normally (the 08-12 disaster was the opposite shape:
+            // SERVER-initiated cancel plus a gated mic).
             if pendingBuffers > 0, sealedEarRoute {
+                if responseActive { send(["type": "response.cancel"]) }
                 flushPlayback()
                 clientLog("barge-in", "speech_started during playback — cut her audio")
             }
@@ -1480,12 +1603,13 @@ final class Conversation: ObservableObject {
         case "input_audio_buffer.speech_stopped":
             serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
+            releaseHeldPlayback()   // his turn is closed — her held answer plays now
             // A reply is now DUE — arm the stall net immediately (with an
             // empty placeholder; the async transcript fills it in). Speech
             // that landed while a response was active would otherwise be
             // dropped by the server — defer a response.create to its done.
             if responseActive {
-                needsResponseAfterDone = true
+                deferResponse(.vadSpeech)
             } else {
                 awaitingReplyText = ""
                 armReplyWatchdog()
@@ -1493,7 +1617,8 @@ final class Conversation: ObservableObject {
             if state == .listening { status = "Thinking…" }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
-            if responseActive { needsResponseAfterDone = true }
+            releaseHeldPlayback()   // his turn is closed — her held answer plays now
+            if responseActive { deferResponse(.vadSpeech) }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
             let toolName = ev["name"] as? String ?? ""
@@ -1526,7 +1651,10 @@ final class Conversation: ObservableObject {
             let msg = (eobj?["message"] as? String) ?? "unknown"
             // A create that collided with an active response is recoverable:
             // re-ask the moment the active one finishes.
-            if code.contains("active_response") { needsResponseAfterDone = true }
+            // Our creates are only ever sent for item-backed inputs (typed
+            // turns, tool outputs, system items) — a collided one must
+            // survive a cancel, so it re-asks as item-backed.
+            if code.contains("active_response") { deferResponse(.itemBacked) }
             clientLog("openai-error", String((code + " " + msg).prefix(200)))
         default: break
         }
@@ -1764,7 +1892,7 @@ final class Conversation: ObservableObject {
             // unconditional create here collides (the 225 error bursts) and
             // the deferral then re-answered the turn twice. Defer instead.
             if responseActive {
-                needsResponseAfterDone = true
+                deferResponse(.itemBacked)   // a tool output only a create can voice
             } else {
                 send(["type": "response.create"])
             }
@@ -1885,7 +2013,7 @@ final class Conversation: ObservableObject {
                                            "item": ["type": "message", "role": "user",
                                                     "content": [["type": "input_text",
                                                                  "text": "[SYSTEM] The \(channelName) call to \(label) FAILED to open (phone locked). Tell Ido honestly in one sentence and offer the cellular fallback."]]]])
-                                if self.responseActive { self.needsResponseAfterDone = true } else { self.send(["type": "response.create"]) }
+                                if self.responseActive { self.deferResponse(.itemBacked) } else { self.send(["type": "response.create"]) }
                             }
                         }
                     }
@@ -2268,6 +2396,11 @@ final class Conversation: ObservableObject {
         // completion handlers, so pendingBuffers would stay > 0 forever →
         // echoRisk stuck true → the mic never streams again ("frozen"). Reset the
         // playback bookkeeping the same way flushPlayback()/stopAudio() do.
+        // Held buffers carry the OLD output rate — never release them into
+        // the re-wired player leg.
+        holdTimeoutTask?.cancel(); holdTimeoutTask = nil
+        holdingForUserSpeech = false
+        heldPlaybackBuffers.removeAll()
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
         playbackDeadline = .distantPast
@@ -2305,21 +2438,78 @@ final class Conversation: ObservableObject {
         // not a throw. Never drive the player unless the engine truly runs;
         // dropping the buffer degrades to text, which recovery undoes.
         guard audioEngine.isRunning else { return }
+        // Already waiting out his utterance: every further delta joins the
+        // held queue in order — speech_stopped/committed (or the hold
+        // timeout) releases them together.
+        if holdingForUserSpeech {
+            heldPlaybackBuffers.append(buf)
+            return
+        }
+        // The echo gate is about to close (her audio starts) while server-VAD
+        // is mid-HIS-utterance. TWO realities share that signal, told apart
+        // by how long ago speech_started fired:
+        //  • under 0.5s — the race window between his voice registering and
+        //    her first buffer. A fragment; discard it (2026-08-12 root cause
+        //    #1) and he repeats naturally once she finishes.
+        //  • longer — he is REALLY talking, and clearing here ate his words
+        //    mid-sentence. Instead she waits out his overlap like a person:
+        //    her buffers queue unplayed, the gate stays OPEN for him, and
+        //    speech_stopped/committed both closes his turn and releases her
+        //    held audio. His words survive.
+        if pendingBuffers == 0, serverHearsSpeech, !sealedEarRoute {
+            if Date().timeIntervalSince(lastSpeechStartedAt) < 0.5 {
+                serverHearsSpeech = false
+                send(["type": "input_audio_buffer.clear"])
+                clientLog("gate-close-clear", "discarded mid-utterance fragment at gate close")
+            } else {
+                holdingForUserSpeech = true
+                heldPlaybackBuffers.append(buf)
+                armHoldTimeout()
+                clientLog("gate-hold", "his speech predates her audio — holding playback for his turn")
+                return
+            }
+        }
+        schedulePlayback(buf)
+    }
+
+    /// His overlapping turn closed (speech_stopped/committed, or the hold
+    /// timeout gave up) — her held answer plays now, from its first word,
+    /// with nothing of his speech lost.
+    private func releaseHeldPlayback() {
+        guard holdingForUserSpeech else { return }
+        holdTimeoutTask?.cancel(); holdTimeoutTask = nil
+        holdingForUserSpeech = false
+        let held = heldPlaybackBuffers
+        heldPlaybackBuffers.removeAll()
+        for buf in held { schedulePlayback(buf) }
+    }
+
+    /// The hold's failsafe: if the server never closes his turn (VAD dangling
+    /// on a noise floor, a missed event), her voice must not be held hostage —
+    /// after 2.5s fall back to exactly the old behavior: clear his input,
+    /// play what was held, and log that the wait was abandoned.
+    private func armHoldTimeout() {
+        holdTimeoutTask?.cancel()
+        holdTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard let self, !Task.isCancelled, self.holdingForUserSpeech else { return }
+            self.serverHearsSpeech = false
+            self.send(["type": "input_audio_buffer.clear"])
+            self.clientLog("gate-hold-timeout", "no speech_stopped in 2.5s — clearing input, playing held audio")
+            self.releaseHeldPlayback()
+        }
+    }
+
+    /// Actually start one of her buffers on the player — the lower half of
+    /// the old playPCM, shared by the live path and the held-queue release.
+    private func schedulePlayback(_ buf: AVAudioPCMBuffer) {
+        guard !interrupted else { return }   // the release path can race an interruption
+        if !audioEngine.isRunning { try? audioEngine.start() }
+        guard audioEngine.isRunning else { return }
+        let frames = buf.frameLength
         if !player.isPlaying { player.play() }
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
-        // The echo gate is about to close (her audio starts). If server-VAD is
-        // mid-HIS-utterance right now — the race window between his speech
-        // registering and her first buffer — the audio stream simply stops
-        // from the server's view: VAD dangles, and the reopened gate later
-        // commits a chopped tail that gets a wrong answer (2026-08-12 root
-        // cause #1). Discard the fragment instead: he repeats naturally once
-        // she finishes, which is honest half-duplex — garbage turns are not.
-        if pendingBuffers == 0, serverHearsSpeech, !sealedEarRoute {
-            serverHearsSpeech = false
-            send(["type": "input_audio_buffer.clear"])
-            clientLog("gate-close-clear", "discarded mid-utterance fragment at gate close")
-        }
         pendingBuffers += 1
         playbackDeadline = max(playbackDeadline, Date()).addingTimeInterval(Double(frames) / 24000.0)
         // Her voice DUCKS the radio (2026-08-11 voice-only audit: both used
@@ -2350,15 +2540,26 @@ final class Conversation: ObservableObject {
     }
 
     private func flushPlayback() {
+        // Audio held back for his overlap dies with the flush — the answer it
+        // belonged to is cut. Held buffers still count as UNPLAYED for the
+        // truncate below: the server must learn none of them was heard.
+        let hadHeld = !heldPlaybackBuffers.isEmpty
+        holdTimeoutTask?.cancel(); holdTimeoutTask = nil
+        holdingForUserSpeech = false
+        heldPlaybackBuffers.removeAll()
         // Tell the server how much he ACTUALLY heard before the cut (root
         // cause #4, "she gives different answers"): without truncate, her
         // context keeps every unplayed word as if spoken, and later replies
         // build on things that never reached his ears. 24kHz mono wire rate.
-        if let itemId = currentAssistantItemId, pendingBuffers > 0 {
+        if let itemId = currentAssistantItemId, pendingBuffers > 0 || hadHeld {
             let heardMs = max(0, drainedAudioFrames * 1000 / 24000)
             send(["type": "conversation.item.truncate",
                   "item_id": itemId, "content_index": 0, "audio_end_ms": heardMs])
             clientLog("truncate", "item=\(itemId) heard=\(heardMs)ms")
+            // Deltas for the truncated item may still be in flight from the
+            // server — remember it so playPCM drops the stragglers instead of
+            // resuming the cut answer garbled (the AirPods barge-in half-fix).
+            truncatedItemId = itemId
             currentAssistantItemId = nil
         }
         player.stop()
@@ -2378,6 +2579,12 @@ final class Conversation: ObservableObject {
 
     private func stopAudio() {
         guard audioReady else { return }
+        // The held-overlap queue holds buffers in the OLD play format — a
+        // graph rebuilt at a new rate must never schedule them (format
+        // mismatch traps), so the hold dies with the graph.
+        holdTimeoutTask?.cancel(); holdTimeoutTask = nil
+        holdingForUserSpeech = false
+        heldPlaybackBuffers.removeAll()
         audioEngine.inputNode.removeTap(onBus: 0)
         // Clear the converter under the lock: the tap is removed, but a callback
         // already dispatched can still be running: snapshotting nil (or the still-
@@ -2466,6 +2673,11 @@ final class Conversation: ObservableObject {
                 os_unfair_lock_unlock(self.audioStateLock)
                 self.pendingBuffers = 0
                 self.speechTailUntil = Date.distantPast
+                // Held-overlap buffers belonged to the orphaned player — a
+                // release into the fresh one would schedule stale audio.
+                self.holdTimeoutTask?.cancel(); self.holdTimeoutTask = nil
+                self.holdingForUserSpeech = false
+                self.heldPlaybackBuffers.removeAll()
                 self.audioEngine = AVAudioEngine()
                 self.player = AVAudioPlayerNode()
                 self.player.volume = self.speakerOn ? 1 : 0
@@ -2541,8 +2753,14 @@ final class Conversation: ObservableObject {
                 self.pingNow()
                 // If audio died while we were away (an interruption whose
                 // .ended never reached us, or a failed recovery), coming back
-                // to the foreground is the moment to reclaim it.
-                if self.wantLive, !self.audioReady {
+                // to the foreground is the moment to reclaim it. The latch
+                // check is SEPARATE from audioReady: `.began` only pauses the
+                // engine, so after a declined call / Siri grab the latch is up
+                // while audioReady is still true — the old !audioReady-only
+                // guard skipped recovery and she stayed deaf for minutes
+                // (2026-08-13 beacons). A standing latch on foreground always
+                // recovers: iOS never promises the `.ended` that would.
+                if self.wantLive, self.interrupted || !self.audioReady {
                     self.interrupted = false
                     try? self.startAudioSession()
                     self.rebuildAudioGraph()

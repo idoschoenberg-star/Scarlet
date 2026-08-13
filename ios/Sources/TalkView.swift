@@ -107,9 +107,8 @@ struct TalkView: View {
                                 }
                                 Spacer()
                                 Button("Done") {
-                                    typeFocused = false
+                                    typeFocused = false   // the focus onChange runs endTyping
                                     showType = false
-                                    convo.endTyping()
                                 }
                                 .fontWeight(.semibold)
                             }
@@ -136,8 +135,7 @@ struct TalkView: View {
                 RoundControl(icon: showType ? "keyboard.chevron.compact.down" : "keyboard",
                              label: "Type", off: showType) {
                     showType.toggle()
-                    typeFocused = showType
-                    if showType { convo.beginTyping() } else { convo.endTyping() }
+                    typeFocused = showType   // the focus onChange drives begin/endTyping
                 }
                 // Hand her a document or a photo — camera, library or Files;
                 // she acknowledges and analyzes it (Claude reads behind her).
@@ -172,6 +170,14 @@ struct TalkView: View {
             }
         }
         .padding(.horizontal, 24)
+        // ONE source of truth for the typing pause: every way the keyboard
+        // rises or falls flows through focus — the Type button, Done, tapping
+        // the transcript, AND the interactive swipe-dismiss, which used to
+        // bypass endTyping entirely and leak a mic pause (ears shut until the
+        // 90s watchdog expiry). Same pattern as DeskView/ChatsView.
+        .onChange(of: typeFocused) { _, focused in
+            if focused { convo.beginTyping() } else { convo.endTyping() }
+        }
         .reportsModalPresence(showSettings)
         .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
         // Auto-connect ONCE per app session: one press → talking. Coming back
