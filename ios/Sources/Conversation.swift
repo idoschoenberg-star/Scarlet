@@ -162,7 +162,7 @@ final class Conversation: ObservableObject {
         pinnedLanguage = lang
         sendContext(lang == "he"
             ? "[LANGUAGE] עידו מדבר עכשיו עברית. ענה אך ורק בעברית עד שהוא עובר שפה. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
-            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. (News items are still read in their original language.)")
+            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. This supersedes ANY earlier language request. (News items are still read in their original language.)")
     }
 
     /// Tool calls already executed this session (by call_id) — execution is

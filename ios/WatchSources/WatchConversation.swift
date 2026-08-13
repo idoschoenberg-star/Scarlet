@@ -452,6 +452,7 @@ final class WatchConversation {
             listen(task)
             reconnectAttempts = 0
             handledToolCalls.removeAll()
+            pinnedLanguage = nil   // fresh session — re-pin from his first words
             responseActive = false
             needsResponseAfterDone = false
             failedResponseRetried = false
@@ -885,6 +886,7 @@ final class WatchConversation {
                 // 25s after every quiet turn (the phantom-stall trap) — arm
                 // only when no response has started since the speech ended.
                 if lastResponseCreatedAt < lastSpeechStoppedAt { armReplyWatchdog() }
+                pinLanguage(from: text)
             }
         case "input_audio_buffer.speech_started":
             state = .listening
@@ -1060,6 +1062,39 @@ final class WatchConversation {
         send(["type": "conversation.item.create",
               "item": ["type": "message", "role": "user",
                        "content": [["type": "input_text", "text": text]]]])
+    }
+
+    // MARK: - language pinning (ported from the phone, 2026-08-13)
+    //
+    // The QA harness proved the mirror rule cannot be prompted into
+    // reliability: the model answers English speech in Hebrew ~1 turn per
+    // session, and after an explicit "עני בעברית" it REFUSES to switch back
+    // ("I can only respond in Hebrew, as you requested" — run 23). The phone
+    // self-corrects within one turn by pinning the reply language from each
+    // completed input transcription; the watch never got that net, which is
+    // where the sticky-wrong-language sessions lived. Detection mirrors the
+    // phone exactly: Hebrew script → "he"; ARABIC script also → "he" (the
+    // transcriber mis-writes his Hebrew in Arabic glyphs; Ido never speaks
+    // Arabic); English needs two real ASCII words so a garbled scrap pins
+    // nothing and the previous pin stands.
+    private var pinnedLanguage: String?
+
+    private func detectLanguage(_ text: String) -> String? {
+        let scalars = text.unicodeScalars
+        if scalars.contains(where: { (0x0590...0x05FF).contains($0.value) }) { return "he" }
+        if scalars.contains(where: { (0x0600...0x06FF).contains($0.value) }) { return "he" }
+        let asciiWords = text.split(whereSeparator: { !$0.isLetter })
+            .filter { w in w.count >= 2 && w.allSatisfy { $0.isASCII } }
+        if asciiWords.count >= 2 { return "en" }
+        return nil
+    }
+
+    private func pinLanguage(from utterance: String) {
+        guard let lang = detectLanguage(utterance), lang != pinnedLanguage else { return }
+        pinnedLanguage = lang
+        sendContext(lang == "he"
+            ? "[LANGUAGE] עידו מדבר עכשיו עברית. ענה אך ורק בעברית עד שהוא עובר שפה. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
+            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. This supersedes ANY earlier language request. (News items are still read in their original language.)")
     }
 
     // MARK: - audio
