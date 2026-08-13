@@ -37,13 +37,24 @@ final class Conversation: ObservableObject {
     /// Just use OpenAI and make it a super reliable platform."). One vendor,
     /// one pipe, the ChatGPT-class voice he picked, semantic turn detection,
     /// the full persona + ~59 tools configured server-side in
-    /// realtime-session. The ElevenLabs branch below is retained as DORMANT
-    /// code only — `engine` never leaves .openai (switchToBackupEngine guards
-    /// on .eleven and so never fires).
+    /// realtime-session. The ElevenLabs branch below is retained as the
+    /// PARACHUTE: `engine` leaves .openai only via switchToElevenFallback
+    /// (two deaf OpenAI sessions inside 90s — tier 2 of the failover
+    /// ladder), and every fresh start() tries OpenAI first again.
     enum Engine: String { case eleven, openai }
     @Published private(set) var engine: Engine = .openai
     /// Set once a failover happened this session — prevents ping-ponging.
+    /// Direction: eleven→openai only (the era ElevenLabs was primary). The
+    /// tier-2 openai→eleven parachute is the OPPOSITE direction and has its
+    /// own flag — elFallbackActive below — never this one.
     private var engineFellBack = false
+    /// The tier-2 parachute is deployed: OpenAI proved deaf twice and this
+    /// session is living on the ElevenLabs voice. One-way for the SESSION —
+    /// while up, the eleven→openai failover paths must NOT bounce back to
+    /// the engine that just proved deaf (they stop honestly via
+    /// voiceUnavailableStop instead). A fresh start() clears it and tries
+    /// OpenAI first again.
+    private var elFallbackActive = false
 
     // OpenAI per-turn bookkeeping. Two GA facts shape the always-answer logic:
     // input transcription is an ASYNC side channel that routinely lands AFTER
@@ -104,10 +115,17 @@ final class Conversation: ObservableObject {
     /// Evidence pair instead: seconds of REAL SPEECH the open gate actually
     /// delivered vs. when the server last acknowledged ANY input. Speech
     /// accumulating with zero acknowledgment is impossible in a healthy
-    /// session — the gate-health tick reconnects on it. Both reset on
-    /// connect(); the ledger also zeroes on every server input event.
+    /// session — convictDeafSessionIfNeeded reconnects on it (tier 1 of the
+    /// voice-failover ladder). Both reset on connect(); the ledger also
+    /// zeroes on every server input event.
     private var lastServerInputEventAt: Date?
     private var loudSpeechSeconds: Double = 0
+    /// Timestamps of deaf-session convictions, pruned past 120s. ONE deaf
+    /// session earns a fast same-vendor rebuild; a SECOND inside 90s means
+    /// the FRESH session was born deaf too — a vendor-side burst, where a
+    /// third identical mint would just keep eating his words. That is the
+    /// tier-2 trigger (switchToElevenFallback).
+    private var recentDeafConvictions: [Date] = []
     /// Truncation bookkeeping (2026-08-12 root-cause finding #4): when local
     /// playback is flushed (barge-in, Stop, interruption), the server still
     /// believes every unplayed word was HEARD — its context and his screen
@@ -173,9 +191,14 @@ final class Conversation: ObservableObject {
     /// The capture sample rate the CURRENT engine expects (OAI 24k; EL 16k).
     private var captureRate: Double = 24000
 
-    /// One-way, once-per-session switch to the backup engine.
+    /// One-way, once-per-session switch to the backup engine (eleven→openai
+    /// — the era ElevenLabs was primary). NEVER while the tier-2 parachute
+    /// is up: elFallbackActive means OpenAI already proved deaf twice this
+    /// session, so "falling back" to it is ping-pong, not recovery — the
+    /// call sites stop honestly via voiceUnavailableStop() instead, and the
+    /// guard here is the belt behind them.
     private func switchToBackupEngine(_ why: String) {
-        guard engine == .eleven, !engineFellBack else { return }
+        guard engine == .eleven, !engineFellBack, !elFallbackActive else { return }
         clientLog("engine-failover", why)
         engine = .openai
         engineFellBack = true
@@ -186,6 +209,57 @@ final class Conversation: ObservableObject {
             fromHer: true))
         status = "Switching to the backup voice…"
         reconnectAttempts = 0
+    }
+
+    /// TIER 2 of the voice-failover ladder — the OPPOSITE direction of
+    /// switchToBackupEngine. In burst windows ~25% of fresh OpenAI Realtime
+    /// sessions are born deaf (2026-08-13: the server never emits input
+    /// events while every audio send SUCCEEDS), and when the fresh session
+    /// of a tier-1 cutover is deaf too, a third identical mint would just
+    /// keep eating his words. Fall over to the dormant ElevenLabs engine
+    /// LIVE: connect() branches on `engine` for the mint URL and handle()
+    /// for the protocol, so flipping the flag + the wire rates + a graph
+    /// rebuild IS the whole switch. One-way for the session
+    /// (elFallbackActive); a fresh start() tries OpenAI first again.
+    private func switchToElevenFallback(_ why: String) {
+        guard engine == .openai, !elFallbackActive else { return }
+        clientLog("el-fallback", why)
+        elFallbackActive = true
+        engine = .eleven
+        captureRate = 16000   // ElevenLabs listens at 16 kHz…
+        outputRate = 16000    // …and speaks it (initiation metadata corrects if not)
+        stopAudio()   // the graph rebuilds at the fallback engine's rates
+        transcript.append(.init(
+            text: "🎙 Voice engine unresponsive — switching to the backup voice for now.",
+            fromHer: true))
+        status = "Switching to the backup voice…"
+        // Same no-backoff logic as the deaf cutover itself: the NETWORK is
+        // fine (sends were succeeding), so the parachute opens NOW — and the
+        // unanswered-turn requeue inside scheduleReconnect carries his
+        // sentence onto the ElevenLabs session.
+        reconnectAttempts = 0
+        scheduleReconnect(reason: "el-fallback: " + why, immediate: true)
+    }
+
+    /// Both rungs of the ladder failed this session: OpenAI proved deaf
+    /// twice, then the ElevenLabs parachute hit its own quota/failure path.
+    /// Bouncing back to OpenAI mid-session would ping-pong into the engine
+    /// that just went deaf — the honest move is a clean stop that SAYS so.
+    /// Deliberately not endedByUser: the foreground self-heal may retry
+    /// later, and start() resets to OpenAI-first, so recovery is one tap
+    /// (or one app-open) away once the burst passes.
+    private func voiceUnavailableStop() {
+        clientLog("voice-unavailable", "EL fallback failed after deaf OpenAI sessions — stopping")
+        wantLive = false
+        reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
+        replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
+        livenessTask?.cancel(); livenessTask = nil
+        ws?.cancel(with: .goingAway, reason: nil)
+        ws = nil
+        stopAudio()
+        endBackgroundAssertion()
+        state = .idle
+        status = "Voice temporarily unavailable — try again in a minute."
     }
 
     struct Line: Identifiable { let id = UUID(); let text: String; let fromHer: Bool }
@@ -452,7 +526,15 @@ final class Conversation: ObservableObject {
         // every audio buffer of this one — a fresh start reclaims the session.
         interrupted = false
         endedByUser = false
-        // OpenAI is the one and only engine — no per-session engine reset.
+        // A fresh user-initiated session ALWAYS tries the primary engine
+        // first: even if the last session ended on the ElevenLabs parachute,
+        // the burst that convicted OpenAI has usually passed by the next
+        // start — and if it hasn't, the parachute just re-opens by itself
+        // (recentDeafConvictions deliberately survives, so a still-deaf
+        // vendor is convicted on the FIRST fresh failure, not two more).
+        engine = .openai
+        elFallbackActive = false
+        outputRate = 24000   // OpenAI's wire rate; connect() re-derives captureRate
         engineFellBack = false
         responseActive = false
         needsResponseAfterDone = false
@@ -551,23 +633,13 @@ final class Conversation: ObservableObject {
                 // 8/12/14/15/16/18): socket open, audio sends SUCCEEDING, yet
                 // the server emits no input_audio_buffer.*/transcription
                 // events at all — no other net can fire (the reply watchdog
-                // needs speech_stopped; the send guards need failures). >10s
-                // of real speech through an open gate with no server input
-                // event in 15s — or ever on this socket — is impossible in a
-                // healthy session; only a rebuild restores the ear, the same
-                // path the reply watchdog takes. OpenAI-only: the dormant
-                // ElevenLabs stream has no input_audio_buffer events, so the
-                // detector would convict every healthy eleven session.
-                if self.engine == .openai, self.micOn, self.ws != nil,
-                   self.loudSpeechSeconds > 10,
-                   self.lastServerInputEventAt.map({ Date().timeIntervalSince($0) > 15 }) ?? true {
-                    let loud = self.loudSpeechSeconds
-                    self.loudSpeechSeconds = 0
-                    self.clientLog("deaf-session",
-                                   "loud=\(String(format: "%.1f", loud))s level=\(String(format: "%.2f", self.inputLevel)) serverInput="
-                                   + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
-                    self.scheduleReconnect(reason: "deaf-session")
-                }
+                // needs speech_stopped; the send guards need failures). The
+                // conviction and its two-tier response live in
+                // convictDeafSessionIfNeeded — the tap's main-actor hop calls
+                // it the moment the ledger crosses (the ~4s verdict the fast
+                // cutover budget is built on); this tick is only the net for
+                // a ledger that crossed right as he stopped talking.
+                self.convictDeafSessionIfNeeded()
                 // Every 30s: one heartbeat line so a dead session names its
                 // own state in the logs instead of dying invisibly.
                 if tick % 3 == 0 {
@@ -1037,6 +1109,46 @@ final class Conversation: ObservableObject {
         loudSpeechSeconds = 0
     }
 
+    /// The deaf-session CONVICTION — tier 1 of the voice-failover ladder.
+    /// Evidence pair: >4s of REAL SPEECH the open gate delivered with no
+    /// server input acknowledgment in 15s (or ever on this socket). VAD
+    /// normally acks within ~1s, so 4s of voiced unacknowledged frames is
+    /// solidly abnormal (was >10s — that number alone cost 6+ extra seconds
+    /// of him repeating himself before the rebuild even began). Called from
+    /// the tap's main-actor hop at the moment the ledger crosses — the ~4s
+    /// verdict a ~6-7s total cutover needs — and from the gate-health tick
+    /// as the net for a ledger that crossed right as he stopped talking.
+    /// OpenAI-only: the dormant ElevenLabs stream has no input_audio_buffer
+    /// events, so the detector would convict every healthy eleven session.
+    private func convictDeafSessionIfNeeded() {
+        guard engine == .openai, micOn, ws != nil,
+              loudSpeechSeconds > 4,
+              lastServerInputEventAt.map({ Date().timeIntervalSince($0) > 15 }) ?? true
+        else { return }
+        let loud = loudSpeechSeconds
+        loudSpeechSeconds = 0
+        clientLog("deaf-session",
+                  "loud=\(String(format: "%.1f", loud))s level=\(String(format: "%.2f", inputLevel)) serverInput="
+                  + (lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
+        recentDeafConvictions.append(Date())
+        recentDeafConvictions.removeAll { Date().timeIntervalSince($0) > 120 }
+        if recentDeafConvictions.filter({ Date().timeIntervalSince($0) < 90 }).count >= 2 {
+            // The REBUILT session was born deaf too — a vendor-side burst,
+            // where a third identical mint would just keep eating his words.
+            // Tier 2: open the ElevenLabs parachute.
+            switchToElevenFallback("2 deaf OpenAI sessions in 90s")
+        } else {
+            // Tier 1: the SESSION is deaf, not the network — every audio
+            // send is still succeeding — so the backoff ladder buys nothing
+            // and costs the very seconds the cutover budget is for. Reset
+            // the ladder and rebuild NOW; the unanswered-turn requeue inside
+            // scheduleReconnect still re-asks his sentence on the fresh
+            // session.
+            reconnectAttempts = 0
+            scheduleReconnect(reason: "deaf-session", immediate: true)
+        }
+    }
+
     /// Send everything queued while the socket was down, exactly once, in order.
     /// Called from `connect()` after the socket is live and initial context has
     /// been replayed, so queued turns land after her focus/continuation setup.
@@ -1140,7 +1252,11 @@ final class Conversation: ObservableObject {
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 // 402 = the quota gate said the premium voice is out of
                 // credits BEFORE a doomed socket — fall over immediately.
+                // Unless ElevenLabs IS the tier-2 parachute: OpenAI just
+                // proved deaf twice, so bouncing back to it is ping-pong,
+                // not recovery — both rungs down, stop honestly.
                 if (resp as? HTTPURLResponse)?.statusCode == 402 {
+                    if elFallbackActive { voiceUnavailableStop(); return }
                     switchToBackupEngine("out of credits")
                     guard wantLive else { return }
                     await connect()
@@ -1229,6 +1345,14 @@ final class Conversation: ObservableObject {
             // never acknowledged must not convict the new one seconds in.
             lastServerInputEventAt = nil
             loudSpeechSeconds = 0
+            // Parachute bookkeeping: a fresh OPENAI socket is proof the
+            // tier-2 fallback is not riding this session — clear any stale
+            // flag so a later REAL fallback isn't a no-op. While the EL
+            // fallback IS live (engine == .eleven) the flag must stand: it
+            // is what keeps the quota/failure paths from bouncing back to
+            // the engine that just proved deaf. (recentDeafConvictions
+            // stays — it is the tier-2 trigger's memory across rebuilds.)
+            if engine == .openai { elFallbackActive = false }
             responseActive = false
             needsResponseAfterDone = false
             pinnedLanguage = nil   // fresh session — re-pin from his first words
@@ -1294,6 +1418,10 @@ final class Conversation: ObservableObject {
                     // continues on the other voice instead of dying.
                     if closeReason.lowercased().contains("quota"), self.engine == .eleven, !self.engineFellBack {
                         self.clientLog("quota-exhausted", closeReason)
+                        // The tier-2 parachute session hitting quota must NOT
+                        // bounce back to the engine that just proved deaf
+                        // twice — both rungs down, stop honestly.
+                        if self.elFallbackActive { self.voiceUnavailableStop(); return }
                         self.switchToBackupEngine("out of credits")
                         self.scheduleReconnect(reason: "quota-failover")
                         return
@@ -1317,13 +1445,19 @@ final class Conversation: ObservableObject {
 
     /// Silent auto-reconnect, native edition of the web app's transport-drop
     /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
-    private func scheduleReconnect(reason: String = "unspecified") {
+    /// `immediate` (the deaf-session cutover and the tier-2 parachute) skips
+    /// the backoff sleep entirely: the SESSION is broken, not the network —
+    /// every audio send was still succeeding — so waiting helps nothing.
+    private func scheduleReconnect(reason: String = "unspecified", immediate: Bool = false) {
         guard wantLive, !reconnecting else { return }
         clientLog("reconnect", reason)
         // Three straight failures on the premium engine → stop insisting and
         // fall over to the backup (≈6s in, not a minute of backoff). She must
-        // ALWAYS come back on SOME voice.
+        // ALWAYS come back on SOME voice — EXCEPT when ElevenLabs is itself
+        // the tier-2 parachute: OpenAI just proved deaf twice, so "the
+        // backup" is the broken engine. Both rungs down → stop honestly.
         if reconnectAttempts >= 3, engine == .eleven, !engineFellBack {
+            if elFallbackActive { voiceUnavailableStop(); return }
             switchToBackupEngine("connection kept failing")
         }
         // Give up after a bounded number of tries so a truly dead network ends in
@@ -1368,10 +1502,12 @@ final class Conversation: ObservableObject {
         status = "Reconnecting…"
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        // Exponential backoff: 0.9s, 1.8s, 3.6s … capped at 30s.
+        // Exponential backoff: 0.9s, 1.8s, 3.6s … capped at 30s — unless the
+        // caller proved the failure is session-side (`immediate`), where even
+        // the first 0.9s rung is pure loss against the ~6-7s cutover budget.
         let attempt = reconnectAttempts
         reconnectAttempts += 1
-        let delay = min(30.0, 0.9 * pow(2.0, Double(attempt)))
+        let delay = immediate ? 0 : min(30.0, 0.9 * pow(2.0, Double(attempt)))
         reconnectTask = Task {
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             // Clear the single-flight flag BEFORE connect(): if connect()
@@ -2402,9 +2538,15 @@ final class Conversation: ObservableObject {
                 // treats as speech (-42 dB RMS on the -60 dB-floor scale;
                 // silence idles under 0.06) — but on the INSTANTANEOUS norm,
                 // not the smoothed meter, so the meter's slow release can't
-                // inflate the count. Zeroed by any server input event; >10s
-                // surviving means the server heard NOTHING he said.
-                if norm > 0.30 { self.loudSpeechSeconds += frameDur }
+                // inflate the count. Zeroed by any server input event; >4s
+                // surviving means the server heard NOTHING he said (VAD
+                // normally acks within ~1s). Convict at the CROSSING, right
+                // here — the next 10s health tick is too late for the ~6-7s
+                // deaf-cutover budget; the tick stays only as the net.
+                if norm > 0.30 {
+                    self.loudSpeechSeconds += frameDur
+                    self.convictDeafSessionIfNeeded()
+                }
                 // Backpressure: never queue unbounded audio into a slow socket.
                 // 96 in-flight (~10s) rides out real network jitter — the old
                 // 24 punched holes in the MIDDLE of his sentences on a slow

@@ -197,6 +197,14 @@ final class WatchConversation {
     // loud-speech ledger); nil since connect() + real speech accumulated =
     // impossible in a healthy session → the health tick reconnects.
     private var lastServerInputEventAt: Date?
+    // Deaf-conviction history (2026-08-13, pruned >120s): the FIRST deaf
+    // conviction earns a zero-delay remint (server-brain failure — the
+    // transport already proved itself by ACKing every send, so backoff buys
+    // nothing but dead air); a SECOND conviction within 90s means the engine
+    // itself is sick and demotes to the normal ladder, so a server that stays
+    // deaf can't drive a hot mint/teardown loop. Deliberately NOT reset in
+    // connect() — it must remember convictions ACROSS rebuilt sessions.
+    private var recentDeafConvictions: [Date] = []
     // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
     // connect used to reset state to .idle and start a SECOND connect — two
     // sockets raced, and the loser's failure path scheduled a reconnect that
@@ -545,18 +553,42 @@ final class WatchConversation {
                     // (4) DEAF SERVER EAR (QA runs 8/12/14/15/16/18): none of
                     //    the guards above can fire because every send SUCCEEDS
                     //    — yet the server emits no input_audio_buffer.* or
-                    //    transcription event at all. >10s of real speech
-                    //    through an OPEN gate with no server input event in
-                    //    15s (or ever on this socket) is impossible in a
-                    //    healthy session; only a rebuild restores the ear.
+                    //    transcription event at all. Server VAD normally ACKs
+                    //    speech within ~1s, so >4s of voiced frames through an
+                    //    OPEN gate with no server input event in 15s (or ever
+                    //    on this socket) is solidly abnormal — and on the
+                    //    wrist every second of dead air is expensive. Only a
+                    //    rebuild restores the ear.
                     let loud = self.tapState.loudSpeechSeconds()
-                    if self.micArmed, self.wantLive, loud > 10,
+                    if self.micArmed, self.wantLive, loud > 4,
                        self.lastServerInputEventAt.map({ Date().timeIntervalSince($0) > 15 }) ?? true {
                         self.tapState.resetLoudSpeech()
+                        // FAST CUTOVER (2026-08-13): a deaf session is a
+                        // server-BRAIN failure, not a transport failure — the
+                        // ladder's delays help nothing, so the first
+                        // conviction remints from attempt zero at ZERO delay;
+                        // connect()'s replay then re-asks his unanswered
+                        // sentence on the fresh session. A SECOND conviction
+                        // within 90s demotes to the honest ladder instead of
+                        // remint-looping hot. (The phone can fall cross-vendor
+                        // to ElevenLabs; the watch has one engine — a
+                        // cross-vendor fallback here is future work.)
+                        self.recentDeafConvictions.removeAll { Date().timeIntervalSince($0) > 120 }
+                        let fastPath = !self.recentDeafConvictions.contains { Date().timeIntervalSince($0) < 90 }
+                        self.recentDeafConvictions.append(Date())
                         self.beacon("watch-deaf-session",
-                                    "loud=\(String(format: "%.1f", loud))s peak=\(stats.peak) serverInput="
+                                    "loud=\(String(format: "%.1f", loud))s peak=\(stats.peak) "
+                                    + "path=\(fastPath ? "fast" : "ladder") serverInput="
                                     + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
-                        self.scheduleReconnect()
+                        if fastPath {
+                            self.reconnectAttempts = 0
+                            self.scheduleReconnect(immediate: true)
+                        } else {
+                            self.scheduleReconnect()
+                            // After the call: scheduleReconnect writes its own
+                            // status; a repeat deaf spell deserves the truth.
+                            self.status = "Voice engine unstable — retrying…"
+                        }
                         continue
                     }
                     if self.pendingBuffers > 0, Date() > self.playbackDeadline.addingTimeInterval(3) {
@@ -642,7 +674,11 @@ final class WatchConversation {
         mintSession.dataTask(with: req).resume()
     }
 
-    private func scheduleReconnect() {
+    /// `immediate`: the deaf-session fast cutover — the caller has already
+    /// proven the transport healthy (every send ACKed), so the backoff delay
+    /// would only buy dead air. Zero delay for THIS attempt only; the attempt
+    /// still counts, so a mint that fails right after re-enters the ladder.
+    private func scheduleReconnect(immediate: Bool = false) {
         // 6 attempts with the delay capped at 8s (~31s of patience) — with
         // waitsForConnectivity each attempt now genuinely waits for a link
         // instead of failing instantly on a transport that isn't up yet.
@@ -677,7 +713,7 @@ final class WatchConversation {
             }
             return
         }
-        let delay = UInt64(min(8, pow(2, Double(reconnectAttempts)))) * 1_000_000_000
+        let delay = immediate ? 0 : UInt64(min(8, pow(2, Double(reconnectAttempts)))) * 1_000_000_000
         reconnectAttempts += 1
         status = "Reconnecting…"
         state = .connecting
