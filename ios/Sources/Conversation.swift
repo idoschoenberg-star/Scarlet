@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Network  // NWPathMonitor — preemptive reconnect on Wi-Fi ⇄ cellular handoff (CarPlay)
 import CallKit // CXCallObserver — announce an incoming cellular call by voice
 import Combine
 import HealthKit // startWatchApp — voice-initiated workouts launch on the WATCH
@@ -55,6 +56,23 @@ final class Conversation: ObservableObject {
     /// voiceUnavailableStop instead). A fresh start() clears it and tries
     /// OpenAI first again.
     private var elFallbackActive = false
+    /// The way BACK off the parachute (Ido 2026-08-13: "think about the
+    /// switching back… when the capability resumes"). While the fallback
+    /// session is live, a 75s background probe POSTs the real mint check
+    /// (realtime-session?check=1 — the server mints and DISCARDS an actual
+    /// OpenAI session, so a 200 is proof the engine can START, not merely
+    /// that the endpoint answers). Two consecutive greens arm this flag; the
+    /// switch itself happens only at a quiet boundary — neither of them
+    /// mid-utterance — checked from the existing 10s health tick
+    /// (completeOpenAIRecoveryIfQuiet), so recovery never cuts a sentence.
+    private var openAIRecovered = false
+    private var elRecoveryProbeTask: Task<Void, Never>?
+    /// Fallback-period epoch: bumped when the parachute deploys and on every
+    /// teardown (end / voiceUnavailableStop / fresh start). The probe captures
+    /// the value it was born with and re-checks it around every await — a
+    /// stale probe from a PREVIOUS fallback period can never count a success
+    /// into, or fire a switch on, a session it doesn't own.
+    private var elFallbackEpoch = 0
 
     // OpenAI per-turn bookkeeping. Two GA facts shape the always-answer logic:
     // input transcription is an ASYNC side channel that routinely lands AFTER
@@ -238,7 +256,110 @@ final class Conversation: ObservableObject {
         // unanswered-turn requeue inside scheduleReconnect carries his
         // sentence onto the ElevenLabs session.
         reconnectAttempts = 0
+        // serverHearsSpeech is OpenAI-socket state and that socket is dead —
+        // a leftover `true` (a speech_started whose stop never arrived) has
+        // no event stream to ever clear it on the ElevenLabs session, and it
+        // would block the recovery boundary check forever.
+        serverHearsSpeech = false
         scheduleReconnect(reason: "el-fallback: " + why, immediate: true)
+        startOpenAIRecoveryProbe()
+    }
+
+    /// The recovery probe: every 75s while the fallback carries a live
+    /// session, POST the mint check — SAME base URL and SAME x-scarlet-token
+    /// auth as connect()'s mint, plus ?check=1 so the minted session is
+    /// discarded server-side. Consecutive successes are counted here; the
+    /// arm threshold is 2 so one lucky mint inside a flapping burst can't
+    /// trigger a bounce back into a still-sick vendor.
+    private func startOpenAIRecoveryProbe() {
+        elRecoveryProbeTask?.cancel()
+        elFallbackEpoch += 1
+        let epoch = elFallbackEpoch
+        elRecoveryProbeTask = Task { @MainActor [weak self] in
+            var consecutiveOK = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 75_000_000_000)
+                // Epoch + liveness gate: only the CURRENT fallback period's
+                // probe may run — a stale one (the session recovered, ended,
+                // or restarted since this task was born) dies here.
+                guard let self, !Task.isCancelled,
+                      self.elFallbackEpoch == epoch, self.elFallbackActive,
+                      self.engine == .eleven, self.wantLive else { return }
+                // Transient, not fatal: the eleven socket mid-reconnect (ws
+                // nil for a beat) just skips this tick — killing the probe
+                // over it would lose recovery for the rest of the session.
+                guard self.ws != nil else { continue }
+                guard let url = URL(string: AppConfig.realtimeURL.absoluteString + "?check=1") else { return }
+                var req = URLRequest(url: url)
+                req.httpMethod = "POST"
+                req.setValue(self.token, forHTTPHeaderField: "x-scarlet-token")
+                req.timeoutInterval = 10   // a hung mint is a failed probe, fast
+                let ok: Bool
+                do {
+                    let (_, resp) = try await URLSession.shared.data(for: req)
+                    ok = (resp as? HTTPURLResponse)?.statusCode == 200
+                } catch { ok = false }
+                // The await released the main actor — re-check the world
+                // before counting anything into it.
+                guard !Task.isCancelled, self.elFallbackEpoch == epoch,
+                      self.elFallbackActive else { return }
+                if ok {
+                    consecutiveOK += 1
+                    self.clientLog("el-recovery-probe", "mint check ok — streak=\(consecutiveOK)")
+                    if consecutiveOK >= 2 { self.openAIRecovered = true }
+                } else {
+                    // A failure breaks the streak AND disarms: the vendor
+                    // flapped, so an armed-but-unlanded switch must wait for
+                    // two FRESH greens, not ride month-old evidence.
+                    consecutiveOK = 0
+                    self.openAIRecovered = false
+                    self.clientLog("el-recovery-probe", "mint check failed — streak reset")
+                }
+            }
+        }
+    }
+
+    /// Kill the probe and invalidate its epoch. Every teardown/restart path
+    /// (end, voiceUnavailableStop, a fresh start) runs this, so no probe can
+    /// outlive the fallback period it was born in.
+    private func cancelOpenAIRecoveryProbe() {
+        elRecoveryProbeTask?.cancel(); elRecoveryProbeTask = nil
+        elFallbackEpoch += 1
+        openAIRecovered = false
+    }
+
+    /// The armed recovery LANDS only at a quiet boundary: she is not speaking
+    /// (no queued playback, no active response) and he is not mid-utterance
+    /// (no VAD-open turn, no fresh speech_started, no overlap hold) — so the
+    /// engine switch never cuts a sentence in either direction. Checked from
+    /// the existing 10s health tick (one bool most ticks) instead of a timer
+    /// of its own; worst case the switch waits one extra tick for quiet.
+    private func completeOpenAIRecoveryIfQuiet() {
+        guard openAIRecovered, elFallbackActive, engine == .eleven, wantLive,
+              state == .listening else { return }
+        guard pendingBuffers == 0, !responseActive,
+              !serverHearsSpeech, !holdingForUserSpeech,
+              Date().timeIntervalSince(lastSpeechStartedAt) > 1 else { return }
+        cancelOpenAIRecoveryProbe()
+        clientLog("el-recovery", "2 consecutive mint checks green — switching back to OpenAI at quiet boundary")
+        transcript.append(.init(
+            text: "🎙 Primary voice engine recovered — switching back.",
+            fromHer: true))
+        engine = .openai
+        elFallbackActive = false
+        // The vendor just PROVED healthy twice in a row — stale convictions
+        // from the old burst must not re-trip the parachute on the first
+        // hiccup of the recovered session. The ladder starts honest again.
+        recentDeafConvictions.removeAll()
+        captureRate = 24000   // OpenAI listens at 24 kHz…
+        outputRate = 24000    // …and speaks 24 kHz PCM16
+        stopAudio()   // graph rebuilds at the primary engine's rates; held/queued buffers die with it
+        status = "Switching back to the primary voice…"
+        // Session-side switch with the network proven fine (the probe just
+        // completed a full mint round-trip) — same no-backoff logic as the
+        // cutovers in the other direction.
+        reconnectAttempts = 0
+        scheduleReconnect(reason: "el-recovery", immediate: true)
     }
 
     /// Both rungs of the ladder failed this session: OpenAI proved deaf
@@ -250,10 +371,12 @@ final class Conversation: ObservableObject {
     /// (or one app-open) away once the burst passes.
     private func voiceUnavailableStop() {
         clientLog("voice-unavailable", "EL fallback failed after deaf OpenAI sessions — stopping")
+        cancelOpenAIRecoveryProbe()
         wantLive = false
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
         livenessTask?.cancel(); livenessTask = nil
+        pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -534,6 +657,7 @@ final class Conversation: ObservableObject {
         // vendor is convicted on the FIRST fresh failure, not two more).
         engine = .openai
         elFallbackActive = false
+        cancelOpenAIRecoveryProbe()   // fresh start owns its own fallback period
         outputRate = 24000   // OpenAI's wire rate; connect() re-derives captureRate
         engineFellBack = false
         responseActive = false
@@ -557,6 +681,7 @@ final class Conversation: ObservableObject {
         // stays — a ringing phone he can't hear is a different animal.
         startCallWatch()
         startGateHealthWatch()
+        startPathMonitor()
     }
 
     /// The gate-wedge failsafe + heartbeat telemetry (see playbackDeadline).
@@ -640,6 +765,10 @@ final class Conversation: ObservableObject {
                 // cutover budget is built on); this tick is only the net for
                 // a ledger that crossed right as he stopped talking.
                 self.convictDeafSessionIfNeeded()
+                // Recovery off the ElevenLabs parachute lands here: the probe
+                // armed openAIRecovered, and this tick is the quiet-boundary
+                // check that performs the actual switch (no-op otherwise).
+                self.completeOpenAIRecoveryIfQuiet()
                 // Every 30s: one heartbeat line so a dead session names its
                 // own state in the logs instead of dying invisibly.
                 if tick % 3 == 0 {
@@ -728,6 +857,7 @@ final class Conversation: ObservableObject {
     func end() {
         endedByUser = true
         wantLive = false
+        cancelOpenAIRecoveryProbe()
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0
         signalsTask?.cancel(); signalsTask = nil
@@ -735,6 +865,7 @@ final class Conversation: ObservableObject {
         pendingOutbound.removeAll()   // hanging up discards anything not yet delivered
         replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
         livenessTask?.cancel(); livenessTask = nil
+        pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
         stopAudio()
@@ -821,6 +952,68 @@ final class Conversation: ObservableObject {
     /// changes re-apply the category only on a car transition, so a category
     /// change can't re-trigger itself through its own route notification.
     private var lastAppliedCar: Bool?
+
+    // MARK: route-aware noise reduction + preemptive path watch (2026-08-13)
+
+    /// The noise-reduction mode the LIVE session was last told. Reset to the
+    /// minted default ("near_field") on every connect — a fresh socket is
+    /// born with the mint config, so only a *change* needs a session.update.
+    private var lastNoiseModeSent: String?
+
+    /// The session is minted with near_field noise reduction — right for the
+    /// phone in his hand and the wrist mic, both close-talking. A CarPlay
+    /// cabin mic is the opposite: a FAR-FIELD array in the dashboard/headliner,
+    /// where near_field under-suppresses road noise — exactly the "catching
+    /// external voices that confused her" failure Ido reported. Retune the
+    /// live session whenever car-ness flips. OpenAI only: the EL fallback has
+    /// no session.update and its pipeline is untouched.
+    private func syncNoiseReductionForRoute() {
+        guard engine == .openai, ws != nil else { return }
+        let mode = onCarRoute ? "far_field" : "near_field"
+        guard mode != lastNoiseModeSent else { return }
+        lastNoiseModeSent = mode
+        send(["type": "session.update",
+              "session": ["type": "realtime",
+                          "audio": ["input": ["noise_reduction": ["type": mode]]]]])
+        clientLog("noise-mode", mode)
+    }
+
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature: String?
+    private var lastPathReconnectAt = Date.distantPast
+
+    /// Driving hands the phone between Wi-Fi and cellular and the socket dies
+    /// SILENTLY on the old interface — the liveness ping finds the corpse in
+    /// ~15s, but the OS knows about the flip instantly. Reconnect the moment
+    /// the path's interface set changes while live (debounced 30s so a
+    /// flapping garage/driveway edge can't reconnect-storm). A path going
+    /// DOWN is deliberately not acted on: nothing to connect to — the ping
+    /// loop + long-tail retry own that; the up-transition lands here and
+    /// recovers immediately.
+    private func startPathMonitor() {
+        pathMonitor?.cancel()
+        let mon = NWPathMonitor()
+        pathMonitor = mon
+        lastPathSignature = nil
+        mon.pathUpdateHandler = { [weak self] path in
+            let sig = path.status == .satisfied
+                ? path.availableInterfaces.map { String(describing: $0.type) }
+                    .sorted().joined(separator: "+")
+                : "down"
+            Task { @MainActor in
+                guard let self, self.wantLive else { return }
+                let prev = self.lastPathSignature
+                self.lastPathSignature = sig
+                // First callback is the baseline, not a change.
+                guard let prev, prev != sig, sig != "down" else { return }
+                guard Date().timeIntervalSince(self.lastPathReconnectAt) > 30 else { return }
+                self.lastPathReconnectAt = Date()
+                self.clientLog("path-change", "\(prev) → \(sig) — preemptive reconnect")
+                self.scheduleReconnect(reason: "network-path-change", immediate: true)
+            }
+        }
+        mon.start(queue: DispatchQueue.global(qos: .utility))
+    }
 
     /// Category options for the chosen output. The thin-voice culprit was
     /// HFP — the narrowband phone-call codec .allowBluetooth invites, which
@@ -1356,6 +1549,7 @@ final class Conversation: ObservableObject {
             responseActive = false
             needsResponseAfterDone = false
             pinnedLanguage = nil   // fresh session — re-pin from his first words
+            lastNoiseModeSent = "near_field"   // the minted default; only a CHANGE sends session.update
             let task = wsSession.webSocketTask(with: socketRequest)
             ws = task
             task.resume()
@@ -1383,6 +1577,9 @@ final class Conversation: ObservableObject {
             // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
             // driving mode if we're already on a car route.
             evaluateDrivingMode(forceAnnounce: true)
+            // If we connected while ALREADY on the car route, retune the
+            // freshly-minted near_field session for the far-field cabin mic.
+            syncNoiseReductionForRoute()
             // Transport truth: without pings a cell socket killed by a NAT
             // timeout looks "connected" forever and the receive callback never
             // fires — this loop finds the corpse within seconds instead of never.
@@ -2721,7 +2918,12 @@ final class Conversation: ObservableObject {
         state = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
         pendingBuffers += 1
-        playbackDeadline = max(playbackDeadline, Date()).addingTimeInterval(Double(frames) / 24000.0)
+        // Duration at the CURRENT engine's play rate, never a hard-coded
+        // 24000: buffers are minted in playFormat (= outputRate), and on the
+        // ElevenLabs fallback that is 16 kHz — dividing by 24k there ran the
+        // deadline 33% short, so the gate-wedge failsafe (deadline+3s) could
+        // flush a perfectly healthy long answer mid-sentence.
+        playbackDeadline = max(playbackDeadline, Date()).addingTimeInterval(Double(frames) / outputRate)
         // Her voice DUCKS the radio (2026-08-11 voice-only audit: both used
         // to play at full volume simultaneously); the last buffer's drain
         // restores the music.
@@ -2934,6 +3136,7 @@ final class Conversation: ObservableObject {
                         self.applyOutputRoute()
                     }
                     self.refreshSealedEarRoute()
+                    self.syncNoiseReductionForRoute()
                     self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
