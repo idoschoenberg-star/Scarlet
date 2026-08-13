@@ -54,6 +54,11 @@ struct RootView: View {
     /// via the shared scarletDraftSheetVisible signal) — the backstop poll must
     /// not open a second window over one already up.
     @State private var draftSheetOpen = false
+    /// Process start, for the stale-draft guard: a fresh open always lands in
+    /// Talk — the draft window may auto-open only for work from THIS run or a
+    /// crash moments ago, never for an old row (Ido 2026-08-13: "she should
+    /// not initiate a session with a draft").
+    private let launchedAt = Date()
     @Environment(\.scenePhase) private var scenePhase
     /// iPhone keeps the TabView; iPad/Mac (regular width) get the
     /// three-pane SplitShell — one codebase, presentation by surface.
@@ -307,10 +312,17 @@ struct RootView: View {
               // window is meant to open immediately and show it filling. Gating
               // on "draft" alone meant the window often never opened.
               ["writing", "draft"].contains(draft["status"] as? String ?? "") else { return }
-        // Only resurrect reasonably recent work (48h) — not archaeology.
-        if let ts = draft["updated_at"] as? String,
-           let when = MailDates.parse(ts),
-           Date().timeIntervalSince(when) > 48 * 3600 { return }
+        // STALE-DRAFT GUARD (Ido 2026-08-13, replaces the 48h window that let
+        // ANY lingering server-side draft hijack a fresh open — "she should
+        // not initiate a session with a draft"): auto-open ONLY drafts
+        // touched during THIS run (a voice-composed draft still pops
+        // instantly, as designed) or in the 15 minutes before launch — a
+        // real crash recovery IS reopening the app right away. Anything
+        // older stays quietly in the table; the app opens in Talk. A row
+        // with no parseable timestamp can't prove freshness — don't hijack.
+        guard let ts = draft["updated_at"] as? String,
+              let when = MailDates.parse(ts),
+              when >= launchedAt.addingTimeInterval(-15 * 60) else { return }
         guard !recoveredDraftIds.contains(id) else { return }
         recoveredDraftIds.insert(id)
         FlightRecorder.note(screen: "draft-recovered:\(id)")
