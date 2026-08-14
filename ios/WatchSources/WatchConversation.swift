@@ -1242,6 +1242,20 @@ final class WatchConversation {
         if player.engine == nil { audioEngine.attach(player) }
         playFormat = AVAudioFormat(standardFormatWithSampleRate: wireRate, channels: 1)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
+        // MAX VOLUME, always (Ido 2026-08-14: "the volume of the speaker is
+        // very low on the watch… start Scarlet always with max volume").
+        // The wrist speaker is small and playAndRecord can attenuate output —
+        // every stage WE control is pinned to full gain on every rebuild.
+        // (The crown still controls the system volume above this.)
+        player.volume = 1.0
+        audioEngine.mainMixerNode.outputVolume = 1.0
+        // Force the SPEAKER route when no headphones are attached — never a
+        // quiet receiver-style route. try? — a route that can't be overridden
+        // (AirPods active) just keeps its own path.
+        let outs = AVAudioSession.sharedInstance().currentRoute.outputs
+        if !outs.contains(where: { $0.portType == .bluetoothA2DP || $0.portType == .headphones }) {
+            try? AVAudioSession.sharedInstance().overrideOutputAudioPort(.speaker)
+        }
         if keepAlivePlayer.engine == nil { audioEngine.attach(keepAlivePlayer) }
         audioEngine.connect(keepAlivePlayer, to: audioEngine.mainMixerNode, format: playFormat)
         keepAlivePlayer.volume = 0   // renders (keeps the app alive), never heard
