@@ -408,6 +408,9 @@ final class WatchConversation {
     // MARK: - connect
 
     private func connect(token: String) async {
+        // A NEW session has no language pin — forget the old one so the first
+        // utterance re-pins (same reconnect-drift fix as the phone).
+        pinnedLanguage = nil
         // Stamp this attempt: any await below is a window where a NEWER
         // connect can start (wrist-raise, a watchdog) — the stale attempt
         // must abandon, never schedule a reconnect that kills the winner.

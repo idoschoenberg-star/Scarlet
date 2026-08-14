@@ -1436,6 +1436,12 @@ final class Conversation: ObservableObject {
     // MARK: signed URL + socket
 
     private func connect() async {
+        // A NEW session has no language pin — forget the old one so the first
+        // utterance re-pins. Keeping the stale value made the client skip the
+        // pin ("unchanged") and the fresh session drifted into Hebrew mid-reply
+        // after every reconnect (audio-e2e runs 34–35; the production
+        // language-mixing class of build 225).
+        pinnedLanguage = nil
         // Mic gate: without record permission the engine can never start, so
         // reconnecting would loop forever. Ask once; if denied, stop cleanly with
         // a message that points at Settings instead of spinning "Reconnecting…".
