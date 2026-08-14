@@ -64,7 +64,7 @@ struct RootView: View {
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, library, health, desk, settings }
+    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, news, library, health, desk, settings }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -251,6 +251,9 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Music", systemImage: "music.note") }
                 .tag(Tab.music)
+            NewsView()
+                .tabItem { Label("News", systemImage: "newspaper.fill") }
+                .tag(Tab.news)
             LibraryView()
                 .environmentObject(convo)
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }

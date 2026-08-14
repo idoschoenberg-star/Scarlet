@@ -37,6 +37,7 @@ struct SplitShell: View {
         case chats
         case photos
         case music
+        case news
         case library
         case health
         case desk
@@ -52,6 +53,7 @@ struct SplitShell: View {
             case .chats: return "Chats"
             case .photos: return "Photos"
             case .music: return "Music"
+            case .news: return "News"
             case .library: return "Library"
             case .health: return "Health"
             case .desk: return "Desk"
@@ -68,6 +70,7 @@ struct SplitShell: View {
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .photos: return "photo.on.rectangle"
             case .music: return "music.note"
+            case .news: return "newspaper.fill"
             case .library: return "books.vertical.fill"
             case .health: return "heart.fill"
             case .desk: return "checklist"
@@ -84,6 +87,7 @@ struct SplitShell: View {
             case .chats: return "4"
             case .photos: return "5"
             case .music: return "6"
+            case .news: return "n"
             case .library: return "7"
             case .health: return "8"
             case .desk: return "9"
@@ -263,6 +267,9 @@ struct SplitShell: View {
             // Self-contained (library shelves, search, now-playing).
             MusicView()
                 .environmentObject(convo)
+        case .news:
+            // Self-contained (Apple-News "Today" surface; breaking pinned top).
+            NewsView()
         case .library:
             // Self-contained NavigationStack (shelves + viewers).
             LibraryView()
