@@ -1145,9 +1145,11 @@ final class WatchConversation {
     private func pinLanguage(from utterance: String) {
         guard let lang = detectLanguage(utterance), lang != pinnedLanguage else { return }
         pinnedLanguage = lang
+        // Same async-pin wording as the phone: the CURRENT audio always
+        // overrides this note (a stale pin must never outvote a switch).
         sendContext(lang == "he"
-            ? "[LANGUAGE] עידו מדבר עכשיו עברית. ענה אך ורק בעברית עד שהוא עובר שפה. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
-            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. This supersedes ANY earlier language request. (News items are still read in their original language.)")
+            ? "[LANGUAGE] התור האחרון של עידו היה בעברית. אם דבריו הנוכחיים בעברית — עני בעברית. אבל שפת האודיו הנוכחי שלו תמיד גוברת על ההערה הזו: אם הוא מדבר עכשיו אנגלית, עני באנגלית. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
+            : "[LANGUAGE] Ido's LAST turn was in ENGLISH. If his current words are English, reply in English. But the language of his CURRENT audio always OVERRIDES this note: if he is speaking Hebrew now, answer in Hebrew. (News items are still read in their original language.)")
     }
 
     // MARK: - audio

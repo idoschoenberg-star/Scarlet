@@ -196,9 +196,13 @@ final class Conversation: ObservableObject {
     private func pinLanguage(from utterance: String) {
         guard engine == .openai, let lang = detectLanguage(utterance), lang != pinnedLanguage else { return }
         pinnedLanguage = lang
+        // The pin arrives ASYNC (from the previous turn's transcript) and can
+        // land after Ido already switched languages — so it must yield to the
+        // CURRENT audio, never outvote it (nightly run 33: a stale Hebrew pin
+        // made her answer an English request in Hebrew).
         sendContext(lang == "he"
-            ? "[LANGUAGE] עידו מדבר עכשיו עברית. ענה אך ורק בעברית עד שהוא עובר שפה. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
-            : "[LANGUAGE] Ido is speaking ENGLISH right now. Reply ONLY in English until he switches languages. This supersedes ANY earlier language request. (News items are still read in their original language.)")
+            ? "[LANGUAGE] התור האחרון של עידו היה בעברית. אם דבריו הנוכחיים בעברית — עני בעברית. אבל שפת האודיו הנוכחי שלו תמיד גוברת על ההערה הזו: אם הוא מדבר עכשיו אנגלית, עני באנגלית. (פריטי חדשות עדיין נקראים בשפת המקור שלהם.)"
+            : "[LANGUAGE] Ido's LAST turn was in ENGLISH. If his current words are English, reply in English. But the language of his CURRENT audio always OVERRIDES this note: if he is speaking Hebrew now, answer in Hebrew. (News items are still read in their original language.)")
     }
 
     /// Tool calls already executed this session (by call_id) — execution is
