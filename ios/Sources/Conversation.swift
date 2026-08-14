@@ -373,6 +373,7 @@ final class Conversation: ObservableObject {
         clientLog("voice-unavailable", "EL fallback failed after deaf OpenAI sessions — stopping")
         cancelOpenAIRecoveryProbe()
         wantLive = false
+        LocationReporter.shared.stopLiveUpdates()
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         replyWatchdog?.cancel(); replyWatchdog = nil; awaitingReplyText = nil
         livenessTask?.cancel(); livenessTask = nil
@@ -670,8 +671,13 @@ final class Conversation: ObservableObject {
         state = .connecting
         status = "Waking her up…"   // don't leave the stale "Ended." line up during connect
         // A live call is the moment "here" questions happen — refresh the
-        // backend's location fix so her answers are about where he IS.
-        LocationReporter.shared.report()
+        // backend's location fix so her answers are about where he IS, and
+        // keep following MOVEMENT (~2 min cadence) for the length of the
+        // call: a CarPlay drive must not answer from the fix taken at
+        // connect time an hour earlier.
+        LocationReporter.shared.startLiveUpdates(while: { [weak self] in
+            self?.wantLive == true
+        })
         Task { await connect() }
         observeInterruptions()
         // Live message ANNOUNCEMENTS are OFF (Ido 2026-08-12: "I don't need
@@ -857,6 +863,7 @@ final class Conversation: ObservableObject {
     func end() {
         endedByUser = true
         wantLive = false
+        LocationReporter.shared.stopLiveUpdates()
         cancelOpenAIRecoveryProbe()
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
         reconnectAttempts = 0

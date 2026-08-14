@@ -21,6 +21,9 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
     /// A report() that arrived before permission was granted — fulfilled from
     /// the authorization callback so the first-ever grant still posts a fix.
     private var wantsFix = false
+    private var liveTask: Task<Void, Never>?
+    /// The floor report() is currently honoring — live sessions lower it.
+    private var minInterval: TimeInterval = 300
 
     private override init() {
         super.init()
@@ -33,7 +36,7 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
     /// (the server then keeps answering from the last known fix, honestly
     /// disclosing its age).
     func report() {
-        guard Date().timeIntervalSince(lastPostAt) > 300 else { return }
+        guard Date().timeIntervalSince(lastPostAt) > minInterval else { return }
         switch manager.authorizationStatus {
         case .notDetermined:
             wantsFix = true
@@ -43,6 +46,33 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         default:
             break
         }
+    }
+
+    /// While a voice session is live, follow MOVEMENT: refresh the fix every
+    /// two minutes instead of the idle five (2026-08-14, wrist mid-travel:
+    /// "the location fetched from an hour ago and not in real time"). The loop
+    /// stops itself the moment `isLive` goes false, so every session-teardown
+    /// path is covered without each one having to remember to call stop.
+    func startLiveUpdates(while isLive: @escaping @MainActor () -> Bool) {
+        liveTask?.cancel()
+        minInterval = 110
+        report()
+        liveTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 120_000_000_000)
+                guard let self, isLive(), !Task.isCancelled else {
+                    self?.minInterval = 300
+                    return
+                }
+                self.report()
+            }
+        }
+    }
+
+    func stopLiveUpdates() {
+        liveTask?.cancel()
+        liveTask = nil
+        minInterval = 300
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

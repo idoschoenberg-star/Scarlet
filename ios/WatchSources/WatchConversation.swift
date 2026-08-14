@@ -269,6 +269,13 @@ final class WatchConversation {
         wantLive = true
         state = .connecting
         status = "Waking her up…"
+        // Real-time position from the WRIST (2026-08-14, mid-travel: "the
+        // location fetched from an hour ago and not in real time"). The watch
+        // is the device that's ON him — feed the same op=location store the
+        // phone uses, and keep following movement every ~2 min while live.
+        LocationReporter.shared.startLiveUpdates(while: { [weak self] in
+            self?.wantLive == true
+        })
         // EXPLICIT mic permission (2026-08-12, "green mic but she never
         // answers"): watchOS permission is separate from the iPhone's, and
         // nothing here ever requested it — without the grant the tap can
@@ -290,6 +297,7 @@ final class WatchConversation {
     func end() {
         endedByUser = true
         wantLive = false
+        LocationReporter.shared.stopLiveUpdates()
         reconnectTask?.cancel(); reconnectTask = nil
         replyWatchdog?.cancel(); replyWatchdog = nil
         livenessTask?.cancel(); livenessTask = nil

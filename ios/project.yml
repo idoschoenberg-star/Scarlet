@@ -131,6 +131,10 @@ targets:
       # Shared endpoints + Keychain token store — one source of truth with
       # the phone app (Foundation + Security only, watch-safe).
       - path: Sources/AppConfig.swift
+      # Same live-position reporter as the phone (CoreLocation is watch-safe):
+      # wrist-only sessions feed the SAME op=location store, so "here" answers
+      # track his movement instead of an hour-old phone fix.
+      - path: Sources/LocationReporter.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.idoschoenberg.scarlettalk.watchkitapp
@@ -158,6 +162,7 @@ targets:
         # Modes, separate from the audio mode above.
         WKBackgroundModes: [workout-processing]
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions from where you are right now."
         NSHealthShareUsageDescription: "Scarlet reads heart rate and calories to narrate your workout live."
         # The watch app WRITES: a voice-started workout is recorded here and
         # saved to Health so it counts toward the rings.
