@@ -148,6 +148,35 @@ final class WatchConversation {
     private var replyWatchdog: Task<Void, Never>?
     private let replyWatchdogSeconds: UInt64 = 25
     private var lastSpeechStoppedAt = Date.distantPast
+    /// When his current utterance began — the patience window scales on it.
+    private var lastSpeechStartedAt = Date.distantPast
+    /// THE PATIENCE WINDOW (2026-08-14; same fix as the phone): this build
+    /// mints with ?defer=1, so VAD detects and commits his turns but the
+    /// CLIENT creates the reply — 0.9s after short utterances, 2.2s after
+    /// long ones (dictation). A fresh speech_started cancels the pending
+    /// create, so a thinking pause lets him resume instead of being talked
+    /// over and truncated.
+    private var pendingResponseCreate: DispatchWorkItem?
+
+    /// Schedule the client-driven response.create behind the patience window.
+    private func schedulePatienceCreate() {
+        pendingResponseCreate?.cancel()
+        let utterance = lastSpeechStoppedAt.timeIntervalSince(lastSpeechStartedAt)
+        let patience: TimeInterval = utterance >= 6 ? 2.2 : 0.9
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingResponseCreate = nil
+            guard self.wantLive else { return }
+            if self.responseActive {
+                self.needsResponseAfterDone = true
+            } else {
+                self.send(["type": "response.create"])
+                self.armReplyWatchdog()
+            }
+        }
+        pendingResponseCreate = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + patience, execute: work)
+    }
     private var lastResponseCreatedAt = Date.distantPast
     private var livenessTask: Task<Void, Never>?
     /// One free retry for a failed/incomplete response: the spoken turn is
@@ -411,6 +440,10 @@ final class WatchConversation {
         // A NEW session has no language pin — forget the old one so the first
         // utterance re-pins (same reconnect-drift fix as the phone).
         pinnedLanguage = nil
+        // A patience-window timer from the OLD session must never fire a
+        // response.create into this fresh, empty one (she'd speak first).
+        pendingResponseCreate?.cancel()
+        pendingResponseCreate = nil
         // Stamp this attempt: any await below is a window where a NEWER
         // connect can start (wrist-raise, a watchdog) — the stale attempt
         // must abandon, never schedule a reconnect that kills the winner.
@@ -419,7 +452,11 @@ final class WatchConversation {
         connectInFlight = true
         defer { if connectEpoch == epoch { connectInFlight = false } }
         do {
-            var req = URLRequest(url: AppConfig.realtimeURL)
+            // ?defer=1 — this build drives response.create itself (the
+            // patience window; same as the phone), so the mint suppresses
+            // the VAD auto-response.
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1") ?? AppConfig.realtimeURL
+            var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             let (data, resp) = try await mintSession.data(for: req)
@@ -936,19 +973,27 @@ final class WatchConversation {
                 pinLanguage(from: text)
             }
         case "input_audio_buffer.speech_started":
+            lastSpeechStartedAt = Date()
+            // He resumed inside the patience window — cancel the pending
+            // reply; his continuation joins the same exchange untruncated.
+            pendingResponseCreate?.cancel()
+            pendingResponseCreate = nil
             state = .listening
             status = "Hearing you…"
         case "input_audio_buffer.speech_stopped":
             lastSpeechStoppedAt = Date()
-            // A reply is now DUE — arm the stall net. Speech that landed while
-            // a response was active is dropped by the server: defer a create
-            // to its done instead of watching for a reply that was never
-            // going to exist.
-            if responseActive { needsResponseAfterDone = true } else { armReplyWatchdog() }
+            // The reply is OURS to request (?defer=1 mint — no VAD
+            // auto-response). Schedule it behind the patience window; the
+            // stall net arms when the create is actually sent.
+            if responseActive { needsResponseAfterDone = true } else { schedulePatienceCreate() }
             status = "Thinking…"
         case "input_audio_buffer.committed":
             lastSpeechStoppedAt = Date()
-            if responseActive { needsResponseAfterDone = true } else { armReplyWatchdog() }
+            if responseActive {
+                needsResponseAfterDone = true
+            } else if pendingResponseCreate == nil {
+                schedulePatienceCreate()   // a commit must never go unanswered
+            }
             state = .thinking
             status = "Thinking…"
         case "response.function_call_arguments.done":

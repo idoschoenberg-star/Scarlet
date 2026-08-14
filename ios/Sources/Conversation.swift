@@ -108,8 +108,43 @@ final class Conversation: ObservableObject {
         }
         needsResponseAfterDone = true
     }
+
+    /// Schedule the client-driven response.create behind the patience window.
+    /// Long utterances (≥6s of speech before the pause — dictation) get 2.2s
+    /// of grace; short ones get 0.9s, close to semantic VAD's own pace. The
+    /// watchdog arms only when the create is actually sent, so the stall net
+    /// never counts the deliberate wait as a stall.
+    private func schedulePatienceCreate() {
+        pendingResponseCreate?.cancel()
+        let utterance = lastSpeechStoppedAt.timeIntervalSince(lastSpeechStartedAt)
+        let patience: TimeInterval = utterance >= 6 ? 2.2 : 0.9
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingResponseCreate = nil
+            guard self.wantLive else { return }
+            if self.responseActive {
+                self.deferResponse(.vadSpeech)   // a reply started meanwhile — create after its done
+            } else {
+                self.awaitingReplyText = ""
+                self.send(["type": "response.create"])
+                self.armReplyWatchdog()
+            }
+        }
+        pendingResponseCreate = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + patience, execute: work)
+    }
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// THE PATIENCE WINDOW (2026-08-14, Ido: "she loses patience and just
+    /// barges in" mid-dictation, and the truncated rest never registers).
+    /// This build mints with ?defer=1 — the server's VAD still detects and
+    /// commits his turns, but no longer auto-creates the reply. Instead,
+    /// speech_stopped schedules this work item: 0.9s after a short utterance,
+    /// 2.2s after a long one (dictation). If he RESUMES speaking inside the
+    /// window, speech_started cancels it and his continuation streams into
+    /// the same exchange — the mic never gated because she never spoke — and
+    /// the eventual reply covers everything he said. Nothing is truncated.
+    private var pendingResponseCreate: DispatchWorkItem?
     /// Server-VAD is mid-utterance: speech_started arrived, speech_stopped
     /// hasn't. If the echo gate closes the mic NOW (her audio starts playing),
     /// the server is left holding a chopped fragment with no end — semantic
@@ -1442,6 +1477,10 @@ final class Conversation: ObservableObject {
         // after every reconnect (audio-e2e runs 34–35; the production
         // language-mixing class of build 225).
         pinnedLanguage = nil
+        // A patience-window timer from the OLD session must never fire a
+        // response.create into this fresh, empty one (she'd speak first).
+        pendingResponseCreate?.cancel()
+        pendingResponseCreate = nil
         // Mic gate: without record permission the engine can never start, so
         // reconnecting would loop forever. Ask once; if denied, stop cleanly with
         // a message that points at Settings instead of spinning "Reconnecting…".
@@ -1485,12 +1524,15 @@ final class Conversation: ObservableObject {
                 // mint returns an ephemeral client secret for the GA socket.
                 // The Settings-chosen voice rides along (?voice=), Marin when
                 // unset — Ido's recorded pick.
-                var mintURL = AppConfig.realtimeURL
-                if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey),
-                   !v.isEmpty,
-                   let u = URL(string: AppConfig.realtimeURL.absoluteString + "?voice=" + v) {
-                    mintURL = u
+                // ?defer=1 — this build drives response.create itself (the
+                // patience window), so the mint suppresses the VAD
+                // auto-response. Older builds don't send it and keep the
+                // legacy auto-reply.
+                var mintString = AppConfig.realtimeURL.absoluteString + "?defer=1"
+                if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey), !v.isEmpty {
+                    mintString += "&voice=" + v
                 }
+                let mintURL = URL(string: mintString) ?? AppConfig.realtimeURL
                 var req = URLRequest(url: mintURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -2004,26 +2046,37 @@ final class Conversation: ObservableObject {
                 flushPlayback()
                 clientLog("barge-in", "speech_started during playback — cut her audio")
             }
+            // He resumed inside the patience window — cancel the pending
+            // reply; his continuation joins the same exchange untruncated.
+            if let pending = pendingResponseCreate {
+                pending.cancel()
+                pendingResponseCreate = nil
+                clientLog("patience", "he resumed — pending reply cancelled")
+            }
             if state == .listening, micOn { status = "Hearing you…" }
         case "input_audio_buffer.speech_stopped":
             serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
-            // A reply is now DUE — arm the stall net immediately (with an
-            // empty placeholder; the async transcript fills it in). Speech
-            // that landed while a response was active would otherwise be
-            // dropped by the server — defer a response.create to its done.
+            // The reply is now OURS to request (?defer=1 mint — no VAD
+            // auto-response). Schedule it behind the patience window; the
+            // watchdog arms when the create is actually sent.
             if responseActive {
                 deferResponse(.vadSpeech)
             } else {
-                awaitingReplyText = ""
-                armReplyWatchdog()
+                schedulePatienceCreate()
             }
             if state == .listening { status = "Thinking…" }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
-            if responseActive { deferResponse(.vadSpeech) }
+            if responseActive {
+                deferResponse(.vadSpeech)
+            } else if pendingResponseCreate == nil {
+                // Defensive: a commit with no scheduled create (some VAD
+                // paths skip speech_stopped) must still get answered.
+                schedulePatienceCreate()
+            }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
             let toolName = ev["name"] as? String ?? ""
