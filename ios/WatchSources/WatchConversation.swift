@@ -1008,8 +1008,17 @@ final class WatchConversation {
     private func performToolHTTP(name: String, params: [String: Any]) async -> String {
         // A bare "tool failed" made her claim the DATA didn't exist — the
         // inbox looked empty because the wrist link hiccuped. Patient session,
-        // one retry, and on real failure a result string that names the truth.
-        for attempt in 0...1 {
+        // retries, and on real failure a result string that names the truth.
+        for attempt in 0...2 {
+            if attempt > 0 {
+                // PAUSE before retrying (2026-08-14, the 8:24 "can't fetch
+                // the news" incident while traveling): back-to-back attempts
+                // both die inside the SAME radio handoff. 1.5s then 3s lets
+                // the wrist link finish its Wi-Fi↔cellular flip — worst case
+                // adds ~4.5s before an honest failure, and turns most
+                // one-off drops into an answer he never knew was retried.
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_500_000_000)
+            }
             do {
                 var req = URLRequest(url: AppConfig.toolURL(name))
                 req.httpMethod = "POST"
