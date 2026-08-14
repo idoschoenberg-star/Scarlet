@@ -126,7 +126,10 @@ struct NewsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: b.title.readingFrameAlignment)
                     }
-                    .environment(\.layoutDirection, b.title.layoutDir)
+                    // NO layoutDirection flip here: the reading* helpers
+                    // already return the visual edge for an LTR container;
+                    // flipping the environment as well re-inverts .trailing
+                    // and lands Hebrew back on the LEFT (Ido 2026-08-14).
                 }
                 .buttonStyle(.plain)
                 if b.id != breaking.last?.id { Divider() }
@@ -297,7 +300,6 @@ private struct HeroCard: View {
                         .foregroundStyle(.white.opacity(0.85))
                         .frame(maxWidth: .infinity, alignment: story.title.readingFrameAlignment)
                 }
-                .environment(\.layoutDirection, story.title.layoutDir)
                 .padding(14)
             }
             .clipShape(RoundedRectangle(cornerRadius: 18))
@@ -325,7 +327,6 @@ private struct StoryRow: View {
                         .font(.caption).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: story.title.readingFrameAlignment)
                 }
-                .environment(\.layoutDirection, story.title.layoutDir)
                 if story.image != nil || story.hasVideo {
                     ZStack(alignment: .center) {
                         NewsImage(url: story.image, height: 92)
