@@ -1,6 +1,11 @@
 import CoreLocation
 import Foundation
 
+extension Notification.Name {
+    /// Raw CLLocation fixes from the live stream (userInfo["location"]).
+    static let scarletLocationFix = Notification.Name("scarlet.locationFix")
+}
+
 /// Posts Ido's live position to the backend (app-api `op=location`) so every
 /// server-side answer about "here" — where-am-I, weather with no place named,
 /// distances, directions, nearby places — works from a fix that is minutes
@@ -114,6 +119,11 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         guard let loc = locations.last else { return }
         let lat = loc.coordinate.latitude
         let lng = loc.coordinate.longitude
+        // Every fix (unthrottled) also reaches local listeners — the
+        // navigation chain needs raw cadence to catch "arrived at the stop"
+        // promptly. The server post below stays throttled.
+        NotificationCenter.default.post(name: .scarletLocationFix, object: nil,
+                                        userInfo: ["location": loc])
         Task { @MainActor in
             // The continuous live stream fires every second on the road —
             // post only when it MEANS something: the interval elapsed, or he

@@ -1,10 +1,40 @@
 import Combine
 import SwiftUI
 import UIKit
+import UserNotifications
+
+/// Local-notification plumbing: the navigation chain's lock-screen fallback
+/// ("Continue to X") must open its Apple Maps link on tap, and chain
+/// notifications should present even while the app is foregrounded.
+final class NotificationOpener: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        UNUserNotificationCenter.current().delegate = self
+        return true
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        if let s = response.notification.request.content.userInfo["open_url"] as? String,
+           let url = URL(string: s),
+           url.host?.lowercased() == "maps.apple.com" || url.scheme?.lowercased() == "maps" {
+            UIApplication.shared.open(url)
+        }
+        completionHandler()
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+}
 
 @main
 struct ScarletTalkApp: App {
     @StateObject private var session = AppSession()
+    @UIApplicationDelegateAdaptor(NotificationOpener.self) private var notificationOpener
 
     init() {
         // Install the crash black-box before anything else can die, so the

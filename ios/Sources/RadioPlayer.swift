@@ -33,12 +33,17 @@ final class RadioPlayer: ObservableObject {
         playing = true
         installRemoteCommands()
         updateNowPlaying()
+        // Ground her: she learns the radio state silently, so "what's
+        // playing?" and pause/stop requests route correctly (fm_radio, not
+        // Spotify) for the rest of the session.
+        Conversation.shared.noteAmbient("[SYSTEM] Scarlet's own radio player just STARTED live station: \(name). Pause/stop requests for this go through fm_radio, not Spotify.")
     }
 
     func pause() {
         player?.pause()
         playing = false
         updateNowPlaying()
+        Conversation.shared.noteAmbient("[SYSTEM] The live radio (\(stationName)) is now PAUSED.")
     }
 
     func resume() {
@@ -47,14 +52,19 @@ final class RadioPlayer: ObservableObject {
         player?.play()
         playing = true
         updateNowPlaying()
+        Conversation.shared.noteAmbient("[SYSTEM] The live radio (\(stationName)) RESUMED playing.")
     }
 
     func stop() {
+        let name = stationName
         player?.pause()
         player = nil
         playing = false
         stationName = ""
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        if !name.isEmpty {
+            Conversation.shared.noteAmbient("[SYSTEM] The live radio (\(name)) STOPPED — nothing is playing from Scarlet's radio now.")
+        }
     }
 
     /// Scarlet's voice ducks the radio and the last drained buffer restores

@@ -1432,6 +1432,15 @@ final class Conversation: ObservableObject {
         sendContext(text ?? "[FOCUS] Nothing focused.")
     }
 
+    /// Silent ambient fact for the session — she LEARNS it, she doesn't
+    /// answer it. Used by the radio player so "what's playing?" is grounded
+    /// in what this phone is actually doing (CarPlay 2026-08-15: she didn't
+    /// know Spotify was open; her own radio must never have that hole).
+    func noteAmbient(_ text: String) {
+        guard state == .listening || state == .speaking else { return }
+        sendContext(text)
+    }
+
     /// Non-interrupting ambient context, engine-appropriate: ElevenLabs has a
     /// dedicated contextual_update event; OpenAI takes a system message item
     /// WITHOUT response.create, so it never counts as a user turn either.
@@ -2524,6 +2533,34 @@ final class Conversation: ObservableObject {
                     }
                 } else {
                     let label = ((obj["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }) ?? "your destination"
+                    // Route THROUGH a point: the server returns `legs`
+                    // [stop, destination]. NavigationChain opens leg 1 now,
+                    // watches his live position, and auto-continues to the
+                    // final leg on arrival (spoken cue + lock-screen
+                    // fallback). Single-destination results fall through to
+                    // the direct-open path below.
+                    if let rawLegs = obj["legs"] as? [[String: Any]], rawLegs.count > 1 {
+                        let legs: [NavigationChain.Leg] = rawLegs.compactMap { l in
+                            guard let n = l["name"] as? String,
+                                  let lat = l["lat"] as? Double,
+                                  let lng = l["lng"] as? Double,
+                                  let u = l["maps_url"] as? String,
+                                  let url = URL(string: u), Self.isAllowedMapsURL(url)
+                            else { return nil }
+                            return NavigationChain.Leg(name: n, lat: lat, lng: lng, mapsURL: u)
+                        }
+                        if legs.count > 1 {
+                            Task { @MainActor in
+                                transcript.append(Line(
+                                    text: "🧭 Navigating via \(legs[0].name) → \(label) — opening Apple Maps",
+                                    fromHer: true))
+                                status = "Navigating via \(legs[0].name)…"
+                                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                NavigationChain.shared.begin(legs: legs)
+                            }
+                            return
+                        }
+                    }
                     var dest: URL?
                     for key in ["maps_url", "url"] {
                         if let s = obj[key] as? String, let u = URL(string: s),
@@ -2546,6 +2583,9 @@ final class Conversation: ObservableObject {
                             transcript.append(Line(text: "🧭 Navigating to \(label) — opening Apple Maps", fromHer: true))
                             status = "Navigating to \(label)…"
                             UINotificationFeedbackGenerator().notificationOccurred(.success)
+                            // A direct destination supersedes any pending
+                            // via-chain from an earlier route.
+                            NavigationChain.shared.clear()
                             UIApplication.shared.open(url)
                         }
                     } else {
