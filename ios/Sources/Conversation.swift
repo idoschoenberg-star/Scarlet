@@ -2756,7 +2756,16 @@ final class Conversation: ObservableObject {
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: playFormat)
 
         input.removeTap(onBus: 0)   // never stack taps — a second install crashes
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
+        // format: nil — ALWAYS the bus's live format (2026-08-15, two real
+        // 04:51/06:38 background crashes: "Failed to create tap due to format
+        // mismatch". Passing a format we read moments earlier races the car/
+        // Bluetooth route change that lands between the read and the install,
+        // and the resulting NSException is uncatchable. With nil, iOS binds
+        // the tap to whatever the hardware is at install time — the mismatch
+        // class is gone by construction; the callback already reads the real
+        // layout from each buffer, and the drift check below rebuilds the
+        // graph if buffers arrive in a format the converter wasn't built for.
+        input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
 
             var outData: Data?
@@ -2764,6 +2773,16 @@ final class Conversation: ObservableObject {
             // One consistent snapshot for this callback — never read the live
             // properties field-by-field while main may be swapping the converter.
             let (snapConverter, snapChannel, gain) = self.audioStateSnapshot()
+
+            // Route flap after install: buffers now differ from the format
+            // the converter was built for. Converting would produce garbage —
+            // drop this buffer and rebuild the graph on fresh hardware truth.
+            if let conv = snapConverter,
+               conv.inputFormat.sampleRate != buffer.format.sampleRate
+                || conv.inputFormat.channelCount != buffer.format.channelCount {
+                Task { @MainActor in self.handleTapFormatDrift() }
+                return
+            }
 
             // Read the layout from the BUFFER ITSELF on every callback, never
             // from the format captured when the tap was installed. On a Mac the
@@ -2935,6 +2954,21 @@ final class Conversation: ObservableObject {
     /// "quit unexpectedly" crashes that fire continuously on the Mac next to
     /// Outlook, where audio devices churn constantly.
     @MainActor
+    /// The tap saw buffers in a format the converter wasn't built for (a
+    /// route flap landed after install). Rebuild once on fresh hardware
+    /// truth; throttled so a callback storm can't queue a rebuild stampede.
+    private var tapDriftRebuildQueued = false
+    func handleTapFormatDrift() {
+        guard !tapDriftRebuildQueued else { return }
+        tapDriftRebuildQueued = true
+        FlightRecorder.note(screen: "tap-format-drift")
+        rebuildAudioGraph()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            self?.tapDriftRebuildQueued = false
+        }
+    }
+
     private func rebuildAudioGraph() {
         // Never rebuild while another app owns the session (`interrupted`):
         // ensureAudio would read a dead input format and fight the other app

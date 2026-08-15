@@ -1343,7 +1343,11 @@ final class WatchConversation {
         input.removeTap(onBus: 0)
         let tapState = self.tapState
         let wire = wireRate   // captured by value — the tap never touches self's state
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
+        // format: nil — the bus's LIVE format, same fix as the phone
+        // (2026-08-15 background crashes: "Failed to create tap due to format
+        // mismatch" when a Bluetooth route flap lands between reading
+        // inFormat and installing the tap; the NSException is uncatchable).
+        input.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             // Audio thread: everything it reads comes from the lock-guarded
             // snapshot; the send hops to the main actor with plain Data.
             // RAW peak first — before gate and converter — so the beacon can
