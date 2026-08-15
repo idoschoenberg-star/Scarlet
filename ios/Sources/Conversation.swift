@@ -707,6 +707,9 @@ final class Conversation: ObservableObject {
         resumedSession = !transcript.isEmpty
         self.token = token
         wantLive = true
+        // Fresh conversation → fresh ledger id (reconnects inside the same
+        // call keep the id, so a drive stays one conversation in memory).
+        if transcript.isEmpty { TurnLogger.shared.sessionId = UUID().uuidString }
         state = .connecting
         status = "Waking her up…"   // don't leave the stale "Ended." line up during connect
         // A live call is the moment "here" questions happen — refresh the
@@ -908,6 +911,7 @@ final class Conversation: ObservableObject {
     func end() {
         endedByUser = true
         wantLive = false
+        TurnLogger.shared.flushNow()   // the call's last words reach the ledger
         LocationReporter.shared.stopLiveUpdates()
         cancelOpenAIRecoveryProbe()
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
@@ -1884,12 +1888,16 @@ final class Conversation: ObservableObject {
             noteSignsOfLife()
             if let x = ev["agent_response_event"] as? [String: Any],
                let t = (x["agent_response"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
+               !t.isEmpty {
+                transcript.append(.init(text: t, fromHer: true))
+                TurnLogger.shared.log(role: "assistant", text: t)
+            }
         case "user_transcript":
             if let x = ev["user_transcription_event"] as? [String: Any],
                let t = (x["user_transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
                 transcript.append(.init(text: t, fromHer: false))
+                TurnLogger.shared.log(role: "user", text: t)
                 // THE ≤2s ACK (Ido 2026-08-11): the instant the server heard
                 // him, he knows it — his words appear as a bubble, the status
                 // flips, and the phone taps. Never again "did she get that?".
@@ -2006,11 +2014,15 @@ final class Conversation: ObservableObject {
         case "response.output_audio_transcript.done", "response.audio_transcript.done":
             noteSignsOfLife()
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !t.isEmpty { transcript.append(.init(text: t, fromHer: true)) }
+               !t.isEmpty {
+                transcript.append(.init(text: t, fromHer: true))
+                TurnLogger.shared.log(role: "assistant", text: t)
+            }
         case "conversation.item.input_audio_transcription.completed":
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
                 transcript.append(.init(text: t, fromHer: false))
+                TurnLogger.shared.log(role: "user", text: t)
                 // Mirror his language mechanically: detect what he ACTUALLY
                 // spoke and pin the session to it the moment it changes.
                 pinLanguage(from: t)
