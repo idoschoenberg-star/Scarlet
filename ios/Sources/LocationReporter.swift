@@ -18,6 +18,8 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
 
     private let manager = CLLocationManager()
     private var lastPostAt = Date.distantPast
+    /// The last coordinate actually posted — movement gate for the live stream.
+    private var lastPostedPoint: CLLocation?
     /// A report() that arrived before permission was granted — fulfilled from
     /// the authorization callback so the first-ever grant still posts a fix.
     private var wantsFix = false
@@ -48,20 +50,33 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         }
     }
 
-    /// While a voice session is live, follow MOVEMENT: refresh the fix every
-    /// two minutes instead of the idle five (2026-08-14, wrist mid-travel:
-    /// "the location fetched from an hour ago and not in real time"). The loop
-    /// stops itself the moment `isLive` goes false, so every session-teardown
-    /// path is covered without each one having to remember to call stop.
+    /// While a voice session is live, follow MOVEMENT with a CONTINUOUS
+    /// location stream, not one-shot fixes. Root cause of the CarPlay bug
+    /// (Ido 2026-08-15: navigation estimated from a position an hour old):
+    /// on CarPlay the phone app is BACKGROUNDED, and a one-shot
+    /// requestLocation() under when-in-use permission silently delivers
+    /// nothing in background — so no fresh fix ever posted while driving.
+    /// startUpdatingLocation + allowsBackgroundLocationUpdates (the target
+    /// has the `location` background mode) keeps real fixes flowing for the
+    /// whole session; the delegate throttles posts. The loop stops itself the
+    /// moment `isLive` goes false, so every teardown path is covered.
     func startLiveUpdates(while isLive: @escaping @MainActor () -> Bool) {
         liveTask?.cancel()
         minInterval = 110
         report()
+        #if os(iOS)
+        if manager.authorizationStatus == .authorizedWhenInUse ||
+           manager.authorizationStatus == .authorizedAlways {
+            manager.allowsBackgroundLocationUpdates = true
+            manager.pausesLocationUpdatesAutomatically = true
+            manager.startUpdatingLocation()
+        }
+        #endif
         liveTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 120_000_000_000)
                 guard let self, isLive(), !Task.isCancelled else {
-                    self?.minInterval = 300
+                    self?.endLiveStream()
                     return
                 }
                 self.report()
@@ -72,7 +87,17 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
     func stopLiveUpdates() {
         liveTask?.cancel()
         liveTask = nil
+        endLiveStream()
+    }
+
+    /// Shared teardown for both stop paths: the continuous stream and the
+    /// background entitlement end WITH the session — no lingering blue arrow.
+    private func endLiveStream() {
         minInterval = 300
+        #if os(iOS)
+        manager.stopUpdatingLocation()
+        manager.allowsBackgroundLocationUpdates = false
+        #endif
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
@@ -90,7 +115,17 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         let lat = loc.coordinate.latitude
         let lng = loc.coordinate.longitude
         Task { @MainActor in
-            self.lastPostAt = Date()
+            // The continuous live stream fires every second on the road —
+            // post only when it MEANS something: the interval elapsed, or he
+            // moved ≥400m since the last posted point (a highway covers that
+            // in ~15s, so navigation math stays honest without spamming).
+            let now = Date()
+            let movedFar = self.lastPostedPoint.map {
+                loc.distance(from: $0) >= 400
+            } ?? true
+            guard now.timeIntervalSince(self.lastPostAt) > self.minInterval || movedFar else { return }
+            self.lastPostAt = now
+            self.lastPostedPoint = loc
             self.post(lat: lat, lng: lng)
         }
     }

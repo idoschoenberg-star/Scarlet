@@ -68,7 +68,12 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        UIBackgroundModes: [audio]
+        # `location` joined `audio` for the live-session location stream:
+        # allowsBackgroundLocationUpdates CRASHES without this mode, and the
+        # CarPlay bug (2026-08-15, navigation from an hour-old position) is
+        # only fixable with background delivery while driving. The stream runs
+        # ONLY during live voice sessions and stops with them.
+        UIBackgroundModes: [audio, location]
         # CarPlay scene (voice-based conversational category, iOS 26.4). Declares
         # ONLY the CarPlay role — leaving the window role undeclared lets SwiftUI's
         # WindowGroup keep managing the phone/iPad/Mac window. Ships DORMANT: with

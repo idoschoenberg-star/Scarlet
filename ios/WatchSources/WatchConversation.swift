@@ -975,9 +975,14 @@ final class WatchConversation {
         case "input_audio_buffer.speech_started":
             lastSpeechStartedAt = Date()
             // He resumed inside the patience window — cancel the pending
-            // reply; his continuation joins the same exchange untruncated.
-            pendingResponseCreate?.cancel()
-            pendingResponseCreate = nil
+            // reply; his continuation joins the same exchange. Arm the stall
+            // net on cancel (same CarPlay silent-death fix as the phone): a
+            // follow-up turn that never closes must reconnect, not go mute.
+            if pendingResponseCreate != nil {
+                pendingResponseCreate?.cancel()
+                pendingResponseCreate = nil
+                armReplyWatchdog()
+            }
             state = .listening
             status = "Hearing you…"
         case "input_audio_buffer.speech_stopped":

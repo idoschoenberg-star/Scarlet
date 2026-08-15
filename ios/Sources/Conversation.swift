@@ -2048,10 +2048,18 @@ final class Conversation: ObservableObject {
             }
             // He resumed inside the patience window — cancel the pending
             // reply; his continuation joins the same exchange untruncated.
+            // ARM THE STALL NET when cancelling (CarPlay 2026-08-15, "I was
+            // talking and there was no response"): if this follow-up turn
+            // never closes (wedged VAD, a noise blip that opens a turn with
+            // no end), NOTHING else would ever create a reply — the watchdog
+            // is what turns that infinite silence into the normal
+            // reconnect-and-recover ladder.
             if let pending = pendingResponseCreate {
                 pending.cancel()
                 pendingResponseCreate = nil
-                clientLog("patience", "he resumed — pending reply cancelled")
+                awaitingReplyText = ""
+                armReplyWatchdog()
+                clientLog("patience", "he resumed — pending reply cancelled, stall net armed")
             }
             if state == .listening, micOn { status = "Hearing you…" }
         case "input_audio_buffer.speech_stopped":
