@@ -480,6 +480,13 @@ enum FlightRecorder {
         d.synchronize() // we are about to die — force it to disk
     }
 
+    /// Server-visible breadcrumb for pipelines that fail silently on-device
+    /// (first user: the Health sync, which went dark for a day with zero
+    /// trace — 2026-08-15). Lands in agent_log as stage app_<kind>.
+    static func telemetry(kind: String, detail: [String: Any]) {
+        post(kind: kind, detail: detail)
+    }
+
     static func reportUncleanExitIfAny() {
         let d = UserDefaults.standard
         // A caught crash from the previous run — the richest signal there is.

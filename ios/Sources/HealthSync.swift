@@ -122,6 +122,27 @@ struct TodaySnapshot {
     var sleepMin: Int = 0
 }
 
+/// HealthKit query watchdog. A query whose callback never fires (a rare but
+/// real HealthKit failure mode) must cost `seconds`, not the whole sync:
+/// syncNow() awaits these queries with `syncing == true`, so one silent query
+/// would latch the flag and every future sync — launch, foreground, observer,
+/// call-start — would no-op forever with zero trace (the 2026-08-15 "no
+/// health row since yesterday" outage pattern). The abandoned query resumes
+/// its continuation harmlessly later if HealthKit ever answers.
+private func hkTimeout<T>(_ seconds: Double = 10, fallback: T,
+                          _ op: @escaping () async -> T) async -> T {
+    await withTaskGroup(of: T?.self) { group in
+        group.addTask { await op() }
+        group.addTask {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return nil
+        }
+        let first = await group.next() ?? nil
+        group.cancelAll()
+        return first ?? fallback
+    }
+}
+
 // MARK: - HealthSync
 
 @MainActor
@@ -164,6 +185,15 @@ final class HealthSync: ObservableObject {
         authorized = UserDefaults.standard.bool(forKey: Self.authorizedKey)
         // Local-first: paint from the cache before any query or network call.
         loadCache()
+    }
+
+    /// One server breadcrumb per skip-reason per process — enough to see
+    /// "the sync never ran and here's why" without flooding agent_log.
+    private static var notedReasons = Set<String>()
+    private static func noteOnce(_ reason: String) {
+        guard !notedReasons.contains(reason) else { return }
+        notedReasons.insert(reason)
+        FlightRecorder.telemetry(kind: "health_sync", detail: ["skip": reason])
     }
 
     var available: Bool { HKHealthStore.isHealthDataAvailable() }
@@ -266,12 +296,21 @@ final class HealthSync: ObservableObject {
     // MARK: sync
 
     func syncNow() async {
-        guard available, authorized, !syncing else { return }
+        // Breadcrumb every skip reason once per process (agent_log stage
+        // app_health_sync): the 2026-08-15 outage — no server row for a full
+        // day — was invisible precisely because every exit here is silent.
+        guard available, authorized, !syncing else {
+            if !authorized { Self.noteOnce("skip-unauthorized") }
+            return
+        }
         // HealthKit data is unreadable while the device is locked (a CarPlay
         // drive, a pocketed phone): every query would return zeros, and
         // pushing those would overwrite real server rows with zeros. Skip
         // the whole run — the observer/foreground paths re-sync on unlock.
-        guard UIApplication.shared.isProtectedDataAvailable else { return }
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            Self.noteOnce("skip-locked")
+            return
+        }
         startObserving()
         syncing = true
         errorText = ""
@@ -343,13 +382,24 @@ final class HealthSync: ObservableObject {
         applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: nil)
 
         // Push, so the server copy includes today...
+        var pushResult = "ok"
         do {
             try await Self.push(days: newDays.map(Self.wireDay),
                                 workouts: newWorkouts.map(Self.wireWorkout))
             lastSync = Date()
         } catch {
             errorText = "Synced locally — couldn't reach the server."
+            pushResult = String(describing: error).prefix(200).description
         }
+        // The one line that makes this pipeline debuggable from the server:
+        // what today looked like on-device and whether the push landed.
+        FlightRecorder.telemetry(kind: "health_sync", detail: [
+            "today_steps": newDays.last?.steps ?? -1,
+            "today_kcal": newDays.last?.activeKcal ?? -1,
+            "days": newDays.count,
+            "workouts": newWorkouts.count,
+            "push": pushResult,
+        ])
 
         // ...then the Withings join: read back the merged overview (server
         // day history + Withings body & sleep) and fold it in.
@@ -476,22 +526,25 @@ final class HealthSync: ObservableObject {
         let anchor = Calendar.current.startOfDay(for: start)
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end,
                                                     options: .strictStartDate)
-        return await withCheckedContinuation { cont in
-            let q = HKStatisticsCollectionQuery(quantityType: type,
-                                                quantitySamplePredicate: predicate,
-                                                options: options,
-                                                anchorDate: anchor,
-                                                intervalComponents: DateComponents(day: 1))
-            q.initialResultsHandler = { _, collection, _ in
-                var out: [Date: Double] = [:]
-                collection?.enumerateStatistics(from: anchor, to: end) { stat, _ in
-                    let qty = options.contains(.cumulativeSum)
-                        ? stat.sumQuantity() : stat.averageQuantity()
-                    if let qty { out[stat.startDate] = qty.doubleValue(for: unit) }
+        let store = self.store
+        return await hkTimeout(fallback: [:]) {
+            await withCheckedContinuation { cont in
+                let q = HKStatisticsCollectionQuery(quantityType: type,
+                                                    quantitySamplePredicate: predicate,
+                                                    options: options,
+                                                    anchorDate: anchor,
+                                                    intervalComponents: DateComponents(day: 1))
+                q.initialResultsHandler = { _, collection, _ in
+                    var out: [Date: Double] = [:]
+                    collection?.enumerateStatistics(from: anchor, to: end) { stat, _ in
+                        let qty = options.contains(.cumulativeSum)
+                            ? stat.sumQuantity() : stat.averageQuantity()
+                        if let qty { out[stat.startDate] = qty.doubleValue(for: unit) }
+                    }
+                    cont.resume(returning: out)
                 }
-                cont.resume(returning: out)
+                store.execute(q)
             }
-            self.store.execute(q)
         }
     }
 
@@ -500,12 +553,15 @@ final class HealthSync: ObservableObject {
         guard let type = HKObjectType.categoryType(forIdentifier: id) else { return [] }
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end, options: [])
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-        return await withCheckedContinuation { cont in
-            let q = HKSampleQuery(sampleType: type, predicate: predicate,
-                                  limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
-                cont.resume(returning: (samples as? [HKCategorySample]) ?? [])
+        let store = self.store
+        return await hkTimeout(fallback: []) {
+            await withCheckedContinuation { cont in
+                let q = HKSampleQuery(sampleType: type, predicate: predicate,
+                                      limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
+                    cont.resume(returning: (samples as? [HKCategorySample]) ?? [])
+                }
+                store.execute(q)
             }
-            self.store.execute(q)
         }
     }
 
@@ -579,14 +635,17 @@ final class HealthSync: ObservableObject {
         let predicate = HKQuery.predicateForSamples(withStart: start, end: end,
                                                     options: .strictStartDate)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: false)
-        return await withCheckedContinuation { cont in
-            let q = HKSampleQuery(sampleType: HKObjectType.workoutType(),
-                                  predicate: predicate,
-                                  limit: HKObjectQueryNoLimit,
-                                  sortDescriptors: [sort]) { _, samples, _ in
-                cont.resume(returning: (samples as? [HKWorkout]) ?? [])
+        let store = self.store
+        return await hkTimeout(fallback: []) {
+            await withCheckedContinuation { cont in
+                let q = HKSampleQuery(sampleType: HKObjectType.workoutType(),
+                                      predicate: predicate,
+                                      limit: HKObjectQueryNoLimit,
+                                      sortDescriptors: [sort]) { _, samples, _ in
+                    cont.resume(returning: (samples as? [HKWorkout]) ?? [])
+                }
+                store.execute(q)
             }
-            self.store.execute(q)
         }
     }
 
@@ -601,44 +660,54 @@ final class HealthSync: ObservableObject {
         }
         let predicate = HKQuery.predicateForSamples(withStart: workout.startDate,
                                                     end: workout.endDate, options: [])
-        return await withCheckedContinuation { cont in
-            let q = HKStatisticsQuery(quantityType: hrType,
-                                      quantitySamplePredicate: predicate,
-                                      options: .discreteAverage) { _, stats, _ in
-                cont.resume(returning: stats?.averageQuantity()?.doubleValue(for: bpm) ?? 0)
+        let store = self.store
+        return await hkTimeout(fallback: 0) {
+            await withCheckedContinuation { cont in
+                let q = HKStatisticsQuery(quantityType: hrType,
+                                          quantitySamplePredicate: predicate,
+                                          options: .discreteAverage) { _, stats, _ in
+                    cont.resume(returning: stats?.averageQuantity()?.doubleValue(for: bpm) ?? 0)
+                }
+                store.execute(q)
             }
-            self.store.execute(q)
         }
     }
 
     /// All CLLocations of a workout's (first) route, in order. Empty when the
     /// workout has no route or the route grant was withheld.
     private func routeLocations(for workout: HKWorkout) async -> [CLLocation] {
-        let routes: [HKWorkoutRoute] = await withCheckedContinuation { cont in
-            let predicate = HKQuery.predicateForObjects(from: workout)
-            let q = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(),
-                                  predicate: predicate,
-                                  limit: HKObjectQueryNoLimit,
-                                  sortDescriptors: nil) { _, samples, _ in
-                cont.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
+        let store = self.store
+        let routes: [HKWorkoutRoute] = await hkTimeout(fallback: []) {
+            await withCheckedContinuation { cont in
+                let predicate = HKQuery.predicateForObjects(from: workout)
+                let q = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(),
+                                      predicate: predicate,
+                                      limit: HKObjectQueryNoLimit,
+                                      sortDescriptors: nil) { _, samples, _ in
+                    cont.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
+                }
+                store.execute(q)
             }
-            self.store.execute(q)
         }
         guard let route = routes.first else { return [] }
-        return await withCheckedContinuation { cont in
-            var collected: [CLLocation] = []
-            var resumed = false
-            // The route streams in batches; `done` marks the last one. On
-            // error the query stops without a final `done` — resume exactly
-            // once either way.
-            let q = HKWorkoutRouteQuery(route: route) { _, batch, done, error in
-                if let batch { collected.append(contentsOf: batch) }
-                if (done || error != nil) && !resumed {
-                    resumed = true
-                    cont.resume(returning: collected)
+        // Routes stream in batches — give long walks more rope than the
+        // point queries, but still never let one wedge the whole sync.
+        return await hkTimeout(20, fallback: []) {
+            await withCheckedContinuation { cont in
+                var collected: [CLLocation] = []
+                var resumed = false
+                // The route streams in batches; `done` marks the last one. On
+                // error the query stops without a final `done` — resume exactly
+                // once either way.
+                let q = HKWorkoutRouteQuery(route: route) { _, batch, done, error in
+                    if let batch { collected.append(contentsOf: batch) }
+                    if (done || error != nil) && !resumed {
+                        resumed = true
+                        cont.resume(returning: collected)
+                    }
                 }
+                store.execute(q)
             }
-            self.store.execute(q)
         }
     }
 
