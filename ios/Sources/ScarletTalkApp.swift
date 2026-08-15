@@ -173,6 +173,13 @@ struct RootView: View {
             // Cold-launch "Talk to Scarlet": the intent may have fired before
             // the observer above was listening, so drain the pending flag once.
             if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
+            // Health sync must not depend on the Health TAB being opened —
+            // that left health_days stale for days and Scarlet answering
+            // "how many steps today" from an old row (CarPlay 2026-08-15).
+            // Register the HealthKit observers and push once at launch.
+            if HealthSync.shared.authorized {
+                Task { await HealthSync.shared.syncNow() }
+            }
         }
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
@@ -184,6 +191,11 @@ struct RootView: View {
                 // Fresh GPS fix to the backend so "here" answers (where am I,
                 // weather, directions) are minutes old, never a stale share.
                 LocationReporter.shared.report()
+                // Same for the body: every return to the foreground pushes
+                // today's HealthKit numbers so the server row stays current.
+                if HealthSync.shared.authorized {
+                    Task { await HealthSync.shared.syncNow() }
+                }
             }
             FlightRecorder.note(screen: "phase:\(phase)")
         }

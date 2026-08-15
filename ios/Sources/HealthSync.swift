@@ -1,6 +1,7 @@
 import Foundation
 import HealthKit
 import CoreLocation
+import UIKit
 
 /// Apple Health sync + the Withings join + the local-first cache.
 ///
@@ -266,6 +267,11 @@ final class HealthSync: ObservableObject {
 
     func syncNow() async {
         guard available, authorized, !syncing else { return }
+        // HealthKit data is unreadable while the device is locked (a CarPlay
+        // drive, a pocketed phone): every query would return zeros, and
+        // pushing those would overwrite real server rows with zeros. Skip
+        // the whole run — the observer/foreground paths re-sync on unlock.
+        guard UIApplication.shared.isProtectedDataAvailable else { return }
         startObserving()
         syncing = true
         errorText = ""

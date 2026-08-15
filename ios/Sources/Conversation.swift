@@ -717,6 +717,12 @@ final class Conversation: ObservableObject {
         LocationReporter.shared.startLiveUpdates(while: { [weak self] in
             self?.wantLive == true
         })
+        // Same logic for the body: a live call is when "how many steps today"
+        // happens, and the apple_health tool answers from the SERVER copy —
+        // push today's HealthKit numbers now so she isn't reading a row from
+        // the last time the Health tab was opened. No-ops while the phone is
+        // locked (HealthKit is sealed then) or when Health was never granted.
+        Task { await HealthSync.shared.syncNow() }
         Task { await connect() }
         observeInterruptions()
         // Live message ANNOUNCEMENTS are OFF (Ido 2026-08-12: "I don't need
