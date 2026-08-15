@@ -990,6 +990,9 @@ final class WatchConversation {
             }
         case "input_audio_buffer.speech_started":
             lastSpeechStartedAt = Date()
+            // Same turn-fresh location guarantee as the phone: he's
+            // speaking, a "navigate/where" ask may be seconds away.
+            LocationReporter.shared.reportNow()
             // He resumed inside the patience window — cancel the pending
             // reply; his continuation joins the same exchange. Arm the stall
             // net on cancel (same CarPlay silent-death fix as the phone): a

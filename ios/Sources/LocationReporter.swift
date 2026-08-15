@@ -69,14 +69,30 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         liveTask?.cancel()
         minInterval = 110
         report()
-        #if os(iOS)
         if manager.authorizationStatus == .authorizedWhenInUse ||
            manager.authorizationStatus == .authorizedAlways {
+            #if os(iOS)
             manager.allowsBackgroundLocationUpdates = true
-            manager.pausesLocationUpdatesAutomatically = true
+            // iOS pausing the stream when he goes stationary NEVER
+            // auto-resumes — arrive at a hotel, sit ten minutes, and the
+            // next "navigate to…" answers from the last mid-drive fix (the
+            // 2026-08-15 "she thought I was on Via Bernina" bug). Sessions
+            // are bounded, so an unpaused stream costs minutes of GPS, not
+            // days.
+            manager.pausesLocationUpdatesAutomatically = false
+            #endif
+            // Runs on the WATCH too — the wrist is the device that's ON him,
+            // and the old iOS-only guard left it with throttled one-shots.
             manager.startUpdatingLocation()
+            // "Always" lets a session that starts with the phone LOCKED
+            // (CarPlay, pocket) still begin the stream — under when-in-use,
+            // iOS silently refuses a background start and the whole drive
+            // runs on a stale fix. Asking when already granted is a no-op;
+            // iOS decides if/when to actually show the upgrade prompt.
+            if manager.authorizationStatus == .authorizedWhenInUse {
+                manager.requestAlwaysAuthorization()
+            }
         }
-        #endif
         liveTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 120_000_000_000)
@@ -99,10 +115,22 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
     /// background entitlement end WITH the session — no lingering blue arrow.
     private func endLiveStream() {
         minInterval = 300
-        #if os(iOS)
         manager.stopUpdatingLocation()
+        #if os(iOS)
         manager.allowsBackgroundLocationUpdates = false
         #endif
+    }
+
+    /// The strongest freshness guarantee we can make: called the moment Ido
+    /// STARTS SPEAKING in a live session, so by the time any tool reads his
+    /// position (seconds later) the fix is turn-fresh — never the drive-in
+    /// point from an hour ago. Gated to one shot per 30s; a no-op without
+    /// permission.
+    func reportNow() {
+        guard Date().timeIntervalSince(lastPostAt) > 30 else { return }
+        guard manager.authorizationStatus == .authorizedWhenInUse ||
+              manager.authorizationStatus == .authorizedAlways else { return }
+        manager.requestLocation()
     }
 
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {

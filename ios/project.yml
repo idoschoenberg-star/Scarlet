@@ -102,6 +102,10 @@ targets:
         # recognition can be re-added later with a valid, non-empty synonym.
         NSCameraUsageDescription: "So you can show Scarlet a document or a scene to analyze."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions where you are."
+        # "Always" lets a voice session that starts with the phone locked
+        # (CarPlay, pocket) still stream your position — without it, iOS
+        # refuses a background start and navigation answers go stale.
+        NSLocationAlwaysAndWhenInUseUsageDescription: "So Scarlet always knows where you are during live calls and drives — even when the phone is locked in the car — and never navigates from an old position."
         NSHealthShareUsageDescription: "Scarlet reads your health and fitness data to show it and answer your questions."
         # Required by App Store validation whenever HealthKit is linked. The
         # iPhone app itself still only reads — workouts started by voice are
@@ -168,6 +172,7 @@ targets:
         WKBackgroundModes: [workout-processing]
         NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
         NSLocationWhenInUseUsageDescription: "So Scarlet can answer weather, distances and directions from where you are right now."
+        NSLocationAlwaysAndWhenInUseUsageDescription: "So Scarlet always knows where you are during live calls, even mid-walk with the watch on your wrist."
         NSHealthShareUsageDescription: "Scarlet reads heart rate and calories to narrate your workout live."
         # The watch app WRITES: a voice-started workout is recorded here and
         # saved to Health so it counts toward the rings.

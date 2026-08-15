@@ -2055,6 +2055,11 @@ final class Conversation: ObservableObject {
         case "input_audio_buffer.speech_started":
             serverHearsSpeech = true
             lastSpeechStartedAt = Date()   // the gate-close branch keys on this age
+            // He's speaking → a question may be seconds away. Post a fresh
+            // fix NOW so any "navigate/where/weather" tool reads a position
+            // that is turn-fresh, never the drive-in point (Via Bernina,
+            // 2026-08-15). Gated to one shot per 30s inside.
+            LocationReporter.shared.reportNow()
             // Server-side truth that his voice is registering — instant cue.
             // On sealed-ear (full-duplex) routes this can fire WHILE she is
             // speaking: that is Ido interrupting her. The server no longer
