@@ -472,6 +472,10 @@ final class Conversation: ObservableObject {
     /// A rebuilt socket is a brand-new ElevenLabs conversation with amnesia —
     /// flag it so she's told this is a continuation, not a fresh caller.
     private var resumedSession = false
+    /// True only when IDO opened the session (start()) — drives the one-word
+    /// presence pulse after connect. Self-heal reconnects never set it, so
+    /// recoveries stay seamless.
+    private var wantPresencePulse = false
 
     /// User messages entered before the socket was live (session idle or still
     /// connecting). `send(_:)` is a no-op against a nil socket, so anything typed
@@ -707,6 +711,9 @@ final class Conversation: ObservableObject {
         resumedSession = !transcript.isEmpty
         self.token = token
         wantLive = true
+        // He fired up Talk himself → she shows a pulse the moment the line
+        // is live (Ido 2026-08-15: "she immediately says hi").
+        wantPresencePulse = true
         // Fresh conversation → fresh ledger id (reconnects inside the same
         // call keep the id, so a drive stays one conversation in memory).
         if transcript.isEmpty { TurnLogger.shared.sessionId = UUID().uuidString }
@@ -1650,6 +1657,14 @@ final class Conversation: ObservableObject {
                     .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
                     .joined(separator: "\n")
                 sendContext("[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent)
+            }
+            // PRESENCE PULSE (Ido 2026-08-15: "she immediately says hi,
+            // showing she has a pulse"): only when HE opened the session
+            // (start()), never on a self-heal reconnect — those stay
+            // seamless. One short word, continuity-aware, then she waits.
+            if wantPresencePulse {
+                wantPresencePulse = false
+                sendUserMessage("[SYSTEM] Ido just opened the voice session himself. Give the PRESENCE PULSE: one short word/phrase in his language showing you're here — thread-aware if this continues a recent conversation, a bare hi if fresh. Nothing more.")
             }
             // Car / eyes-free: now that we're connected, re-check the live route.
             // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
