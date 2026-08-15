@@ -279,17 +279,17 @@ final class Conversation: ObservableObject {
     /// rebuild IS the whole switch. One-way for the session
     /// (elFallbackActive); a fresh start() tries OpenAI first again.
     private func switchToElevenFallback(_ why: String) {
-        // PARACHUTE RETIRED (Ido 2026-08-15). During tonight's OpenAI burst
-        // this path minted the dormant ElevenLabs agent, whose brain is
-        // whatever was last pushed there — weeks stale — and Ido got a
-        // stranger's replies ("Hi there!", a word-game JSON) instead of
-        // Scarlet. His standing order is OpenAI-only; a wrong-brain answer
-        // destroys trust in a way an honest "voice unavailable" never does.
-        // The server mint 410s as the backstop; this is the front door.
-        clientLog("el-fallback-retired", why)
-        voiceUnavailableStop()
-        return
-        // ── retired path below (compiler-kept for a deliberate re-enable) ──
+        // PARACHUTE RE-ARMED (Ido 2026-08-15, same evening it was retired:
+        // "sessions with me never ever die... I don't care how many backups
+        // and redundancies you need"). What changed to make this safe again:
+        // the server mint now enforces FRESH-BRAIN-OR-REFUSE — every deploy
+        // pushes the current persona+tools into the ElevenLabs agent and
+        // records its hash; a mint whose recorded brain differs from the
+        // deployed persona is refused (409). So this parachute can only ever
+        // open into a session that IS Scarlet; if the standby's brain were
+        // stale, connect() fails the mint in one round-trip and stops
+        // honestly — the stranger of 2026-08-15 is impossible by
+        // construction.
         guard engine == .openai, !elFallbackActive else { return }
         clientLog("el-fallback", why)
         elFallbackActive = true
