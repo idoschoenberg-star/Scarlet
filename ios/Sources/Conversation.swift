@@ -1664,7 +1664,7 @@ final class Conversation: ObservableObject {
             // seamless. One short word, continuity-aware, then she waits.
             if wantPresencePulse {
                 wantPresencePulse = false
-                sendUserMessage("[SYSTEM] Ido just opened the voice session himself. Give the PRESENCE PULSE: one short word/phrase in his language showing you're here — thread-aware if this continues a recent conversation, a bare hi if fresh. Nothing more.")
+                sendUserMessage("[SYSTEM] Ido just opened the voice session himself. Give the PRESENCE PULSE: ONE short word/phrase in his language ('כן, עידו?' mid-thread, 'היי, עידו' fresh) and NOTHING else — never a recap of memory or the previous conversation; he lived it, and reciting it back is a bug.")
             }
             // Car / eyes-free: now that we're connected, re-check the live route.
             // forceAnnounce so a fresh OR rebuilt (amnesiac) socket is told about
