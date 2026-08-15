@@ -522,6 +522,10 @@ final class AppSession: ObservableObject {
     func setToken(_ token: String) {
         TokenStore.token = token
         unlocked = true
+        // A fresh sign-in reaches the paired Watch IMMEDIATELY — waiting for
+        // the next app-foreground left the wrist on "Sign in again" for the
+        // whole gap (2026-08-15).
+        PhoneWatchBridge.shared.pushToken()
     }
     func signOut() {
         TokenStore.token = nil

@@ -134,6 +134,11 @@ final class WatchConversation {
     private var wantLive = false
     private var endedByUser = false
     private var reconnectAttempts = 0
+    /// Consecutive auth failures from the mint. ONE 401 must never sign the
+    /// watch out (2026-08-15: "Sign in again" on the wrist from a transient
+    /// server-side validation blip) — a genuinely dead token fails twice in
+    /// a row; a blip doesn't.
+    private var authFailStreak = 0
     private var reconnectTask: Task<Void, Never>?
     private var handledToolCalls = Set<String>()
     private var responseActive = false
@@ -466,15 +471,26 @@ final class WatchConversation {
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
                   let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
                 if httpStatus == 401 || httpStatus == 403 {
-                    TokenStore.token = nil
-                    status = "Sign in again"
-                    state = .idle; wantLive = false
+                    authFailStreak += 1
+                    if authFailStreak >= 2 {
+                        // Two consecutive rejections = the token is really
+                        // dead (revoked/expired) — sign out for real.
+                        TokenStore.token = nil
+                        status = "Sign in again"
+                        state = .idle; wantLive = false
+                    } else {
+                        // First rejection: could be a transient validation
+                        // blip server-side. Keep the token, retry shortly.
+                        beacon("watch-auth-blip", "http=\(httpStatus) — retrying before sign-out")
+                        if wantLive { scheduleReconnect() }
+                    }
                     return
                 }
                 beacon("watch-mint-fail", "http=\(httpStatus) attempt=\(reconnectAttempts)")
                 if wantLive { scheduleReconnect() }
                 return
             }
+            authFailStreak = 0   // a successful mint clears the strike count
             guard wantLive else { return }
             do { try await ensureAudio() } catch {
                 beacon("watch-audio-fail", String(describing: error).prefix(120).description + " " + routeSummary())
