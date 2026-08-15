@@ -279,6 +279,17 @@ final class Conversation: ObservableObject {
     /// rebuild IS the whole switch. One-way for the session
     /// (elFallbackActive); a fresh start() tries OpenAI first again.
     private func switchToElevenFallback(_ why: String) {
+        // PARACHUTE RETIRED (Ido 2026-08-15). During tonight's OpenAI burst
+        // this path minted the dormant ElevenLabs agent, whose brain is
+        // whatever was last pushed there — weeks stale — and Ido got a
+        // stranger's replies ("Hi there!", a word-game JSON) instead of
+        // Scarlet. His standing order is OpenAI-only; a wrong-brain answer
+        // destroys trust in a way an honest "voice unavailable" never does.
+        // The server mint 410s as the backstop; this is the front door.
+        clientLog("el-fallback-retired", why)
+        voiceUnavailableStop()
+        return
+        // ── retired path below (compiler-kept for a deliberate re-enable) ──
         guard engine == .openai, !elFallbackActive else { return }
         clientLog("el-fallback", why)
         elFallbackActive = true
