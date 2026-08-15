@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CoreLocation
 
 /// Settings: pick Scarlet's voice, and tune the microphone input.
 struct VoiceOption: Identifiable {
@@ -125,6 +126,8 @@ struct SettingsView: View {
                 // channel pickers, and input gain — for capturing a close mic on
                 // a multichannel interface (e.g. the RME Babyface on the Mac).
                 MicrophoneSettingsSection()
+
+                LocationSettingsSection()
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -133,6 +136,56 @@ struct SettingsView: View {
                 }
             }
             .task { await m.load() }
+        }
+    }
+}
+
+/// Location access, as a Settings row (Ido 2026-08-15: "I never got to
+/// approve always access — screen never appeared. Make it a setting
+/// option?"). iOS shows its own While-Using→Always upgrade prompt only when
+/// IT decides to, which can be never — so the reliable path is this one-tap
+/// jump to the app's page in the Settings app, where the Always switch
+/// always exists.
+private struct LocationSettingsSection: View {
+    @State private var status: CLAuthorizationStatus = CLLocationManager().authorizationStatus
+
+    private var label: String {
+        switch status {
+        case .authorizedAlways: return "Always ✓"
+        case .authorizedWhenInUse: return "While Using — upgrade to Always"
+        case .denied, .restricted: return "Off"
+        default: return "Not set yet"
+        }
+    }
+
+    private var good: Bool { status == .authorizedAlways }
+
+    var body: some View {
+        Section {
+            HStack {
+                Text("Access").foregroundStyle(.secondary)
+                Spacer()
+                Text(label).fontWeight(.semibold)
+                    .foregroundStyle(good ? Color.green : Color.orange)
+            }
+            if !good {
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Label("Open iOS Settings → Location", systemImage: "location.fill")
+                }
+            }
+        } header: {
+            Text("Location")
+        } footer: {
+            Text("“Always” is what lets navigation and “where am I” answers work while the phone is locked in the car. On the page that opens, tap Location and choose Always.")
+        }
+        // Re-read on return from the Settings app so the row reflects reality.
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didBecomeActiveNotification)) { _ in
+            status = CLLocationManager().authorizationStatus
         }
     }
 }

@@ -2606,7 +2606,14 @@ final class Conversation: ObservableObject {
                             // A direct destination supersedes any pending
                             // via-chain from an earlier route.
                             NavigationChain.shared.clear()
-                            UIApplication.shared.open(url)
+                            // Telemetry either way (2026-08-15, "she did not
+                            // open maps as promised"): a refused open must be
+                            // visible server-side, not a mystery.
+                            UIApplication.shared.open(url, options: [:]) { opened in
+                                FlightRecorder.telemetry(kind: "nav_open", detail: [
+                                    "dest": label, "opened": opened,
+                                ])
+                            }
                         }
                     } else {
                         Task { @MainActor in

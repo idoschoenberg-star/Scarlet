@@ -143,8 +143,17 @@ final class NavigationChain: ObservableObject {
     private func openMaps(_ leg: Leg) {
         guard let url = URL(string: leg.mapsURL),
               url.host?.lowercased() == "maps.apple.com" || url.scheme?.lowercased() == "maps"
-        else { return }
-        UIApplication.shared.open(url)
+        else {
+            FlightRecorder.telemetry(kind: "nav_open", detail: [
+                "leg": leg.name, "opened": false, "why": "blocked-url",
+            ])
+            return
+        }
+        UIApplication.shared.open(url, options: [:]) { opened in
+            FlightRecorder.telemetry(kind: "nav_open", detail: [
+                "leg": leg.name, "opened": opened,
+            ])
+        }
     }
 
     private func persist() {
