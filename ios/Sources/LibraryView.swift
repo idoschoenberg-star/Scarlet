@@ -360,22 +360,37 @@ struct LibraryView: View {
                 case .file(let file):
                     // InboxView's attachment-viewer pattern: the document
                     // scroll swallows the swipe-down gesture, so a floating ✕
-                    // must always be visible and always work.
-                    ZStack(alignment: .topLeading) {
+                    // must always be visible and always work. A Share button
+                    // mirrors it on the trailing edge — a Library item must
+                    // never be a dead end (Ido 2026-08-14: "can not be
+                    // shared, please fix"): the file is already local, so the
+                    // native sheet sends the REAL document anywhere.
+                    ZStack(alignment: .top) {
                         QuickLookPreview(url: file.url)
                             .ignoresSafeArea()
-                        Button {
-                            activeSheet = nil
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 30, height: 30)
-                                .background(Circle().fill(Color.black.opacity(0.5)))
+                        HStack {
+                            Button {
+                                activeSheet = nil
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 30, height: 30)
+                                    .background(Circle().fill(Color.black.opacity(0.5)))
+                            }
+                            .accessibilityLabel("Close document")
+                            Spacer()
+                            ShareLink(item: file.url) {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 30, height: 30)
+                                    .background(Circle().fill(Color.black.opacity(0.5)))
+                            }
+                            .accessibilityLabel("Share document")
                         }
                         .padding(.top, 12)
-                        .padding(.leading, 12)
-                        .accessibilityLabel("Close document")
+                        .padding(.horizontal, 12)
                     }
                     .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
@@ -898,15 +913,24 @@ struct LibraryWebItem: Identifiable {
 }
 
 /// The in-app browser sheet: WKWebView inside a NavigationStack with a Done
-/// button and a Share link — html pages and external links stay in the app
+/// button and a Share button — html pages and external links stay in the app
 /// instead of bouncing out to Safari.
+///
+/// SHARE SHARES A DOCUMENT, NOT A LINK (Ido 2026-08-14, "one pager as a dead
+/// end — can not be shared"): the old ShareLink handed out the signed storage
+/// URL, which dies after 7 days — a report forwarded on WhatsApp would go
+/// dark. Share now renders the page to a real PDF on the spot and shares
+/// THAT; the link is only the fallback if the render fails.
 struct LibraryWebSheet: View {
     let item: LibraryWebItem
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var holder = WebViewHolder()
+    @State private var shareFile: ShareFileItem?
+    @State private var rendering = false
 
     var body: some View {
         NavigationStack {
-            LibraryWebView(url: item.url, forceHTML: item.forceHTML)
+            LibraryWebView(url: item.url, forceHTML: item.forceHTML, holder: holder)
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle(item.title)
                 .navigationBarTitleDisplayMode(.inline)
@@ -915,13 +939,69 @@ struct LibraryWebSheet: View {
                         Button("Done") { dismiss() }
                     }
                     ToolbarItem(placement: .topBarTrailing) {
-                        ShareLink(item: item.url) {
-                            Image(systemName: "square.and.arrow.up")
+                        Button {
+                            sharePDF()
+                        } label: {
+                            if rendering {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "square.and.arrow.up")
+                            }
                         }
+                        .disabled(rendering)
+                        .accessibilityLabel("Share as PDF")
                     }
+                }
+                // One extra sheet on THIS view is safe — the one-sheet-per-view
+                // Catalyst rule counts modifiers per view, and LibraryWebSheet
+                // had none of its own.
+                .sheet(item: $shareFile) { f in
+                    ActivityShareSheet(items: [f.url])
                 }
         }
     }
+
+    private func sharePDF() {
+        guard let web = holder.web else { return }
+        rendering = true
+        Task { @MainActor in
+            defer { rendering = false }
+            do {
+                let data = try await web.pdf(configuration: WKPDFConfiguration())
+                let safe = item.title.replacingOccurrences(of: "[/\\\\:]", with: "-", options: .regularExpression)
+                let name = (safe.isEmpty ? "Scarlet Report" : safe).prefix(60)
+                let tmp = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("\(name).pdf")
+                try data.write(to: tmp, options: .atomic)
+                shareFile = ShareFileItem(url: tmp)
+            } catch {
+                // Render failed (page still loading, huge page) — the link is
+                // better than a dead end, even if it expires.
+                shareFile = ShareFileItem(url: item.url)
+            }
+        }
+    }
+}
+
+/// Weak handle so the SwiftUI sheet can reach the live WKWebView for PDF export.
+final class WebViewHolder: ObservableObject {
+    weak var web: WKWebView?
+}
+
+struct ShareFileItem: Identifiable {
+    let url: URL
+    var id: String { url.absoluteString }
+}
+
+/// Native share sheet (UIActivityViewController) — AirDrop, WhatsApp, Mail,
+/// Save to Files, print. ShareLink can't take an item produced on tap, so the
+/// classic representable does it.
+struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
 
 /// Plain WKWebView wrapper for the web sheet. Loads the page once per URL;
@@ -930,6 +1010,9 @@ struct LibraryWebSheet: View {
 struct LibraryWebView: UIViewRepresentable {
     let url: URL
     var forceHTML: Bool = false
+    /// Optional handle back to the sheet so Share can render this exact web
+    /// view to PDF.
+    var holder: WebViewHolder? = nil
 
     final class Coordinator {
         var loadedURL: URL?
@@ -943,6 +1026,7 @@ struct LibraryWebView: UIViewRepresentable {
         web.backgroundColor = .white
         web.scrollView.backgroundColor = .white
         web.allowsBackForwardNavigationGestures = true
+        holder?.web = web
         return web
     }
 
