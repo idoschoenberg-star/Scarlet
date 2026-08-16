@@ -173,16 +173,20 @@ final class Conversation: ObservableObject {
     /// zeroes on every server input event.
     private var lastServerInputEventAt: Date?
     private var loudSpeechSeconds: Double = 0
-    /// Highest smoothed input level this session — the born-deaf birth check
-    /// (review finding #7) uses a real-speech peak to tell a soft-spoken user
-    /// from a noisy-but-silent car.
-    private var sessionPeakLevel: Double = 0
+    /// Accumulated seconds of quieter-but-real speech (level > 0.15) — the
+    /// born-deaf birth check (review finding #7). SUSTAINED soft speech, not a
+    /// monotonic peak: a transient spike (door slam, road-noise burst) adds one
+    /// negligible frame, so it can't tear down a healthy silent session (a
+    /// diff-review defect in the first cut). Zeroed by any server input event.
+    private var softSpeechSeconds: Double = 0
     /// One-shot per session: the loudness-independent born-deaf check has run.
     private var bornDeafChecked = false
-    /// session_mints id from this session's mint, echoed on the alive beacon.
+    /// session_mints id from this session's mint, echoed on the liveness beacons.
     private var currentMintId: String?
-    /// One-shot per session: the session-alive beacon has been sent.
-    private var aliveBeaconSent = false
+    /// One-shot per session: the "established" (first server event) beacon sent.
+    private var establishedBeaconSent = false
+    /// One-shot per session: the "heard" (first input event) beacon sent.
+    private var heardBeaconSent = false
     /// Timestamps of deaf-session convictions, pruned past 120s. ONE deaf
     /// session earns a fast same-vendor rebuild; a SECOND inside 90s means
     /// the FRESH session was born deaf too — a vendor-side burst, where a
@@ -848,21 +852,26 @@ final class Conversation: ObservableObject {
                 // a ledger that crossed right as he stopped talking.
                 self.convictDeafSessionIfNeeded()
                 // BORN-DEAF, loudness-independent (review finding #7): a soft-
-                // spoken user never crosses the 0.30 loud-speech bar, so the
-                // loud ledger can entirely miss a session that was deaf from
-                // birth. Once per session, in its first ~32s: if a REAL
-                // utterance happened (session peak ≥ 0.22, well above the 0.06
-                // silence floor and a level road noise rarely sustains) yet the
-                // server produced ZERO input events, the ear never opened —
-                // rebuild once. The real-speech-peak requirement is what keeps
-                // a noisy-but-silent car from tripping it.
+                // spoken user never crosses the 0.30 loud bar, so the loud
+                // ledger can entirely miss a session deaf from birth. Once per
+                // session, in its first ~32s: if ≥4s of SUSTAINED soft speech
+                // accumulated (a level a real quiet voice reaches but steady
+                // road noise does not) yet the server produced ZERO input
+                // events, the ear never opened — rebuild once. Requiring
+                // sustained speech (not a monotonic peak) is what keeps a noisy
+                // car from tripping it; rebuild-ONLY (never a direct engine
+                // switch) means a rare false positive costs one ~1s reconnect,
+                // not a wrong fallback. The conviction is still recorded, so a
+                // real vendor burst escalates through the loud path's ladder.
                 if !self.bornDeafChecked, self.engine == .openai, self.micOn, self.ws != nil,
-                   self.lastServerInputEventAt == nil, self.sessionPeakLevel >= 0.22,
+                   self.lastServerInputEventAt == nil, self.softSpeechSeconds >= 4.0,
                    Date().timeIntervalSince(self.connectedAt) > 12,
                    Date().timeIntervalSince(self.connectedAt) < 32 {
                     self.bornDeafChecked = true
                     self.clientLog("born-deaf",
-                                   "peak=\(String(format: "%.2f", self.sessionPeakLevel)) — real speech, zero server input; rebuilding")
+                                   "soft=\(String(format: "%.1f", self.softSpeechSeconds))s, zero server input; rebuilding")
+                    self.recentDeafConvictions.append(Date())
+                    self.recentDeafConvictions.removeAll { Date().timeIntervalSince($0) > 120 }
                     self.reconnectAttempts = 0
                     self.scheduleReconnect(reason: "born-deaf-soft-speech", immediate: true)
                 }
@@ -1403,18 +1412,22 @@ final class Conversation: ObservableObject {
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
         loudSpeechSeconds = 0
-        // ALIVE BEACON (Outcome #1; review finding #3): the server just proved
-        // it HEARD him — the session came alive. Tell the registry exactly
-        // once, so a mint whose ear never opened stays counted dead-on-arrival.
-        if !aliveBeaconSent, let mintId = currentMintId {
-            aliveBeaconSent = true
-            sendSessionAlive(mintId)
+        softSpeechSeconds = 0
+        // HEARD BEACON (Outcome #1; review finding #3): the server just proved
+        // it HEARD him — the ear opened. Stamp heard_at exactly once. A row
+        // with established_at set but heard_at null is a silent (healthy) or
+        // born-deaf session — distinct from an establishment failure.
+        if !heardBeaconSent, let mintId = currentMintId {
+            heardBeaconSent = true
+            sendSessionAlive(mintId, phase: "heard")
         }
     }
 
-    /// Fire-and-forget: tell the session registry this mint's ear opened, so
-    /// the never-alive rows are a measurable dead-on-arrival count.
-    private func sendSessionAlive(_ mintId: String) {
+    /// Fire-and-forget liveness beacon to the session registry.
+    /// phase "established" = first server event (session came up); phase
+    /// "heard" = first input event (ear opened). Two honest SLOs, so a
+    /// silent-but-healthy session is never miscounted as dead-on-arrival.
+    private func sendSessionAlive(_ mintId: String, phase: String) {
         guard let token = TokenStore.token,
               var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return }
         var items = comps.queryItems ?? []
@@ -1425,7 +1438,7 @@ final class Conversation: ObservableObject {
         req.httpMethod = "POST"
         req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["mint_id": mintId])
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["mint_id": mintId, "phase": phase])
         URLSession.shared.dataTask(with: req).resume()
     }
 
@@ -1622,8 +1635,12 @@ final class Conversation: ObservableObject {
                 if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey), !v.isEmpty {
                     mintString += "&voice=" + v
                 }
-                // Registry breadcrumbs (Outcome #1): the mint records these so
-                // DOA can be sliced by build. Best-effort, URL-safe.
+                // Registry breadcrumbs (Outcome #1): surface marks this as a
+                // BEACONING client — the server only inserts a registry row for
+                // known surfaces, so old builds and the (not-yet-instrumented)
+                // Watch never poison the DOA metric. build lets DOA be sliced
+                // by version. Both best-effort and URL-safe.
+                mintString += "&surface=phone"
                 if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
                     mintString += "&build=" + b
                 }
@@ -1696,11 +1713,12 @@ final class Conversation: ObservableObject {
             // never acknowledged must not convict the new one seconds in.
             lastServerInputEventAt = nil
             loudSpeechSeconds = 0
-            // Fresh session: reset the born-deaf birth check and the alive
-            // beacon (currentMintId was just set by THIS connect's mint).
-            sessionPeakLevel = 0
+            // Fresh session: reset the born-deaf birth check and both liveness
+            // beacons (currentMintId was just set by THIS connect's mint).
+            softSpeechSeconds = 0
             bornDeafChecked = false
-            aliveBeaconSent = false
+            establishedBeaconSent = false
+            heardBeaconSent = false
             // Parachute bookkeeping: a fresh OPENAI socket is proof the
             // tier-2 fallback is not riding this session — clear any stale
             // flag so a later REAL fallback isn't a no-op. While the EL
@@ -1946,22 +1964,28 @@ final class Conversation: ObservableObject {
         guard let d = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: d, encoding: .utf8) else { return }
         let type = (obj["type"] as? String) ?? ""
-        ws?.send(.string(s)) { [weak self] err in
+        let task = ws
+        task?.send(.string(s)) { [weak self] err in
             guard let err else { return }
             Task { @MainActor in
-                guard let self else { return }
+                // SOCKET-IDENTITY GUARD — the invariant every async socket
+                // callback in this file honors (listen(), pingNow()): a late
+                // failure from a socket that has ALREADY been replaced must
+                // never tear down its healthy successor (diff-review high
+                // finding). Act only if this is still the live socket.
+                guard let self, self.ws === task, self.wantLive else { return }
                 self.clientLog("send-failed", "type=\(type) err=\(err.localizedDescription)")
                 // A lost CONTROL frame strands the session (review finding #9):
                 // a response.create that never lands = she agreed then went
                 // silent; a tool output that never lands = the answer never
-                // comes — both with zero telemetry until now. The socket
-                // rejected a write, so it is dying: rebuild and let the requeue
-                // machinery recover the turn. Audio and session.update frames
-                // are self-correcting and never warrant a teardown.
+                // comes — both with zero telemetry until now. This IS the live
+                // socket and it rejected a write, so it is dying: rebuild and
+                // let the requeue machinery recover the turn. Audio and
+                // session.update frames are self-correcting — never a teardown.
                 let critical = type == "response.create"
                     || type == "conversation.item.create"
                     || type == "client_tool_result"
-                if critical, self.wantLive, self.ws != nil {
+                if critical {
                     self.scheduleReconnect(reason: "control-send-failed-\(type)")
                 }
             }
@@ -2068,6 +2092,15 @@ final class Conversation: ObservableObject {
     /// The backup engine's event stream (OpenAI Realtime GA). Beta-era event
     /// names are handled alongside GA ones so an API-side rename can't mute her.
     private func handleOpenAI(_ ev: [String: Any]) {
+        // ESTABLISHED BEACON (Outcome #1): ANY server event proves the session
+        // came UP (session.created is always first). Stamp established_at once —
+        // this is the "session-establish success" signal, separate from whether
+        // the ear later opened. A mint with no established beacon is a true
+        // establishment failure (network / vendor DOA).
+        if !establishedBeaconSent, let mintId = currentMintId {
+            establishedBeaconSent = true
+            sendSessionAlive(mintId, phase: "established")
+        }
         // Server-ear heartbeat: ANY input-side event (speech start/stop,
         // commit, transcription — even a failed one) is proof the server
         // hears the mic. Matched by prefix, not per-case, so a server-side
@@ -2997,7 +3030,6 @@ final class Conversation: ObservableObject {
                 let next = norm > prev ? norm : prev * 0.82 + norm * 0.18   // fast attack, slow release
                 self.levelSmoothed = next
                 self.inputLevel = next
-                if next > self.sessionPeakLevel { self.sessionPeakLevel = next }
                 MicSettings.shared.level = next
                 // Live "I hear you" cue: real speech energy while she listens
                 // flips the status instantly — sub-second visible proof his
@@ -3031,6 +3063,13 @@ final class Conversation: ObservableObject {
                 if norm > 0.30 {
                     self.loudSpeechSeconds += frameDur
                     self.convictDeafSessionIfNeeded()
+                }
+                // Quieter-but-real speech for the born-deaf birth check: a
+                // level a soft voice reaches but steady room/road noise (under
+                // ~0.15) does not. Accumulated, so a lone transient can't arm
+                // it; zeroed by any server input event.
+                if norm > 0.15 {
+                    self.softSpeechSeconds += frameDur
                 }
                 // Backpressure: never queue unbounded audio into a slow socket.
                 // 96 in-flight (~10s) rides out real network jitter — the old
