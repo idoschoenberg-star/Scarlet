@@ -173,6 +173,16 @@ final class Conversation: ObservableObject {
     /// zeroes on every server input event.
     private var lastServerInputEventAt: Date?
     private var loudSpeechSeconds: Double = 0
+    /// Highest smoothed input level this session — the born-deaf birth check
+    /// (review finding #7) uses a real-speech peak to tell a soft-spoken user
+    /// from a noisy-but-silent car.
+    private var sessionPeakLevel: Double = 0
+    /// One-shot per session: the loudness-independent born-deaf check has run.
+    private var bornDeafChecked = false
+    /// session_mints id from this session's mint, echoed on the alive beacon.
+    private var currentMintId: String?
+    /// One-shot per session: the session-alive beacon has been sent.
+    private var aliveBeaconSent = false
     /// Timestamps of deaf-session convictions, pruned past 120s. ONE deaf
     /// session earns a fast same-vendor rebuild; a SECOND inside 90s means
     /// the FRESH session was born deaf too — a vendor-side burst, where a
@@ -837,6 +847,25 @@ final class Conversation: ObservableObject {
                 // cutover budget is built on); this tick is only the net for
                 // a ledger that crossed right as he stopped talking.
                 self.convictDeafSessionIfNeeded()
+                // BORN-DEAF, loudness-independent (review finding #7): a soft-
+                // spoken user never crosses the 0.30 loud-speech bar, so the
+                // loud ledger can entirely miss a session that was deaf from
+                // birth. Once per session, in its first ~32s: if a REAL
+                // utterance happened (session peak ≥ 0.22, well above the 0.06
+                // silence floor and a level road noise rarely sustains) yet the
+                // server produced ZERO input events, the ear never opened —
+                // rebuild once. The real-speech-peak requirement is what keeps
+                // a noisy-but-silent car from tripping it.
+                if !self.bornDeafChecked, self.engine == .openai, self.micOn, self.ws != nil,
+                   self.lastServerInputEventAt == nil, self.sessionPeakLevel >= 0.22,
+                   Date().timeIntervalSince(self.connectedAt) > 12,
+                   Date().timeIntervalSince(self.connectedAt) < 32 {
+                    self.bornDeafChecked = true
+                    self.clientLog("born-deaf",
+                                   "peak=\(String(format: "%.2f", self.sessionPeakLevel)) — real speech, zero server input; rebuilding")
+                    self.reconnectAttempts = 0
+                    self.scheduleReconnect(reason: "born-deaf-soft-speech", immediate: true)
+                }
                 // Recovery off the ElevenLabs parachute lands here: the probe
                 // armed openAIRecovered, and this tick is the quiet-boundary
                 // check that performs the actual switch (no-op otherwise).
@@ -1374,6 +1403,30 @@ final class Conversation: ObservableObject {
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
         loudSpeechSeconds = 0
+        // ALIVE BEACON (Outcome #1; review finding #3): the server just proved
+        // it HEARD him — the session came alive. Tell the registry exactly
+        // once, so a mint whose ear never opened stays counted dead-on-arrival.
+        if !aliveBeaconSent, let mintId = currentMintId {
+            aliveBeaconSent = true
+            sendSessionAlive(mintId)
+        }
+    }
+
+    /// Fire-and-forget: tell the session registry this mint's ear opened, so
+    /// the never-alive rows are a measurable dead-on-arrival count.
+    private func sendSessionAlive(_ mintId: String) {
+        guard let token = TokenStore.token,
+              var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return }
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "session_alive"))
+        comps.queryItems = items
+        guard let url = comps.url else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["mint_id": mintId])
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     /// The deaf-session CONVICTION — tier 1 of the voice-failover ladder.
@@ -1569,6 +1622,11 @@ final class Conversation: ObservableObject {
                 if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey), !v.isEmpty {
                     mintString += "&voice=" + v
                 }
+                // Registry breadcrumbs (Outcome #1): the mint records these so
+                // DOA can be sliced by build. Best-effort, URL-safe.
+                if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
+                    mintString += "&build=" + b
+                }
                 let mintURL = URL(string: mintString) ?? AppConfig.realtimeURL
                 var req = URLRequest(url: mintURL)
                 req.httpMethod = "POST"
@@ -1576,6 +1634,10 @@ final class Conversation: ObservableObject {
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                // Registry id for the alive beacon — captured before the socket
+                // opens so the first server event can echo it. nil is fine
+                // (older server / mint hiccup): the beacon simply no-ops.
+                currentMintId = obj?["mint_id"] as? String
                 guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
                       let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
                     // A bad token is terminal; everything else (cold start,
@@ -1634,6 +1696,11 @@ final class Conversation: ObservableObject {
             // never acknowledged must not convict the new one seconds in.
             lastServerInputEventAt = nil
             loudSpeechSeconds = 0
+            // Fresh session: reset the born-deaf birth check and the alive
+            // beacon (currentMintId was just set by THIS connect's mint).
+            sessionPeakLevel = 0
+            bornDeafChecked = false
+            aliveBeaconSent = false
             // Parachute bookkeeping: a fresh OPENAI socket is proof the
             // tier-2 fallback is not riding this session — clear any stale
             // flag so a later REAL fallback isn't a no-op. While the EL
@@ -1785,12 +1852,19 @@ final class Conversation: ObservableObject {
             return
         }
         reconnecting = true
-        // A turn still waiting for its reply rides over to the rebuilt session:
-        // requeue it so connect() re-asks it — never silently dropped.
+        // A stale patience-window response.create from the DYING socket must
+        // never fire into the fresh session — it would force a reply to
+        // nothing, a source of unprompted/invented turns after a reconnect
+        // (review finding #10). connect() re-arms cleanly.
+        pendingResponseCreate?.cancel(); pendingResponseCreate = nil
+        // A turn still awaiting its reply rides over to the rebuilt session —
+        // but ONLY if it carries real text. The empty-string placeholder is
+        // the patience marker, not a user turn; requeuing it would re-ask an
+        // empty question and force an answer to nothing (review finding #8).
         if let text = awaitingReplyText {
             awaitingReplyText = nil
             replyWatchdog?.cancel(); replyWatchdog = nil
-            pendingOutbound.insert(text, at: 0)
+            if !text.isEmpty { pendingOutbound.insert(text, at: 0) }
         }
         // Only claim a "continuation" when a conversation actually happened —
         // a failed FIRST connect (empty transcript) must greet normally, not
@@ -1871,7 +1945,27 @@ final class Conversation: ObservableObject {
     private func send(_ obj: [String: Any]) {
         guard let d = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: d, encoding: .utf8) else { return }
-        ws?.send(.string(s)) { _ in }
+        let type = (obj["type"] as? String) ?? ""
+        ws?.send(.string(s)) { [weak self] err in
+            guard let err else { return }
+            Task { @MainActor in
+                guard let self else { return }
+                self.clientLog("send-failed", "type=\(type) err=\(err.localizedDescription)")
+                // A lost CONTROL frame strands the session (review finding #9):
+                // a response.create that never lands = she agreed then went
+                // silent; a tool output that never lands = the answer never
+                // comes — both with zero telemetry until now. The socket
+                // rejected a write, so it is dying: rebuild and let the requeue
+                // machinery recover the turn. Audio and session.update frames
+                // are self-correcting and never warrant a teardown.
+                let critical = type == "response.create"
+                    || type == "conversation.item.create"
+                    || type == "client_tool_result"
+                if critical, self.wantLive, self.ws != nil {
+                    self.scheduleReconnect(reason: "control-send-failed-\(type)")
+                }
+            }
+        }
     }
 
     /// Audio chunk send with in-flight accounting — the completion is the only
@@ -2903,6 +2997,7 @@ final class Conversation: ObservableObject {
                 let next = norm > prev ? norm : prev * 0.82 + norm * 0.18   // fast attack, slow release
                 self.levelSmoothed = next
                 self.inputLevel = next
+                if next > self.sessionPeakLevel { self.sessionPeakLevel = next }
                 MicSettings.shared.level = next
                 // Live "I hear you" cue: real speech energy while she listens
                 // flips the status instantly — sub-second visible proof his
