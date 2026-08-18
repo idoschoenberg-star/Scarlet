@@ -85,9 +85,14 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
     /// POST app-api?op=device_grant with the phone's token → a fresh device
     /// token for the watch. nil on any failure; the caller retries later.
     private static func mintGrant(phoneToken: String) async -> String? {
-        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)
-        comps?.queryItems = (comps?.queryItems ?? []) + [URLQueryItem(name: "op", value: "device_grant")]
-        guard let url = comps?.url else { return nil }
+        guard var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)
+        else { return nil }
+        // The appended list is built into a local FIRST: reading
+        // `comps.queryItems` inside the expression that assigns to it is an
+        // overlapping exclusive access, which Swift rejects outright.
+        let items = (comps.queryItems ?? []) + [URLQueryItem(name: "op", value: "device_grant")]
+        comps.queryItems = items
+        guard let url = comps.url else { return nil }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
