@@ -252,7 +252,11 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         #if os(watchOS)
         return "watch"
         #else
-        return UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone"
+        switch UIDevice.current.userInterfaceIdiom {
+        case .pad: return "ipad"
+        case .mac: return "mac"
+        default: return "iphone"
+        }
         #endif
     }
 
