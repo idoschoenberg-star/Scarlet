@@ -72,6 +72,28 @@ struct TalkView: View {
             Text(convo.status).font(.callout).foregroundStyle(.secondary)
                 .frame(minHeight: 22)
 
+            // The mic she actually ended up on. Only appears when it is NOT
+            // the one he picked — a session quietly running off a different
+            // microphone is exactly the kind of surprise this app doesn't ship.
+            if let note = convo.micFallbackNote {
+                Button { convo.micFallbackNote = nil } label: {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "mic.badge.xmark")
+                        Text(note)
+                            .font(.footnote)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        Image(systemName: "xmark").font(.caption2).foregroundStyle(.tertiary)
+                    }
+                    .foregroundStyle(.orange)
+                    .padding(10)
+                    .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 4)
+            }
+
             // Her reply lives here — always a real, readable, scrollable area
             // (never squeezed to nothing), and it takes any spare height so a
             // silent answer is easy to read.

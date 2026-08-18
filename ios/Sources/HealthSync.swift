@@ -40,6 +40,10 @@ struct HealthDay: Identifiable, Codable {
     var activeKcal: Int = 0
     var exerciseMin: Int = 0
     var standHours: Int = 0
+    /// Flights of stairs climbed (HealthKit `flightsClimbed`). The Watch shows
+    /// this on the same screen as steps; Scarlet had no elevation axis at all
+    /// until now (Ido, 2026-08-18: "מה הנתונים בגובה?").
+    var flightsClimbed: Int = 0
     var restingHR: Int = 0  // 0 = no reading that day
     var hrvMS: Int = 0
     var sleepMin: Int = 0
@@ -60,6 +64,11 @@ struct HealthWorkout: Identifiable, Codable {
     var distanceM: Int = 0
     var kcal: Int = 0
     var avgHR: Int = 0
+    /// Cumulative ascent in metres. Read from HealthKit's own
+    /// `elevationAscended` workout metadata when the device recorded it, and
+    /// otherwise INTEGRATED from the route's altitudes — a Watch walk in the
+    /// Alps has a real climb even when the metadata key is absent.
+    var elevationGainM: Int = 0
     /// Downsampled [lat, lng] pairs (≤500), empty when no route was recorded.
     var route: [[Double]] = []
 
@@ -118,6 +127,9 @@ struct TodaySnapshot {
     var steps: Int = 0
     var activeKcal: Int = 0
     var exerciseMin: Int = 0
+    /// Flights of stairs climbed today — the elevation axis Scarlet used to
+    /// have no answer for at all.
+    var flightsClimbed: Int = 0
     /// Last night's total (the night attributed to today's wake date).
     var sleepMin: Int = 0
 }
@@ -178,6 +190,9 @@ final class HealthSync: ObservableObject {
     private var observerQueries: [HKObserverQuery] = []
     private var observing = false
     private var lastObserverSync = Date.distantPast
+    /// Guards + throttles the fast today-only path (`syncToday`).
+    private var todaySyncing = false
+    private var lastTodaySync = Date.distantPast
     private var observerSyncScheduled = false
     private static let observerDebounce: TimeInterval = 60
 
@@ -206,7 +221,7 @@ final class HealthSync: ObservableObject {
         let quantities: [HKQuantityTypeIdentifier] = [
             .stepCount, .distanceWalkingRunning, .activeEnergyBurned,
             .appleExerciseTime, .restingHeartRate,
-            .heartRateVariabilitySDNN, .heartRate,
+            .heartRateVariabilitySDNN, .heartRate, .flightsClimbed,
         ]
         for id in quantities {
             if let t = HKObjectType.quantityType(forIdentifier: id) { read.insert(t) }
@@ -251,7 +266,7 @@ final class HealthSync: ObservableObject {
         guard available, authorized, !observing else { return }
         observing = true
         var types: [HKSampleType] = []
-        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned] {
+        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned, .flightsClimbed] {
             if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
         }
         if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(t) }
@@ -330,6 +345,8 @@ final class HealthSync: ObservableObject {
                                     options: .cumulativeSum, from: windowStart, to: now)
         let exercise = await dailyStats(.appleExerciseTime, unit: .minute(),
                                         options: .cumulativeSum, from: windowStart, to: now)
+        let flights = await dailyStats(.flightsClimbed, unit: .count(),
+                                       options: .cumulativeSum, from: windowStart, to: now)
         let restingHR = await dailyStats(.restingHeartRate,
                                          unit: HKUnit.count().unitDivided(by: .minute()),
                                          options: .discreteAverage, from: windowStart, to: now)
@@ -348,6 +365,7 @@ final class HealthSync: ObservableObject {
             d.activeKcal = Int(kcal[dayStart] ?? 0)
             d.exerciseMin = Int(exercise[dayStart] ?? 0)
             d.standHours = stand[dayStart] ?? 0
+            d.flightsClimbed = Int(flights[dayStart] ?? 0)
             d.restingHR = Int((restingHR[dayStart] ?? 0).rounded())
             d.hrvMS = Int((hrv[dayStart] ?? 0).rounded())
             if let n = nights[dayStart] {
@@ -374,6 +392,7 @@ final class HealthSync: ObservableObject {
             out.avgHR = Int(await averageHR(for: w).rounded())
             let locations = await routeLocations(for: w)
             out.route = Self.downsample(locations, to: 500)
+            out.elevationGainM = Self.elevationGain(for: w, route: locations)
             newWorkouts.append(out)
         }
 
@@ -406,6 +425,60 @@ final class HealthSync: ObservableObject {
         if let overview = try? await Self.fetchOverview(windowDays: 30) {
             applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: overview)
         }
+    }
+
+    /// TODAY, FAST (task #120). `syncNow()` reads a 14-day window across ~8
+    /// statistics collections plus every workout and its route — seconds of
+    /// work. That is fine for the Health tab, and far too slow for the moment
+    /// that actually matters: he starts a call and asks "how many steps today"
+    /// within a couple of seconds, and the answer comes from the SERVER row.
+    /// Before this, that row was whatever the last full sync left behind — the
+    /// 2026-08-18 evidence, Watch 17,985 against a spoken "18,238".
+    ///
+    /// So: five cheap single-day sums, one one-row push, no routes, no
+    /// workouts, no read-back. Runs alongside the full sync (the upsert is
+    /// keyed by date and idempotent) and throttles to one per 20 s so a burst
+    /// of foreground/call-start events costs one round trip.
+    func syncToday() async {
+        guard available, authorized, !todaySyncing else { return }
+        guard UIApplication.shared.isProtectedDataAvailable else {
+            Self.noteOnce("skip-locked-today")
+            return
+        }
+        guard Date().timeIntervalSince(lastTodaySync) > 20 else { return }
+        todaySyncing = true
+        lastTodaySync = Date()
+        defer { todaySyncing = false }
+
+        let cal = Calendar.current
+        let now = Date()
+        let todayStart = cal.startOfDay(for: now)
+
+        async let stepsQ = dailyStats(.stepCount, unit: .count(),
+                                      options: .cumulativeSum, from: todayStart, to: now)
+        async let distQ = dailyStats(.distanceWalkingRunning, unit: .meter(),
+                                     options: .cumulativeSum, from: todayStart, to: now)
+        async let kcalQ = dailyStats(.activeEnergyBurned, unit: .kilocalorie(),
+                                     options: .cumulativeSum, from: todayStart, to: now)
+        async let exQ = dailyStats(.appleExerciseTime, unit: .minute(),
+                                   options: .cumulativeSum, from: todayStart, to: now)
+        async let flightsQ = dailyStats(.flightsClimbed, unit: .count(),
+                                        options: .cumulativeSum, from: todayStart, to: now)
+        let (steps, dist, kcal, ex, flights) = await (stepsQ, distQ, kcalQ, exQ, flightsQ)
+
+        var d = HealthDay(date: todayStart, dateKey: Self.dayKey.string(from: todayStart))
+        // Carry forward everything this fast path does not read (sleep, stand,
+        // resting HR, HRV) from what the model already holds for today, so the
+        // push never blanks a field it simply didn't look at.
+        if let existing = days.first(where: { $0.dateKey == d.dateKey }) { d = existing }
+        d.steps = Int(steps[todayStart] ?? 0)
+        d.distanceM = Int(dist[todayStart] ?? 0)
+        d.activeKcal = Int(kcal[todayStart] ?? 0)
+        d.exerciseMin = Int(ex[todayStart] ?? 0)
+        d.flightsClimbed = Int(flights[todayStart] ?? 0)
+
+        applyMerged(localDays: [d], localWorkouts: [], overview: nil)
+        try? await Self.push(days: [Self.wireDay(d)], workouts: [])
     }
 
     /// Merge policy: existing model days ∪ server days ∪ local days, with
@@ -449,6 +522,7 @@ final class HealthSync: ObservableObject {
         todaySnapshot = TodaySnapshot(steps: today?.steps ?? 0,
                                       activeKcal: today?.activeKcal ?? 0,
                                       exerciseMin: today?.exerciseMin ?? 0,
+                                      flightsClimbed: today?.flightsClimbed ?? 0,
                                       sleepMin: today?.sleepMin ?? 0)
     }
 
@@ -757,6 +831,43 @@ final class HealthSync: ObservableObject {
         }
     }
 
+    /// Cumulative ascent for one workout, in metres.
+    ///
+    /// Two sources, in order of trust:
+    /// 1. `HKMetadataKeyElevationAscended` — what the Watch itself recorded
+    ///    with its barometric altimeter. Authoritative when present.
+    /// 2. The route's altitudes, integrated: sum every positive step between
+    ///    consecutive fixes. GPS altitude is noisy, so steps under a 1.5 m
+    ///    threshold are treated as jitter and dropped — without that floor a
+    ///    flat walk "climbs" hundreds of metres of noise.
+    ///
+    /// Zero means "no ascent data", never "flat" — the server and the tool
+    /// stay honest about the difference by omitting the field rather than
+    /// claiming a zero climb.
+    static func elevationGain(for workout: HKWorkout, route: [CLLocation]) -> Int {
+        if let q = workout.metadata?[HKMetadataKeyElevationAscended] as? HKQuantity {
+            let m = q.doubleValue(for: .meter())
+            if m > 0 { return Int(m.rounded()) }
+        }
+        guard route.count > 1 else { return 0 }
+        var gain = 0.0
+        var reference: Double?
+        for loc in route {
+            // verticalAccuracy < 0 means the altitude is not valid at all.
+            guard loc.verticalAccuracy >= 0 else { continue }
+            let alt = loc.altitude
+            guard let prev = reference else { reference = alt; continue }
+            let delta = alt - prev
+            if delta >= 1.5 {
+                gain += delta
+                reference = alt
+            } else if delta <= -1.5 {
+                reference = alt   // descending: move the reference down, add nothing
+            }
+        }
+        return Int(gain.rounded())
+    }
+
     /// ≤ maxCount evenly-strided [lat, lng] pairs, endpoints preserved,
     /// rounded to 5 decimals (~1 m) to keep the payload small.
     static func downsample(_ locations: [CLLocation], to maxCount: Int) -> [[Double]] {
@@ -783,6 +894,7 @@ final class HealthSync: ObservableObject {
             "active_kcal": d.activeKcal,
             "exercise_min": d.exerciseMin,
             "stand_hours": d.standHours,
+            "flights_climbed": d.flightsClimbed,
             "resting_hr": d.restingHR,
             "hrv_ms": d.hrvMS,
             "sleep_min": d.sleepMin,
@@ -793,7 +905,7 @@ final class HealthSync: ObservableObject {
     }
 
     static func wireWorkout(_ w: HealthWorkout) -> [String: Any] {
-        [
+        var out: [String: Any] = [
             "start": iso.string(from: w.start),
             "end": iso.string(from: w.end),
             "kind": w.kind,
@@ -802,6 +914,15 @@ final class HealthSync: ObservableObject {
             "avg_hr": w.avgHR,
             "route": w.route,
         ]
+        // OMITTED when zero, deliberately: the server stores a missing key as
+        // NULL, and "no altitude was recorded" is a different claim from "this
+        // route was flat". Sending 0 would let Scarlet answer "you climbed
+        // nothing" about a walk whose device simply had no altimeter fix —
+        // exactly the class of confident-but-wrong answer this batch is
+        // fixing. Flights climbed is NOT treated this way: a genuine zero-step
+        // day really did climb zero flights.
+        if w.elevationGainM > 0 { out["elevation_gain_m"] = w.elevationGainM }
+        return out
     }
 
     // MARK: network (op rides the query string, x-scarlet-token — app convention)
@@ -866,6 +987,7 @@ final class HealthSync: ObservableObject {
             d.activeKcal = intVal(row["active_kcal"])
             d.exerciseMin = intVal(row["exercise_min"])
             d.standHours = intVal(row["stand_hours"])
+            d.flightsClimbed = intVal(row["flights_climbed"])
             d.restingHR = intVal(row["resting_hr"])
             d.hrvMS = intVal(row["hrv_ms"])
             d.sleepMin = intVal(row["sleep_min"])
@@ -885,6 +1007,7 @@ final class HealthSync: ObservableObject {
             w.distanceM = intVal(row["distance_m"])
             w.kcal = intVal(row["kcal"])
             w.avgHR = intVal(row["avg_hr"])
+            w.elevationGainM = intVal(row["elevation_gain_m"])
             if let raw = row["route"] as? [[Any]] {
                 w.route = raw.compactMap { pair in
                     let nums = pair.compactMap { ($0 as? NSNumber)?.doubleValue }

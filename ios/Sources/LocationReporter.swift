@@ -1,5 +1,8 @@
 import CoreLocation
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 extension Notification.Name {
     /// Raw CLLocation fixes from the live stream (userInfo["location"]).
@@ -32,10 +35,30 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
     /// The floor report() is currently honoring — live sessions lower it.
     private var minInterval: TimeInterval = 300
 
+    // MARK: the trail (the journal's "where" axis)
+
+    /// A SECOND manager, dedicated to significant-change monitoring. It must
+    /// be separate from `manager`: one CLLocationManager delivers every fix
+    /// through one delegate with no way to tell which service produced it, so
+    /// sharing it would make the trail indistinguishable from the live
+    /// session stream — and stopping one service would silently reconfigure
+    /// the other. Two managers, two delegates, two independent lifetimes.
+    private let trailManager = CLLocationManager()
+    private lazy var trailDelegate = TrailDelegate(owner: self)
+    private var trailRunning = false
+    /// The last point handed to op=loc_ping, so a phone that wakes us with a
+    /// near-identical fix doesn't spend a request the server would only thin.
+    private var lastTrailPoint: CLLocation?
+    private var lastTrailAt = Date.distantPast
+
     private override init() {
         super.init()
         manager.delegate = self
         manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        // Significant-change monitoring needs NO background-updates flag and
+        // shows no location indicator: iOS relaunches the app to deliver a
+        // fix, wakes us for the length of one post, and lets us go again.
+        trailManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
     }
 
     /// Ask for one fresh fix and post it. Safe to call often; no-ops within
@@ -133,6 +156,106 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         manager.requestLocation()
     }
 
+    // MARK: - The trail (task #112 — the journal's "where" axis)
+
+    /// Start (or re-start) significant-change monitoring. This is the trail:
+    /// iOS wakes the app — even after termination — whenever Ido has moved
+    /// meaningfully (cell/Wi-Fi derived, typically ~500 m, no GPS duty cycle),
+    /// and each wake posts one point to `op=loc_ping`. The server thins
+    /// anything within ~150 m of the previous point inside 10 minutes, so a
+    /// stationary phone costs nothing and a day of movement reconstructs as a
+    /// real route.
+    ///
+    /// Requires ALWAYS authorization — under when-in-use iOS accepts the call
+    /// and then delivers nothing once the app leaves the foreground, which is
+    /// exactly the silent-failure shape we refuse to ship. When the grant is
+    /// only when-in-use we ask for the upgrade and leave the Settings row (the
+    /// established one-tap path) as the reliable way in.
+    func startTrail() {
+        #if os(iOS)
+        guard CLLocationManager.significantLocationChangeMonitoringAvailable() else { return }
+        switch trailManager.authorizationStatus {
+        case .authorizedAlways:
+            guard !trailRunning else { return }
+            trailRunning = true
+            trailManager.delegate = trailDelegate
+            trailManager.startMonitoringSignificantLocationChanges()
+        case .authorizedWhenInUse:
+            // iOS shows the While-Using → Always upgrade prompt on its own
+            // schedule (sometimes never); Settings › Location is the sure path
+            // and LocationSettingsSection puts it one tap away.
+            trailManager.delegate = trailDelegate
+            trailManager.requestAlwaysAuthorization()
+        case .notDetermined:
+            trailManager.delegate = trailDelegate
+            trailManager.requestWhenInUseAuthorization()
+        default:
+            break
+        }
+        #endif
+    }
+
+    /// True when the trail is actually recording — what the Settings row reads.
+    var trailActive: Bool { trailRunning }
+
+    /// Post one point to the trail. Called from the significant-change wake and
+    /// (already-throttled) from the live-session stream, so a drive or a walk
+    /// lands with real resolution instead of two endpoints. Locally gated at
+    /// 60 s / 120 m purely to avoid spending a request on something the server
+    /// would thin anyway; the server remains the authority on what is stored.
+    fileprivate func pingTrail(_ loc: CLLocation) {
+        let now = Date()
+        if let prev = lastTrailPoint,
+           now.timeIntervalSince(lastTrailAt) < 60,
+           loc.distance(from: prev) < 120 { return }
+        lastTrailPoint = loc
+        lastTrailAt = now
+        postTrail(loc)
+    }
+
+    private func postTrail(_ loc: CLLocation) {
+        guard let token = TokenStore.token, !token.isEmpty else { return }
+        var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
+        comps.queryItems = (comps.queryItems ?? []) + [URLQueryItem(name: "op", value: "loc_ping")]
+        guard let u = comps.url else { return }
+        var req = URLRequest(url: u)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+        var body: [String: Any] = [
+            "lat": loc.coordinate.latitude,
+            "lng": loc.coordinate.longitude,
+            "at": Self.iso.string(from: loc.timestamp),
+            "source": Self.trailSource,
+        ]
+        // The wire key the server reads is `accuracy`; `accuracy_m` is sent
+        // alongside it because that is the name the spec uses and a future
+        // server revision may prefer it. Negative means "no estimate" in
+        // CoreLocation — send nothing rather than a lie.
+        if loc.horizontalAccuracy >= 0 {
+            body["accuracy"] = loc.horizontalAccuracy
+            body["accuracy_m"] = loc.horizontalAccuracy
+        }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req).resume()
+    }
+
+    private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// Which device laid the point down — the correlator distinguishes a
+    /// phone left on a desk from the watch that was actually on his wrist.
+    private static var trailSource: String {
+        #if os(watchOS)
+        return "watch"
+        #else
+        return UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone"
+        #endif
+    }
+
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         let status = manager.authorizationStatus
         Task { @MainActor in
@@ -165,6 +288,11 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
             self.lastPostAt = now
             self.lastPostedPoint = loc
             self.post(lat: lat, lng: lng)
+            // The same fix also lays a trail point: a live call is when he is
+            // usually MOVING, and significant-change wakes alone would render
+            // a drive as two dots. Both gates (this one and the server's) keep
+            // it honest.
+            self.pingTrail(loc)
         }
     }
 
@@ -183,5 +311,34 @@ final class LocationReporter: NSObject, CLLocationManagerDelegate {
         req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["lat": lat, "lng": lng])
         URLSession.shared.dataTask(with: req).resume()
+    }
+}
+
+/// Delegate for the significant-change manager only. Kept separate from
+/// LocationReporter's own delegate conformance so the two location services
+/// (live session stream, trail) can never be confused for one another — the
+/// delegate callback carries no indication of which service produced a fix.
+private final class TrailDelegate: NSObject, CLLocationManagerDelegate {
+    private weak var owner: LocationReporter?
+
+    init(owner: LocationReporter) {
+        self.owner = owner
+        super.init()
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        Task { @MainActor [weak owner] in owner?.pingTrail(loc) }
+    }
+
+    /// The Always grant can land long after the first ask (he may approve it
+    /// from Settings days later) — start the trail the moment it does.
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        guard manager.authorizationStatus == .authorizedAlways else { return }
+        Task { @MainActor [weak owner] in owner?.startTrail() }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // A failed significant-change fix is not actionable — the next wake retries.
     }
 }

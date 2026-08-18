@@ -460,7 +460,11 @@ final class WatchConversation {
             // ?defer=1 — this build drives response.create itself (the
             // patience window; same as the phone), so the mint suppresses
             // the VAD auto-response.
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1") ?? AppConfig.realtimeURL
+            // &mdl=1 — the wrist joins the model contract too: it dials the
+            // model the MINT returns rather than a name compiled in here, so a
+            // server-side model move carries the watch with it instead of
+            // leaving it on a stale name (a mismatched pair just hangs).
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1") ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -468,15 +472,20 @@ final class WatchConversation {
             guard connectEpoch == epoch else { return }
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let mintedModel = (obj?["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? "gpt-realtime"
+            let socketURL = "wss://api.openai.com/v1/realtime?model="
+                + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
-                  let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                  let url = URL(string: socketURL) else {
                 if httpStatus == 401 || httpStatus == 403 {
                     authFailStreak += 1
                     if authFailStreak >= 2 {
                         // Two consecutive rejections = the token is really
                         // dead (revoked/expired) — sign out for real.
                         TokenStore.token = nil
-                        status = "Sign in again"
+                        NotificationCenter.default.post(name: .scarletWatchTokenCleared, object: nil)
+                        status = "Setting up again…"
                         state = .idle; wantLive = false
                     } else {
                         // First rejection: could be a transient validation

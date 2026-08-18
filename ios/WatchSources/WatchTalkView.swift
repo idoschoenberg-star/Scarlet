@@ -116,9 +116,10 @@ struct WatchSettingsView: View {
                 Button("Sign out", role: .destructive) {
                     WatchConversation.shared.end()
                     TokenStore.token = nil
+                    NotificationCenter.default.post(name: .scarletWatchTokenCleared, object: nil)
                 }
             } footer: {
-                Text("Open the Scarlet app on your iPhone nearby to sign in again automatically.")
+                Text("Your iPhone sets this watch up again by itself the next time Scarlet is open on it — there is nothing to type.")
             }
         }
         .navigationTitle("Settings")

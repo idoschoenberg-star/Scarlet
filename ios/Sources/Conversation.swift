@@ -471,6 +471,17 @@ final class Conversation: ObservableObject {
     /// `MicSettings.shared.level` for the Settings sheet, which doesn't hold a
     /// reference to this live instance.
     @Published var inputLevel: Float = 0
+    /// Set when the chosen input wouldn't start and we dropped to the built-in
+    /// mic (task #49). Shown as a banner on the Talk screen and cleared by a
+    /// tap — a silent switch to a different microphone is its own bug.
+    @Published var micFallbackNote: String?
+    /// The device we fell back FROM, for the banner's wording.
+    private var micFellBackFrom: String?
+    /// The Realtime model this session is actually running on — whatever the
+    /// mint handed back. Recorded so the client log says which model a session
+    /// used, and a model rollout can be read off real sessions rather than
+    /// assumed.
+    private var activeModel = "gpt-realtime"
 
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
@@ -757,7 +768,13 @@ final class Conversation: ObservableObject {
         // push today's HealthKit numbers now so she isn't reading a row from
         // the last time the Health tab was opened. No-ops while the phone is
         // locked (HealthKit is sealed then) or when Health was never granted.
-        Task { await HealthSync.shared.syncNow() }
+        // TODAY first and fast (five single-day sums, one row pushed) so
+        // "how many steps today" is answered from a number seconds old — the
+        // full 14-day window behind it can take its time.
+        Task {
+            await HealthSync.shared.syncToday()
+            await HealthSync.shared.syncNow()
+        }
         Task { await connect() }
         observeInterruptions()
         // Live message ANNOUNCEMENTS are OFF (Ido 2026-08-12: "I don't need
@@ -1641,6 +1658,14 @@ final class Conversation: ObservableObject {
                 // Watch never poison the DOA metric. build lets DOA be sliced
                 // by version. Both best-effort and URL-safe.
                 mintString += "&surface=phone"
+                // MODEL CONTRACT (model-migration task): `mdl=1` promises the
+                // server that this build dials the model the MINT returns,
+                // instead of a name compiled into the URL. That promise is
+                // what lets the model move server-side without a flag day —
+                // and what guarantees mint and socket can never disagree (a
+                // mismatched pair just hangs; proved 2026-08-16). Builds
+                // without the flag stay pinned to the legacy model forever.
+                mintString += "&mdl=1"
                 if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
                     mintString += "&build=" + b
                 }
@@ -1655,8 +1680,18 @@ final class Conversation: ObservableObject {
                 // opens so the first server event can echo it. nil is fine
                 // (older server / mint hiccup): the beacon simply no-ops.
                 currentMintId = obj?["mint_id"] as? String
+                // The model the server actually minted this session with. It
+                // is the ONLY correct value for the socket URL. The fallback
+                // is the legacy name the server serves anyone who did not
+                // send mdl=1, so an old/partial response still connects.
+                let mintedModel = (obj?["model"] as? String).flatMap {
+                    $0.isEmpty ? nil : $0
+                } ?? "gpt-realtime"
+                activeModel = mintedModel
+                let socketURL = "wss://api.openai.com/v1/realtime?model="
+                    + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)
                 guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
-                      let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                      let url = URL(string: socketURL) else {
                     // A bad token is terminal; everything else (cold start,
                     // 429, 5xx, malformed body) is TRANSIENT — retry through
                     // the normal backoff and KEEP the queued text. Hard-idling
@@ -1694,7 +1729,7 @@ final class Conversation: ObservableObject {
             do {
                 try ensureAudio()
             } catch where !interrupted {
-                status = "Can't reach the microphone right now. Check it's free (not held by another app) and try again."
+                status = "No microphone would start — even the built-in one. Check nothing else is holding it, or pick another input in Settings › Microphone."
                 state = .idle; wantLive = false
                 reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
                 pendingOutbound.removeAll()
@@ -1705,7 +1740,7 @@ final class Conversation: ObservableObject {
             // Connected: a real socket is up. Clear the backoff counter and
             // stale send accounting from the previous socket's corpse.
             connectedAt = Date()   // BEFORE the beacon, so session_secs is sane
-            clientLog("connected", "attempt=\(reconnectAttempts)")
+            clientLog("connected", "attempt=\(reconnectAttempts) model=\(activeModel)")
             reconnectAttempts = 0
             audioSendsInFlight = 0
             handledToolCalls.removeAll()
@@ -2853,11 +2888,87 @@ final class Conversation: ObservableObject {
 
     /// Idempotent: builds the audio graph exactly once; later calls just make
     /// sure the engine is running.
+    ///
+    /// AUTO-FALLBACK (task #49, root-caused 2026-08-16): on the Mac his default
+    /// input is an RME Babyface Pro — a 14-channel USB interface whose capture
+    /// init fails outright, so the graph build threw, Talk said "can't reach the
+    /// microphone" and the Start button was dead with no way forward. A mic that
+    /// won't start is never a dead end now: we drop to the BUILT-IN mic, rebuild,
+    /// and say so in the UI. Silent success on the wrong device would be worse
+    /// than the failure, so the fallback always announces itself.
     private func ensureAudio() throws {
         if audioReady {
             if !audioEngine.isRunning { try audioEngine.start() }
             return
         }
+        do {
+            try buildAudioGraph()
+        } catch {
+            // An INTERRUPTION (Spotify, a phone call) makes the input format
+            // read dead for reasons that have nothing to do with which device
+            // is selected — falling back there would throw away his RME pick
+            // over a transient. The interruption's .ended handler rebuilds.
+            guard !interrupted else { throw error }
+            guard forceBuiltInMic() else { throw error }
+            // Tear the half-built graph down before trying again — a second
+            // installTap on a live bus is an uncatchable NSException.
+            tearDownPartialGraph()
+            do {
+                try buildAudioGraph()
+            } catch {
+                // The built-in mic failed too: this is a real audio outage, not
+                // a bad device choice. Undo the forced override so his saved
+                // pick survives, and let the caller surface the failure.
+                micFellBackFrom = nil
+                throw error
+            }
+            micFallbackNote = micFellBackFrom.map {
+                "“\($0)” wouldn't start — using the built-in microphone instead. Change it in Settings › Microphone."
+            } ?? "That microphone wouldn't start — using the built-in one instead."
+            clientLog("mic-fallback", "from=\(micFellBackFrom ?? "?") to=builtin")
+        }
+    }
+
+    /// Undo a graph build that threw partway. `stopAudio()` can't do this job:
+    /// it guards on `audioReady`, which the failed build never set — so a tap
+    /// installed just before the throw would survive into the retry, and the
+    /// second installTap on that bus is an uncatchable NSException.
+    private func tearDownPartialGraph() {
+        audioEngine.inputNode.removeTap(onBus: 0)
+        os_unfair_lock_lock(audioStateLock)
+        converter = nil
+        os_unfair_lock_unlock(audioStateLock)
+        audioEngine.stop()
+        audioReady = false
+    }
+
+    /// Point the session at the built-in microphone and clear the saved input
+    /// choice, so the Settings picker shows the truth and the next session
+    /// starts on a device that works. Returns false when there is nothing to
+    /// fall back TO — already on the built-in mic, or no built-in mic exists —
+    /// in which case the original failure stands.
+    private func forceBuiltInMic() -> Bool {
+        let s = AVAudioSession.sharedInstance()
+        let inputs = s.availableInputs ?? []
+        guard let builtIn = inputs.first(where: { $0.portType == .builtInMic }) else { return false }
+        let current = s.currentRoute.inputs.first
+        let m = MicSettings.shared
+        // Nothing to gain from "falling back" to the device we already failed on.
+        if m.preferredInputUID == nil, current?.portType == .builtInMic { return false }
+        micFellBackFrom = m.preferredInputName ?? current?.portName
+        m.selectInput(nil)          // forget the broken pick — Settings shows reality
+        // His CHANNEL choice is left alone: it only means anything on a
+        // multichannel device, and the tap already clamps the index to the
+        // live buffer's channel count — so it costs nothing here and is still
+        // right the moment he re-selects the interface.
+        try? s.setPreferredInput(builtIn)
+        m.activeInputName = builtIn.portName
+        return true
+    }
+
+    /// Builds the capture/playback graph. Split out of `ensureAudio` so the
+    /// built-in-mic retry above can run the exact same build twice.
+    private func buildAudioGraph() throws {
         try startAudioSession()
 
         let input = audioEngine.inputNode

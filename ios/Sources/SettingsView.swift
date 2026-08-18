@@ -148,6 +148,7 @@ struct SettingsView: View {
 /// always exists.
 private struct LocationSettingsSection: View {
     @State private var status: CLAuthorizationStatus = CLLocationManager().authorizationStatus
+    @State private var trailOn = false
 
     private var label: String {
         switch status {
@@ -168,6 +169,15 @@ private struct LocationSettingsSection: View {
                 Text(label).fontWeight(.semibold)
                     .foregroundStyle(good ? Color.green : Color.orange)
             }
+            // The trail is what gives the Journal its "where" axis — a day
+            // reconstructs as a real route instead of a list of guesses. It
+            // records only on Always, so say plainly whether it is running.
+            HStack {
+                Text("Journal trail").foregroundStyle(.secondary)
+                Spacer()
+                Text(trailOn ? "Recording ✓" : "Needs “Always”").fontWeight(.semibold)
+                    .foregroundStyle(trailOn ? Color.green : Color.orange)
+            }
             if !good {
                 Button {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -180,12 +190,14 @@ private struct LocationSettingsSection: View {
         } header: {
             Text("Location")
         } footer: {
-            Text("“Always” is what lets navigation and “where am I” answers work while the phone is locked in the car. On the page that opens, tap Location and choose Always.")
+            Text("“Always” is what lets navigation and “where am I” answers work while the phone is locked in the car — and what lets the Journal record where your day was spent. On the page that opens, tap Location and choose Always. The trail only wakes on meaningful movement; a phone sitting still costs nothing.")
         }
         // Re-read on return from the Settings app so the row reflects reality.
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didBecomeActiveNotification)) { _ in
             status = CLLocationManager().authorizationStatus
+            trailOn = LocationReporter.shared.trailActive
         }
+        .onAppear { trailOn = LocationReporter.shared.trailActive }
     }
 }

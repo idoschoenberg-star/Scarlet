@@ -42,6 +42,12 @@ struct ScarletTalkApp: App {
         FlightRecorder.installCrashHandlers()
         // Hand the device token to a paired Apple Watch (no-op without one).
         PhoneWatchBridge.shared.start()
+        // The journal's "where" axis (task #112): significant-change monitoring
+        // runs for the life of the install, not the life of a session — iOS
+        // relaunches the app in the background to deliver each point. Started
+        // here so a cold background launch (which never reaches a scene phase
+        // change) re-arms it too. No-op until Always is granted.
+        LocationReporter.shared.startTrail()
     }
 
     var body: some Scene {
@@ -94,7 +100,7 @@ struct RootView: View {
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, news, library, health, desk, settings }
+    enum Tab: Hashable { case talk, inbox, journal, calendar, chats, photos, music, news, library, health, desk, settings }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -221,10 +227,18 @@ struct RootView: View {
                 // Fresh GPS fix to the backend so "here" answers (where am I,
                 // weather, directions) are minutes old, never a stale share.
                 LocationReporter.shared.report()
+                // Re-arm the trail: he may have granted Always from the
+                // Settings row since the last foreground, and a grant that
+                // lands while we're backgrounded has nothing else to start it.
+                LocationReporter.shared.startTrail()
                 // Same for the body: every return to the foreground pushes
-                // today's HealthKit numbers so the server row stays current.
+                // today's HealthKit numbers so the server row stays current —
+                // today's fast path first, then the full window behind it.
                 if HealthSync.shared.authorized {
-                    Task { await HealthSync.shared.syncNow() }
+                    Task {
+                        await HealthSync.shared.syncToday()
+                        await HealthSync.shared.syncNow()
+                    }
                 }
             }
             FlightRecorder.note(screen: "phase:\(phase)")
@@ -271,6 +285,14 @@ struct RootView: View {
                 // focused unread count (`op=inbox_counts` outlook_mail).
                 .badge(counts.inboxBadge)
                 .tag(Tab.inbox)
+            // The Journal — the review lane where staged actions and derived
+            // storylines wait for his ruling (docs/JOURNAL_PROGRAM.md). Sits
+            // right after Inbox: it is the OTHER inbox, and the two are the
+            // pair he works through.
+            JournalView()
+                .environmentObject(convo)
+                .tabItem { Label("Journal", systemImage: "book.closed.fill") }
+                .tag(Tab.journal)
             CalendarView()
                 .environmentObject(convo)
                 .tabItem { Label("Calendar", systemImage: "calendar") }

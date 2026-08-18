@@ -21,8 +21,10 @@ struct ScarletWatchApp: App {
     @State private var unlocked = TokenStore.token != nil
 
     init() {
-        // Bring the phone-token bridge up first: if the iPhone app is already
-        // unlocked, the token lands before Ido ever sees the unlock screen.
+        // Bring the provisioning bridge up first: if the iPhone app is already
+        // unlocked, this watch's own minted token lands before Ido ever sees
+        // the waiting screen. There is no password path to fall back to — the
+        // watch being active on his wrist IS the authorization (zero-lock).
         WatchBridge.shared.activate()
     }
 
@@ -32,11 +34,17 @@ struct ScarletWatchApp: App {
                 if unlocked {
                     WatchTalkView()
                 } else {
-                    WatchUnlockView(onUnlocked: { unlocked = true })
+                    WatchProvisioningView()
                 }
             }
             .onReceive(WatchBridge.shared.tokenArrived) { _ in
                 unlocked = TokenStore.token != nil
+            }
+            // Signing out (or a revoked token) must take effect NOW — the
+            // shell used to keep showing Talk until the next launch.
+            .onReceive(NotificationCenter.default.publisher(for: .scarletWatchTokenCleared)) { _ in
+                unlocked = TokenStore.token != nil
+                if !unlocked { WatchBridge.shared.requestToken() }
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active { WatchConversation.shared.appBecameActive() }

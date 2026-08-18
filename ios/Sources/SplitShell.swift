@@ -33,6 +33,7 @@ struct SplitShell: View {
     enum ShellSection: String, CaseIterable, Identifiable {
         case talk
         case inbox
+        case journal
         case calendar
         case chats
         case photos
@@ -49,6 +50,7 @@ struct SplitShell: View {
             switch self {
             case .talk: return "Talk"
             case .inbox: return "Inbox"
+            case .journal: return "Journal"
             case .calendar: return "Calendar"
             case .chats: return "Chats"
             case .photos: return "Photos"
@@ -66,6 +68,7 @@ struct SplitShell: View {
             switch self {
             case .talk: return "waveform"
             case .inbox: return "envelope.fill"
+            case .journal: return "book.closed.fill"
             case .calendar: return "calendar"
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .photos: return "photo.on.rectangle"
@@ -83,14 +86,15 @@ struct SplitShell: View {
             switch self {
             case .talk: return "1"
             case .inbox: return "2"
-            case .calendar: return "3"
-            case .chats: return "4"
-            case .photos: return "5"
-            case .music: return "6"
+            case .journal: return "3"
+            case .calendar: return "4"
+            case .chats: return "5"
+            case .photos: return "6"
+            case .music: return "7"
             case .news: return "n"
-            case .library: return "7"
-            case .health: return "8"
-            case .desk: return "9"
+            case .library: return "8"
+            case .health: return "9"
+            case .desk: return "d"
             case .settings: return "0"
             }
         }
@@ -113,7 +117,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk]
+        [.talk, .inbox, .journal, .calendar, .chats, .photos, .music, .library, .health, .desk]
     }
 
     var body: some View {
@@ -249,6 +253,10 @@ struct SplitShell: View {
             // Self-contained NavigationStack: list full-width, pushed reader
             // becomes the big reading pane. Zero rewrites.
             InboxView()
+                .environmentObject(convo)
+        case .journal:
+            // Self-contained NavigationStack (review cards + amend sheet).
+            JournalView()
                 .environmentObject(convo)
         case .calendar:
             // Manages its own layout (week strip + agenda; detail is a sheet).
