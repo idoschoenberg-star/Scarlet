@@ -767,6 +767,21 @@ final class Conversation: ObservableObject {
     /// as "your voice is being captured".
     var micStreaming: Bool { micOn && !echoRisk && (state == .listening || state == .speaking) }
 
+    // MARK: barge-in return path (tasks #54/#90, Ido 2026-08-20)
+
+    /// Routes where minting with ?barge=1 (server interrupt_response:true)
+    /// is safe: sealed-ear (headphones/AirPods — her voice can't reach the
+    /// mic) and CarPlay (the work order's echo-safe list). NEVER the open
+    /// iPhone speaker — the 2026-08-12 disaster is what the flag does to an
+    /// open-air route without voice processing.
+    private var bargeInEligibleRoute: Bool { sealedEarRoute || onCarRoute }
+    /// Whether the LIVE session was minted with ?barge=1 — the flag is a
+    /// client promise, so the client must know what it promised. Route
+    /// changes that flip eligibility are DEFERRED to the next mint (safe→
+    /// unsafe is already covered: the echo gate stops streaming her
+    /// playback back, so no speech_started can fire from her own voice).
+    private var bargeInMinted = false
+
     // MARK: lifecycle
 
     func start(token: String) {
@@ -1772,6 +1787,9 @@ final class Conversation: ObservableObject {
         do {
             // ── Mint per engine ──
             let socketRequest: URLRequest
+            // Barge-in promise evaluated per mint, from the route truth at
+            // THIS moment (refreshed below for the OpenAI branch).
+            var mintedBarge = false
             if engine == .eleven {
                 var req = URLRequest(url: AppConfig.elevenURL)
                 req.httpMethod = "POST"
@@ -1824,6 +1842,17 @@ final class Conversation: ObservableObject {
                 // mismatched pair just hangs; proved 2026-08-16). Builds
                 // without the flag stay pinned to the legacy model forever.
                 mintString += "&mdl=1"
+                // BARGE-IN RETURN PATH (tasks #54/#90): ?barge=1 makes the
+                // mint set interrupt_response:true for THIS session. Sent
+                // ONLY on echo-safe routes (headphones/AirPods, CarPlay) —
+                // never the open iPhone speaker. The client's half of the
+                // promise: cut local playback + truncate on speech_started
+                // (see the handler) so a barge never replays a stale tail.
+                refreshSealedEarRoute()
+                if bargeInEligibleRoute {
+                    mintedBarge = true
+                    mintString += "&barge=1"
+                }
                 if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
                     mintString += "&build=" + b
                 }
@@ -1933,6 +1962,8 @@ final class Conversation: ObservableObject {
                 send(["type": "conversation_initiation_client_data"])
             }
             listen(task)
+            bargeInMinted = mintedBarge   // what THIS session actually promised
+            if mintedBarge { clientLog("barge-flag", "minted with ?barge=1 (echo-safe route)") }
             state = .listening
             turnPhase = .listening
             status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
@@ -2477,7 +2508,12 @@ final class Conversation: ObservableObject {
             // his utterance always completes and semantic VAD closes the turn
             // normally (the 08-12 disaster was the opposite shape:
             // SERVER-initiated cancel plus a gated mic).
-            if pendingBuffers > 0, sealedEarRoute {
+            // Also on a ?barge=1 session on an (eligible) car route: the
+            // server may already be truncating its side — the LOCAL player
+            // and queue must stop the same instant, and flushPlayback's
+            // conversation.item.truncate reports the true played-ms. A tail
+            // left queued would replay stale audio later ("she talks over me").
+            if pendingBuffers > 0, sealedEarRoute || (bargeInMinted && bargeInEligibleRoute) {
                 if responseActive { send(["type": "response.cancel"]) }
                 flushPlayback()
                 clientLog("barge-in", "speech_started during playback — cut her audio")
@@ -3895,6 +3931,19 @@ final class Conversation: ObservableObject {
                     }
                     self.refreshSealedEarRoute()
                     self.syncNoiseReductionForRoute()
+                    // Barge-in flag re-evaluation on EVERY route change: the
+                    // promise must track the route. Deferred to the next mint
+                    // rather than a mid-session remint — safe→unsafe is
+                    // already covered (the echo gate stops streaming her
+                    // playback back, so her voice can't trip the server);
+                    // unsafe→safe merely lacks server-side interrupt until
+                    // the next rebuild (the sealed-ear client cut still works).
+                    if self.engine == .openai, self.ws != nil,
+                       self.bargeInEligibleRoute != self.bargeInMinted {
+                        self.clientLog("barge-flag", self.bargeInEligibleRoute
+                            ? "route now echo-safe — ?barge=1 arms at the next mint"
+                            : "route no longer echo-safe — flag parks until the next mint (echo gate covers)")
+                    }
                     self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;
