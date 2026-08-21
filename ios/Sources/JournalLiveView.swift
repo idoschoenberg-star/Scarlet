@@ -825,6 +825,7 @@ struct JournalView: View {
                     monthAnchor = selectedDay
                     screen = .month
                 })
+                .environmentObject(convo) // Catalyst SIGTRAP class: re-inject across the screen switch
         case .month:
             JournalMonthScreen(
                 model: monthModel,
