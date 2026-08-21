@@ -1233,16 +1233,24 @@ struct ChatThreadView: View {
     /// crashed the Mac ("Talk quit unexpectedly") on tapping a photo/video/pill.
     /// A single enum-driven sheet fixes it.
     enum ThreadSheet: Identifiable {
-        case photo(WAPhotoItem), video(WAVideoItem), draft(ChannelDraftSeed)
+        case photo(WAPhotoItem), video(WAVideoItem)
+        case chooser
+        case draft(ChannelDraftSeed, ReplyMode?)
         var id: String {
             switch self {
             case .photo(let i): return "photo-\(i.id)"
             case .video(let i): return "video-\(i.id)"
-            case .draft(let s): return "draft-\(s.id)"
+            case .chooser: return "chooser"
+            case .draft(let s, _): return "draft-\(s.id)"
             }
         }
     }
     @State private var activeSheet: ThreadSheet?
+    /// The reply chooser's pick — the review surface presents from the
+    /// sheet's onDismiss (the reliable Catalyst sheet-swap pattern).
+    @State private var pendingReplyMode: ReplyMode?
+    /// iPhone → the chooser is a bottom sheet; iPad/Mac → a menu on the pill.
+    @Environment(\.horizontalSizeClass) private var hSize
     /// WhatsApp voice notes: inline playback, one at a time. playingVoiceID
     /// is the ChatMessage.id currently playing (nil when idle/paused).
     @State private var voicePlayer: AVPlayer?
@@ -1300,24 +1308,71 @@ struct ChatThreadView: View {
         .onChange(of: composeFocused) { _, focused in
             if focused { convo.beginTyping() } else { convo.endTyping() }
         }
+        // Work-surface key (§5): R = the reply chooser — a silent twin of
+        // the Scarlet pill (inert while the compose field has the keyboard).
+        .background {
+            Button("") { if !composeFocused { activeSheet = .chooser } }
+                .keyboardShortcut("r", modifiers: [])
+                .opacity(0)
+                .accessibilityHidden(true)
+        }
         // ONE sheet for the whole thread (see ThreadSheet) — photo viewer,
         // video player, or the Scarlet drafting studio. On dismiss, reload once
         // (an approved send appears via the mirror shortly; harmless for the
         // media cases).
         .reportsModalPresence(activeSheet != nil)
-        .sheet(item: $activeSheet, onDismiss: {
-            Task { await model.load() }
-        }) { sheet in
+        .sheet(item: $activeSheet, onDismiss: threadSheetClosed) { sheet in
             switch sheet {
             case .photo(let item):
                 WAPhotoView(item: item)
             case .video(let item):
                 WAVideoView(item: item)
-            case .draft(let seed):
-                DraftView(seed: nil, channelSeed: seed)
+            case .chooser:
+                // READ-FIRST (§2): the thread IS the read view; the pill
+                // offers the same three choices as everywhere else. The pick
+                // is only remembered — the next surface presents on dismiss.
+                ReplyChooserView(recipient: chat.name) { mode in
+                    pendingReplyMode = mode
+                }
+            case .draft(let seed, let mode):
+                DraftView(seed: nil, channelSeed: seed, replyMode: mode)
                     .environmentObject(convo)
                     .preferredColorScheme(.dark)
             }
+        }
+    }
+
+    /// One dismiss handler for the thread's single sheet: reload (an
+    /// approved send appears via the mirror shortly; harmless for media),
+    /// then act on the chooser's pick — manual focuses the native compose
+    /// bar, the other two open the drafting studio.
+    private func threadSheetClosed() {
+        Task { await model.load() }
+        guard let mode = pendingReplyMode else { return }
+        pendingReplyMode = nil
+        chooseReplyMode(mode)
+    }
+
+    /// The chooser's three choices, mapped to this thread. Manual = the
+    /// channel's own compose bar (typing + tapping send IS the approval,
+    /// standing rule); the other two land in the standard review surface.
+    private func chooseReplyMode(_ mode: ReplyMode) {
+        switch mode {
+        case .manual:
+            composeFocused = true
+        case .scarlet:
+            activeSheet = .draft(ChannelDraftSeed(
+                channel: channel.rawValue,
+                recipient: chat.name,
+                contextLines: recentLines.joined(separator: "\n"),
+                instruction: ReplyMode.scarletInstruction
+            ), .scarlet)
+        case .instructed:
+            activeSheet = .draft(ChannelDraftSeed(
+                channel: channel.rawValue,
+                recipient: chat.name,
+                contextLines: recentLines.joined(separator: "\n")
+            ), .instructed)
         }
     }
 
@@ -1566,6 +1621,8 @@ struct ChatThreadView: View {
                 .frame(height: 36)
             }
             .disabled(!canSend)
+            // ⌘Return = stage (the work-surface send convention, §5).
+            .keyboardShortcut(.return, modifiers: .command)
         } else {
             // WhatsApp: #00A884 disc; iMessage: #0A84FF disc — each app's
             // own send affordance.
@@ -1580,38 +1637,69 @@ struct ChatThreadView: View {
                         .opacity(canSend ? 1 : 0.4)))
             }
             .disabled(!canSend)
+            // ⌘Return = send (the work-surface convention, §5). Plain Return
+            // stays a newline — a keystroke must never send by itself.
+            .keyboardShortcut(.return, modifiers: .command)
         }
     }
 
     /// "Scarlet" — the ONE Scarlet control on this screen: a compact labeled
-    /// pill at the bar's left, channel-tinted. Whatever is typed rides along
-    /// as the instruction (and the field clears); nothing typed → the studio
-    /// asks first. The last ~6 thread lines ride along too so the draft never
-    /// loses its context.
+    /// pill at the bar's left, channel-tinted. Text already typed rides along
+    /// as the instruction (🎙 mode, the field clears); nothing typed → the
+    /// SAME three-option reply chooser as every other surface — a bottom
+    /// sheet on iPhone, a menu here on iPad/Mac (§2). The last ~6 thread
+    /// lines ride along too so a draft never loses its context.
+    @ViewBuilder
     private var scarletDraftButton: some View {
-        Button {
+        if hSize == .regular {
+            ReplyChooserMenu(onChoose: { mode in scarletPillTapped(menuMode: mode) }) {
+                scarletPillLabel
+            }
+            .disabled(model.sending)
+        } else {
+            Button {
+                scarletPillTapped(menuMode: nil)
+            } label: {
+                scarletPillLabel
+            }
+            .disabled(model.sending)
+        }
+    }
+
+    private var scarletPillLabel: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 12, weight: .semibold))
+            Text("Scarlet")
+                .font(.system(size: 12, weight: .semibold))
+        }
+        .foregroundStyle(channel.accent)
+        .padding(.horizontal, 10)
+        .frame(height: 36)
+        .background(Capsule().fill(channel.accent.opacity(0.18)))
+        .overlay(Capsule().stroke(channel.accent.opacity(0.45), lineWidth: 1))
+    }
+
+    /// The pill's routing. Typed text is already the instruction — that IS
+    /// "tell Scarlet what to say", no second question asked. Empty: on
+    /// iPhone open the chooser sheet; on iPad/Mac the menu already picked.
+    private func scarletPillTapped(menuMode: ReplyMode?) {
+        let typed = composeText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !typed.isEmpty {
             activeSheet = .draft(ChannelDraftSeed(
                 channel: channel.rawValue,
                 recipient: chat.name,
                 contextLines: recentLines.joined(separator: "\n"),
-                instruction: composeText.trimmingCharacters(in: .whitespacesAndNewlines)
-            ))
+                instruction: typed
+            ), .instructed)
             composeText = ""
-        } label: {
-            HStack(spacing: 5) {
-                // Authoring/AI cue — a waveform read as "record a voice note".
-                Image(systemName: "sparkles")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("Scarlet")
-                    .font(.system(size: 12, weight: .semibold))
-            }
-            .foregroundStyle(channel.accent)
-            .padding(.horizontal, 10)
-            .frame(height: 36)
-            .background(Capsule().fill(channel.accent.opacity(0.18)))
-            .overlay(Capsule().stroke(channel.accent.opacity(0.45), lineWidth: 1))
+            return
         }
-        .disabled(model.sending)
+        if let menuMode {
+            chooseReplyMode(menuMode)
+        } else {
+            activeSheet = .chooser
+        }
     }
 
     private var stagedCard: some View {
