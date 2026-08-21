@@ -444,7 +444,7 @@ final class Conversation: ObservableObject {
         pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        stopAudio()
+        stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
         status = "Voice temporarily unavailable — try again in a minute."
@@ -677,8 +677,17 @@ final class Conversation: ObservableObject {
     private var echoRisk: Bool {
         if chatMode || !speakerOn { return false }   // her voice is silent
         if sealedEarRoute { return false }           // her voice can't reach the mic
+        if voiceProcessingActive { return false }    // hardware AEC strips her voice (flag-gated trial)
         return pendingBuffers > 0 || Date() < speechTailUntil
     }
+
+    /// Apple's Voice-Processing I/O (hardware AEC/AGC/NS) is engaged on the
+    /// input node — full duplex is safe because the cabin speakers' playback
+    /// is stripped from the cabin mic. DARK by default: only true when the
+    /// `scarlet.vpio.enabled` trial flag is on AND the enable call succeeded
+    /// on a car route (see buildAudioGraph). Build-218 echo-loop history —
+    /// never widen without on-device measurement in a real car.
+    private var voiceProcessingActive = false
 
     /// True when EVERY live output is sealed in/against Ido's ear — wired
     /// headphones, a Bluetooth headset (AirPods run the HFP hands-free
@@ -1017,7 +1026,7 @@ final class Conversation: ObservableObject {
         pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        stopAudio()
+        stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
@@ -3072,6 +3081,24 @@ final class Conversation: ObservableObject {
         try startAudioSession()
 
         let input = audioEngine.inputNode
+        // CarPlay: Apple's Voice-Processing I/O gives hardware AEC/AGC/NS so
+        // the cabin speakers' playback is stripped from the cabin mic — full
+        // duplex (real barge-in) becomes safe. MUST run before the format
+        // read and the tap install: enabling it changes the input format.
+        // DARK until measured in a real car (build-218 echo-loop risk on
+        // high-latency wireless routes): flip scarlet.vpio.enabled to trial.
+        let wantVP = onCarRoute && UserDefaults.standard.bool(forKey: "scarlet.vpio.enabled")
+        if input.isVoiceProcessingEnabled != wantVP {
+            do {
+                try input.setVoiceProcessingEnabled(wantVP)
+                voiceProcessingActive = wantVP
+            } catch {
+                voiceProcessingActive = false
+                clientLog("vp-io", "setVoiceProcessingEnabled(\(wantVP)) failed: \(error.localizedDescription) — staying half-duplex")
+            }
+        } else {
+            voiceProcessingActive = wantVP && input.isVoiceProcessingEnabled
+        }
         let inFormat = input.outputFormat(forBus: 0)
         // While another app owns the audio session (an interruption in
         // progress, e.g. Spotify mid-handoff) the input node can report a dead
@@ -3481,7 +3508,13 @@ final class Conversation: ObservableObject {
         // to play at full volume simultaneously); the last buffer's drain
         // restores the music.
         RadioPlayer.shared.duck(true)
-        player.scheduleBuffer(buf) { [weak self] in
+        // .dataPlayedBack, NOT the default .dataConsumed: the default fires
+        // when the engine has RENDERED the buffer, not when sound left the
+        // car speakers — on wireless CarPlay / BT A2DP the downstream output
+        // latency meant pendingBuffers hit 0 while her voice was still
+        // audible in the cabin, the mic reopened, and her own TTS tail
+        // streamed to the server as "Ido speaking" (phantom turns).
+        player.scheduleBuffer(buf, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 // She's done only when the LAST queued buffer drains — the
@@ -3493,12 +3526,18 @@ final class Conversation: ObservableObject {
                     // phantom user turn. 0.6s (was 0.35): loudspeaker now runs
                     // WITHOUT a voice-processing mode, so this client gate is
                     // the only echo protection — the wider tail is its price.
-                    self.speechTailUntil = Date().addingTimeInterval(0.6)
-                    RadioPlayer.shared.duck(false)
+                    // Plus a small fixed margin for BT stacks that under-report
+                    // output latency. .dataPlayedBack already accounts for
+                    // reported latency — do NOT add outputLatency here
+                    // (double-count = deaf window after replies).
+                    self.speechTailUntil = Date().addingTimeInterval(0.6 + 0.25)
                     if self.state == .speaking {
                         self.state = .listening
                         if self.micOn { self.status = "Listening…" }
                     }
+                    // AFTER the state flip: duck(false) reads state to pick
+                    // the in-car listening tier (0.5) vs full volume.
+                    RadioPlayer.shared.duck(false)
                 }
             }
         }
@@ -3531,7 +3570,6 @@ final class Conversation: ObservableObject {
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
         playbackDeadline = .distantPast
-        RadioPlayer.shared.duck(false)
         // Only her-speaking transitions back to listening. Forcing .listening
         // from ANY state let an interruption during a reconnect fake a live
         // session (nil socket, "Listening…" status) — or resurrect End-state
@@ -3540,9 +3578,11 @@ final class Conversation: ObservableObject {
             state = .listening
             if micOn { status = "Listening…" }
         }
+        // AFTER the state flip: duck(false) reads state for the in-car tier.
+        RadioPlayer.shared.duck(false)
     }
 
-    private func stopAudio() {
+    private func stopAudio(deactivateSession: Bool = false) {
         guard audioReady else { return }
         // The held-overlap queue holds buffers in the OLD play format — a
         // graph rebuilt at a new rate must never schedule them (format
@@ -3563,7 +3603,19 @@ final class Conversation: ObservableObject {
         playbackDeadline = .distantPast
         audioEngine.stop()
         audioReady = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // Release the hardware ONLY when the call is over — a mid-call graph
+        // rebuild must keep the session claimed, or every rebuild bounces the
+        // car route and un-ducks/re-ducks other audio.
+        if deactivateSession {
+            if RadioPlayer.shared.playing {
+                // Radio owns the session now — hand it a playback-only
+                // category instead of deactivating out from under its AVPlayer
+                // (background-capable, silent-switch-immune).
+                try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            } else {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
+        }
     }
 
     // MARK: interruptions — the flow guarantee
@@ -3685,8 +3737,11 @@ final class Conversation: ObservableObject {
                     // through the port override and stuttered the audio.
                     let s = AVAudioSession.sharedInstance()
                     if s.mode != self.sessionMode(car: self.onCarRoute)
-                        || self.onCarRoute != self.lastAppliedCar {
+                        || self.onCarRoute != self.lastAppliedCar
+                        || self.audioEngine.inputNode.isVoiceProcessingEnabled
+                           != (self.onCarRoute && UserDefaults.standard.bool(forKey: "scarlet.vpio.enabled")) {
                         self.applyOutputRoute()
+                        self.rebuildAudioGraph()
                     }
                     self.refreshSealedEarRoute()
                     self.syncNoiseReductionForRoute()
