@@ -172,6 +172,9 @@ final class SignalsModel: ObservableObject {
     /// When the rows last came back from the server — drives the header's
     /// "updated Xm ago" stamp (the anti-spinner, like Chats and Inbox).
     @Published var updatedAt: Date?
+    /// A draft in review/writing waiting for Ido — the "Waiting on you"
+    /// section at the top of the list (§5; pin drafts land here too).
+    @Published var waitingDraft: DraftFlowAPI.WaitingDraft?
 
     /// Monotonic load token: a slow fetch landing after a newer one is
     /// dropped (InboxModel / ChatListModel discipline).
@@ -231,6 +234,9 @@ final class SignalsModel: ObservableObject {
             rows.removeAll { pendingArchiveIds.contains($0.id) }
             withAnimation(.snappy) { items = rows }
             updatedAt = Date()
+            // "Waiting on you": one cheap check per refresh, never blocking
+            // the list itself. Failure just means no section.
+            waitingDraft = await DraftFlowAPI.fetchWaiting()
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach the inbox — check your connection."
@@ -265,18 +271,24 @@ final class SignalsModel: ObservableObject {
         }
     }
 
-    /// Reply-tap bookkeeping, exactly like the web Signals reader: opening
-    /// the item marks it read, starting the reply marks it acted. Local flip
-    /// first so the row un-bolds instantly; the mirrors are fire-and-forget
-    /// (the next refresh reconciles either way).
-    func markEngaged(_ item: SignalItem) {
+    /// READ-FIRST state discipline (spec §1): opening an item marks it READ
+    /// and nothing else — only starting an actual reply marks it acted.
+    /// Local flip first so the row un-bolds instantly; the mirrors are
+    /// fire-and-forget (the next refresh reconciles either way).
+    func markRead(_ item: SignalItem) {
         if let i = items.firstIndex(where: { $0.id == item.id }) { items[i].read = true }
         Task {
             _ = try? await ChatsAPI.request("op=inbox_read", method: "POST",
                                             body: ["ids": [item.id]])
+            await InboxCounts.shared.refresh()
+        }
+    }
+
+    /// Ido chose a reply mode — NOW the item counts as acted on.
+    func markActed(_ item: SignalItem) {
+        Task {
             _ = try? await ChatsAPI.request("op=inbox_acted", method: "POST",
                                             body: ["ids": [item.id]])
-            await InboxCounts.shared.refresh()
         }
     }
 
@@ -311,32 +323,33 @@ struct SignalsListView: View {
     @EnvironmentObject private var convo: Conversation
     @ObservedObject private var counts = InboxCounts.shared
     /// ONE sheet on this view (the Catalyst single-presentation rule): the
-    /// reply draft window, driven by `.sheet(item:)`.
-    @State private var replyItem: SignalItem?
+    /// review surface for a "Waiting on you" draft, driven by `.sheet(item:)`.
+    /// (Replies now go READ VIEW → chooser → review, never straight from a
+    /// row tap — spec §1: tapping an item NEVER creates a draft.)
+    enum ListSheet: Identifiable {
+        case waitingDraft(String)   // draft id — attach to the active draft
+        var id: String {
+            switch self { case .waitingDraft(let id): return "waiting-\(id)" }
+        }
+    }
+    @State private var activeSheet: ListSheet?
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
     var body: some View {
         content
-            .reportsModalPresence(replyItem != nil)
-            // The SAME drafting studio as every other entry point — seed mode
-            // auto-composes on appear, revisions and Approve are untouched.
-            // The event_id binds the draft to THIS conversation server-side
-            // (true threaded Reply-All for mail, exact chat for the mirrors).
-            .sheet(item: $replyItem, onDismiss: {
+            .reportsModalPresence(activeSheet != nil)
+            .sheet(item: $activeSheet, onDismiss: {
                 Task { await model.load() }
-            }) { item in
-                DraftView(seed: DraftSeed(
-                    messageId: "",
-                    fromName: item.sender,
-                    fromEmail: "",
-                    subject: "",
-                    preview: item.preview,
-                    eventId: item.id,
-                    channel: item.draftChannel ?? "email_outlook"
-                ))
-                .environmentObject(convo)   // DraftView hard-requires it; match every other call site
-                .preferredColorScheme(.dark)
+            }) { sheet in
+                switch sheet {
+                case .waitingDraft:
+                    // The standard review surface, attached to the draft that
+                    // is already waiting server-side (pin drafts included).
+                    DraftView(seed: nil, attachToActive: true)
+                        .environmentObject(convo)   // DraftView hard-requires it
+                        .preferredColorScheme(.dark)
+                }
             }
             // Piggyback reconcile: when the badge poll sees the store change,
             // the visible list catches up too — no timer of its own.
@@ -395,6 +408,24 @@ struct SignalsListView: View {
                     .font(.footnote)
                     .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
                     .listRowBackground(Color.clear)
+            }
+            // "Waiting on you" (§5): drafts in review/saved sit ABOVE the new
+            // mail — his own unfinished decisions outrank fresh arrivals.
+            if let waiting = model.waitingDraft {
+                Section {
+                    Button {
+                        activeSheet = .waitingDraft(waiting.id)
+                    } label: {
+                        WaitingDraftRow(draft: waiting)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowSeparatorTint(.white.opacity(0.12))
+                } header: {
+                    Text("WAITING ON YOU")
+                        .font(.system(size: 12, weight: .semibold))
+                        .kerning(0.5)
+                        .foregroundStyle(scarletRose.opacity(0.9))
+                }
             }
             Section {
                 ForEach(focusedItems) { item in
@@ -457,7 +488,9 @@ struct SignalsListView: View {
     }
 
     /// One row with the shared tap + swipe behavior (identical in both
-    /// sections — the approve-loop consistency rule).
+    /// sections — the approve-loop consistency rule). READ-FIRST (spec §1):
+    /// the tap opens the full READ view — it NEVER starts a draft; list
+    /// swipes stay triage-only.
     private func signalRow(_ item: SignalItem) -> some View {
         // Archive is the SAME gesture as the Amwell inbox everywhere
         // (OutlookArchiveSwipe): full-bleed green bar, glyph pops at the 45%
@@ -466,12 +499,21 @@ struct SignalsListView: View {
             baseBackground: Color.clear,
             onArchive: { model.archive(item) }
         ) {
-            SignalRow(item: item)
-                .contentShape(Rectangle())
-                // Tap = react: open the reply draft bound to this item
-                // (non-draftable sources — e.g. calendar pushes — have
-                // nothing to reply to; their tap is a no-op).
-                .onTapGesture { replyTapped(item) }
+            ZStack {
+                // ZStack + zero-opacity link (InboxView's pattern): full
+                // NavigationLink behavior without the disclosure chevron.
+                NavigationLink {
+                    SignalReadView(item: item, model: model)
+                        // Catalyst drops @EnvironmentObject across the
+                        // NavigationLink boundary — re-inject (crash class
+                        // already fixed in Inbox/Chats).
+                        .environmentObject(convo)
+                } label: {
+                    EmptyView()
+                }
+                .opacity(0)
+                SignalRow(item: item)
+            }
         }
         .listRowSeparatorTint(.white.opacity(0.12))
         // Leading files it for later (a reminder, not a cleanup) — stays on
@@ -484,12 +526,6 @@ struct SignalsListView: View {
             }
             .tint(OutlookStyle.flagOrange)
         }
-    }
-
-    private func replyTapped(_ item: SignalItem) {
-        guard item.draftChannel != nil else { return }
-        model.markEngaged(item)
-        replyItem = item
     }
 }
 
@@ -561,5 +597,523 @@ struct SignalRow: View {
                 .overlay(Circle().stroke(Color.black.opacity(0.55), lineWidth: 1.5))
                 .offset(x: 3, y: 3)
         }
+    }
+}
+
+// MARK: - Read view (READ FIRST — the item in full, then the reply chooser)
+
+/// Keep byte-identical to ChatsView's allNewFocus (it's private there): the
+/// read view restores this exact line on the way out, stale-guarded.
+private let signalsBrowsingFocus =
+    "[FOCUS] Ido is browsing his unified All-new inbox — every open message across Amwell Outlook, Gmail, Teams, WhatsApp and iMessage. No single item open."
+
+/// The full READ view for a unified-inbox item (spec §1/§3): tapping a row
+/// lands HERE — never in a draft. Email signals load their complete message
+/// (op=inbox_full, same renderer as the Amwell reader); chat signals show the
+/// message big and bidirectional. "Reply" opens the three-option chooser —
+/// bottom sheet on iPhone, menu on iPad/Mac — and every option lands in the
+/// standard review surface.
+struct SignalReadView: View {
+    let item: SignalItem
+    @ObservedObject var model: SignalsModel
+    @EnvironmentObject private var convo: Conversation
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.horizontalSizeClass) private var hSize
+
+    /// One fetched email, as `op=inbox_full` returns it.
+    struct FullEmail {
+        let subject: String
+        let from: String
+        let to: String
+        let at: Date?
+        let html: String
+        let attachments: [EmailAttachment]
+    }
+
+    /// One attachment on a fetched email; `dataUrl` nil → too big to inline.
+    struct EmailAttachment: Identifiable {
+        let id = UUID()
+        let name: String
+        let size: Int
+        let dataUrl: String?
+    }
+
+    @State private var email: FullEmail?
+    @State private var emailFailed = false
+    /// ONE sheet on this view (the Catalyst single-presentation rule):
+    /// chooser, review surface, or attachment preview — one enum drives all.
+    enum ReadSheet: Identifiable {
+        case chooser
+        case draft(ReplyMode)
+        case preview(PreviewFile)
+        var id: String {
+            switch self {
+            case .chooser: return "chooser"
+            case .draft(let m): return "draft-\(m.rawValue)"
+            case .preview(let f): return "preview-\(f.id)"
+            }
+        }
+    }
+    @State private var activeSheet: ReadSheet?
+    /// The chooser's pick — presented from the sheet's onDismiss (the
+    /// reliable Catalyst sheet-swap pattern; never two presentations at once).
+    @State private var pendingMode: ReplyMode?
+    /// In-app reading size (§5): default 17, A−/A+ steps to 19/21.
+    @AppStorage("scarlet.readingSize") private var readingSize: Double = 17
+
+    private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
+
+    private var isEmail: Bool {
+        item.source == "outlook_mail" || item.source == "gmail"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider().overlay(OutlookStyle.separator)
+            if isEmail, let email, !email.attachments.isEmpty {
+                attachmentsRow(email.attachments)
+                Divider().overlay(OutlookStyle.separator)
+            }
+            bodyPane
+            Divider().overlay(OutlookStyle.separator)
+            actionBar
+        }
+        .background(OutlookStyle.background.ignoresSafeArea())
+        .navigationTitle(item.displaySource)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(OutlookStyle.background, for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
+        .toolbarColorScheme(.dark, for: .navigationBar)
+        .reportsModalPresence(activeSheet != nil)
+        .sheet(item: $activeSheet, onDismiss: sheetClosed) { sheet in
+            switch sheet {
+            case .chooser:
+                ReplyChooserView(recipient: senderName) { mode in
+                    // Only remember the pick; the review surface presents
+                    // from onDismiss — never two sheets in flight.
+                    pendingMode = mode
+                }
+            case .draft(let mode):
+                DraftView(seed: DraftSeed(
+                    messageId: "",
+                    fromName: item.sender,
+                    fromEmail: "",
+                    subject: email?.subject ?? "",
+                    preview: item.preview,
+                    eventId: item.id,
+                    channel: item.draftChannel ?? "email_outlook"
+                ), replyMode: mode)
+                .environmentObject(convo)   // DraftView hard-requires it
+                .preferredColorScheme(.dark)
+            case .preview(let file):
+                ZStack(alignment: .topLeading) {
+                    QuickLookPreview(url: file.url)
+                        .ignoresSafeArea()
+                    Button {
+                        activeSheet = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(Color.black.opacity(0.5)))
+                    }
+                    .padding(.top, 12)
+                    .padding(.leading, 12)
+                    .accessibilityLabel("Close attachment")
+                }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+                .presentationBackground(OutlookStyle.background)
+                .preferredColorScheme(.dark)
+            }
+        }
+        .task {
+            FlightRecorder.note(screen: "signal-reader")
+            // READ-FIRST: opening marks READ — and nothing else (spec §1).
+            model.markRead(item)
+            await fetchEmail()
+        }
+        .onAppear { convo.setFocus(readFocus) }
+        .onDisappear {
+            if convo.currentFocus == readFocus {
+                convo.setFocus(signalsBrowsingFocus)
+            }
+        }
+        // Work-surface keys (§5): R = reply chooser, E = archive; both are
+        // silent twins of the visible buttons below.
+        .background {
+            Group {
+                if item.draftChannel != nil {
+                    Button("") { activeSheet = .chooser }
+                        .keyboardShortcut("r", modifiers: [])
+                }
+                Button("") { archiveTapped() }
+                    .keyboardShortcut("e", modifiers: [])
+            }
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    // MARK: header (sender card + reading-size control)
+
+    private var senderName: String {
+        item.sender.isEmpty ? item.displaySource : item.sender
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if isEmail {
+                Text(subjectText)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(subjectText.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: subjectText.readingFrameAlignment)
+                    .environment(\.layoutDirection, subjectText.layoutDir)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+            }
+            HStack(alignment: .center, spacing: 10) {
+                ZStack(alignment: .bottomTrailing) {
+                    SenderAvatar(name: senderName, email: "", size: 40)
+                    Circle()
+                        .fill(item.sourceTint)
+                        .frame(width: 17, height: 17)
+                        .overlay(
+                            Image(systemName: item.sourceIcon)
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(.white)
+                        )
+                        .overlay(Circle().stroke(Color.black.opacity(0.55), lineWidth: 1.5))
+                        .offset(x: 3, y: 3)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(senderName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    HStack(spacing: 6) {
+                        Text(item.displaySource)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(item.sourceTint)
+                        if let d = item.receivedAt {
+                            Text(ChatTimeFormat.agoLabel(d))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer(minLength: 8)
+                if !isEmail {
+                    readingSizeControl
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// A−/A+ (§5): the chat body's type size, remembered across launches.
+    /// (Email bodies render in the shared HTML frame, which pinch-zooms.)
+    private var readingSizeControl: some View {
+        HStack(spacing: 0) {
+            Button {
+                readingSize = max(15, readingSize - 2)
+            } label: {
+                Text("A−").font(.system(size: 13, weight: .semibold))
+                    .frame(width: 34, height: 28)
+            }
+            .disabled(readingSize <= 15)
+            Divider().frame(height: 16).overlay(OutlookStyle.separator)
+            Button {
+                readingSize = min(25, readingSize + 2)
+            } label: {
+                Text("A+").font(.system(size: 15, weight: .semibold))
+                    .frame(width: 34, height: 28)
+            }
+            .disabled(readingSize >= 25)
+        }
+        .foregroundStyle(.white.opacity(0.8))
+        .background(OutlookStyle.surface, in: Capsule())
+        .overlay(Capsule().stroke(OutlookStyle.separator, lineWidth: 1))
+        .buttonStyle(.plain)
+    }
+
+    private var subjectText: String {
+        if let s = email?.subject, !s.isEmpty { return s }
+        return item.preview
+    }
+
+    // MARK: body
+
+    @ViewBuilder
+    private var bodyPane: some View {
+        if isEmail {
+            if let email {
+                // The shared dark-mode-safe email frame — one renderer with
+                // the Amwell reader, so the two readers never drift.
+                MailBodyView(html: email.html)
+            } else if emailFailed {
+                VStack(spacing: 12) {
+                    Text("Couldn't open this message.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Button("Try again") {
+                        emailFailed = false
+                        Task { await fetchEmail() }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(OutlookStyle.accentBlue)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            // Chat message: the words, big (≥17pt, user-scalable), each
+            // paragraph in ITS OWN direction — Hebrew hugs the right, English
+            // the left. Measure capped so long lines stay readable (§5).
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(item.preview.components(separatedBy: "\n").enumerated()),
+                            id: \.offset) { _, line in
+                        if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Color.clear.frame(height: 10)
+                        } else {
+                            Text(line)
+                                .font(.system(size: readingSize))
+                                .lineSpacing(4)
+                                .foregroundStyle(.white.opacity(0.92))
+                                .textSelection(.enabled)
+                                .multilineTextAlignment(line.readingAlignment)
+                                .frame(maxWidth: .infinity, alignment: line.readingFrameAlignment)
+                                .environment(\.layoutDirection, line.layoutDir)
+                        }
+                    }
+                    Text("The full conversation lives in the \(item.displaySource) tab.")
+                        .font(.footnote)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 18)
+                }
+                .padding(16)
+                .frame(maxWidth: 680)
+                .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: attachments (email only — inline data from op=inbox_full)
+
+    private func attachmentsRow(_ attachments: [EmailAttachment]) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(attachments) { att in
+                    Button {
+                        openAttachment(att)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "paperclip")
+                                .font(.system(size: 15))
+                                .foregroundStyle(att.dataUrl == nil ? .gray : OutlookStyle.accentBlue)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(att.name)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: 170, alignment: .leading)
+                                Text(att.dataUrl == nil
+                                     ? "Too big here — open in the mail app"
+                                     : ByteCountFormatter.string(fromByteCount: Int64(att.size),
+                                                                 countStyle: .file))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .background(RoundedRectangle(cornerRadius: 12).fill(OutlookStyle.surface))
+                        .overlay(RoundedRectangle(cornerRadius: 12)
+                            .stroke(OutlookStyle.separator, lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(att.dataUrl == nil)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.vertical, 8)
+    }
+
+    /// data: URI → temp file (real filename, so QuickLook picks the right
+    /// renderer) → the system viewer. Same isolation discipline as the
+    /// Amwell reader: each open gets its own subfolder.
+    private func openAttachment(_ att: EmailAttachment) {
+        guard let dataUrl = att.dataUrl,
+              let comma = dataUrl.firstIndex(of: ","),
+              let data = Data(base64Encoded: String(dataUrl[dataUrl.index(after: comma)...]),
+                              options: .ignoreUnknownCharacters) else { return }
+        var clean = att.name
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .replacingOccurrences(of: ":", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.isEmpty || clean == "." || clean == ".." { clean = "attachment" }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sig-att-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(clean)
+        guard (try? data.write(to: url, options: .atomic)) != nil else { return }
+        activeSheet = .preview(PreviewFile(url: url))
+    }
+
+    // MARK: action bar (Reply · Archive · Later — triage verbs, one look)
+
+    private var actionBar: some View {
+        HStack(spacing: 10) {
+            replyControl
+            actionButton("Archive", icon: "archivebox.fill",
+                         tint: OutlookStyle.archiveGreen) {
+                archiveTapped()
+            }
+            actionButton("Later", icon: "clock.fill",
+                         tint: OutlookStyle.flagOrange) {
+                model.later(item)
+                dismiss()
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    /// The Reply control: iPhone opens the chooser as a bottom sheet;
+    /// iPad/Mac offers the SAME three choices as a menu (§2, §5). A
+    /// non-replyable source (calendar pushes) simply has no Reply.
+    @ViewBuilder
+    private var replyControl: some View {
+        if item.draftChannel != nil {
+            if hSize == .regular {
+                ReplyChooserMenu(onChoose: { mode in choose(mode) }) {
+                    replyLabel
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                Button {
+                    activeSheet = .chooser
+                } label: {
+                    replyLabel
+                }
+                .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    private var replyLabel: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrowshape.turn.up.left.fill")
+                .font(.system(size: 13, weight: .semibold))
+            Text("Reply").font(.footnote.weight(.semibold))
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(OutlookStyle.primaryBlue, in: Capsule())
+        .foregroundStyle(.white)
+    }
+
+    private func actionButton(_ label: String, icon: String, tint: Color,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+                Text(label).font(.footnote.weight(.semibold))
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(OutlookStyle.surface, in: Capsule())
+            .overlay(Capsule().stroke(OutlookStyle.separator, lineWidth: 1))
+            .foregroundStyle(tint)
+        }
+    }
+
+    private func archiveTapped() {
+        model.archive(item)
+        dismiss()
+    }
+
+    // MARK: chooser plumbing
+
+    /// A mode was picked. From the menu (no sheet up) the review surface
+    /// presents immediately; from the chooser sheet it presents on dismiss.
+    private func choose(_ mode: ReplyMode) {
+        model.markActed(item)
+        if activeSheet == nil {
+            activeSheet = .draft(mode)
+        } else {
+            pendingMode = mode
+        }
+    }
+
+    private func sheetClosed() {
+        if let mode = pendingMode {
+            pendingMode = nil
+            model.markActed(item)
+            activeSheet = .draft(mode)
+            return
+        }
+        // A closed review surface may have changed the waiting/read state.
+        Task { await model.load() }
+    }
+
+    // MARK: fetch (email signals only)
+
+    private func fetchEmail() async {
+        guard isEmail, email == nil else { return }
+        let encoded = ChatsAPI.encode(item.id)
+        guard let data = try? await ChatsAPI.request("op=inbox_full&id=\(encoded)",
+                                                     method: "GET"),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              obj["error"] == nil else {
+            emailFailed = true
+            return
+        }
+        let atts: [EmailAttachment] = ((obj["attachments"] as? [[String: Any]]) ?? [])
+            .compactMap { a in
+                guard let name = a["name"] as? String, !name.isEmpty else { return nil }
+                return EmailAttachment(
+                    name: name,
+                    size: (a["size"] as? Int) ?? 0,
+                    dataUrl: a["dataUrl"] as? String
+                )
+            }
+        email = FullEmail(
+            subject: (obj["subject"] as? String) ?? "",
+            from: (obj["from"] as? String) ?? "",
+            to: (obj["to"] as? String) ?? "",
+            at: MailDates.parse(obj["at"] as? String),
+            html: (obj["html"] as? String) ?? "",
+            attachments: atts
+        )
+    }
+
+    // MARK: focus
+
+    /// Byte-identical on appear and disappear (built from the list row
+    /// alone) — the stale-guard compares against it.
+    private var readFocus: String {
+        "[FOCUS] Ido is READING an inbound \(item.displaySource) item full-screen (read-first view).\n"
+            + "from: \(item.sender)\n"
+            + "source: \(item.source)\n"
+            + "event_id: \(item.id)\n"
+            + "preview: \(String(item.preview.prefix(280)))\n"
+            + "He has NOT chosen to reply. If he asks to reply, the reply "
+            + "chooser applies: Scarlet drafts it / he writes it himself / "
+            + "he dictates what to say — never draft without his choice."
     }
 }
