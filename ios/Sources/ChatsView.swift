@@ -1361,11 +1361,12 @@ struct ChatThreadView: View {
         case .manual:
             composeFocused = true
         case .scarlet:
+            // No instruction in the seed — the ✨ path is one draft_mode
+            // call, made by the studio itself on appear.
             activeSheet = .draft(ChannelDraftSeed(
                 channel: channel.rawValue,
                 recipient: chat.name,
-                contextLines: recentLines.joined(separator: "\n"),
-                instruction: ReplyMode.scarletInstruction
+                contextLines: recentLines.joined(separator: "\n")
             ), .scarlet)
         case .instructed:
             activeSheet = .draft(ChannelDraftSeed(

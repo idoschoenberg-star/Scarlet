@@ -173,18 +173,10 @@ struct ReplyChooserMenu<MenuLabel: View>: View {
 /// backend generations read (`id` and `draft_id`) so neither shape 400s.
 enum DraftFlowAPI {
 
-    /// Record which chooser option opened this draft ('scarlet' | 'manual' |
-    /// 'instructed'), with the instruction when there was one. Bookkeeping —
-    /// never blocks the compose it annotates.
-    static func mode(draftId: String, mode: ReplyMode, instructions: String? = nil) {
-        var body: [String: Any] = ["id": draftId, "draft_id": draftId,
-                                   "mode": mode.rawValue]
-        if let instructions, !instructions.isEmpty { body["instructions"] = instructions }
-        Task { _ = try? await request("op=draft_mode", body: body) }
-    }
-
     /// Stamp reviewed_at the moment the review surface actually renders the
     /// finished draft — the send path's read-back gate depends on it.
+    /// Server-idempotent (`.is("reviewed_at", null)` guard), so re-sending
+    /// after a regeneration (which CLEARS the stamp) is exactly right.
     static func reviewSeen(draftId: String) {
         Task {
             _ = try? await request("op=draft_review_seen",

@@ -165,13 +165,6 @@ final class DraftModel: ObservableObject {
     /// draft server-side, so this sheet adopts whatever `op=draft_active`
     /// returns instead of composing its own.
     private var adoptActive = false
-    /// The chooser option that opened this window ('scarlet'|'manual'|
-    /// 'instructed'). Recorded server-side via `op=draft_mode` the moment the
-    /// draft id lands; nil for legacy/voice paths.
-    var chooserMode: ReplyMode?
-    /// `op=draft_review_seen` fires exactly once per draft — the moment the
-    /// finished draft first renders on this review surface.
-    private var reviewSeenSent = false
     /// Set the moment discard() runs, so the closing sheet's save-on-leave
     /// can never resurrect a draft Ido explicitly discarded.
     private var discardedExplicitly = false
@@ -213,6 +206,34 @@ final class DraftModel: ObservableObject {
             "recipient": seed.recipient,
             "instruction": instr.isEmpty ? "Draft this message." : instr,
         ])
+    }
+
+    /// READ-FIRST chooser start (spec §6): ONE `op=draft_mode` call carries
+    /// the mode, the destination, and the threading binding; the backend
+    /// composes (scarlet/instructed) or just stages the row (manual). Falls
+    /// back to the legacy compose lane if the endpoint isn't there yet.
+    func startFlow(mode: ReplyMode, instructions: String? = nil,
+                   seed: DraftSeed? = nil, channelSeed: ChannelDraftSeed? = nil) {
+        guard phase == .idle, draftId == nil else { return }
+        var body: [String: Any] = ["mode": mode.rawValue]
+        if let seed {
+            body["channel"] = seed.channel
+            body["recipient"] = seed.recipientLine
+            if seed.eventId.isEmpty {
+                body["message_id"] = seed.messageId
+            } else {
+                body["event_id"] = seed.eventId
+            }
+            let original = seed.originalLine
+            if !original.isEmpty { body["original"] = original }
+        } else if let cs = channelSeed {
+            body["channel"] = cs.channel
+            body["recipient"] = cs.recipient
+        } else {
+            return
+        }
+        if let instructions, !instructions.isEmpty { body["instructions"] = instructions }
+        compose(body)
     }
 
     /// New-mail mode: no original message — the backend composes fresh and
@@ -318,12 +339,13 @@ final class DraftModel: ObservableObject {
         }
     }
 
-    /// The review surface just rendered the finished draft — stamp
-    /// reviewed_at server-side, exactly once per draft (spec §6: the send
-    /// path's read-back gate keys off it).
+    /// The review surface just rendered a finished draft — stamp reviewed_at
+    /// server-side (spec §6: the send path's read-back gate keys off it).
+    /// Fires on every writing→ready transition: a regeneration CLEARS the
+    /// stamp server-side, so each new body needs its own; the op itself is
+    /// idempotent (`.is null` guarded), so repeats can never overwrite.
     func noteReviewSeen() {
-        guard !reviewSeenSent, let id = draftId else { return }
-        reviewSeenSent = true
+        guard let id = draftId else { return }
         DraftFlowAPI.reviewSeen(draftId: id)
     }
 
@@ -341,21 +363,38 @@ final class DraftModel: ObservableObject {
         pendingInstruction = text
         errorText = ""
         Task {
-            do {
-                let data = try await Self.request("op=draft_action", method: "POST",
-                                                  body: ["id": id, "action": "revise", "instruction": text])
-                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
-                // The revised body streams server-side — pull the first partial
-                // now and let the heartbeat flip to .ready when it completes,
-                // so the new text visibly writes instead of snapping in.
-                if let d = try? await Self.fetchActive(), d.id == id {
-                    draft = d
-                    if d.status == "draft" { phase = .ready }
+            // Read-first lane FIRST (spec §6 note): draft_mode with a
+            // draft_id runs the same revise pipeline AND clears reviewed_at,
+            // so a regenerated body must be re-reviewed before it can send.
+            var accepted = false
+            if let data = try? await Self.request("op=draft_mode", method: "POST",
+                                                  body: ["draft_id": id,
+                                                         "mode": "instructed",
+                                                         "instructions": text]),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+               (obj["ok"] as? Bool) == true {
+                accepted = true
+            }
+            if !accepted {
+                // Older backend — the legacy revise action (no reviewed_at
+                // semantics, but the loop itself is identical).
+                do {
+                    let data = try await Self.request("op=draft_action", method: "POST",
+                                                      body: ["id": id, "action": "revise", "instruction": text])
+                    let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
+                } catch {
+                    errorText = "That revision didn't go through — try again."
+                    phase = .ready
+                    return
                 }
-            } catch {
-                errorText = "That revision didn't go through — try again."
-                phase = .ready
+            }
+            // The revised body streams server-side — pull the first partial
+            // now and let the heartbeat flip to .ready when it completes,
+            // so the new text visibly writes instead of snapping in.
+            if let d = try? await Self.fetchActive(), d.id == id {
+                draft = d
+                if d.status == "draft" { phase = .ready }
             }
         }
     }
@@ -405,8 +444,13 @@ final class DraftModel: ObservableObject {
             return
         }
         Task {
-            _ = try? await Self.request("op=draft_action", method: "POST",
-                                        body: ["id": id, "action": "dismiss"])
+            // The read-first discard keeps the row (state 'discarded',
+            // restorable); an older backend falls back to the legacy dismiss.
+            let ok = await DraftFlowAPI.action(draftId: id, action: "discard")
+            if !ok {
+                _ = try? await Self.request("op=draft_action", method: "POST",
+                                            body: ["id": id, "action": "dismiss"])
+            }
         }
     }
 
@@ -455,6 +499,9 @@ final class DraftModel: ObservableObject {
 
     // MARK: compose + polling
 
+    /// A read-first body (has "mode") posts to `op=draft_mode`; everything
+    /// else stays on the legacy `op=draft_compose`. Same response key
+    /// (`draft_id`), same polling afterwards.
     private func compose(_ body: [String: Any], isRetry: Bool = false) {
         pendingCompose = body
         if !isRetry { composeRetried = false }
@@ -464,12 +511,14 @@ final class DraftModel: ObservableObject {
         phase = .writing
         writingStartedAt = Date()
         pendingRecipient = (body["recipient"] as? String) ?? ""
-        pendingInstruction = (body["instruction"] as? String) ?? ""
+        pendingInstruction = (body["instruction"] as? String)
+            ?? (body["instructions"] as? String) ?? ""
         pendingChannel = (body["channel"] as? String) ?? ""
         startPolling()
+        let op = body["mode"] != nil ? "op=draft_mode" : "op=draft_compose"
         Task {
             do {
-                let data = try await Self.request("op=draft_compose", method: "POST", body: body)
+                let data = try await Self.request(op, method: "POST", body: body)
                 // A retry superseded this request while it was in flight — only
                 // the newest compose may adopt a draft; the poll follows the
                 // server's active row either way.
@@ -477,12 +526,6 @@ final class DraftModel: ObservableObject {
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let id = obj?["draft_id"] as? String else { throw URLError(.badServerResponse) }
                 draftId = id
-                // Record which chooser option started this draft (read-first
-                // flow bookkeeping — never blocks the compose).
-                if let m = chooserMode {
-                    DraftFlowAPI.mode(draftId: id, mode: m,
-                                      instructions: pendingInstruction)
-                }
                 // The sheet was closed while this compose was in flight — SAVE
                 // the just-created draft (never-events: no lost draft; his
                 // intent was captured, it waits in "Waiting on you").
@@ -511,10 +554,32 @@ final class DraftModel: ObservableObject {
                     if draftId == nil, !dismissRequested { compose(body, isRetry: true) }
                     return
                 }
+                // A draft_mode body that failed twice may have hit a backend
+                // that predates the read-first ops — translate once to the
+                // legacy compose shape (which cannot loop back here).
+                if body["mode"] != nil, draftId == nil, !dismissRequested {
+                    compose(Self.legacyComposeBody(body))
+                    return
+                }
                 errorText = "Scarlet couldn't start this draft."
                 phase = .idle
             }
         }
+    }
+
+    /// draft_mode body → draft_compose body: same destination and threading
+    /// fields; the mode collapses into the instruction it implies.
+    private static func legacyComposeBody(_ flow: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for key in ["channel", "recipient", "original", "event_id", "message_id",
+                    "chat_id", "subject"] {
+            if let v = flow[key] { out[key] = v }
+        }
+        out["instruction"] = (flow["instructions"] as? String)
+            ?? ((flow["mode"] as? String) == "scarlet"
+                ? ReplyMode.scarletInstruction
+                : "Draft the appropriate reply.")
+        return out
     }
 
     /// Light 1.5s heartbeat while the sheet is open: keeps the sheet current
@@ -742,18 +807,23 @@ struct DraftView: View {
             NotificationCenter.default.post(name: .scarletDraftSheetVisible,
                                             object: nil,
                                             userInfo: ["visible": true])
-            model.chooserMode = replyMode
             if attachToActive {
                 model.attachToActive(intent: voiceIntent)
             } else if let channelSeed {
                 let instr = channelSeed.instruction
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !instr.isEmpty {
-                    model.startChannelDraft(seed: channelSeed, instruction: instr)
+                    if replyMode == .instructed {
+                        // 🎙 with the ask already typed — one draft_mode call.
+                        model.startFlow(mode: .instructed, instructions: instr,
+                                        channelSeed: channelSeed)
+                    } else {
+                        // Legacy compose lane (Desk notes, photo forwards).
+                        model.startChannelDraft(seed: channelSeed, instruction: instr)
+                    }
                 } else if replyMode == .scarlet {
                     // ✨ Scarlet drafts it — no comments from him.
-                    model.startChannelDraft(seed: channelSeed,
-                                            instruction: ReplyMode.scarletInstruction)
+                    model.startFlow(mode: .scarlet, channelSeed: channelSeed)
                 } else if replyMode == .manual {
                     // ⌨️ He writes it himself — the manual editor opens.
                     editingManually = true
@@ -772,8 +842,7 @@ struct DraftView: View {
                     // he says or types what the reply should say.
                     revisionFocused = true
                 case .scarlet:
-                    model.startReply(seed: seed,
-                                     instruction: ReplyMode.scarletInstruction)
+                    model.startFlow(mode: .scarlet, seed: seed)
                 case nil:
                     // Legacy path (kept for voice/compat callers).
                     model.startReply(seed: seed, instruction: instruction)
@@ -1288,10 +1357,13 @@ struct DraftView: View {
         if model.draft != nil {
             model.revise(verbatim)
         } else if let cs = channelSeed {
-            model.startChannelDraft(seed: cs, instruction: verbatim)
+            model.startFlow(mode: .instructed, instructions: verbatim, channelSeed: cs)
         } else if let seed {
-            model.startReply(seed: seed, instruction: verbatim)
+            model.startFlow(mode: .instructed, instructions: verbatim, seed: seed)
         }
+        // The writing card echoes the request — show HIS words, not the
+        // verbatim wrapper around them.
+        model.pendingInstruction = text
     }
 
     /// The draft itself: an elegant dark card, readable, scrollable, selectable.
@@ -1759,10 +1831,16 @@ struct DraftView: View {
         if model.draft != nil {
             model.revise(text)
         } else if let cs = channelSeed {
-            model.startChannelDraft(seed: cs, instruction: text)
+            if replyMode == nil {
+                // Legacy pill lane (no chooser context).
+                model.startChannelDraft(seed: cs, instruction: text)
+            } else {
+                model.startFlow(mode: .instructed, instructions: text,
+                                channelSeed: cs)
+            }
         } else if let seed, replyMode == .instructed {
             // 🎙 Tell Scarlet what to say — his words become the instruction.
-            model.startReply(seed: seed, instruction: text)
+            model.startFlow(mode: .instructed, instructions: text, seed: seed)
         } else {
             model.startNewMail(recipient: newTo, instruction: text)
         }
