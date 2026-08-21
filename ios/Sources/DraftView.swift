@@ -1923,8 +1923,8 @@ struct DraftView: View {
             // alone never sends, so a stray keystroke can't fire a message.
             .keyboardShortcut(.return, modifiers: .command)
             .animation(.easeInOut(duration: 0.25), value: model.phase)
-            // (No footer "Discard" — the always-visible ✕ in the header already
-            // discards; two controls for one action was clutter.)
+            // (Discard lives in the review-actions row above, with undo;
+            // the header ✕ CLOSES and keeps the work — never discards.)
         }
     }
 }
