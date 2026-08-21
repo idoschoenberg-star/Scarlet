@@ -447,12 +447,20 @@ final class Conversation: ObservableObject {
         stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
+        turnPhase = .idle
+        terminalStartFailure = true   // both engines down — a car retry loop can't fix a vendor burst
         status = "Voice temporarily unavailable — try again in a minute."
     }
 
     struct Line: Identifiable { let id = UUID(); let text: String; let fromHer: Bool }
 
     @Published var state: State = .idle
+    /// Typed turn phase for surfaces that must not compare status STRINGS
+    /// (CarPlay's thinking state broke on any copy tweak). Set at the same
+    /// points the strings are set; `.thinking` covers "his turn closed, her
+    /// reply not yet audible".
+    enum TurnPhase { case idle, listening, thinking, speaking }
+    @Published private(set) var turnPhase: TurnPhase = .idle
     @Published var status = "Waking her up…"
     @Published var transcript: [Line] = []
     @Published var micOn = true
@@ -743,6 +751,8 @@ final class Conversation: ObservableObject {
         // every audio buffer of this one — a fresh start reclaims the session.
         interrupted = false
         endedByUser = false
+        terminalStartFailure = false   // every fresh start earns a clean verdict
+        turnPhase = .idle
         // A fresh user-initiated session ALWAYS tries the primary engine
         // first: even if the last session ended on the ElevenLabs parachute,
         // the burst that convicted OpenAI has usually passed by the next
@@ -1010,6 +1020,12 @@ final class Conversation: ObservableObject {
     /// readable so CarPlay's self-restart also respects his End.
     private(set) var endedByUser = false
 
+    /// A start failed for a reason RETRYING cannot fix (mic permission
+    /// denied, 401/403 mint, both voice engines down). CarPlay's retry
+    /// ladder reads this to show an honest terminal state instead of
+    /// feeding an endless start→fail loop. Cleared by every fresh start().
+    private(set) var terminalStartFailure = false
+
     func end() {
         endedByUser = true
         wantLive = false
@@ -1029,6 +1045,7 @@ final class Conversation: ObservableObject {
         stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
+        turnPhase = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
     }
 
@@ -1711,6 +1728,7 @@ final class Conversation: ObservableObject {
         // a message that points at Settings instead of spinning "Reconnecting…".
         guard await ensureMicPermission() else {
             status = "Microphone access is off — turn it on in Settings to talk."
+            terminalStartFailure = true   // retrying cannot grant a permission
             state = .idle; wantLive = false
             reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
             pendingOutbound.removeAll()
@@ -1804,6 +1822,7 @@ final class Conversation: ObservableObject {
                     // machinery was holding.
                     if httpStatus == 401 || httpStatus == 403 {
                         status = "Couldn't start — sign in again from Settings."
+                        terminalStartFailure = true   // a bad token needs Ido, not a retry
                         state = .idle; wantLive = false
                         pendingOutbound.removeAll()
                         return
@@ -1880,6 +1899,7 @@ final class Conversation: ObservableObject {
             }
             listen(task)
             state = .listening
+            turnPhase = .listening
             status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
             // A fresh socket knows nothing about the screen — replay the
             // current focus so a reconnect regains ambient context.
@@ -2199,6 +2219,7 @@ final class Conversation: ObservableObject {
                 // him, he knows it — his words appear as a bubble, the status
                 // flips, and the phone taps. Never again "did she get that?".
                 status = "Got it — on it…"
+                if state == .listening { turnPhase = .thinking }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // A SPOKEN turn the server heard gets the same always-answer
                 // guarantee as a typed one: if no reply ever starts, the
@@ -2333,6 +2354,7 @@ final class Conversation: ObservableObject {
                 // spoke and pin the session to it the moment it changes.
                 pinLanguage(from: t)
                 status = "Got it — on it…"
+                if state == .listening { turnPhase = .thinking }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // Transcription is ASYNC and routinely lands AFTER the reply.
                 // Arming the watchdog here regardless tore down a healthy
@@ -2390,7 +2412,7 @@ final class Conversation: ObservableObject {
                 armReplyWatchdog()
                 clientLog("patience", "he resumed — pending reply cancelled, stall net armed")
             }
-            if state == .listening, micOn { status = "Hearing you…" }
+            if state == .listening, micOn { status = "Hearing you…"; turnPhase = .listening }
         case "input_audio_buffer.speech_stopped":
             serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
@@ -2403,7 +2425,7 @@ final class Conversation: ObservableObject {
             } else {
                 schedulePatienceCreate()
             }
-            if state == .listening { status = "Thinking…" }
+            if state == .listening { status = "Thinking…"; turnPhase = .thinking }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
@@ -3496,6 +3518,7 @@ final class Conversation: ObservableObject {
         let frames = buf.frameLength
         if !player.isPlaying { player.play() }
         state = .speaking
+        turnPhase = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
         pendingBuffers += 1
         // Duration at the CURRENT engine's play rate, never a hard-coded
@@ -3533,6 +3556,7 @@ final class Conversation: ObservableObject {
                     self.speechTailUntil = Date().addingTimeInterval(0.6 + 0.25)
                     if self.state == .speaking {
                         self.state = .listening
+                        self.turnPhase = .listening
                         if self.micOn { self.status = "Listening…" }
                     }
                     // AFTER the state flip: duck(false) reads state to pick
@@ -3576,6 +3600,7 @@ final class Conversation: ObservableObject {
         // UI from idle.
         if state == .speaking {
             state = .listening
+            turnPhase = .listening
             if micOn { status = "Listening…" }
         }
         // AFTER the state flip: duck(false) reads state for the in-car tier.

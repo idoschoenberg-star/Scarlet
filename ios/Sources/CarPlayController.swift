@@ -31,15 +31,33 @@ final class CarPlayController {
     /// hard failure (mic permission revoked) can't spin a start loop.
     private var lastAutoStart = Date.distantPast
 
+    /// Bounded retry ladder for the in-car self-restart (2026-08-19): a failed
+    /// revival inside the 5s debounce used to render .muted and nothing ever
+    /// re-invoked applyState — the car showed a dead end for the rest of the
+    /// drive. The ladder retries at 6/12/24/48/48s, then stops honestly.
+    private var retryTask: Task<Void, Never>?
+    private var retryCount = 0
+
+    /// Signed-out watch (P16): the sign-in notice path installs no sinks, so
+    /// signing in on the phone while parked left the car stuck until re-plug.
+    private var signInWatch: Task<Void, Never>?
+
+    /// Scene-flap grace (2026-08-19): wireless-CarPlay scenes disconnect and
+    /// reconnect in seconds. The teardown is DELAYED 25s; a scene that comes
+    /// back inside the window cancels it and reclaims ownership. Static — the
+    /// controller instance itself dies with the scene.
+    private static var pendingTeardown: Task<Void, Never>?
+
     private lazy var voiceTemplate: CPVoiceControlTemplate = {
         let states: [CPVoiceControlState] = [
             state(.connecting, "Connecting…"),
             state(.listening,  "Listening…"),
             state(.thinking,   "Thinking…"),
             state(.speaking,   "Scarlet"),
-            // A muted mic cannot HEAR "unmute" — never instruct the driver to
-            // speak to a deaf session; the phone's Mic button is the way back.
-            state(.muted,      "Mic off — tap Mic on your phone"),
+            // One muted state covers mic-off, ended, and can't-connect — the
+            // title must be truthful for ALL of them: never promise a control
+            // (like "tap Mic") that cannot revive an ended session.
+            state(.muted,      "Not listening — use Scarlet on your phone"),
         ]
         return CPVoiceControlTemplate(voiceControlStates: states)
     }()
@@ -51,13 +69,37 @@ final class CarPlayController {
     // MARK: lifecycle
 
     func start() {
+        if Self.pendingTeardown != nil {
+            Self.pendingTeardown?.cancel(); Self.pendingTeardown = nil
+            // Scene flapped back — the session survived the grace window and
+            // the car RECLAIMS ownership, or the eventual real disconnect
+            // would never tear it down (hot-mic-in-pocket leak).
+            if Conversation.shared.state != .idle { startedSession = true }
+        }
+        signInWatch?.cancel(); signInWatch = nil
         guard TokenStore.token != nil else {
             showSignInNotice()
             return
         }
-        interfaceController.setRootTemplate(voiceTemplate, animated: false) { [weak self] _, _ in
+        interfaceController.setRootTemplate(voiceTemplate, animated: false) { [weak self] ok, err in
             guard let self else { return }
-            self.rootIsVoice = true
+            // Root-template guard (P17): if the iOS 26.4 voice-conversation
+            // entitlement refuses CPVoiceControlTemplate as ROOT, the car
+            // screen would blank SILENTLY. Log the verdict; fall back to an
+            // information root while the session still runs.
+            FlightRecorder.telemetry(kind: "carplay_root", detail: [
+                "ok": ok, "err": err.map { String(describing: $0) } ?? "",
+            ])
+            if ok {
+                self.rootIsVoice = true
+            } else {
+                self.rootIsVoice = false
+                let item = CPInformationItem(title: "Scarlet is listening",
+                                             detail: "Just talk — she answers out loud.")
+                let info = CPInformationTemplate(title: "Scarlet", layout: .leading,
+                                                 items: [item], actions: [])
+                self.interfaceController.setRootTemplate(info, animated: false, completion: nil)
+            }
             let convo = Conversation.shared
             if convo.state == .idle {
                 convo.start(token: TokenStore.token ?? "")
@@ -71,15 +113,27 @@ final class CarPlayController {
 
     func stop() {
         cancellables.removeAll()
+        retryTask?.cancel(); retryTask = nil
+        retryCount = 0
+        signInWatch?.cancel(); signInWatch = nil
         clearNowPlaying()
-        // Only end the shared conversation if the car started it AND the phone
-        // UI isn't in the foreground continuing it. Otherwise just relinquish the
-        // CarPlay surface and leave the conversation running on the phone.
-        let phoneActive = UIApplication.shared.applicationState == .active
-        if startedSession && !phoneActive {
-            Conversation.shared.end()   // end() stops audio + setActive(false, notifyOthers)
-        }
+        let owned = startedSession
         startedSession = false
+        guard owned else { return }
+        // 25s flap grace instead of an instant kill: a wireless-CarPlay scene
+        // flap used to mean fresh mint + wiped context, and end() set
+        // endedByUser — permanently suppressing the foreground self-heal.
+        // Accepted cost: in a parked car the audio session stays live up to
+        // 25s, her voice rerouting to the phone speaker for that window.
+        Self.pendingTeardown?.cancel()
+        Self.pendingTeardown = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 25_000_000_000)   // 25s flap grace
+            guard !Task.isCancelled else { return }
+            Self.pendingTeardown = nil
+            if UIApplication.shared.applicationState != .active {
+                Conversation.shared.endBySystem()   // NOT end(): must not set endedByUser
+            }
+        }
     }
 
     // MARK: state bridge
@@ -88,8 +142,9 @@ final class CarPlayController {
         let convo = Conversation.shared
         convo.$state.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
         convo.$micOn.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
-        // Status drives the listening↔thinking distinction on the car screen.
-        convo.$status.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
+        // The TYPED turn phase drives the listening↔thinking distinction —
+        // status STRINGS broke on any copy tweak (P18).
+        convo.$turnPhase.sink { [weak self] _ in self?.applyState() }.store(in: &cancellables)
     }
 
     /// Map the engine state to a voice-control state + the head unit's now-playing.
@@ -104,29 +159,51 @@ final class CarPlayController {
             // ITSELF while the car surface is up. Debounced; start() is a
             // no-op unless truly idle. But an End IDO PRESSED is sacred — the
             // car never resurrects a session he explicitly hung up on.
-            if !convo.endedByUser, Date().timeIntervalSince(lastAutoStart) > 5,
-               let t = TokenStore.token {
+            if convo.endedByUser {
+                retryCount = 0
+                v = .muted   // his End stands; the phone (or a fresh plug-in) is the way back
+            } else if retryCount >= 5 || convo.terminalStartFailure || TokenStore.token == nil {
+                // Honest terminal state: retrying cannot fix a revoked mic
+                // permission, a 401 mint, or a missing token — no fake spinner.
+                v = .muted
+            } else if Date().timeIntervalSince(lastAutoStart) > 5 {
                 lastAutoStart = Date()
                 convo.hasAutoStarted = true
                 startedSession = true   // the car owns this revival — end it on disconnect
-                convo.start(token: t)
+                convo.start(token: TokenStore.token ?? "")
                 v = .connecting
             } else {
-                // Truthful idle: ended (or unable to start) is "mic off", not
-                // an eternal fake "Connecting…".
-                v = .muted
+                // Inside the debounce after a failed revival: truthful — we
+                // WILL retry, on a bounded backoff ladder, never a dead end.
+                v = .connecting
+                scheduleRetry()
             }
         case .connecting: v = .connecting
         case .listening:
-            // "Thinking" between his speech ending and her reply starting —
-            // the status strings are the live turn markers.
+            retryCount = 0   // a live session pays off the ladder
+            // "Thinking" between his speech ending and her reply starting.
             if !convo.micOn { v = .muted }
-            else if convo.status == "Thinking…" || convo.status == "Got it — on it…" { v = .thinking }
+            else if convo.turnPhase == .thinking { v = .thinking }
             else { v = .listening }
         case .speaking:   v = .speaking
         }
         voiceTemplate.activateVoiceControlState(withIdentifier: v.rawValue)
         if convo.state == .speaking { setNowPlaying() } else { clearNowPlaying() }
+    }
+
+    /// One bounded retry step: 6, 12, 24, 48, 48s — then applyState's ladder
+    /// cap renders the honest terminal state instead of looping forever on a
+    /// hard failure (P12).
+    private func scheduleRetry() {
+        guard retryTask == nil else { return }
+        let delay = UInt64(min(6 * (1 << retryCount), 48)) * 1_000_000_000
+        retryCount += 1
+        retryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return }
+            self?.retryTask = nil
+            self?.applyState()   // re-enters the .idle branch past the debounce
+        }
     }
 
     // MARK: helpers
@@ -142,12 +219,28 @@ final class CarPlayController {
 
     private func showSignInNotice() {
         let item = CPInformationItem(title: "Sign in on your phone",
-                                     detail: "Open Scarlet on your iPhone to sign in, then reconnect.")
+                                     detail: "Open Scarlet on your iPhone to sign in — the car connects by itself.")
         let info = CPInformationTemplate(title: "Scarlet",
                                          layout: .leading,
                                          items: [item],
                                          actions: [])
         interfaceController.setRootTemplate(info, animated: false, completion: nil)
+        // Token watch (P16): this path installs no sinks, so signing in on
+        // the phone while parked used to leave the car stuck until re-plug.
+        // Poll every 2s and take the normal start() path the moment the
+        // token appears; stop() cancels the watch.
+        signInWatch?.cancel()
+        signInWatch = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if TokenStore.token != nil {
+                    self.signInWatch = nil
+                    self.start()
+                    return
+                }
+            }
+        }
     }
 
     private func setNowPlaying() {
@@ -158,7 +251,11 @@ final class CarPlayController {
     }
 
     private func clearNowPlaying() {
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        // RadioPlayer is the FALLBACK owner of the widget (P13): nil-ing the
+        // center on every state flicker wiped live radio metadata/transport
+        // off the car's audio screen. The radio re-asserts itself when a
+        // station is loaded; otherwise the widget clears as before.
+        RadioPlayer.shared.reassertNowPlaying()
     }
 }
 
@@ -175,7 +272,8 @@ final class CarPlayController {
 fileprivate enum CarPlayOrbArt {
 
     /// Canvas side in points. The orb disc fills ~68% of it; the rest is halo.
-    private static let side: CGFloat = 168
+    /// 150, not 168: sits inside the documented voice-state image bounds (P17).
+    private static let side: CGFloat = 150
 
     static func image(for state: CarPlayController.VState) -> UIImage {
         switch state {
