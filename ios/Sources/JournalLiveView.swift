@@ -244,13 +244,14 @@ struct JStay {
     let place: String
 }
 
-/// What a walk's map can honestly draw. The shipped wire carries each move as
-/// {start,end,km,kind} — NO raw GPS trace yet — so the route is the straight
-/// line between the dwells that bracket it, and it says so (dashed stroke +
-/// caption). When the backend starts shipping point arrays, feed them here
-/// and `approximate` goes false.
+/// What a walk's map can honestly draw. The wire ships `route` on both moves
+/// and workouts: an array of [lat,lng] pairs (≤120 points, Douglas-Peucker
+/// simplified), or null when there were under 4 fixes. A real trace draws
+/// solid with `approximate` false; a null route falls back to the straight
+/// line between the dwells that bracket the window — dashed, and the caption
+/// says so.
 struct JRoute {
-    let coords: [CLLocationCoordinate2D]   // 1 (loop / lone anchor) or 2 points
+    let coords: [CLLocationCoordinate2D]   // full trace, or 1–2 dwell anchors
     let startPlace: String
     let endPlace: String
     let approximate: Bool                  // endpoints only, not the true path
@@ -322,7 +323,8 @@ private enum JDayParser {
         }
 
         // 🚶 moves — walks and transit hops between dwells
-        // (wire: data.moves[{start,end,km,kind:"walk"|"transit"}])
+        // (wire: data.moves[{start,end,km,kind:"walk"|"transit",
+        //  route:[[lat,lng],…]|null — present for walks, ≤120 DP points})
         for (i, m) in ((data["moves"] as? [[String: Any]]) ?? []).enumerated() {
             let mode = jStr(m, ["kind", "mode"]).lowercased()
             let isWalk = mode != "transit"
@@ -345,11 +347,16 @@ private enum JDayParser {
                 chip: nil, chipGood: false,
                 icon: isWalk ? "figure.walk" : "arrow.right.circle",
                 tint: isWalk ? JStyle.pink : JStyle.sky,
-                route: isWalk ? routeBetween(stays: stays, start: start, end: end) : nil))
+                route: isWalk
+                    ? (traceRoute(m["route"])
+                        ?? routeBetween(stays: stays, start: start, end: end))
+                    : nil))
         }
 
         // 💪 workouts (wire: {start_at,end_at,kind,distance_m,kcal,avg_hr,
-        // elevation_gain_m} — duration computed from the range)
+        // elevation_gain_m, route:[[lat,lng],…]|null} — duration computed
+        // from the range; route prefers the device-recorded trail, falling
+        // back server-side to location fixes over the workout window)
         for (i, w) in ((data["workouts"] as? [[String: Any]]) ?? []).enumerated() {
             let kind = jStr(w, ["kind", "type"])
             let start = JDates.parseWhen(jStr(w, ["start_at", "start"]))
@@ -375,8 +382,12 @@ private enum JDayParser {
                 chip: nil, chipGood: false,
                 icon: JStyle.workoutIcon(kind),
                 tint: JStyle.rose,
-                route: JStyle.isOutdoor(kind)
-                    ? routeBetween(stays: stays, start: start, end: end) : nil))
+                // A real trail wins whatever the kind (the server only ships
+                // one when there were fixes); the dwell fallback stays gated
+                // to outdoor kinds so a gym session never grows a fake map.
+                route: traceRoute(w["route"])
+                    ?? (JStyle.isOutdoor(kind)
+                        ? routeBetween(stays: stays, start: start, end: end) : nil)))
         }
 
         // 📅 episodes — what actually happened (wire: planned = the matched
@@ -544,11 +555,31 @@ private enum JDayParser {
             fetchedAt: Date())
     }
 
-    /// The dwells that bracket a movement window → its honest snapshot route.
-    /// The wire has no raw trace for moves (yet), so this is the straight
-    /// line "left HERE, arrived THERE" — approximate by construction. An
-    /// anchor is only trusted within 45 minutes of the move's edge; a loop
-    /// (left home, came back) collapses to a single marker.
+    /// The REAL trace off the wire: `route` = [[lat,lng],…] (≤120 points,
+    /// Douglas-Peucker simplified) or null. Every pair is validated before
+    /// MapKit sees it (the lat-999 assert class — same guard as HealthView);
+    /// under 2 sane points it's no trace at all, and the caller falls back
+    /// to the dwell-anchored straight line.
+    private static func traceRoute(_ raw: Any?) -> JRoute? {
+        guard let pairs = raw as? [[Any]] else { return nil }
+        let coords: [CLLocationCoordinate2D] = pairs.compactMap { pair in
+            guard pair.count >= 2,
+                  let lat = (pair[0] as? NSNumber)?.doubleValue,
+                  let lng = (pair[1] as? NSNumber)?.doubleValue else { return nil }
+            let c = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+            guard CLLocationCoordinate2DIsValid(c),
+                  abs(lat) > 0.0001 || abs(lng) > 0.0001 else { return nil }
+            return c
+        }
+        guard coords.count >= 2 else { return nil }
+        return JRoute(coords: coords, startPlace: "", endPlace: "", approximate: false)
+    }
+
+    /// FALLBACK when `route` is null (under 4 fixes): the dwells that bracket
+    /// the movement window → the straight line "left HERE, arrived THERE" —
+    /// approximate by construction. An anchor is only trusted within 45
+    /// minutes of the move's edge; a loop (left home, came back) collapses
+    /// to a single marker.
     private static func routeBetween(stays: [JStay], start: Date?, end: Date?) -> JRoute? {
         guard let start, let end, !stays.isEmpty else { return nil }
         let tolerance: TimeInterval = 45 * 60
