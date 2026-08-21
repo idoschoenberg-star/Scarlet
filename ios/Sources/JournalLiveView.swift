@@ -282,6 +282,11 @@ struct JDayItem: Identifiable {
     var thin: Bool = false
     /// Walks and outdoor workouts carry their route snapshot.
     var route: JRoute? = nil
+    /// Server-side identity for drill-down (op=journal_item): pins and
+    /// episodes carry their row id so tapping the card opens the full
+    /// conversation/detail (Ido 2026-08-21). nil = the row is all there is.
+    var sourceId: String? = nil
+    var sourceKind: String? = nil   // "pin" | "episode"
 
     var accessLabel: String { "\(timeLabel) \(title)" }
 }
@@ -433,7 +438,9 @@ private enum JDayParser {
                 chip: chip, chipGood: good,
                 icon: episodeIcon(epKind),
                 tint: JStyle.sky,
-                thin: thin))
+                thin: thin,
+                sourceId: jStr(e, ["id"]).isEmpty ? nil : jStr(e, ["id"]),
+                sourceKind: "episode"))
         }
 
         // 📅 calendar events that never became episodes (attended ones ARE
@@ -470,7 +477,9 @@ private enum JDayParser {
                 place: "",
                 chip: nil, chipGood: false,
                 icon: "waveform",
-                tint: JStyle.rose))
+                tint: JStyle.rose,
+                sourceId: jStr(p, ["id"]).isEmpty ? nil : jStr(p, ["id"]),
+                sourceKind: "pin"))
         }
 
         // 🎙 synced recorder/Plaud documents (no timestamp on the wire —
@@ -1563,6 +1572,7 @@ struct JournalDayScreen: View {
 
 private struct JTimelineRow: View {
     let item: JDayItem
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -1581,8 +1591,29 @@ private struct JTimelineRow: View {
                 .frame(width: 12)
                 .padding(.top, 12)
 
-            rowCard
-                .padding(.bottom, 10)
+            // Rows with a server-side story behind them (pin conversations,
+            // episodes) push the full detail on the Journal's single
+            // NavigationStack — never a sheet (Catalyst one-sheet rule).
+            Group {
+                if item.sourceId != nil {
+                    NavigationLink { JItemDetailScreen(item: item) } label: { rowCard }
+                        .buttonStyle(.plain)
+                } else {
+                    rowCard
+                }
+            }
+            .padding(.bottom, 10)
+        }
+    }
+
+    /// Tap the route snapshot → the spot opens in Apple Maps, zoomable with
+    /// the real map behind it (Ido 2026-08-21). maps.apple.com routes to the
+    /// native Maps app on iPhone/iPad/Mac.
+    private func openAppleMaps(_ route: JRoute) {
+        guard !route.coords.isEmpty else { return }
+        let mid = route.coords[route.coords.count / 2]
+        if let url = URL(string: "https://maps.apple.com/?ll=\(mid.latitude),\(mid.longitude)&z=15") {
+            openURL(url)
         }
     }
 
@@ -1641,6 +1672,16 @@ private struct JTimelineRow: View {
             if let route = item.route {
                 JRouteMap(route: route, tint: item.tint)
                     .padding(.top, 2)
+                    .overlay(alignment: .topTrailing) {
+                        Image(systemName: "arrow.up.forward.app.fill")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .padding(6)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { openAppleMaps(route) }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint(Text("Opens in Apple Maps"))
             }
             if !item.subtitle.isEmpty {
                 // On mapped rows this line doubles as the map's caption —
@@ -1703,6 +1744,101 @@ private struct JTimelineRow: View {
         case .pin: return "Pinned conversation"
         case .meal: return "Meal"
         }
+    }
+}
+
+// MARK: - Item detail (drill-down)
+
+/// The full story behind one journal row (Ido 2026-08-21: "when you click on
+/// it, you can go into more detail on that conversation"): a pin fetches its
+/// COMPLETE transcript via op=journal_item (the day payload carries only a
+/// 400-char excerpt); an episode fetches its full row (summary, people,
+/// place). Pushed on the Journal's single NavigationStack — never a sheet.
+private struct JItemDetailScreen: View {
+    let item: JDayItem
+    @State private var fullText = ""
+    @State private var people: [String] = []
+    @State private var loading = true
+    @State private var loadError: String? = nil
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: item.icon)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(item.tint)
+                    Text(item.timeLabel)
+                        .font(.system(size: 13, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.55))
+                    if !item.place.isEmpty {
+                        Text("· " + item.place)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.55))
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                }
+                if !people.isEmpty {
+                    Text(people.joined(separator: ", "))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+                if loading {
+                    ProgressView()
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 30)
+                } else {
+                    if let err = loadError {
+                        Text(err)
+                            .font(.system(size: 12))
+                            .foregroundStyle(JStyle.amber)
+                    }
+                    // Mixed Hebrew/English: direction per paragraph, never
+                    // per screen (TextDirection.swift rule).
+                    ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, p in
+                        Text(p)
+                            .font(.system(size: 15))
+                            .foregroundStyle(.white.opacity(0.88))
+                            .multilineTextAlignment(p.readingAlignment)
+                            .frame(maxWidth: .infinity, alignment: p.readingFrameAlignment)
+                            .environment(\.layoutDirection, p.layoutDir)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(ScarletBackground().ignoresSafeArea())
+        .navigationTitle(item.title.isEmpty ? "Detail" : item.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .task { await load() }
+    }
+
+    private var paragraphs: [String] {
+        let text = fullText.isEmpty ? item.subtitle : fullText
+        return text.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
+    }
+
+    private func load() async {
+        guard let sid = item.sourceId, let kind = item.sourceKind else {
+            loading = false
+            return
+        }
+        do {
+            let obj = try await JWire.request("op=journal_item&kind=\(kind)&id=\(sid)")
+            if kind == "pin" {
+                fullText = (obj["transcript"] as? String) ?? ""
+            } else {
+                fullText = (obj["summary"] as? String) ?? ""
+                people = (obj["people"] as? [String]) ?? []
+            }
+        } catch {
+            // The row's own excerpt still shows — say so, honestly.
+            loadError = "Couldn't load the full text — showing the summary from the day page."
+        }
+        loading = false
     }
 }
 
