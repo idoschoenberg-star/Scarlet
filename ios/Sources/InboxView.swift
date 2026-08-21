@@ -987,19 +987,25 @@ struct MailDetailView: View {
     @State private var downloadingAttachmentId: String?
     /// Small red footnote under the chips; cleared on the next tap.
     @State private var attachmentError = ""
-    /// ONE sheet for the reader — the Reply drafting window OR a QuickLook
-    /// attachment preview. Two stacked `.sheet` modifiers on one view crash Mac
-    /// Catalyst; a single enum-driven sheet is safe.
+    /// ONE sheet for the reader — the reply CHOOSER, the review surface, or a
+    /// QuickLook attachment preview. Two stacked `.sheet` modifiers on one
+    /// view crash Mac Catalyst; a single enum-driven sheet is safe.
     enum ReaderSheet: Identifiable {
-        case draft, preview(PreviewFile)
+        case chooser, draft(ReplyMode), preview(PreviewFile)
         var id: String {
             switch self {
-            case .draft: return "draft"
+            case .chooser: return "chooser"
+            case .draft(let m): return "draft-\(m.rawValue)"
             case .preview(let f): return "preview-\(f.id)"
             }
         }
     }
     @State private var activeSheet: ReaderSheet?
+    /// The chooser's pick — the review surface presents from the sheet's
+    /// onDismiss (the reliable Catalyst sheet-swap pattern).
+    @State private var pendingReplyMode: ReplyMode?
+    /// iPhone → the chooser is a bottom sheet; iPad/Mac → a menu on Reply.
+    @Environment(\.horizontalSizeClass) private var hSize
     /// Display name of the attachment being previewed — feeds the viewer's
     /// [FOCUS] line so Scarlet knows exactly which file is on screen.
     @State private var previewName = ""
@@ -1041,9 +1047,16 @@ struct MailDetailView: View {
         // `onDismiss` runs the attachment-focus restore for every case — it's a
         // no-op when the draft closes (no attachment focus was set).
         .reportsModalPresence(activeSheet != nil)
-        .sheet(item: $activeSheet, onDismiss: attachmentViewerClosed) { sheet in
+        .sheet(item: $activeSheet, onDismiss: readerSheetClosed) { sheet in
             switch sheet {
-            case .draft:
+            case .chooser:
+                // READ-FIRST (spec §2): Reply presents the three choices —
+                // never a draft straight away. The pick is only remembered
+                // here; the review surface presents from onDismiss.
+                ReplyChooserView(recipient: senderDisplayName) { mode in
+                    pendingReplyMode = mode
+                }
+            case .draft(let mode):
                 // The loaded detail carries the original's To/Cc; Reply is only
                 // reachable once it's up, but fall back to empty gracefully.
                 DraftView(seed: DraftSeed(
@@ -1054,7 +1067,7 @@ struct MailDetailView: View {
                     preview: message.preview,
                     toLine: detail?.to ?? "",
                     ccLine: detail?.cc ?? ""
-                ))
+                ), replyMode: mode)
                 .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                 .preferredColorScheme(.dark)
             case .preview(let file):
@@ -1083,6 +1096,32 @@ struct MailDetailView: View {
             if convo.currentFocus == emailFocus {
                 convo.setFocus(inboxBrowsingFocus(model.tab))
             }
+        }
+        // Work-surface keys (§5): R = reply chooser, E = archive — silent
+        // twins of the action-bar buttons.
+        .background {
+            Group {
+                Button("") { activeSheet = .chooser }
+                    .keyboardShortcut("r", modifiers: [])
+                Button("") {
+                    model.archive(message)
+                    dismiss()
+                }
+                .keyboardShortcut("e", modifiers: [])
+            }
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    /// One dismiss handler for the reader's single sheet: restore the
+    /// attachment focus (no-op for the other cases), then present the review
+    /// surface if the chooser just picked a mode.
+    private func readerSheetClosed() {
+        attachmentViewerClosed()
+        if let mode = pendingReplyMode {
+            pendingReplyMode = nil
+            activeSheet = .draft(mode)
         }
     }
 
@@ -1404,11 +1443,23 @@ struct MailDetailView: View {
     /// quiet raised chips. Same three behaviors as always.
     private var actionBar: some View {
         HStack(spacing: 10) {
-            // "Reply All" — the draft is a true threaded Reply-All (every
-            // original recipient), so the button says exactly that.
-            actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
-                         tint: OutlookStyle.primaryBlue, filled: true) {
-                activeSheet = .draft
+            // "Reply All" — the eventual draft is a true threaded Reply-All
+            // (every original recipient). READ-FIRST: the button opens the
+            // three-option chooser — a bottom sheet on iPhone, the same three
+            // choices as a menu on iPad/Mac — never a draft directly.
+            if hSize == .regular {
+                ReplyChooserMenu(onChoose: { mode in
+                    activeSheet = .draft(mode)
+                }) {
+                    actionLabel("Reply All", icon: "arrowshape.turn.up.left.2.fill",
+                                tint: OutlookStyle.primaryBlue, filled: true)
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
+                             tint: OutlookStyle.primaryBlue, filled: true) {
+                    activeSheet = .chooser
+                }
             }
             // Archive is GREEN here too, matching the list swipe — one color per
             // concept.
@@ -1429,18 +1480,25 @@ struct MailDetailView: View {
                               filled: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 13, weight: .semibold))
-                Text(label).font(.footnote.weight(.semibold))
-            }
-            .lineLimit(1)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .background(filled ? tint : OutlookStyle.surface, in: Capsule())
-            .overlay(Capsule().stroke(
-                filled ? Color.clear : OutlookStyle.separator, lineWidth: 1))
-            .foregroundStyle(filled ? Color.white : tint)
+            actionLabel(label, icon: icon, tint: tint, filled: filled)
         }
+    }
+
+    /// The action-bar chip's face, shared by plain buttons and the Reply
+    /// menu (which needs the label without a Button around it).
+    private func actionLabel(_ label: String, icon: String, tint: Color,
+                             filled: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+            Text(label).font(.footnote.weight(.semibold))
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(filled ? tint : OutlookStyle.surface, in: Capsule())
+        .overlay(Capsule().stroke(
+            filled ? Color.clear : OutlookStyle.separator, lineWidth: 1))
+        .foregroundStyle(filled ? Color.white : tint)
     }
 
     /// "All Scarlet capabilities" in the reader: hand this email to the live
