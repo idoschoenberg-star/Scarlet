@@ -18,12 +18,17 @@ import UIKit
 // this tab still exists — see JournalView.swift (`JournalReviewScreen`) —
 // reachable from a quiet banner whenever anything waits for his ruling.
 //
-// Server truth (fixes-journal-live.md):
-//   op=journal_day&date=YYYY-MM-DD  → {date, narrative, data{episodes,
-//       movements, weather, health, workouts, pins, calendar, meals,
-//       missing}, updated_at}
-//   op=journal_month&month=YYYY-MM  → per-day headline stats
-//   op=journal_search {q, tz}       → {answer, days, evidence}
+// Server truth (fixes-journal-live.md — the authoritative wire contract):
+//   op=journal_day&date=YYYY-MM-DD&tz=  → {date, narrative|null,
+//       data{place, weather{icon,words,tmin,tmax}, stays, moves, movement,
+//       episodes (planned = matched calendar event | null), calendar
+//       (attended flag; attended ones ARE the episodes), pins, docs, meals,
+//       health|null, workouts, missing, failures}, updated_at}
+//   op=journal_month&month=YYYY-MM&tz=  → {days:[{date, steps, km,
+//       episodes, meetings, meals, has_pins, weather{icon,tmin,tmax}, place}]}
+//       (only days WITH data appear — absent days render quietly dimmed)
+//   op=journal_search {q, tz}           → {answer, days (newest-first, ≤30),
+//       evidence:[{date, kind: episode|narrative|segment|weather, title}]}
 // Older backend without these ops → the honest "journal engine is deploying"
 // placeholder, never a crash.
 
@@ -156,10 +161,12 @@ private enum JWire {
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         if !(200...299).contains(status) {
-            // An older backend answers unknown ops with 404 (or a 400 naming
-            // the op) — that is "the engine is deploying", not an error.
+            // An older backend answers unknown ops with 400 {"error":"unknown
+            // op"} — that is "the engine is deploying", not an error. A 404
+            // here is a REAL answer (journal_day: future date), so it stays
+            // an ordinary error.
             let errText = ((obj["error"] as? String) ?? "").lowercased()
-            if status == 404 || errText.contains("unknown op") || errText.contains("unsupported op") {
+            if errText.contains("unknown op") || errText.contains("unsupported op") {
                 throw JWireError.opMissing
             }
             throw JWireError.badStatus(status)
@@ -261,23 +268,19 @@ private enum JDayParser {
         let data = (obj["data"] as? [String: Any]) ?? [:]
         var items: [JDayItem] = []
 
-        // 🚶 movements — walks and transit hops between dwells
-        for (i, m) in ((data["movements"] as? [[String: Any]]) ?? []).enumerated() {
-            let mode = jStr(m, ["mode", "kind", "type"]).lowercased()
-            let isWalk = mode.contains("walk") || mode.contains("foot") || mode.isEmpty
-            let km = jNum(m, ["km", "distance_km", "distanceKm"])
-                ?? jNum(m, ["meters", "distance_m"]).map { $0 / 1000 }
-            let dur = jInt(m, ["minutes", "duration_min", "durationMin", "min"])
-            let start = JDates.parseWhen(jStr(m, ["start", "start_at", "from", "at"]))
-            let end = JDates.parseWhen(jStr(m, ["end", "end_at", "to"]))
+        // 🚶 moves — walks and transit hops between dwells
+        // (wire: data.moves[{start,end,km,kind:"walk"|"transit"}])
+        for (i, m) in ((data["moves"] as? [[String: Any]]) ?? []).enumerated() {
+            let mode = jStr(m, ["kind", "mode"]).lowercased()
+            let isWalk = mode != "transit"
+            let km = jNum(m, ["km"])
+            let start = JDates.parseWhen(jStr(m, ["start", "start_at"]))
+            let end = JDates.parseWhen(jStr(m, ["end", "end_at"]))
             var bits: [String] = []
-            if let dur { bits.append(HealthMin.text(dur)) }
-            else if let s = start, let e = end {
+            if let s = start, let e = end {
                 bits.append(HealthMin.text(max(1, Int(e.timeIntervalSince(s) / 60))))
             }
             if let km, km > 0 { bits.append(String(format: "%.1f km", km)) }
-            let placeBits = [jStr(m, ["from_place", "from_name"]), jStr(m, ["to_place", "to_name", "place"])]
-                .filter { !$0.isEmpty }
             items.append(JDayItem(
                 id: "move-\(i)",
                 kind: isWalk ? .walk : .transit,
@@ -285,26 +288,28 @@ private enum JDayParser {
                 timeLabel: rangeLabel(start, end),
                 title: isWalk ? "Walk" : "On the move",
                 subtitle: bits.joined(separator: " · "),
-                place: placeBits.joined(separator: " → "),
+                place: "",
                 chip: nil, chipGood: false,
                 icon: isWalk ? "figure.walk" : "arrow.right.circle",
                 tint: isWalk ? JStyle.pink : JStyle.sky))
         }
 
-        // 💪 workouts
+        // 💪 workouts (wire: {start_at,end_at,kind,distance_m,kcal,avg_hr,
+        // elevation_gain_m} — duration computed from the range)
         for (i, w) in ((data["workouts"] as? [[String: Any]]) ?? []).enumerated() {
-            let kind = jStr(w, ["kind", "type", "name"])
-            let start = JDates.parseWhen(jStr(w, ["start", "start_at", "at"]))
+            let kind = jStr(w, ["kind", "type"])
+            let start = JDates.parseWhen(jStr(w, ["start_at", "start"]))
+            let end = JDates.parseWhen(jStr(w, ["end_at", "end"]))
             var bits: [String] = []
-            if let d = jInt(w, ["duration_min", "durationMin", "minutes", "min"]) {
-                bits.append(HealthMin.text(d))
+            if let s = start, let e = end {
+                bits.append(HealthMin.text(max(1, Int(e.timeIntervalSince(s) / 60))))
             }
-            if let km = jNum(w, ["km", "distance_km"]) ?? jNum(w, ["distance_m", "meters"]).map({ $0 / 1000 }),
-               km > 0 { bits.append(String(format: "%.1f km", km)) }
-            if let el = jInt(w, ["elevation_m", "elevation_gain_m", "elevation"]), el > 0 {
-                bits.append("+\(el) m")
+            if let km = jNum(w, ["distance_m"]).map({ $0 / 1000 }), km >= 0.1 {
+                bits.append(String(format: "%.1f km", km))
             }
-            if let kc = jInt(w, ["kcal", "active_kcal"]), kc > 0 { bits.append("\(kc) kcal") }
+            if let el = jInt(w, ["elevation_gain_m"]), el > 0 { bits.append("+\(el) m") }
+            if let kc = jInt(w, ["kcal"]), kc > 0 { bits.append("\(kc) kcal") }
+            if let hr = jInt(w, ["avg_hr"]), hr > 0 { bits.append("avg HR \(hr)") }
             items.append(JDayItem(
                 id: "workout-\(i)",
                 kind: .workout,
@@ -318,88 +323,112 @@ private enum JDayParser {
                 tint: JStyle.rose))
         }
 
-        // 📅 episodes — meetings and gatherings the lifegraph reconstructed
+        // 📅 episodes — what actually happened (wire: planned = the matched
+        // calendar event object or null; actual_delta_min = start slip)
         for (i, e) in ((data["episodes"] as? [[String: Any]]) ?? []).enumerated() {
-            let start = JDates.parseWhen(jStr(e, ["start", "start_at", "at"]))
-            let end = JDates.parseWhen(jStr(e, ["end", "end_at"]))
+            let start = JDates.parseWhen(jStr(e, ["started_at", "start_at", "start"]))
+            let end = JDates.parseWhen(jStr(e, ["ended_at", "end_at", "end"]))
             let people = (e["people"] as? [String])?.filter { !$0.isEmpty } ?? []
+            // Planned-vs-actual chip: linked to a calendar event → "planned"
+            // (with the start slip when it's meaningful); otherwise the day
+            // held something the calendar never knew about.
             var chip: String?
             var good = true
-            if let planned = e["planned"] as? Bool {
-                chip = planned ? "planned" : "unplanned"
-                good = planned
-            } else {
-                let pv = jStr(e, ["planned_vs_actual", "plan_chip", "chip"])
-                if !pv.isEmpty {
-                    chip = pv
-                    good = !pv.lowercased().contains("un") && !pv.lowercased().contains("missed")
+            if e["planned"] as? [String: Any] != nil {
+                if let delta = jInt(e, ["actual_delta_min"]), abs(delta) >= 10 {
+                    chip = delta > 0 ? "planned · \(delta)m late" : "planned · \(-delta)m early"
+                } else {
+                    chip = "planned"
                 }
+            } else {
+                chip = "unplanned"
+                good = false
             }
-            var sub = jStr(e, ["summary", "body", "detail"])
+            var sub = jStr(e, ["summary"])
             if !people.isEmpty {
                 sub = sub.isEmpty ? people.joined(separator: ", ")
                                   : people.joined(separator: ", ") + " — " + sub
             }
+            let epKind = jStr(e, ["kind"]).lowercased()
             items.append(JDayItem(
                 id: "ep-" + (jStr(e, ["id"]).isEmpty ? "\(i)" : jStr(e, ["id"])),
                 kind: .meeting,
                 when: start,
                 timeLabel: rangeLabel(start, end),
-                title: jStr(e, ["title", "subject", "name"]),
+                title: jStr(e, ["title"]),
                 subtitle: sub,
-                place: jStr(e, ["place", "location", "place_name"]),
+                place: jStr(e, ["place"]),
                 chip: chip, chipGood: good,
-                icon: "person.2.fill",
+                icon: episodeIcon(epKind),
                 tint: JStyle.sky))
         }
 
-        // 📅 calendar events that never became episodes (dimmer identity)
+        // 📅 calendar events that never became episodes (attended ones ARE
+        // the episodes above — listing both would double every meeting)
         for (i, c) in ((data["calendar"] as? [[String: Any]]) ?? []).enumerated() {
-            let start = JDates.parseWhen(jStr(c, ["start", "start_at"]))
-            let end = JDates.parseWhen(jStr(c, ["end", "end_at"]))
+            if (c["attended"] as? Bool) == true { continue }
+            let allDay = (c["all_day"] as? Bool) == true
+            let online = (c["is_online"] as? Bool) == true
+            let start = JDates.parseWhen(jStr(c, ["scheduled_start"]))
+            let end = JDates.parseWhen(jStr(c, ["scheduled_end"]))
             items.append(JDayItem(
                 id: "cal-\(i)",
                 kind: .calendar,
-                when: start,
-                timeLabel: rangeLabel(start, end),
-                title: jStr(c, ["subject", "title", "name"]),
-                subtitle: jStr(c, ["organizer", "detail"]),
-                place: jStr(c, ["location", "place"]),
+                when: allDay ? nil : start,
+                timeLabel: allDay ? "All day" : rangeLabel(start, end),
+                title: jStr(c, ["title"]),
+                subtitle: jStr(c, ["organizer"]),
+                place: jStr(c, ["location"]),
                 chip: nil, chipGood: false,
-                icon: "calendar",
+                icon: online ? "video" : "calendar",
                 tint: Color.white.opacity(0.45)))
         }
 
         // 🎙 pin conversations
         for (i, p) in ((data["pins"] as? [[String: Any]]) ?? []).enumerated() {
-            let at = JDates.parseWhen(jStr(p, ["at", "created_at", "start", "time"]))
+            let at = JDates.parseWhen(jStr(p, ["started_at", "start_at", "at"]))
             items.append(JDayItem(
                 id: "pin-\(i)",
                 kind: .pin,
                 when: at,
                 timeLabel: at.map { JDates.time.string(from: $0) } ?? "",
-                title: jStr(p, ["title", "subject", "name"]),
-                subtitle: jStr(p, ["excerpt", "summary", "preview", "body"]),
+                title: jStr(p, ["title"]),
+                subtitle: jStr(p, ["excerpt"]),
                 place: "",
                 chip: nil, chipGood: false,
                 icon: "waveform",
                 tint: JStyle.rose))
         }
 
-        // 🍽 meals
+        // 🎙 synced recorder/Plaud documents (no timestamp on the wire —
+        // they settle at the end of the day)
+        for (i, d) in ((data["docs"] as? [[String: Any]]) ?? []).enumerated() {
+            items.append(JDayItem(
+                id: "doc-\(i)",
+                kind: .pin,
+                when: nil,
+                timeLabel: "",
+                title: jStr(d, ["title"]),
+                subtitle: jStr(d, ["source"]),
+                place: "",
+                chip: nil, chipGood: false,
+                icon: "doc.text.fill",
+                tint: JStyle.rose))
+        }
+
+        // 🍽 meals (wire: {at, title, calories, protein_g})
         for (i, m) in ((data["meals"] as? [[String: Any]]) ?? []).enumerated() {
-            let at = JDates.parseWhen(jStr(m, ["at", "created_at", "time"]))
-            var sub = jStr(m, ["detail", "body", "notes", "description"])
-            if let kcal = jInt(m, ["kcal", "calories"]), kcal > 0 {
-                sub = sub.isEmpty ? "\(kcal) kcal" : sub + " · \(kcal) kcal"
-            }
+            let at = JDates.parseWhen(jStr(m, ["at"]))
+            var bits: [String] = []
+            if let kcal = jInt(m, ["calories", "kcal"]), kcal > 0 { bits.append("\(kcal) kcal") }
+            if let pr = jInt(m, ["protein_g"]), pr > 0 { bits.append("\(pr)g protein") }
             items.append(JDayItem(
                 id: "meal-\(i)",
                 kind: .meal,
                 when: at,
                 timeLabel: at.map { JDates.time.string(from: $0) } ?? "",
-                title: jStr(m, ["title", "meal", "name", "kind"]),
-                subtitle: sub,
+                title: jStr(m, ["title"]),
+                subtitle: bits.joined(separator: " · "),
                 place: "",
                 chip: nil, chipGood: false,
                 icon: "fork.knife",
@@ -411,36 +440,42 @@ private enum JDayParser {
             ($0.when ?? .distantFuture) < ($1.when ?? .distantFuture)
         }
 
+        // wire: weather {tmin, tmax, precip_mm, code, words, icon, rain_hours}
         var weather: JDayWeather?
         if let w = data["weather"] as? [String: Any] {
-            let emoji = jStr(w, ["emoji", "icon"])
-            let words = jStr(w, ["words", "summary", "description"])
-            let hi = jNum(w, ["high", "high_c", "tmax", "max"])
-            let lo = jNum(w, ["low", "low_c", "tmin", "min"])
+            let emoji = jStr(w, ["icon", "emoji"])
+            let words = jStr(w, ["words"])
+            let hi = jNum(w, ["tmax"])
+            let lo = jNum(w, ["tmin"])
             if !(emoji.isEmpty && words.isEmpty && hi == nil && lo == nil) {
                 weather = JDayWeather(emoji: emoji, words: words, highC: hi, lowC: lo)
             }
         }
 
+        // wire: health {steps, distance_m, active_kcal, exercise_min,
+        // stand_hours, resting_hr, hrv_ms, sleep_min, …} | null
         let h = (data["health"] as? [String: Any]) ?? [:]
         let health = JDayHealth(
             steps: jInt(h, ["steps"]),
-            distanceKm: jNum(h, ["distance_km", "km", "distanceKm"])
-                ?? jNum(h, ["distance_m"]).map { $0 / 1000 },
-            exerciseMin: jInt(h, ["exercise_min", "exerciseMin"]),
-            hrvMs: jInt(h, ["hrv_ms", "hrv"]),
-            restingHR: jInt(h, ["resting_hr", "restingHR", "resting_heart_rate"]),
-            activeKcal: jInt(h, ["active_kcal", "kcal", "activeKcal"]),
-            sleepMin: jInt(h, ["sleep_min", "sleepMin"]))
+            distanceKm: jNum(h, ["distance_m"]).map { $0 / 1000 },
+            exerciseMin: jInt(h, ["exercise_min"]),
+            hrvMs: jInt(h, ["hrv_ms"]),
+            restingHR: jInt(h, ["resting_hr"]),
+            activeKcal: jInt(h, ["active_kcal"]),
+            sleepMin: jInt(h, ["sleep_min"]))
 
-        let missing = ((data["missing"] as? [String]) ?? []).filter { !$0.isEmpty }
+        // `missing` = axes with no data; `failures` = axes whose fetch broke.
+        // Both surface in the one honest footer line.
+        var missing = ((data["missing"] as? [String]) ?? []).filter { !$0.isEmpty }
+        let failures = ((data["failures"] as? [String]) ?? []).filter { !$0.isEmpty }
+        if !failures.isEmpty {
+            missing.append(contentsOf: failures.map { "\($0) (fetch failed)" })
+        }
 
         return JDayPayload(
             dateKey: jStr(obj, ["date"]).isEmpty ? dateKey : jStr(obj, ["date"]),
             narrative: jStr(obj, ["narrative"]),
-            place: jStr(obj, ["place", "dominant_place"]).isEmpty
-                ? jStr(data, ["place", "dominant_place"])
-                : jStr(obj, ["place", "dominant_place"]),
+            place: jStr(data, ["place"]),
             weather: weather,
             health: health,
             items: items,
@@ -453,6 +488,19 @@ private enum JDayParser {
         guard let start else { return "" }
         guard let end else { return JDates.time.string(from: start) }
         return "\(JDates.time.string(from: start)) – \(JDates.time.string(from: end))"
+    }
+
+    /// Episode kinds carry their own icon (wire: meeting|visit|conversation|
+    /// travel|meal|other).
+    private static func episodeIcon(_ kind: String) -> String {
+        switch kind {
+        case "visit": return "mappin.and.ellipse"
+        case "conversation": return "bubble.left.and.bubble.right.fill"
+        case "travel": return "airplane"
+        case "meal": return "fork.knife"
+        case "meeting": return "person.2.fill"
+        default: return "sparkles"
+        }
     }
 }
 
@@ -470,14 +518,17 @@ struct JMonthDay: Identifiable {
     let day: Date
     let steps: Int
     let km: Double
+    let episodes: Int
     let meetings: Int
     let meals: Int
+    let hasPins: Bool
     let weatherEmoji: String
     let place: String
 
     var id: String { dateKey }
     var hasData: Bool {
-        steps > 0 || km > 0 || meetings > 0 || meals > 0 || !weatherEmoji.isEmpty
+        steps > 0 || km > 0 || episodes > 0 || meetings > 0 || meals > 0
+            || hasPins || !weatherEmoji.isEmpty
     }
 }
 
@@ -531,20 +582,27 @@ final class JournalMonthModel: ObservableObject {
         loadingKey = monthKey
         defer { loadingKey = nil }
         do {
-            let obj = try await JWire.request("op=journal_month&month=\(monthKey)")
+            let tz = TimeZone.current.secondsFromGMT() / 60
+            let obj = try await JWire.request("op=journal_month&month=\(monthKey)&tz=\(tz)")
+            // wire: one row per day WITH data — absent days render empty.
+            // {date, steps|null, km|null, episodes, meetings, meals,
+            //  has_pins, weather{icon,tmin,tmax}|null, place|null}
             let rows = (obj["days"] as? [[String: Any]]) ?? []
             months[monthKey] = rows.compactMap { r in
-                let key = jStr(r, ["date", "day"])
+                let key = jStr(r, ["date"])
                 guard let day = JDates.parseDayKey(key) else { return nil }
+                let weather = r["weather"] as? [String: Any]
                 return JMonthDay(
                     dateKey: key,
                     day: day,
                     steps: jInt(r, ["steps"]) ?? 0,
-                    km: jNum(r, ["km", "distance_km"]) ?? 0,
-                    meetings: jInt(r, ["meetings", "episodes", "episode_count", "meeting_count"]) ?? 0,
-                    meals: jInt(r, ["meals", "meal_count"]) ?? 0,
-                    weatherEmoji: jStr(r, ["weather", "weather_emoji", "emoji"]),
-                    place: jStr(r, ["place", "dominant_place"]))
+                    km: jNum(r, ["km"]) ?? 0,
+                    episodes: jInt(r, ["episodes"]) ?? 0,
+                    meetings: jInt(r, ["meetings"]) ?? 0,
+                    meals: jInt(r, ["meals"]) ?? 0,
+                    hasPins: (r["has_pins"] as? Bool) ?? false,
+                    weatherEmoji: weather.map { jStr($0, ["icon", "emoji"]) } ?? "",
+                    place: jStr(r, ["place"]))
             }
             engineDeploying = false
             error = nil
@@ -654,15 +712,19 @@ struct JournalView: View {
             }
             // Work-surface keys: ←/→ walk days, T jumps to today, ⌘F focuses
             // search — silent twins of the visible controls (SignalReadView's
-            // hidden-button pattern).
+            // hidden-button pattern). The bare keys VANISH while the search
+            // field has focus, or they would swallow his typing and the
+            // text cursor's arrow keys.
             .background {
                 Group {
-                    Button("") { step(-1) }
-                        .keyboardShortcut(.leftArrow, modifiers: [])
-                    Button("") { step(1) }
-                        .keyboardShortcut(.rightArrow, modifiers: [])
-                    Button("") { goToday() }
-                        .keyboardShortcut("t", modifiers: [])
+                    if !searchFocused {
+                        Button("") { step(-1) }
+                            .keyboardShortcut(.leftArrow, modifiers: [])
+                        Button("") { step(1) }
+                            .keyboardShortcut(.rightArrow, modifiers: [])
+                        Button("") { goToday() }
+                            .keyboardShortcut("t", modifiers: [])
+                    }
                     Button("") { searchFocused = true }
                         .keyboardShortcut("f", modifiers: .command)
                 }
@@ -1538,6 +1600,10 @@ private struct JMonthCell: View {
                                                 .frame(width: 3.5, height: 3.5)
                                         }
                                     }
+                                }
+                                if s.hasPins {
+                                    Circle().fill(JStyle.rose)
+                                        .frame(width: 3.5, height: 3.5)
                                 }
                             }
                             if s.steps > 0 {
