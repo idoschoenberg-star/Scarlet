@@ -348,7 +348,9 @@ private enum JDayParser {
                 icon: isWalk ? "figure.walk" : "arrow.right.circle",
                 tint: isWalk ? JStyle.pink : JStyle.sky,
                 route: isWalk
-                    ? (traceRoute(m["route"])
+                    // Wire contract (lifegraph-sweep a47cc12): moves carry the
+                    // trace under `points`; `route` kept as a fallback key.
+                    ? (traceRoute(m["points"]) ?? traceRoute(m["route"])
                         ?? routeBetween(stays: stays, start: start, end: end))
                     : nil))
         }
