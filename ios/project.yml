@@ -128,6 +128,14 @@ targets:
         # doesn't include the entitlement", the App ID capability got dropped —
         # re-check it in the portal before touching this line.
         com.apple.developer.carplay-voice-based-conversation: true
+        # Time Sensitive Notifications — lets the NavigationChain leg-2
+        # handoff break through Driving Focus (interruptionLevel =
+        # .timeSensitive degrades silently to .active without this). Same
+        # portal rule as CarPlay above: the ScarletTalk App ID must have the
+        # Time Sensitive Notifications capability enabled or codesign fails
+        # with "profile doesn't include the entitlement" — enable it in the
+        # portal before removing this note.
+        com.apple.developer.usernotifications.time-sensitive: true
 
   # Scarlet on the wrist — same server brain, one-orb UI. Standalone on
   # cellular (leave the phone at home); the token arrives from the iPhone

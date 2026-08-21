@@ -47,21 +47,42 @@ final class ScarletLauncher: ObservableObject {
     }
 }
 
-/// "Talk to Scarlet" — the Siri phrase and Shortcuts action. Opens the app and
-/// starts a hands-free conversation. iOS 16+/17 AppIntents.
-struct TalkToScarletIntent: AppIntent {
+/// "Talk to Scarlet" — the Siri phrase and Shortcuts action. iOS 16.4+
+/// `AudioStartingIntent`, background-capable: `openAppWhenRun = true` made
+/// the intent unrunnable from CarPlay/Watch Siri ("continue on your iPhone"
+/// — the 2026-08-18 morning failure). App Intents run IN-PROCESS, so the
+/// shared Conversation and the Keychain token are reachable directly; the
+/// session starts right here, and the launcher handoff stays so the UI
+/// catches up whenever the app is (or becomes) visible.
+struct TalkToScarletIntent: AudioStartingIntent {
     static var title: LocalizedStringResource = "Talk to Scarlet"
     static var description = IntentDescription(
-        "Open Scarlet and start a live, hands-free conversation.")
+        "Start a live, hands-free conversation with Scarlet.")
 
-    /// Foreground the app on run — the conversation needs the audio engine and
-    /// the device token, which live in the running app, not the extension.
-    static var openAppWhenRun: Bool = true
+    /// Background-capable — the whole point: from CarPlay/Watch Siri the
+    /// audio session starts without bouncing to the phone screen.
+    static var openAppWhenRun: Bool = false
 
     func perform() async throws -> some IntentResult {
-        // `requestStart` is MainActor-isolated; hop onto the main actor.
-        await ScarletLauncher.shared.requestStart()
+        try await MainActor.run {
+            guard let t = TokenStore.token else {
+                // Something TRUTHFUL for Siri to say, not a silent shrug.
+                throw TalkIntentError.notSignedIn
+            }
+            if Conversation.shared.state == .idle {
+                Conversation.shared.hasAutoStarted = true
+                Conversation.shared.start(token: t)
+            }
+            ScarletLauncher.shared.requestStart()   // UI handoff for when the app IS visible
+        }
         return .result()
+    }
+}
+
+enum TalkIntentError: Error, CustomLocalizedStringResourceConvertible {
+    case notSignedIn
+    var localizedStringResource: LocalizedStringResource {
+        "Open Scarlet on your iPhone and sign in first."
     }
 }
 
