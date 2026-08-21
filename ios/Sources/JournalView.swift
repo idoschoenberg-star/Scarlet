@@ -23,6 +23,11 @@ import SwiftUI
 // Server truth: op=pins_list (already priority-first) and op=pins_review
 // {id, action: accept|amend|reject, title?, body?, …}. The API names stay
 // `pins_*` for app compatibility; every user-facing surface says Journal.
+//
+// 2026-08-21: the Journal SECTION is now the LIVE day-by-day browser
+// (JournalLiveView.swift — `JournalView` lives there). This screen is the
+// REVIEW LANE it pushes to from its banner: same cards, same rulings,
+// unchanged behavior — one push deeper.
 
 struct JournalCard: Identifiable, Equatable {
     let id: String
@@ -178,42 +183,53 @@ final class JournalModel: ObservableObject {
     }
 }
 
-// MARK: - Screen
+// MARK: - Screen (the review lane — pushed from the Live Journal's banner)
 
-struct JournalView: View {
-    @StateObject private var model = JournalModel()
+struct JournalReviewScreen: View {
+    /// Owned by the Live Journal root (JournalLiveView.swift), so the banner
+    /// count and this list are one source of truth.
+    @ObservedObject var model: JournalModel
     @EnvironmentObject private var convo: Conversation
     /// ONE sheet on this view (Mac Catalyst allows exactly one presentation
     /// per view — stacking a second is an app-quits-on-appear crash), driven
     /// by `.sheet(item:)` so the amend editor is the only thing it presents.
     @State private var amending: JournalCard?
 
+    /// Explicit internal init: the private @State above would make the
+    /// synthesized memberwise init private to THIS file, and the Live
+    /// Journal (JournalLiveView.swift) constructs this screen.
+    init(model: JournalModel) {
+        _model = ObservedObject(wrappedValue: model)
+    }
+
     var body: some View {
-        NavigationStack {
-            content
-                .background(ScarletBackground().ignoresSafeArea())
-                .navigationTitle("Journal")
-                .safeAreaInset(edge: .bottom) {
-                    ScarletPresenceView(convo: convo)
-                        .padding(.vertical, 6)
+        content
+            .background(ScarletBackground().ignoresSafeArea())
+            .navigationTitle("For review")
+            .navigationBarTitleDisplayMode(.inline)
+            .refreshable { await model.load() }
+            // Same contract every other list screen honours: while this
+            // sheet is up, the root's draft backstop must not open one
+            // over it (Catalyst allows a single presentation per view).
+            .reportsModalPresence(amending != nil)
+            .sheet(item: $amending) { card in
+                JournalAmendSheet(card: card) { title, body in
+                    Task { await model.review(card, action: "amend", title: title, body: body) }
                 }
-                .refreshable { await model.load() }
-                // Same contract every other list screen honours: while this
-                // sheet is up, the root's draft backstop must not open one
-                // over it (Catalyst allows a single presentation per view).
-                .reportsModalPresence(amending != nil)
-                .sheet(item: $amending) { card in
-                    JournalAmendSheet(card: card) { title, body in
-                        Task { await model.review(card, action: "amend", title: title, body: body) }
-                    }
-                    .preferredColorScheme(.dark)
+                .preferredColorScheme(.dark)
+            }
+            .onAppear { convo.setFocus(Self.focusLine(model.cards)) }
+            .onChange(of: model.cards) { _, cards in
+                convo.setFocus(Self.focusLine(cards))
+            }
+            // Popping back to the day browser: release the focus only if we
+            // still own it (SignalReadView's stale-guard pattern).
+            .onDisappear {
+                if convo.currentFocus == Self.focusLine(model.cards) {
+                    convo.setFocus("[FOCUS] Ido is back on the Journal's day browser.")
                 }
-                .onAppear { convo.setFocus(Self.focusLine(model.cards)) }
-                .onChange(of: model.cards) { _, cards in
-                    convo.setFocus(Self.focusLine(cards))
-                }
-        }
-        .task { await model.load() }
+            }
+            .task { await model.load() }
     }
 
     /// ALWAYS a ScrollView, empty or not — `.refreshable` only attaches to a
@@ -292,10 +308,10 @@ struct JournalView: View {
     /// one" or "what's in my journal" work by voice.
     private static func focusLine(_ cards: [JournalCard]) -> String {
         guard !cards.isEmpty else {
-            return "[FOCUS] Ido is on the Journal screen. The review inbox is empty."
+            return "[FOCUS] Ido is on the Journal's review lane. The review inbox is empty."
         }
         let verifications = cards.filter(\.isVerification).count
-        var line = "[FOCUS] Ido is on the Journal screen, reviewing \(cards.count) "
+        var line = "[FOCUS] Ido is on the Journal's review lane, reviewing \(cards.count) "
             + "entr\(cards.count == 1 ? "y" : "ies")"
         if verifications > 0 {
             line += " (\(verifications) of them storyline verifications)"
