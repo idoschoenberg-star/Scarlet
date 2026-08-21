@@ -540,6 +540,11 @@ final class Conversation: ObservableObject {
     /// session is declared stalled. Signs of life (first audio/text/tool
     /// event) cancel it — so a long tool run doesn't trip it, only silence.
     private let replyWatchdogSeconds: UInt64 = 25
+    /// First watchdog fire tries a SOFT recovery before any teardown — a
+    /// wedged VAD turn or slow reply costs one nudge (or one extra window),
+    /// never a mid-dialogue restart with amnesia (2026-08-19 CarPlay:
+    /// three sessions in one drive).
+    private var replyWatchdogNudged = false
     private var livenessTask: Task<Void, Never>?
 
     // Transport visibility (2026-08-11 death-loop hunt): every reconnect and
@@ -892,6 +897,21 @@ final class Conversation: ObservableObject {
                     self.reconnectAttempts = 0
                     self.scheduleReconnect(reason: "born-deaf-soft-speech", immediate: true)
                 }
+                // Proactive quiet-boundary rotation (2026-08-19): OpenAI
+                // enforces a server-side session lifetime cap that eventually
+                // drops the socket mid-sentence. Rotate at a QUIET boundary
+                // well before the cap — the P4 handover carries language +
+                // context, so the rebuild is invisible instead of an amnesia
+                // cut mid-answer. Rides the existing 10s tick, never a new timer.
+                if self.engine == .openai, self.state == .listening,
+                   Date().timeIntervalSince(self.connectedAt) > 50 * 60,
+                   self.pendingBuffers == 0, !self.responseActive,
+                   !self.serverHearsSpeech, !self.holdingForUserSpeech,
+                   Date().timeIntervalSince(self.lastSpeechStartedAt) > 5 {
+                    self.clientLog("session-rotate", "quiet-boundary rebuild before vendor lifetime cap")
+                    self.reconnectAttempts = 0
+                    self.scheduleReconnect(reason: "session-rotate", immediate: true)
+                }
                 // Recovery off the ElevenLabs parachute lands here: the probe
                 // armed openAIRecovered, and this tick is the quiet-boundary
                 // check that performs the actual switch (no-op otherwise).
@@ -1001,6 +1021,14 @@ final class Conversation: ObservableObject {
         endBackgroundAssertion()
         state = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
+    }
+
+    /// System-initiated teardown (CarPlay unplug, etc.) — same shutdown as
+    /// end(), but it is NOT Ido's choice: self-heal and the car's own
+    /// auto-revival stay armed.
+    func endBySystem() {
+        end()
+        endedByUser = false
     }
 
     // MARK: background survival (locked screen in the car)
@@ -1137,8 +1165,26 @@ final class Conversation: ObservableObject {
                 guard let prev, prev != sig, sig != "down" else { return }
                 guard Date().timeIntervalSince(self.lastPathReconnectAt) > 30 else { return }
                 self.lastPathReconnectAt = Date()
-                self.clientLog("path-change", "\(prev) → \(sig) — preemptive reconnect")
-                self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                // VERIFY, don't assume (2026-08-19 CarPlay: healthy sessions
+                // were being restarted mid-dialogue on every interface flip).
+                // A changed interface SET does not prove the socket died —
+                // sockets routinely survive Wi-Fi-assist flips. Ping the live
+                // socket: a dead one fails the pong and reconnects
+                // near-instantly; a healthy one is left alone.
+                guard let task = self.ws else {
+                    self.clientLog("path-change", "\(prev) → \(sig) — no socket, reconnecting")
+                    self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                    return
+                }
+                self.clientLog("path-change", "\(prev) → \(sig) — verifying socket with ping")
+                task.sendPing { [weak self] error in
+                    guard error != nil else { return }   // pong OK — the socket survived the handoff
+                    Task { @MainActor in
+                        guard let self, self.wantLive, self.ws === task else { return }
+                        self.clientLog("path-change", "ping failed after path change — reconnecting")
+                        self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                    }
+                }
             }
         }
         mon.start(queue: DispatchQueue.global(qos: .utility))
@@ -1403,6 +1449,31 @@ final class Conversation: ObservableObject {
 
     private func replyWatchdogFired() {
         guard wantLive else { return }
+        if engine == .openai, !replyWatchdogNudged, ws != nil {
+            replyWatchdogNudged = true
+            // If he may STILL be speaking (VAD open or speech started
+            // recently), do NOT clear his uncommitted audio or force a reply
+            // mid-utterance (2026-08-14 barge-in bug). Extend one window.
+            if serverHearsSpeech || Date().timeIntervalSince(lastSpeechStartedAt) < 5 {
+                clientLog("reply-watchdog-nudge", "speech may be ongoing — extending window, no clear/create")
+                armReplyWatchdog()
+                return
+            }
+            clientLog("reply-watchdog-nudge",
+                      "no reply in \(replyWatchdogSeconds)s — soft recovery before any teardown")
+            pendingResponseCreate?.cancel(); pendingResponseCreate = nil
+            if responseActive {
+                deferResponse(.itemBacked)
+            } else if let text = awaitingReplyText, !text.isEmpty {
+                // Only nudge when a REAL committed/typed turn awaits a reply.
+                // The empty-string placeholder means no committed item exists —
+                // an input-less response.create would invent a turn (225 class).
+                send(["type": "response.create"])
+            }
+            armReplyWatchdog()   // one more window; a second silence reconnects
+            return
+        }
+        replyWatchdogNudged = false
         // Total silence for the whole window — the session is stalled or the
         // socket is dead. Hold the question when its text is known (a spoken
         // turn's watchdog can be armed before its transcript arrives — then
@@ -1418,6 +1489,7 @@ final class Conversation: ObservableObject {
     /// Her first response event for the outstanding turn — the reply is coming,
     /// stand the watchdog down.
     private func noteSignsOfLife() {
+        replyWatchdogNudged = false   // life returned — the soft rung re-arms
         guard awaitingReplyText != nil || replyWatchdog != nil else { return }
         awaitingReplyText = nil
         replyWatchdog?.cancel(); replyWatchdog = nil
@@ -1555,6 +1627,29 @@ final class Conversation: ObservableObject {
         }
     }
 
+    /// The compact handover injected into every rebuilt session BEFORE it
+    /// can speak: continuation contract, the LANGUAGE he was speaking, his
+    /// last turn (answered NOW only on a self-heal rebuild), and the recent
+    /// exchange. Built purely from state the singleton already holds.
+    private func makeHandoverContext(language: String?, selfHeal: Bool) -> String {
+        var parts: [String] = []
+        parts.append("[FOCUS] Connection renewed mid-conversation (transport drop or forced rebuild). This is a CONTINUATION of the SAME conversation — do not greet, do not reset, do not re-introduce yourself, never mention the reconnect.")
+        if let lang = language {
+            parts.append(lang == "he"
+                ? "LANGUAGE: Ido was speaking HEBREW — continue in Hebrew unless his next words are clearly English."
+                : "LANGUAGE: Ido was speaking ENGLISH — continue in English unless his next words are clearly Hebrew.")
+        }
+        if selfHeal,
+           let lastAsk = transcript.last(where: { !$0.fromHer })?.text, !lastAsk.isEmpty {
+            parts.append("HIS LAST TURN: \"\(lastAsk.prefix(300))\" — if it was not fully answered before the drop, answer it now without making him re-ask.")
+        }
+        let recent = transcript.suffix(8)
+            .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
+            .joined(separator: "\n")
+        if !recent.isEmpty { parts.append("Recent exchange:\n" + recent) }
+        return parts.joined(separator: "\n")
+    }
+
     // MARK: car / eyes-free driving mode
 
     /// Re-derive `drivingMode` from the live route and, when appropriate, tell
@@ -1591,11 +1686,12 @@ final class Conversation: ObservableObject {
     // MARK: signed URL + socket
 
     private func connect() async {
-        // A NEW session has no language pin — forget the old one so the first
-        // utterance re-pins. Keeping the stale value made the client skip the
-        // pin ("unchanged") and the fresh session drifted into Hebrew mid-reply
-        // after every reconnect (audio-e2e runs 34–35; the production
-        // language-mixing class of build 225).
+        // Carry the conversation's language across the rebuild — the pin is
+        // re-SEEDED into the new session below, not forgotten: the first
+        // reply after a reconnect must not flip languages (2026-08-19
+        // CarPlay, 21:12:20 boundary). The nil reset still makes the first
+        // utterance re-pin mechanically (audio-e2e runs 34–35).
+        let handoverLanguage = pinnedLanguage
         pinnedLanguage = nil
         // A patience-window timer from the OLD session must never fire a
         // response.create into this fresh, empty one (she'd speak first).
@@ -1763,6 +1859,7 @@ final class Conversation: ObservableObject {
             // stays — it is the tier-2 trigger's memory across rebuilds.)
             if engine == .openai { elFallbackActive = false }
             responseActive = false
+            replyWatchdogNudged = false   // fresh socket — the soft rung is armed again
             needsResponseAfterDone = false
             pinnedLanguage = nil   // fresh session — re-pin from his first words
             lastNoiseModeSent = "near_field"   // the minted default; only a CHANGE sends session.update
@@ -1782,12 +1879,15 @@ final class Conversation: ObservableObject {
             }
             if resumedSession {
                 resumedSession = false
-                // Recent transcript lines ride along so the renewed session
-                // keeps the thread instead of greeting him like a stranger.
-                let recent = transcript.suffix(6)
-                    .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
-                    .joined(separator: "\n")
-                sendContext("[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent)
+                // Answer-the-open-question only on SELF-HEAL rebuilds — on a
+                // user-initiated reopen hours later it would collide with the
+                // presence-pulse contract ("ONE short word… never a recap")
+                // and spontaneously re-answer a stale question.
+                sendContext(makeHandoverContext(language: handoverLanguage,
+                                                selfHeal: !wantPresencePulse))
+                // Re-seed the mechanical pin so pinLanguage() treats the
+                // carried language as current.
+                if let lang = handoverLanguage { pinnedLanguage = lang }
             }
             // PRESENCE PULSE (Ido 2026-08-15: "she immediately says hi,
             // showing she has a pulse"): only when HE opened the session
