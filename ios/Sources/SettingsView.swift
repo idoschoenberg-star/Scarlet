@@ -79,6 +79,9 @@ struct SettingsView: View {
 
     @StateObject private var m = SettingsModel()
     @Environment(\.dismiss) private var dismiss
+    /// Address gate (car cabins): GateSettings.enabledKey is the single
+    /// source of truth; @AppStorage just gives the toggle live UI state.
+    @AppStorage(GateSettings.enabledKey) private var addressGateOn = true
 
     var body: some View {
         NavigationStack {
@@ -120,6 +123,12 @@ struct SettingsView: View {
                     Text("Scarlet's voice")
                 } footer: {
                     Text("Tap play to hear a sample. Changes apply from your next conversation.")
+                }
+
+                Section {
+                    Toggle("In the car: answer only when addressed", isOn: $addressGateOn)
+                } footer: {
+                    Text("With this on, cabin conversation and media speech she wasn't part of stay unanswered — say “Scarlet” to reach her cold, or just keep talking within half a minute of her last reply.")
                 }
 
                 // Microphone: live level meter (ground truth), input-device and

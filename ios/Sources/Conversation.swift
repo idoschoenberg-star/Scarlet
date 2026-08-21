@@ -221,6 +221,34 @@ final class Conversation: ObservableObject {
     /// wins where prose lost. nil until his first utterance each session.
     private var pinnedLanguage: String?
 
+    // MARK: address gating (multi-speaker car cabin, 2026-08-19)
+    /// When her last reply stopped being AUDIBLE / the last deliberate
+    /// interaction happened. The follow-up window runs from
+    /// max(lastEngagedAt, playbackDeadline).
+    private var lastEngagedAt = Date.distantPast
+    /// speech_stopped held a gate-cold turn; awaiting committed's item_id.
+    private var gatePendingHold = false
+    private var gateHoldFailOpen: DispatchWorkItem?
+    /// Committed items held for their transcript verdict.
+    private var gateHeldItems = Set<String>()
+    /// Ambient speech_started cancelled a pending create for IDO'S engaged
+    /// turn — if the ambient turn is gate-IGNORED, that create must be
+    /// re-scheduled (panel: otherwise his question silently dies and the
+    /// pre-armed empty-placeholder watchdog reconnect-storms).
+    private var gateInterruptedPendingCreate = false
+
+    private var addressGateActive: Bool {
+        GateSettings.enabled && drivingMode && engine == .openai
+    }
+    private func gateSignals(transcript: String?) -> AddressGate.Signals {
+        .init(inCar: drivingMode,
+              speakingNow: responseActive || pendingBuffers > 0,
+              secondsSinceEngaged: Date().timeIntervalSince(max(lastEngagedAt, playbackDeadline)),
+              otherAudioPlaying: AVAudioSession.sharedInstance().isOtherAudioPlaying,
+              transcript: transcript)
+    }
+    private func noteEngagement() { lastEngagedAt = Date() }
+
     /// Detect the utterance's language by script. Hebrew letters → "he".
     /// ARABIC script ALSO → "he" (2026-08-12: the transcriber sometimes
     /// mis-writes his Hebrew in Arabic script — Ido never speaks Arabic, so
@@ -1106,6 +1134,7 @@ final class Conversation: ObservableObject {
     /// (one shared session); the car screen itself cannot take touches under
     /// Apple's voice-conversation template.
     func stopSpeaking() {
+        noteEngagement()   // a deliberate interaction — he is engaged with her
         guard state == .speaking || pendingBuffers > 0 || responseActive else { return }
         if engine == .openai, responseActive {
             send(["type": "response.cancel"])
@@ -1420,6 +1449,7 @@ final class Conversation: ObservableObject {
     /// path requeues the text and rebuilds the socket, so the question is
     /// re-asked on the fresh session instead of vanishing.
     private func sendUserMessage(_ text: String, createResponse: Bool = true) {
+        noteEngagement()   // a typed/system turn is a deliberate interaction
         awaitingReplyText = text
         armReplyWatchdog()
         let payload: [String: Any] = engine == .eleven
@@ -1723,6 +1753,11 @@ final class Conversation: ObservableObject {
         // response.create into this fresh, empty one (she'd speak first).
         pendingResponseCreate?.cancel()
         pendingResponseCreate = nil
+        // Gate hygiene: held items/holds belong to the DEAD socket's ids.
+        // lastEngagedAt deliberately survives (it's the singleton's memory —
+        // a silent self-heal must not mint a fresh open-mic window).
+        gatePendingHold = false; gateHoldFailOpen?.cancel(); gateHoldFailOpen = nil
+        gateHeldItems.removeAll(); gateInterruptedPendingCreate = false
         // Mic gate: without record permission the engine can never start, so
         // reconnecting would loop forever. Ask once; if denied, stop cleanly with
         // a message that points at Settings instead of spinning "Reconnecting…".
@@ -2301,6 +2336,7 @@ final class Conversation: ObservableObject {
             noteSignsOfLife()
         case "response.done":
             responseActive = false
+            noteEngagement()   // her reply just landed — the follow-up window opens
             let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
             if rstatus == "cancelled", deferredResponseReason == .vadSpeech {
                 // Cancelled = Ido cut her off (barge-in or Stop). Semantic VAD
@@ -2348,6 +2384,46 @@ final class Conversation: ObservableObject {
         case "conversation.item.input_audio_transcription.completed":
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
+                let itemId = ev["item_id"] as? String
+                if let itemId, gateHeldItems.remove(itemId) != nil {
+                    let verdict = AddressGate.decide(gateSignals(transcript: t), config: GateSettings.config)
+                    if case .ignore(let why) = verdict {
+                        // Journal it (the ledger still captures the cabin),
+                        // purge it from her context, stay silent. Never arm
+                        // the reply watchdog for a turn we chose not to answer.
+                        TurnLogger.shared.log(role: "ambient", text: t)
+                        send(["type": "conversation.item.delete", "item_id": itemId])
+                        clientLog("gate-ignored", "\(why) — \(String(t.prefix(80)))")
+                        if state == .listening, micOn { status = "Listening…" }
+                        // PANEL FIX — the interplay hole: if this ambient turn
+                        // had trampled HIS pending create (speech_started
+                        // cancelled it and armed the "" placeholder), restore
+                        // his turn instead of leaving it to die + watchdog-storm.
+                        if gateInterruptedPendingCreate {
+                            gateInterruptedPendingCreate = false
+                            if awaitingReplyText == "" { awaitingReplyText = nil }  // disarm placeholder
+                            schedulePatienceCreate()   // answer his real question
+                        } else if awaitingReplyText == "" {
+                            awaitingReplyText = nil    // placeholder was for THIS ignored turn
+                        }
+                        break
+                    }
+                    // Addressed (or engagement re-warmed while held): answer
+                    // the already-committed turn NOW.
+                    gateInterruptedPendingCreate = false
+                    noteEngagement()
+                    clientLog("gate-answered", "addressed while cold")
+                    transcript.append(.init(text: t, fromHer: false))
+                    TurnLogger.shared.log(role: "user", text: t)
+                    pinLanguage(from: t)
+                    status = "Got it — on it…"
+                    if state == .listening { turnPhase = .thinking }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    awaitingReplyText = t
+                    if responseActive { deferResponse(.itemBacked) }
+                    else { send(["type": "response.create"]); armReplyWatchdog() }
+                    break
+                }
                 transcript.append(.init(text: t, fromHer: false))
                 TurnLogger.shared.log(role: "user", text: t)
                 // Mirror his language mechanically: detect what he ACTUALLY
@@ -2369,6 +2445,15 @@ final class Conversation: ObservableObject {
                 }
             }
         case "conversation.item.input_audio_transcription.failed":
+            if let id = ev["item_id"] as? String, gateHeldItems.remove(id) != nil {
+                clientLog("gate-ignored", "transcription failed while held — discarded")
+                if state == .listening, micOn { status = "Listening…" }
+                if gateInterruptedPendingCreate {
+                    gateInterruptedPendingCreate = false
+                    if awaitingReplyText == "" { awaitingReplyText = nil }
+                    schedulePatienceCreate()
+                }
+            }
             clientLog("transcription-failed",
                       String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
@@ -2405,6 +2490,9 @@ final class Conversation: ObservableObject {
             // no end), NOTHING else would ever create a reply — the watchdog
             // is what turns that infinite silence into the normal
             // reconnect-and-recover ladder.
+            if addressGateActive, pendingResponseCreate != nil {
+                gateInterruptedPendingCreate = true   // may be ambient trampling HIS turn
+            }
             if let pending = pendingResponseCreate {
                 pending.cancel()
                 pendingResponseCreate = nil
@@ -2422,19 +2510,56 @@ final class Conversation: ObservableObject {
             // watchdog arms when the create is actually sent.
             if responseActive {
                 deferResponse(.vadSpeech)
+            } else if addressGateActive,
+                      !AddressGate.engaged(gateSignals(transcript: nil), config: GateSettings.config) {
+                // GATE-COLD: she wasn't just talking with him — this may be
+                // his wife, a passenger, or the documentary. Hold the reply;
+                // committed's item_id + the transcript verdict decide.
+                gatePendingHold = true
+                gateHoldFailOpen?.cancel()
+                let w = DispatchWorkItem { [weak self] in
+                    guard let self, self.gatePendingHold else { return }
+                    // committed never arrived — fail OPEN, answer as today.
+                    self.gatePendingHold = false
+                    self.schedulePatienceCreate()
+                }
+                gateHoldFailOpen = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: w)
             } else {
                 schedulePatienceCreate()
             }
-            if state == .listening { status = "Thinking…"; turnPhase = .thinking }
+            if state == .listening {
+                // A held turn truthfully stays "Listening" — the car orb must
+                // never show Thinking for a turn she chose not to answer.
+                status = gatePendingHold ? "Listening…" : "Thinking…"
+                turnPhase = gatePendingHold ? .listening : .thinking
+            }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
-            if responseActive {
+            if gatePendingHold {
+                gatePendingHold = false
+                gateHoldFailOpen?.cancel(); gateHoldFailOpen = nil
+                if let id = ev["item_id"] as? String {
+                    gateHeldItems.insert(id)
+                    if gateHeldItems.count > 50, let any = gateHeldItems.first { gateHeldItems.remove(any) }
+                    clientLog("gate-hold", "cold turn held for transcript verdict")
+                } else {
+                    schedulePatienceCreate()   // can't track it → fail open
+                }
+            } else if responseActive {
                 deferResponse(.vadSpeech)
             } else if pendingResponseCreate == nil {
-                // Defensive: a commit with no scheduled create (some VAD
-                // paths skip speech_stopped) must still get answered.
-                schedulePatienceCreate()
+                // Defensive path (some VAD paths skip speech_stopped) — a
+                // commit with no scheduled create must still get answered,
+                // unless the gate says it's a cold, trackable turn.
+                if addressGateActive, let id = ev["item_id"] as? String,
+                   !AddressGate.engaged(gateSignals(transcript: nil), config: GateSettings.config) {
+                    gateHeldItems.insert(id)
+                    clientLog("gate-hold", "cold turn held (no speech_stopped)")
+                } else {
+                    schedulePatienceCreate()
+                }
             }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
