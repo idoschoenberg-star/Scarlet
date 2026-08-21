@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import MapKit
 
 // MARK: - The LIVE Journal (Ido's commission, 2026-08-21)
 //
@@ -8,11 +9,14 @@ import UIKit
 // review and navigate between days… a beautiful way to follow up on
 // everything that is happening."
 //
-// This file is the browser: a per-day timeline (walks, workouts, meetings,
-// pins, meals) under a narrative summary, weather in the header, health in
-// the footer; a month grid with compact per-day signals; and free-text
-// search over the whole journal. TODAY is alive — it refreshes while he
-// looks at it, so a busy morning is visible at noon.
+// This file is the browser. The day page reads by IMPORTANCE (2026-08-21):
+// header (date/place/weather) → narrative → KEY MOMENTS (one chronological
+// thread of summarized meetings + walks/workouts, walks carrying route
+// snapshot maps) → health grid + meals → pins → a muted APPENDIX for the
+// thin and speculative (no-summary episodes, unmatched calendar rows, the
+// missing-axes line). Then a month grid with compact per-day signals, and
+// free-text search over the whole journal. TODAY is alive — it refreshes
+// while he looks at it, so a busy morning is visible at noon.
 //
 // The review lane (staged actions + storyline verifications) that used to BE
 // this tab still exists — see JournalView.swift (`JournalReviewScreen`) —
@@ -41,6 +45,11 @@ private enum JStyle {
     static let sky = Color(red: 0.45, green: 0.72, blue: 0.98)
     static let mint = Color(red: 0.40, green: 0.85, blue: 0.62)
     static let card = Color.white.opacity(0.06)
+
+    /// Workout kinds that happen OUT THERE — the ones whose row earns a map.
+    static func isOutdoor(_ kind: String) -> Bool {
+        ["walking", "running", "cycling", "hiking"].contains(kind.lowercased())
+    }
 
     static func workoutIcon(_ kind: String) -> String {
         switch kind.lowercased() {
@@ -226,6 +235,30 @@ struct JDayHealth {
     }
 }
 
+/// A dwell from the wire (data.stays{start,end,lat,lng,place}) — the anchors
+/// a walk stretches between.
+struct JStay {
+    let start: Date
+    let end: Date
+    let coord: CLLocationCoordinate2D
+    let place: String
+}
+
+/// What a walk's map can honestly draw. The shipped wire carries each move as
+/// {start,end,km,kind} — NO raw GPS trace yet — so the route is the straight
+/// line between the dwells that bracket it, and it says so (dashed stroke +
+/// caption). When the backend starts shipping point arrays, feed them here
+/// and `approximate` goes false.
+struct JRoute {
+    let coords: [CLLocationCoordinate2D]   // 1 (loop / lone anchor) or 2 points
+    let startPlace: String
+    let endPlace: String
+    let approximate: Bool                  // endpoints only, not the true path
+
+    /// Left from a place and came back to it (or only one anchor was found).
+    var isLoop: Bool { coords.count < 2 }
+}
+
 /// One row on the day timeline — every item type flattened to what the row
 /// renders, each kind keeping its own visual identity.
 struct JDayItem: Identifiable {
@@ -243,6 +276,11 @@ struct JDayItem: Identifiable {
     let chipGood: Bool
     let icon: String
     let tint: Color
+    /// Thin/speculative (an episode with no summary and nobody named) — sinks
+    /// to the appendix, never the key-moments thread.
+    var thin: Bool = false
+    /// Walks and outdoor workouts carry their route snapshot.
+    var route: JRoute? = nil
 
     var accessLabel: String { "\(timeLabel) \(title)" }
 }
@@ -268,6 +306,21 @@ private enum JDayParser {
         let data = (obj["data"] as? [String: Any]) ?? [:]
         var items: [JDayItem] = []
 
+        // 🛏 stays — the day's dwells, each a single validated coordinate.
+        // They are not rows themselves; they anchor the walk maps. Invalid
+        // pairs are dropped BEFORE MapKit ever sees them (a lat 999 fed to
+        // MapPolyline/MKCoordinateRegion asserts and takes the app down —
+        // same guard as HealthView's route parser).
+        let stays: [JStay] = ((data["stays"] as? [[String: Any]]) ?? []).compactMap { s in
+            guard let start = JDates.parseWhen(jStr(s, ["start"])),
+                  let end = JDates.parseWhen(jStr(s, ["end"])),
+                  let lat = jNum(s, ["lat"]), let lng = jNum(s, ["lng"]) else { return nil }
+            let c = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+            guard CLLocationCoordinate2DIsValid(c),
+                  abs(lat) > 0.0001 || abs(lng) > 0.0001 else { return nil }
+            return JStay(start: start, end: end, coord: c, place: jStr(s, ["place"]))
+        }
+
         // 🚶 moves — walks and transit hops between dwells
         // (wire: data.moves[{start,end,km,kind:"walk"|"transit"}])
         for (i, m) in ((data["moves"] as? [[String: Any]]) ?? []).enumerated() {
@@ -291,7 +344,8 @@ private enum JDayParser {
                 place: "",
                 chip: nil, chipGood: false,
                 icon: isWalk ? "figure.walk" : "arrow.right.circle",
-                tint: isWalk ? JStyle.pink : JStyle.sky))
+                tint: isWalk ? JStyle.pink : JStyle.sky,
+                route: isWalk ? routeBetween(stays: stays, start: start, end: end) : nil))
         }
 
         // 💪 workouts (wire: {start_at,end_at,kind,distance_m,kcal,avg_hr,
@@ -320,7 +374,9 @@ private enum JDayParser {
                 place: "",
                 chip: nil, chipGood: false,
                 icon: JStyle.workoutIcon(kind),
-                tint: JStyle.rose))
+                tint: JStyle.rose,
+                route: JStyle.isOutdoor(kind)
+                    ? routeBetween(stays: stays, start: start, end: end) : nil))
         }
 
         // 📅 episodes — what actually happened (wire: planned = the matched
@@ -350,6 +406,9 @@ private enum JDayParser {
                                   : people.joined(separator: ", ") + " — " + sub
             }
             let epKind = jStr(e, ["kind"]).lowercased()
+            // No summary AND nobody named = thin evidence — the appendix's
+            // material, never a key moment.
+            let thin = jStr(e, ["summary"]).isEmpty && people.isEmpty
             items.append(JDayItem(
                 id: "ep-" + (jStr(e, ["id"]).isEmpty ? "\(i)" : jStr(e, ["id"])),
                 kind: .meeting,
@@ -360,7 +419,8 @@ private enum JDayParser {
                 place: jStr(e, ["place"]),
                 chip: chip, chipGood: good,
                 icon: episodeIcon(epKind),
-                tint: JStyle.sky))
+                tint: JStyle.sky,
+                thin: thin))
         }
 
         // 📅 calendar events that never became episodes (attended ones ARE
@@ -482,6 +542,47 @@ private enum JDayParser {
             missing: missing,
             updatedAt: JDates.parseWhen(jStr(obj, ["updated_at", "updatedAt"])),
             fetchedAt: Date())
+    }
+
+    /// The dwells that bracket a movement window → its honest snapshot route.
+    /// The wire has no raw trace for moves (yet), so this is the straight
+    /// line "left HERE, arrived THERE" — approximate by construction. An
+    /// anchor is only trusted within 45 minutes of the move's edge; a loop
+    /// (left home, came back) collapses to a single marker.
+    private static func routeBetween(stays: [JStay], start: Date?, end: Date?) -> JRoute? {
+        guard let start, let end, !stays.isEmpty else { return nil }
+        let tolerance: TimeInterval = 45 * 60
+        let slack: TimeInterval = 10 * 60   // dwell edges and move edges jitter
+        let from = stays
+            .filter { $0.end <= start.addingTimeInterval(slack) }
+            .min { abs($0.end.timeIntervalSince(start)) < abs($1.end.timeIntervalSince(start)) }
+        let to = stays
+            .filter { $0.start >= end.addingTimeInterval(-slack) }
+            .min { abs($0.start.timeIntervalSince(end)) < abs($1.start.timeIntervalSince(end)) }
+        let a = from.flatMap { abs($0.end.timeIntervalSince(start)) <= tolerance ? $0 : nil }
+        let b = to.flatMap { abs($0.start.timeIntervalSince(end)) <= tolerance ? $0 : nil }
+
+        func close(_ x: CLLocationCoordinate2D, _ y: CLLocationCoordinate2D) -> Bool {
+            abs(x.latitude - y.latitude) < 0.0005 && abs(x.longitude - y.longitude) < 0.0005
+        }
+
+        switch (a, b) {
+        case let (aa?, bb?) where close(aa.coord, bb.coord):
+            // Round trip — one anchor, same place both ends.
+            return JRoute(coords: [aa.coord], startPlace: aa.place,
+                          endPlace: bb.place, approximate: true)
+        case let (aa?, bb?):
+            return JRoute(coords: [aa.coord, bb.coord], startPlace: aa.place,
+                          endPlace: bb.place, approximate: true)
+        case let (aa?, nil):
+            return JRoute(coords: [aa.coord], startPlace: aa.place,
+                          endPlace: "", approximate: true)
+        case let (nil, bb?):
+            return JRoute(coords: [bb.coord], startPlace: "",
+                          endPlace: bb.place, approximate: true)
+        default:
+            return nil
+        }
     }
 
     private static func rangeLabel(_ start: Date?, _ end: Date?) -> String {
@@ -1060,6 +1161,11 @@ struct JournalDayScreen: View {
 
     // MARK: the day body
 
+    // The day reads by IMPORTANCE (Ido's commission, 2026-08-21): header →
+    // narrative → key moments (meetings with summaries + walks/workouts with
+    // maps, one chronological thread) → the body + meals → pins → and an
+    // appendix at the very end for everything thin or speculative. Nothing
+    // speculative ever sits above the appendix line.
     @ViewBuilder
     private func dayBody(_ p: JDayPayload) -> some View {
         if p.isEmpty {
@@ -1068,20 +1174,214 @@ struct JournalDayScreen: View {
             if !p.narrative.isEmpty {
                 narrativeCard(p.narrative)
             }
-            if !p.items.isEmpty {
-                timeline(p.items)
+            let key = p.items.filter { Self.isKeyMoment($0) }
+            let meals = p.items.filter { $0.kind == .meal }
+            let pins = p.items.filter { $0.kind == .pin }
+            let appendix = p.items.filter { Self.isAppendix($0) }
+            if !key.isEmpty {
+                sectionLabel("Key moments", icon: "sparkles", tint: JStyle.amber)
+                timeline(key)
             }
             if !p.health.isEmpty {
                 JHealthFooter(health: p.health)
             }
-            if !p.missing.isEmpty {
-                // One quiet honest line — never a wall of empty boxes.
-                Text("Not captured this day: \(p.missing.joined(separator: ", ")).")
-                    .font(.footnote)
-                    .foregroundStyle(.tertiary)
+            if !meals.isEmpty {
+                mealsCard(meals)
+            }
+            if !pins.isEmpty {
+                pinsCard(pins)
+            }
+            if !appendix.isEmpty || !p.missing.isEmpty {
+                appendixSection(appendix, missing: p.missing)
+            }
+        }
+    }
+
+    /// Solid evidence, chronological: episodes with substance, plus every
+    /// walk, transit hop and workout (movement is GPS truth, not speculation).
+    private static func isKeyMoment(_ i: JDayItem) -> Bool {
+        switch i.kind {
+        case .walk, .transit, .workout: return true
+        case .meeting: return !i.thin
+        default: return false
+        }
+    }
+
+    /// The appendix's material: episodes with no summary and weak evidence,
+    /// and calendar rows nothing corroborated.
+    private static func isAppendix(_ i: JDayItem) -> Bool {
+        i.kind == .calendar || (i.kind == .meeting && i.thin)
+    }
+
+    /// Uppercase section label — the same voice as the in-card headers.
+    private func sectionLabel(_ title: String, icon: String, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.6))
+                .textCase(.uppercase)
+                .kerning(0.8)
+        }
+        .padding(.top, 2)
+    }
+
+    // MARK: meals (rides with the body — fuel next to the engine)
+
+    private func mealsCard(_ meals: [JDayItem]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "fork.knife")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(JStyle.amber)
+                Text("Meals")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .textCase(.uppercase)
+                    .kerning(0.8)
+            }
+            ForEach(meals) { m in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(m.timeLabel)
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.5))
+                        .frame(width: 42, alignment: .trailing)
+                    Text(m.title.isEmpty ? "Meal" : m.title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .multilineTextAlignment(m.title.readingAlignment)
+                        .environment(\.layoutDirection, m.title.layoutDir)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    if !m.subtitle.isEmpty {
+                        Text(m.subtitle)
+                            .font(.system(size: 12))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.55))
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 20).fill(JStyle.card))
+    }
+
+    // MARK: pins (recordings — pin conversations + synced recorder docs)
+
+    private func pinsCard(_ pins: [JDayItem]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "waveform")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(JStyle.rose)
+                Text("Pins")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.6))
+                    .textCase(.uppercase)
+                    .kerning(0.8)
+            }
+            ForEach(pins) { p in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Image(systemName: p.icon)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(JStyle.rose)
+                        Text(p.title.isEmpty ? "Pinned conversation" : p.title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.9))
+                            .multilineTextAlignment(p.title.readingAlignment)
+                            .environment(\.layoutDirection, p.title.layoutDir)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                        if !p.timeLabel.isEmpty {
+                            Text(p.timeLabel)
+                                .font(.system(size: 12, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(.white.opacity(0.5))
+                        }
+                    }
+                    if !p.subtitle.isEmpty {
+                        Text(p.subtitle)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.65))
+                            .multilineTextAlignment(p.subtitle.readingAlignment)
+                            .frame(maxWidth: .infinity, alignment: p.subtitle.readingFrameAlignment)
+                            .environment(\.layoutDirection, p.subtitle.layoutDir)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(3)
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 20).fill(JStyle.card))
+    }
+
+    // MARK: appendix — the thin and the uncaptured, visually muted, dead last
+
+    private func appendixSection(_ items: [JDayItem], missing: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider().overlay(Color.white.opacity(0.12))
+                .padding(.top, 8)
+            Text("Appendix")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.45))
+                .textCase(.uppercase)
+                .kerning(0.8)
+                .padding(.top, 2)
+            ForEach(items) { i in
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(i.timeLabel.components(separatedBy: " – ").first ?? "")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.35))
+                        .frame(width: 42, alignment: .trailing)
+                    Image(systemName: i.icon)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.35))
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(i.title.isEmpty ? appendixFallback(i) : i.title)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white.opacity(0.55))
+                            .multilineTextAlignment(i.title.readingAlignment)
+                            .environment(\.layoutDirection, i.title.layoutDir)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(2)
+                        if !i.subtitle.isEmpty || !i.place.isEmpty {
+                            Text([i.subtitle, i.place].filter { !$0.isEmpty }
+                                .joined(separator: " · "))
+                                .font(.system(size: 11))
+                                .foregroundStyle(.white.opacity(0.35))
+                                .lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                    if let chip = i.chip {
+                        Text(chip)
+                            .font(.system(size: 9, weight: .bold))
+                            .textCase(.uppercase)
+                            .kerning(0.4)
+                            .foregroundStyle(.white.opacity(0.35))
+                    }
+                }
+            }
+            if !missing.isEmpty {
+                // The quiet honest line — never a wall of empty boxes.
+                Text("Not captured this day: \(missing.joined(separator: ", ")).")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.35))
                     .padding(.top, 2)
             }
         }
+    }
+
+    private func appendixFallback(_ i: JDayItem) -> String {
+        i.kind == .calendar ? "On the calendar" : "Untitled episode"
     }
 
     private var quietEmptyDay: some View {
@@ -1305,7 +1605,13 @@ private struct JTimelineRow: View {
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.55))
             }
+            if let route = item.route {
+                JRouteMap(route: route, tint: item.tint)
+                    .padding(.top, 2)
+            }
             if !item.subtitle.isEmpty {
+                // On mapped rows this line doubles as the map's caption —
+                // duration · distance, straight under the snapshot.
                 Text(item.subtitle)
                     .font(.system(size: 13))
                     .foregroundStyle(.white.opacity(0.7))
@@ -1314,6 +1620,15 @@ private struct JTimelineRow: View {
                     .environment(\.layoutDirection, item.subtitle.layoutDir)
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(4)
+            }
+            if let route = item.route, let note = Self.routeNote(route) {
+                Text(note)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .multilineTextAlignment(note.readingAlignment)
+                    .environment(\.layoutDirection, note.layoutDir)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(2)
             }
         }
         .padding(12)
@@ -1325,6 +1640,26 @@ private struct JTimelineRow: View {
     /// Calendar-only rows (never became an episode) read quieter.
     private var dimmed: Bool { item.kind == .calendar }
 
+    /// The honest word under an approximate map: where it ran, and that the
+    /// line is endpoints, not the traced path.
+    static func routeNote(_ route: JRoute) -> String? {
+        guard route.approximate else { return nil }
+        let a = route.startPlace, b = route.endPlace
+        var where_: String
+        if route.isLoop {
+            let p = a.isEmpty ? b : a
+            where_ = p.isEmpty ? "" : "Around \(p)"
+        } else if !a.isEmpty && !b.isEmpty {
+            where_ = a == b ? "Around \(a)" : "\(a) → \(b)"
+        } else {
+            where_ = [a, b].first { !$0.isEmpty } ?? ""
+        }
+        let honesty = "route shows start and end — the full trace isn't captured yet"
+        return where_.isEmpty
+            ? "Route shows start and end — the full trace isn't captured yet"
+            : "\(where_) · \(honesty)"
+    }
+
     private var fallbackTitle: String {
         switch item.kind {
         case .walk: return "Walk"
@@ -1335,6 +1670,71 @@ private struct JTimelineRow: View {
         case .pin: return "Pinned conversation"
         case .meal: return "Meal"
         }
+    }
+}
+
+// MARK: - Route snapshot map (walks + outdoor workouts)
+
+/// A non-interactive snapshot: fixed camera fitted to the route, start/end
+/// markers, no gestures (scrolling glides over it). iOS 17 Map API —
+/// MapPolyline in the MapContentBuilder, the same precedent as HealthView's
+/// WorkoutDetailSheet. Approximate (endpoint-only) routes draw dashed.
+private struct JRouteMap: View {
+    let route: JRoute
+    let tint: Color
+
+    var body: some View {
+        Map(initialPosition: .region(Self.region(for: route.coords))) {
+            if route.coords.count >= 2 {
+                MapPolyline(coordinates: route.coords)
+                    .stroke(tint, style: StrokeStyle(
+                        lineWidth: 3, lineCap: .round, lineJoin: .round,
+                        dash: route.approximate ? [6, 6] : []))
+            }
+            if let first = route.coords.first {
+                Annotation(route.isLoop ? "Start · End" : "Start",
+                           coordinate: first) { marker(.green) }
+            }
+            if route.coords.count >= 2, let last = route.coords.last {
+                Annotation("End", coordinate: last) { marker(tint) }
+            }
+        }
+        .mapStyle(.standard(elevation: .flat))
+        .allowsHitTesting(false)   // a snapshot, not a browser
+        .frame(height: 132)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .accessibilityLabel("Route map")
+    }
+
+    private func marker(_ color: Color) -> some View {
+        Circle().fill(color)
+            .frame(width: 11, height: 11)
+            .overlay(Circle().stroke(.white, lineWidth: 2))
+    }
+
+    /// The route's bounding box with breathing room; a lone anchor (loop)
+    /// gets a fixed neighborhood-sized window. Same math as HealthView.
+    private static func region(for coords: [CLLocationCoordinate2D]) -> MKCoordinateRegion {
+        guard let first = coords.first else {
+            return MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 0, longitude: 0),
+                span: MKCoordinateSpan(latitudeDelta: 1, longitudeDelta: 1))
+        }
+        var minLat = first.latitude
+        var maxLat = first.latitude
+        var minLon = first.longitude
+        var maxLon = first.longitude
+        for c in coords {
+            minLat = min(minLat, c.latitude)
+            maxLat = max(maxLat, c.latitude)
+            minLon = min(minLon, c.longitude)
+            maxLon = max(maxLon, c.longitude)
+        }
+        return MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2,
+                                           longitude: (minLon + maxLon) / 2),
+            span: MKCoordinateSpan(latitudeDelta: max((maxLat - minLat) * 1.5, 0.008),
+                                   longitudeDelta: max((maxLon - minLon) * 1.5, 0.008)))
     }
 }
 
