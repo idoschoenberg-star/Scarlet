@@ -21,6 +21,14 @@ extension Notification.Name {
     /// Posted by Conversation when the compose_draft voice tool starts a
     /// draft; RootView presents the drafting sheet in attach mode.
     static let scarletVoiceDraftStarted = Notification.Name("scarletVoiceDraftStarted")
+    /// Posted after the server rejects this device's token twice in a row
+    /// (revoked/rotated) — RootView signs the session out so the unlock
+    /// screen appears, instead of every screen lying "check your connection".
+    static let scarletAuthExpired = Notification.Name("scarletAuthExpired")
+    /// Posted by SplitShell whenever its sidebar section changes, carrying the
+    /// section name as a String — RootView's desk-focus poll needs to know
+    /// what is ACTUALLY frontmost at regular width, where `tab` is inert.
+    static let scarletShellSection = Notification.Name("scarletShellSection")
     /// Posted by Conversation the INSTANT a compose_draft tool call arrives —
     /// before the network round-trip — carrying [channel, recipient,
     /// instruction, subject]. RootView opens the drafting sheet immediately and
@@ -183,10 +191,17 @@ private struct InboxCache: Codable {
 // MARK: - Model
 
 @MainActor
+/// The server said WHO YOU ARE is wrong (401/403) — a different failure
+/// class from "the network is down", and it must never be rendered as one.
+struct ScarletAuthError: Error {}
+
 final class InboxModel: ObservableObject {
     @Published var messages: [MailMessage] = []
     @Published var loading = false
     @Published var errorText = ""
+    /// Consecutive 401/403s from the inbox ops — two in a row means the
+    /// device key is really dead, not blinking.
+    private var consecutiveAuthFailures = 0
     /// Focused | Other pill. Switch via `setTab`, which reloads.
     @Published var tab: MailTab = .focused
     /// When the current tab's rows last came back from the server (the cache
@@ -305,6 +320,19 @@ final class InboxModel: ObservableObject {
             cache.set(rows: fetched, stamp: Date(), for: tab)
             lastUpdated = cache.stamp(for: tab)
             persistCache()
+            consecutiveAuthFailures = 0
+        } catch is ScarletAuthError {
+            guard generation == loadGeneration else { return }
+            // The token is being rejected, not the network. ONE 401 can be a
+            // transient server-side validation blip (2026-08-15, the Watch),
+            // so the sign-out fires on the second consecutive rejection; the
+            // banner is honest immediately. Cached rows stay visible — with
+            // their "updated …" stamp — as clearly stale content.
+            consecutiveAuthFailures += 1
+            errorText = "The server no longer accepts this device's key — unlock again."
+            if consecutiveAuthFailures >= 2 {
+                NotificationCenter.default.post(name: .scarletAuthExpired, object: nil)
+            }
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach the inbox — check your connection."
@@ -471,6 +499,7 @@ final class InboxModel: ObservableObject {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            if http.statusCode == 401 || http.statusCode == 403 { throw ScarletAuthError() }
             throw URLError(.badServerResponse)
         }
         return data

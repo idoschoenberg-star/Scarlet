@@ -147,6 +147,15 @@ struct SplitShell: View {
         // report their own from their onAppears, exactly as on the phone).
         .onChange(of: section) { _, newSection in
             if newSection == .talk { convo.setFocus(Self.talkFocus) }
+            // Tell RootView what is frontmost: its desk-focus poll must not
+            // clobber a non-Talk pane's own [FOCUS] (the `tab` guard it uses
+            // on the phone is inert at regular width).
+            NotificationCenter.default.post(name: .scarletShellSection,
+                                            object: String(describing: newSection))
+        }
+        .onAppear {
+            NotificationCenter.default.post(name: .scarletShellSection,
+                                            object: String(describing: section))
         }
     }
 

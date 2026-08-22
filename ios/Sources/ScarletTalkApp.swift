@@ -77,15 +77,24 @@ struct RootView: View {
     /// Refreshed by piggybacking the existing backstop loop below (the store
     /// gates itself to ~30s) — no timer of its own.
     @ObservedObject private var counts = InboxCounts.shared
+    /// Injected by ScarletTalkApp — the auth-expired path signs out through it.
+    @EnvironmentObject private var session: AppSession
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
     /// The compose_draft tool arguments (recipient, instruction, channel) posted
     /// the instant Scarlet calls the tool — handed to the DraftView so the
     /// writing card paints his request before the server row exists.
     @State private var voiceDraftIntent: [String: String]? = nil
-    /// Draft ids already offered for recovery THIS process — a fresh launch
-    /// (i.e. after a crash) offers again; within one run we don't nag.
-    @State private var recoveredDraftIds: Set<String> = []
+    /// Draft ids this process has SEEN, with where they stand: "live" while
+    /// their sheet is on screen, or the Date the sheet was dismissed. The
+    /// backstop poll uses this to (a) never re-open a draft he just swiped
+    /// away unchanged — the false "your draft was interrupted" 2s after a
+    /// dismissal — and (b) STILL re-open it, quietly, when a later voice
+    /// revision lands server-side (updated_at after the dismissal): work he
+    /// asked for must reach the screen. A fresh launch (crash) starts empty,
+    /// so real recovery still announces.
+    @State private var seenDrafts: [String: DraftMark] = [:]
+    enum DraftMark: Equatable { case live, dismissed(Date) }
     /// True while ANY draft sheet is on screen (RootView's or Inbox/Chats/Desk's,
     /// via the shared scarletDraftSheetVisible signal) — the backstop poll must
     /// not open a second window over one already up.
@@ -95,7 +104,23 @@ struct RootView: View {
     /// crash moments ago, never for an old row (Ido 2026-08-13: "she should
     /// not initiate a session with a draft").
     private let launchedAt = Date()
+    /// SplitShell's frontmost section (regular width), mirrored via
+    /// .scarletShellSection. On the phone `tab` is the truth instead.
+    @State private var splitSection = "talk"
     @Environment(\.scenePhase) private var scenePhase
+
+    /// Whether the Talk screen is what Ido is actually looking at, on either
+    /// presentation. The desk-mode Mac-focus poll runs ONLY then — desktop
+    /// Outlook focus must never overwrite the [FOCUS] of a pane he has open
+    /// in the app itself (the iPad/Mac clobber bug).
+    private var talkIsFrontmost: Bool {
+        hSize == .regular ? splitSection == "talk" : tab == .talk
+    }
+    /// Restart key for the desk poll: changes whenever the frontmost screen
+    /// (on the relevant axis for this width class) changes.
+    private var deskPollKey: String {
+        hSize == .regular ? "r-" + splitSection : "c-" + String(describing: tab)
+    }
     /// iPhone keeps the TabView; iPad/Mac (regular width) get the
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
@@ -159,14 +184,16 @@ struct RootView: View {
         // drafting table over whatever screen Ido is on. The sheet attaches
         // to the active server-side draft instead of composing its own.
         .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { note in
-            // Mark the id "seen" ONLY when we actually present it. Marking it
-            // unconditionally (the old bug) permanently blinded the backstop
-            // poll for that draft whenever draftSheetOpen was momentarily true,
-            // so the window then never opened at all.
-            if !draftSheetOpen {
-                if let id = note.object as? String { recoveredDraftIds.insert(id) }
-                voiceDraftPresented = true
-            }
+            // A sheet already on screen IS this draft's window (attach mode) —
+            // record the id as live either way, and only the PRESENTATION is
+            // gated. Not recording it here was the false-interruption bug:
+            // he dismissed the sheet, the backstop found the still-active id
+            // it had never "seen", and re-opened it 2s later announcing an
+            // interruption that never happened. The dismissal stamp (not a
+            // permanent blind) is what keeps the backstop able to re-open on
+            // a real later revision.
+            if let id = note.object as? String { seenDrafts[id] = .live }
+            if !draftSheetOpen { voiceDraftPresented = true }
         }
         // The INSTANT Scarlet calls compose_draft (before the network round-trip):
         // capture his request and open the window immediately so it reacts the
@@ -178,7 +205,9 @@ struct RootView: View {
         // Track any draft sheet's visibility (from every DraftView) so the
         // backstop poll never double-opens.
         .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
-            draftSheetOpen = (note.userInfo?["visible"] as? Bool) ?? false
+            let visible = (note.userInfo?["visible"] as? Bool) ?? false
+            draftSheetOpen = visible
+            if !visible { stampDismissedDrafts() }
         }
         // Reliability backstop: a voice-composed draft reaches the window even if
         // the compose_draft tool-result notification is missed. Every ~2s, if no
@@ -194,7 +223,10 @@ struct RootView: View {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
-        .sheet(isPresented: $voiceDraftPresented, onDismiss: { voiceDraftIntent = nil }) {
+        .sheet(isPresented: $voiceDraftPresented, onDismiss: {
+            voiceDraftIntent = nil
+            stampDismissedDrafts()
+        }) {
             DraftView(seed: nil, attachToActive: true, voiceIntent: voiceDraftIntent)
                 .environmentObject(convo)
                 .preferredColorScheme(.dark)
@@ -246,13 +278,23 @@ struct RootView: View {
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .scarletShellSection)) { note in
+            if let name = note.object as? String { splitSection = name }
+        }
+        // A revoked/rotated device key (two consecutive 401/403s from the
+        // API) is a sign-in problem, not a network problem: drop to the
+        // unlock screen instead of letting every list claim the network is
+        // down while showing stale rows.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletAuthExpired)) { _ in
+            session.signOut()
+        }
         // Desk mode: while the phone sits open on Talk next to his Mac, poll
         // what he's focused on at the desk. Reading an email in DESKTOP
         // Outlook flows to Scarlet as [FOCUS] — he speaks to the phone, the
         // draft opens here, and the approved reply lands back in Outlook.
         // Only on the Talk tab: inside the app, each screen owns its focus.
-        .task(id: tab) {
-            guard tab == .talk else { return }
+        .task(id: deskPollKey) {
+            guard talkIsFrontmost else { return }
             var lastSig = ""
             while !Task.isCancelled {
                 if convo.state == .listening || convo.state == .speaking {
@@ -263,7 +305,7 @@ struct RootView: View {
                         }
                     } else if lastSig != "" {
                         lastSig = ""
-                        if tab == .talk { convo.setFocus(Self.talkFocus) }
+                        if talkIsFrontmost { convo.setFocus(Self.talkFocus) }
                     }
                 }
                 try? await Task.sleep(nanoseconds: 8_000_000_000)
@@ -357,9 +399,18 @@ struct RootView: View {
     /// whatever screen we're on. Once per draft per process: a fresh launch
     /// after a crash offers again; dismissing it doesn't nag within a run.
     // @MainActor: after the `await` below the continuation can resume off-main,
-    // and everything past it mutates SwiftUI @State (recoveredDraftIds,
+    // and everything past it mutates SwiftUI @State (seenDrafts,
     // voiceDraftPresented) and touches `convo`. Pin the whole method to main.
     @MainActor
+    /// Every draft marked live gets a dismissal stamp the moment its sheet
+    /// leaves the screen — the timestamp the backstop compares revisions to.
+    private func stampDismissedDrafts() {
+        let now = Date()
+        for (id, mark) in seenDrafts where mark == .live {
+            seenDrafts[id] = .dismissed(now)
+        }
+    }
+
     private func recoverActiveDraft() async {
         guard !voiceDraftPresented, !draftSheetOpen else { return }
         var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
@@ -390,8 +441,25 @@ struct RootView: View {
         guard let ts = draft["updated_at"] as? String,
               let when = MailDates.parse(ts),
               when >= launchedAt.addingTimeInterval(-15 * 60) else { return }
-        guard !recoveredDraftIds.contains(id) else { return }
-        recoveredDraftIds.insert(id)
+        switch seenDrafts[id] {
+        case .live:
+            // Its sheet is (or moments ago was) on screen — nothing to recover.
+            return
+        case .dismissed(let at):
+            // He swiped this one away. Unchanged → stays away. Revised AFTER
+            // the dismissal (5s grace absorbs the compose-stream's own tail
+            // writes) → his spoken revision landed and must reach the screen:
+            // re-open QUIETLY — no "interrupted" announcement, he asked for
+            // this change seconds ago.
+            guard when > at.addingTimeInterval(5) else { return }
+            seenDrafts[id] = .live
+            FlightRecorder.note(screen: "draft-reopened-revision:\(id)")
+            voiceDraftPresented = true
+            return
+        case nil:
+            break   // never seen this run — genuine recovery, announce below
+        }
+        seenDrafts[id] = .live
         FlightRecorder.note(screen: "draft-recovered:\(id)")
         voiceDraftPresented = true
         // She announces it — Ido should never have to go looking for lost

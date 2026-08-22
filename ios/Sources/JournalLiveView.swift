@@ -691,7 +691,10 @@ final class JournalDayModel: ObservableObject {
     func load(dateKey: String) async {
         guard loadingKey != dateKey else { return }
         loadingKey = dateKey
-        defer { loadingKey = nil }
+        // Scoped, not blanket: .task(id:) cancels this load when he swipes to
+        // the NEXT day — a blanket `loadingKey = nil` here killed the new
+        // day's own spinner state.
+        defer { if loadingKey == dateKey { loadingKey = nil } }
         do {
             let tz = TimeZone.current.secondsFromGMT() / 60
             let obj = try await JWire.request("op=journal_day&date=\(dateKey)&tz=\(tz)")
@@ -702,6 +705,9 @@ final class JournalDayModel: ObservableObject {
             engineDeploying = true
             error = nil
         } catch {
+            // A swipe-cancelled fetch is not a failure — surfacing it painted
+            // a phantom "Couldn't load this day" over a perfectly fine day.
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
             // Keep whatever is on screen; only surface the failure when there
             // is nothing cached to show.
             self.error = days[dateKey] == nil
@@ -723,7 +729,7 @@ final class JournalMonthModel: ObservableObject {
     func load(monthKey: String) async {
         guard loadingKey != monthKey else { return }
         loadingKey = monthKey
-        defer { loadingKey = nil }
+        defer { if loadingKey == monthKey { loadingKey = nil } }
         do {
             let tz = TimeZone.current.secondsFromGMT() / 60
             let obj = try await JWire.request("op=journal_month&month=\(monthKey)&tz=\(tz)")
@@ -753,6 +759,7 @@ final class JournalMonthModel: ObservableObject {
             engineDeploying = true
             error = nil
         } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
             self.error = months[monthKey] == nil
                 ? "Couldn't load the month. Try again."
                 : nil
@@ -1314,6 +1321,45 @@ struct JournalDayScreen: View {
 
     // MARK: pins (recordings — pin conversations + synced recorder docs)
 
+    private func pinRow(_ p: JDayItem) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 7) {
+                Image(systemName: p.icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(JStyle.rose)
+                Text(p.title.isEmpty ? "Pinned conversation" : p.title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                    .multilineTextAlignment(p.title.readingAlignment)
+                    .environment(\.layoutDirection, p.title.layoutDir)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if !p.timeLabel.isEmpty {
+                    Text(p.timeLabel)
+                        .font(.system(size: 12, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white.opacity(0.5))
+                }
+                if p.sourceId != nil {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+            }
+            if !p.subtitle.isEmpty {
+                Text(p.subtitle)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .multilineTextAlignment(p.subtitle.readingAlignment)
+                    .frame(maxWidth: .infinity, alignment: p.subtitle.readingFrameAlignment)
+                    .environment(\.layoutDirection, p.subtitle.layoutDir)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(3)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
     private func pinsCard(_ pins: [JDayItem]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
@@ -1327,34 +1373,18 @@ struct JournalDayScreen: View {
                     .kerning(0.8)
             }
             ForEach(pins) { p in
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 7) {
-                        Image(systemName: p.icon)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(JStyle.rose)
-                        Text(p.title.isEmpty ? "Pinned conversation" : p.title)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .multilineTextAlignment(p.title.readingAlignment)
-                            .environment(\.layoutDirection, p.title.layoutDir)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 0)
-                        if !p.timeLabel.isEmpty {
-                            Text(p.timeLabel)
-                                .font(.system(size: 12, weight: .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(.white.opacity(0.5))
-                        }
-                    }
-                    if !p.subtitle.isEmpty {
-                        Text(p.subtitle)
-                            .font(.system(size: 13))
-                            .foregroundStyle(.white.opacity(0.65))
-                            .multilineTextAlignment(p.subtitle.readingAlignment)
-                            .frame(maxWidth: .infinity, alignment: p.subtitle.readingFrameAlignment)
-                            .environment(\.layoutDirection, p.subtitle.layoutDir)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .lineLimit(3)
+                // Same rule as the timeline rows: a pin with a server-side
+                // story behind it pushes the full conversation detail on the
+                // Journal's NavigationStack. The tap-to-transcript commission
+                // (2026-08-21) shipped for episodes but this card's rows were
+                // plain VStacks — pins, THE main capture device's output,
+                // never opened anywhere.
+                Group {
+                    if p.sourceId != nil {
+                        NavigationLink { JItemDetailScreen(item: p) } label: { pinRow(p) }
+                            .buttonStyle(.plain)
+                    } else {
+                        pinRow(p)
                     }
                 }
             }

@@ -135,6 +135,14 @@ final class Conversation: ObservableObject {
     }
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// Transcript length at the moment his turn closed. Transcription is
+    /// ASYNC and routinely lands AFTER her reply's transcript — appending in
+    /// arrival order put his words BELOW the answer they prompted. His line
+    /// inserts at this mark instead, i.e. before anything that landed after
+    /// his turn closed. (Under ?defer=1 her response can't even be created
+    /// until the patience window fires, so at speech_stopped/committed this
+    /// mark reliably precedes her whole reply.)
+    private var transcriptMarkAtTurnClose = 0
     /// THE PATIENCE WINDOW (2026-08-14, Ido: "she loses patience and just
     /// barges in" mid-dictation, and the truncated rest never registers).
     /// This build mints with ?defer=1 — the server's VAD still detects and
@@ -207,6 +215,23 @@ final class Conversation: ObservableObject {
     /// playPCM's delta path drops them until a DIFFERENT item id appears.
     private var truncatedItemId: String?
     private var drainedAudioFrames = 0
+    /// Frames RECEIVED for the current assistant item (drained ≤ received).
+    /// drained/received is the honest fraction of her answer he actually
+    /// heard when a barge-in cuts playback — what the on-screen transcript
+    /// must be trimmed to. ElevenLabs sends agent_response_correction with
+    /// her exact spoken words; OpenAI has no such event, so the proportional
+    /// cut is the best truth available (Ido 2026-08-11: the text box must
+    /// never keep words she never voiced).
+    private var receivedAudioFrames = 0
+    /// Whether the current item's full transcript already reached the screen.
+    /// Decides WHERE the barge-in trim applies: to the line already shown, or
+    /// to the transcript.done still in flight (pendingTranscriptTrimFraction).
+    private var assistantTranscriptLanded = false
+    /// Armed by a barge-in flush when her line hasn't landed yet; the next
+    /// output_audio_transcript.done applies it. Cleared on response.created
+    /// so a cancelled response that never sends its transcript can't trim a
+    /// healthy future reply.
+    private var pendingTranscriptTrimFraction: Double?
     /// One free retry for a failed/incomplete response when there is no
     /// queued text to re-send (finding #5): the spoken turn is still in the
     /// conversation, so a bare response.create recovers it. Reset on every
@@ -525,6 +550,25 @@ final class Conversation: ObservableObject {
 
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
+    /// Mint and tool calls used URLSession.shared — the 60s default meant a
+    /// hung mint mid-reconnect or a hung tool proxy was a full minute of dead
+    /// air. Mirror the Watch: wait for connectivity (a link mid-handoff is
+    /// not a failure), but cap the whole task so a hang becomes a retry.
+    /// resourceTimeout is task-lifetime — right for these one-shot POSTs,
+    /// fatal for the WebSocket, which keeps its default session above.
+    private static func patientSession(resourceTimeout: TimeInterval) -> URLSession {
+        let c = URLSessionConfiguration.default
+        c.waitsForConnectivity = true
+        c.timeoutIntervalForResource = resourceTimeout
+        return URLSession(configuration: c)
+    }
+    /// 20s: the server mint can add whole seconds under cold start and the
+    /// budget absorbs a radio wake, but a reconnect must fail into the
+    /// backoff ladder fast enough that the cutover budget survives.
+    private let mintSession = Conversation.patientSession(resourceTimeout: 20)
+    /// 30s: tools may legitimately be slow (search, mail), but past that the
+    /// turn is dead air — fail so the model can say "that's taking too long".
+    private let toolSession = Conversation.patientSession(resourceTimeout: 30)
     private var token = ""
     private var outputRate: Double = 24000   // OpenAI Realtime speaks 24 kHz PCM16
 
@@ -1714,10 +1758,24 @@ final class Conversation: ObservableObject {
            let lastAsk = transcript.last(where: { !$0.fromHer })?.text, !lastAsk.isEmpty {
             parts.append("HIS LAST TURN: \"\(lastAsk.prefix(300))\" — if it was not fully answered before the drop, answer it now without making him re-ask.")
         }
-        let recent = transcript.suffix(8)
-            .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
+        // 16 REAL lines × 400 chars, not 6 × 200: a rebuilt session restored
+        // from a keyhole answered mid-dialogue questions from amnesia. Emoji
+        // status lines (radio/music/call cards) are UI, not conversation —
+        // they used to eat most of the tiny window.
+        let statusMarks = ["📻", "🎵", "📞", "🎧"]
+        let recent = transcript
+            .filter { line in !statusMarks.contains(where: { line.text.hasPrefix($0) }) }
+            .suffix(16)
+            .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(400) }
             .joined(separator: "\n")
         if !recent.isEmpty { parts.append("Recent exchange:\n" + recent) }
+        // What her tools just FOUND survives the rebuild too — facts she
+        // already reported must not need a re-lookup (or get re-invented).
+        let toolLines = recentToolResults
+            .filter { Date().timeIntervalSince($0.at) < 600 }
+            .map { "\($0.name): \($0.summary)" }
+            .joined(separator: "\n")
+        if !toolLines.isEmpty { parts.append("Recent tool results (already delivered — reuse, don't re-run):\n" + toolLines) }
         return parts.joined(separator: "\n")
     }
 
@@ -1794,7 +1852,7 @@ final class Conversation: ObservableObject {
                 var req = URLRequest(url: AppConfig.elevenURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await mintSession.data(for: req)
                 // 402 = the quota gate said the premium voice is out of
                 // credits BEFORE a doomed socket — fall over immediately.
                 // Unless ElevenLabs IS the tier-2 parachute: OpenAI just
@@ -1807,10 +1865,23 @@ final class Conversation: ObservableObject {
                     await connect()
                     return
                 }
-                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let elStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let signed = obj?["signed_url"] as? String, let url = URL(string: signed) else {
-                    status = "Couldn't start — try again."; state = .idle; wantLive = false
-                    pendingOutbound.removeAll()   // no session is coming — don't replay stale text later
+                    // Mirror the OpenAI branch: a bad token is terminal;
+                    // everything else (cold start, 429, 5xx, malformed body)
+                    // is TRANSIENT — retry through the normal backoff and
+                    // KEEP the queued text. Hard-idling here destroyed live
+                    // ElevenLabs sessions (and their queued dictation) on a
+                    // single relay blip.
+                    if elStatus == 401 || elStatus == 403 {
+                        status = "Couldn't start — sign in again from Settings."
+                        terminalStartFailure = true
+                        state = .idle; wantLive = false
+                        pendingOutbound.removeAll()
+                        return
+                    }
+                    if wantLive { scheduleReconnect(reason: "eleven-mint-failed-\(elStatus)") }
                     return
                 }
                 socketRequest = URLRequest(url: url)
@@ -1860,7 +1931,7 @@ final class Conversation: ObservableObject {
                 var req = URLRequest(url: mintURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await mintSession.data(for: req)
                 let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 // Registry id for the alive beacon — captured before the socket
@@ -2352,6 +2423,8 @@ final class Conversation: ObservableObject {
                 if id != currentAssistantItemId {
                     currentAssistantItemId = id
                     drainedAudioFrames = 0
+                    receivedAudioFrames = 0
+                    assistantTranscriptLanded = false
                 }
             }
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
@@ -2360,6 +2433,7 @@ final class Conversation: ObservableObject {
             // the full conversation, so every input that landed before this
             // moment is covered by it — a deferred create would only make her
             // re-answer the same thing (the 225 double-answer/translation bug).
+            pendingTranscriptTrimFraction = nil   // the cancelled item never sent its transcript
             responseActive = true
             needsResponseAfterDone = false
             lastResponseCreatedAt = Date()
@@ -2370,15 +2444,23 @@ final class Conversation: ObservableObject {
             noteEngagement()   // her reply just landed — the follow-up window opens
             let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
             if rstatus == "cancelled", deferredResponseReason == .vadSpeech {
-                // Cancelled = Ido cut her off (barge-in or Stop). Semantic VAD
-                // creates the response for his NEW turn itself (create_response
-                // is on) — a deferred create here would race that one and then
-                // re-fire input-less at ITS done: the 225 double-answer bug in
-                // a new coat. Drop the deferral; his next turn answers itself.
-                // ONLY for a vad-speech deferral, though: an ITEM-backed one
-                // (typed turn, tool output, system item) has no VAD turn coming
-                // to answer it — keep it, and the create below fires as usual.
+                // Cancelled = Ido cut her off (barge-in or Stop). The old rule
+                // dropped the deferral outright — correct in the auto-response
+                // era, when semantic VAD would create the reply for his new
+                // turn itself. This build mints ?defer=1: the client is the
+                // ONLY party that ever creates responses, so a dropped
+                // deferral was a turn NOBODY answered — short barge-in turns
+                // went silent until the watchdog forced a full reconnect.
+                // If his turn already closed (speech_stopped fired while the
+                // dying response was still active — the exact race that set
+                // this deferral), re-enter the patience window now. If he is
+                // still mid-speech, drop it: his own speech_stopped schedules
+                // the create, and creating early would answer half a sentence.
                 needsResponseAfterDone = false
+                if !serverHearsSpeech {
+                    clientLog("patience", "cancelled response — re-arming create for his closed turn")
+                    schedulePatienceCreate()
+                }
             }
             if rstatus != "completed" && rstatus != "cancelled" {
                 // Failed/incomplete response: the always-answer net catches it
@@ -2409,7 +2491,19 @@ final class Conversation: ObservableObject {
             noteSignsOfLife()
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
+                // A barge-in flush may have cut this answer before its text
+                // ever reached the screen — land only what he heard.
+                if let f = pendingTranscriptTrimFraction {
+                    pendingTranscriptTrimFraction = nil
+                    if let heard = Self.trimToHeard(t, fraction: f) {
+                        transcript.append(.init(text: heard, fromHer: true))
+                        TurnLogger.shared.log(role: "assistant", text: heard)
+                    }
+                    assistantTranscriptLanded = true
+                    break
+                }
                 transcript.append(.init(text: t, fromHer: true))
+                assistantTranscriptLanded = true
                 TurnLogger.shared.log(role: "assistant", text: t)
             }
         case "conversation.item.input_audio_transcription.completed":
@@ -2455,7 +2549,16 @@ final class Conversation: ObservableObject {
                     else { send(["type": "response.create"]); armReplyWatchdog() }
                     break
                 }
-                transcript.append(.init(text: t, fromHer: false))
+                // Conversation order, not arrival order: land his line at
+                // the mark recorded when his turn closed, so it sits ABOVE
+                // the reply it prompted even when transcription lags her.
+                let insertAt = min(transcriptMarkAtTurnClose, transcript.count)
+                if insertAt < transcript.count {
+                    transcript.insert(.init(text: t, fromHer: false), at: insertAt)
+                } else {
+                    transcript.append(.init(text: t, fromHer: false))
+                }
+                transcriptMarkAtTurnClose = insertAt + 1   // a second late line stays in order
                 TurnLogger.shared.log(role: "user", text: t)
                 // Mirror his language mechanically: detect what he ACTUALLY
                 // spoke and pin the session to it the moment it changes.
@@ -2540,6 +2643,7 @@ final class Conversation: ObservableObject {
         case "input_audio_buffer.speech_stopped":
             serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
+            transcriptMarkAtTurnClose = transcript.count
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
             // The reply is now OURS to request (?defer=1 mint — no VAD
             // auto-response). Schedule it behind the patience window; the
@@ -2572,6 +2676,7 @@ final class Conversation: ObservableObject {
             }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
+            transcriptMarkAtTurnClose = transcript.count
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
             if gatePendingHold {
                 gatePendingHold = false
@@ -2693,7 +2798,7 @@ final class Conversation: ObservableObject {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await toolSession.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code < 200 || code > 299 {
                 clientLog("tool-http", "\(name) status=\(code)")
@@ -2857,11 +2962,20 @@ final class Conversation: ObservableObject {
     }
 
     /// OpenAI Realtime function-call entry (the backup engine).
+    /// The last few tool results, kept for reconnect handover: a rebuilt
+    /// session that just searched his mail / checked his calendar must not
+    /// forget WHAT IT FOUND the moment the socket flips (a normal drive used
+    /// to wipe this repeatedly — she re-ran the same lookups or, worse,
+    /// answered from nothing).
+    private var recentToolResults: [(at: Date, name: String, summary: String)] = []
+
     private func runToolOpenAI(name: String, callId: String, argsJSON: String) {
         let params = (try? JSONSerialization.jsonObject(with: Data(argsJSON.utf8))) as? [String: Any] ?? [:]
         preToolCues(name: name, params: params)
         Task {
             let out = await performTool(name: name, params: params)
+            recentToolResults.append((Date(), name, String(out.prefix(300))))
+            if recentToolResults.count > 5 { recentToolResults.removeFirst() }
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
                            "output": cappedToolResult(name, out)]])
@@ -3682,6 +3796,7 @@ final class Conversation: ObservableObject {
         turnPhase = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
         pendingBuffers += 1
+        receivedAudioFrames += Int(frames)
         // Duration at the CURRENT engine's play rate, never a hard-coded
         // 24000: buffers are minted in playFormat (= outputRate), and on the
         // ElevenLabs fallback that is 16 kHz — dividing by 24k there ran the
@@ -3728,6 +3843,22 @@ final class Conversation: ObservableObject {
         }
     }
 
+    /// The heard prefix of an interrupted answer, cut at a word boundary,
+    /// with an ellipsis marking the interruption. nil = nothing was heard
+    /// (drop the line). Near-complete playback (≥98%) keeps the full text.
+    private static func trimToHeard(_ t: String, fraction: Double) -> String? {
+        guard fraction < 0.98 else { return t }
+        guard fraction > 0.02 else { return nil }
+        let cut = max(1, Int((Double(t.count) * fraction).rounded()))
+        var head = String(t.prefix(cut))
+        if let sp = head.range(of: " ", options: .backwards), fraction < 0.9 {
+            head = String(head[..<sp.lowerBound])
+        }
+        head = head.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !head.isEmpty else { return nil }
+        return head + " …"
+    }
+
     private func flushPlayback() {
         // Audio held back for his overlap dies with the flush — the answer it
         // belonged to is cut. Held buffers still count as UNPLAYED for the
@@ -3745,6 +3876,24 @@ final class Conversation: ObservableObject {
             send(["type": "conversation.item.truncate",
                   "item_id": itemId, "content_index": 0, "audio_end_ms": heardMs])
             clientLog("truncate", "item=\(itemId) heard=\(heardMs)ms")
+            // Mirror the truncation on the SCREEN (the OpenAI half of
+            // ElevenLabs' agent_response_correction): server context now
+            // holds only the heard words — the text box must match, not keep
+            // the full answer she never finished voicing.
+            let fraction = receivedAudioFrames > 0
+                ? min(1, Double(drainedAudioFrames) / Double(receivedAudioFrames)) : 1
+            if assistantTranscriptLanded {
+                if let idx = transcript.lastIndex(where: { $0.fromHer && !$0.text.hasPrefix("📻")
+                        && !$0.text.hasPrefix("🎵") && !$0.text.hasPrefix("📞") }) {
+                    if let heard = Self.trimToHeard(transcript[idx].text, fraction: fraction) {
+                        transcript[idx] = .init(text: heard, fromHer: true)
+                    } else {
+                        transcript.remove(at: idx)   // cut before a word landed
+                    }
+                }
+            } else {
+                pendingTranscriptTrimFraction = fraction
+            }
             // Deltas for the truncated item may still be in flight from the
             // server — remember it so playPCM drops the stragglers instead of
             // resuming the cut answer garbled (the AirPods barge-in half-fix).

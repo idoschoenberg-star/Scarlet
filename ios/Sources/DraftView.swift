@@ -153,6 +153,17 @@ final class DraftModel: ObservableObject {
     /// a stalled server stream. Purely a UI hint (the ✕ always closes); it never
     /// changes the phase or interferes with streaming.
     @Published var writingStalled = false
+    /// When the current revise round-trip started — pollTick's exit hatch
+    /// from a .revising that will never stream (the row left the active set:
+    /// already sent, approved, or discarded under us).
+    private var revisingStartedAt: Date?
+    /// Parked (state 'saved') drafts, for the shelf in the compose screen —
+    /// the restore path that made parked work reachable again.
+    @Published var savedShelf: [SavedDraft] = []
+    struct SavedDraft: Identifiable {
+        let id: String; let channel: String; let recipient: String
+        let subject: String; let preview: String
+    }
     private var writingProgressAt: Date?
     private var lastBodyLen = -1
     /// The in-flight (debouncing or fetching) contact search, cancelled by
@@ -349,6 +360,43 @@ final class DraftModel: ObservableObject {
         DraftFlowAPI.reviewSeen(draftId: id)
     }
 
+    /// The saved shelf — parked (state 'saved') drafts, newest first.
+    func fetchSavedShelf() async {
+        guard let data = try? await Self.request("op=drafts_saved", method: "GET"),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = obj["drafts"] as? [[String: Any]] else { return }
+        savedShelf = rows.compactMap { r in
+            guard let id = r["id"] as? String else { return nil }
+            return SavedDraft(id: id,
+                              channel: (r["channel"] as? String) ?? "",
+                              recipient: (r["recipient"] as? String) ?? "",
+                              subject: (r["subject"] as? String) ?? "",
+                              preview: String(((r["body"] as? String) ?? "").prefix(120)))
+        }
+    }
+
+    /// Resume a parked draft: server-side pickup (state back to 'review', so
+    /// draft_active serves it again), then adopt it into this window.
+    func pickup(_ id: String) {
+        guard draftId == nil else { return }
+        errorText = ""
+        Task {
+            guard let data = try? await Self.request("op=draft_action", method: "POST",
+                                                     body: ["id": id, "action": "pickup"]),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (obj["ok"] as? Bool) == true else {
+                errorText = "Couldn't pick that draft back up — try again."
+                return
+            }
+            savedShelf.removeAll { $0.id == id }
+            draftId = id
+            phase = .writing
+            writingStartedAt = Date()
+            startPolling()
+            if let d = try? await Self.fetchActive(), d.id == id { adopt(d) }
+        }
+    }
+
     /// Re-run the last failed compose.
     func retry() {
         guard let body = pendingCompose, draftId == nil else { return }
@@ -360,6 +408,7 @@ final class DraftModel: ObservableObject {
         guard let id = draftId, phase == .ready, !text.isEmpty else { return }
         phase = .revising
         writingStartedAt = Date()
+        revisingStartedAt = Date()
         pendingInstruction = text
         errorText = ""
         Task {
@@ -367,13 +416,19 @@ final class DraftModel: ObservableObject {
             // draft_id runs the same revise pipeline AND clears reviewed_at,
             // so a regenerated body must be re-reviewed before it can send.
             var accepted = false
+            var serverError: String? = nil
             if let data = try? await Self.request("op=draft_mode", method: "POST",
                                                   body: ["draft_id": id,
                                                          "mode": "instructed",
                                                          "instructions": text]),
-               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-               (obj["ok"] as? Bool) == true {
-                accepted = true
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                if (obj["ok"] as? Bool) == true {
+                    accepted = true
+                } else if let msg = obj["error"] as? String, !msg.isEmpty {
+                    // The server explained itself ("draft already sent…") —
+                    // that explanation, verbatim, beats a generic shrug.
+                    serverError = msg
+                }
             }
             if !accepted {
                 // Older backend — the legacy revise action (no reviewed_at
@@ -382,10 +437,14 @@ final class DraftModel: ObservableObject {
                     let data = try await Self.request("op=draft_action", method: "POST",
                                                       body: ["id": id, "action": "revise", "instruction": text])
                     let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                    guard (obj?["ok"] as? Bool) == true else { throw URLError(.badServerResponse) }
+                    guard (obj?["ok"] as? Bool) == true else {
+                        if let msg = obj?["error"] as? String, !msg.isEmpty { serverError = msg }
+                        throw URLError(.badServerResponse)
+                    }
                 } catch {
-                    errorText = "That revision didn't go through — try again."
+                    errorText = serverError ?? "That revision didn't go through — try again."
                     phase = .ready
+                    revisingStartedAt = nil
                     return
                 }
             }
@@ -656,6 +715,24 @@ final class DraftModel: ObservableObject {
                 return
             }
         }
+        // Exit hatch from a wedged "Revising…": the revise was accepted but
+        // the row then LEFT the active set (already sent/approved/discarded
+        // under us) — nothing will ever stream, and the spinner used to spin
+        // forever. Confirmed against a real server answer, never a network
+        // blip: only an HTTP-200 draft_active with no draft counts.
+        if phase == .revising, let started = revisingStartedAt,
+           Date().timeIntervalSince(started) > 12 {
+            if let data = try? await Self.request("op=draft_active", method: "GET"),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               (obj["draft"] as? [String: Any]) == nil {
+                revisingStartedAt = nil
+                errorText = "That draft already went out (or was discarded) — the revision had nothing to change. Start a fresh draft if you still need it."
+                draft = nil; draftId = nil
+                phase = .idle
+                Task { await fetchSavedShelf() }
+                return
+            }
+        }
         if adoptActive {
             // Adopt whatever the server calls active — the voice flow may
             // replace the draft entirely. Active-nil (approved or dismissed
@@ -670,7 +747,7 @@ final class DraftModel: ObservableObject {
             draft = d
             // Streamed body finished → review; a revision put it back to
             // 'writing' → show the writing indicator again.
-            if (phase == .writing || phase == .revising) && d.status == "draft" { phase = .ready }
+            if (phase == .writing || phase == .revising) && d.status == "draft" { phase = .ready; revisingStartedAt = nil }
             if phase == .ready && d.status == "writing" { phase = .writing }
             // Voice approval (her approve_draft tool) — mirror it here so the
             // button, the green check, and her voice stay one single story.
@@ -678,7 +755,13 @@ final class DraftModel: ObservableObject {
         } else if d.status == "draft" || d.status == "writing" {
             // The active draft IS the window's truth. If voice work replaced
             // it under a different id (Scarlet revised or re-composed), follow
-            // it instead of showing a stale copy forever.
+            // it instead of showing a stale copy forever — but say so when
+            // real work was set aside: the supersede path PARKS a non-empty
+            // body (state 'saved'), and silently swapping was how parked
+            // drafts became unreachable.
+            if let old = draft, !(old.body.isEmpty), old.id != d.id {
+                errorText = "Your draft to \(old.recipient.isEmpty ? "them" : old.recipient) was set aside — it's waiting in Saved drafts."
+            }
             draftId = d.id
             draft = d
             if d.status == "draft", phase == .writing || phase == .revising { phase = .ready }
@@ -1224,7 +1307,10 @@ struct DraftView: View {
         case .revising:
             HStack(spacing: 7) {
                 ProgressView().controlSize(.small).tint(scarletRose)
-                Text("Revising…").font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
+                Text(model.writingStalled
+                     ? "The revision is taking longer than usual — you can close (✕) and try again."
+                     : "Revising…")
+                    .font(.footnote).foregroundStyle(scarletRose.opacity(0.95))
             }
         case .approving:
             HStack(spacing: 7) {
@@ -1571,9 +1657,52 @@ struct DraftView: View {
             if !suggestionRows.isEmpty {
                 suggestionList
             }
+            if !model.savedShelf.isEmpty {
+                savedShelfSection
+            }
             Spacer()
         }
         .padding(.top, 6)
+        .task { await model.fetchSavedShelf() }
+    }
+
+    /// Parked drafts, resumable in one tap — the shelf that makes
+    /// save_for_later (and the supersede park) reachable instead of a
+    /// write-only hole.
+    private var savedShelfSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Saved drafts")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            ForEach(model.savedShelf) { d in
+                Button { model.pickup(d.id) } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text(d.recipient.isEmpty ? "(no recipient)" : d.recipient)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.9))
+                            Spacer(minLength: 0)
+                            Text("Resume")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(scarletRose)
+                        }
+                        if !d.preview.isEmpty {
+                            Text(d.preview)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(d.preview.readingAlignment)
+                                .frame(maxWidth: .infinity, alignment: d.preview.readingFrameAlignment)
+                                .environment(\.layoutDirection, d.preview.layoutDir)
+                        }
+                    }
+                    .padding(12)
+                    .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 
     /// Channel-draft mode, no draft yet: the recipient is fixed (the chat
