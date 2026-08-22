@@ -202,6 +202,8 @@ struct JournalReviewScreen: View {
         _model = ObservedObject(wrappedValue: model)
     }
 
+    @Environment(\.horizontalSizeClass) private var hSize
+
     var body: some View {
         content
             .background(ScarletBackground().ignoresSafeArea())
@@ -213,8 +215,12 @@ struct JournalReviewScreen: View {
             // over it (Catalyst allows a single presentation per view).
             .reportsModalPresence(amending != nil)
             .sheet(item: $amending) { card in
+                // LEAVE-SAVES, part 2: the sheet AWAITS the server and closes
+                // only on success — a failed amend keeps his edits on screen
+                // with the error instead of dismissing into silence.
                 JournalAmendSheet(card: card) { title, body in
-                    Task { await model.review(card, action: "amend", title: title, body: body) }
+                    await model.review(card, action: "amend", title: title, body: body)
+                    return !model.cards.contains { $0.id == card.id }
                 }
                 .preferredColorScheme(.dark)
             }
@@ -250,21 +256,34 @@ struct JournalReviewScreen: View {
                 }
                 if model.cards.isEmpty {
                     emptyState
-                } else {
-                    ForEach(model.cards) { card in
-                        JournalCardRow(
-                            card: card,
-                            deciding: model.decidingId == card.id,
-                            busy: model.decidingId != nil,
-                            onAccept: { Task { await model.review(card, action: "accept") } },
-                            onAmend: { amending = card },
-                            onReject: { Task { await model.review(card, action: "reject") } })
+                } else if hSize == .regular {
+                    // Work surface (doctrine §11): the wide screen carries a
+                    // two-column card grid instead of one stretched column.
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 420), spacing: 12)],
+                              alignment: .leading, spacing: 12) {
+                        cardViews
                     }
+                } else {
+                    cardViews
                 }
             }
             .padding(.horizontal, 14)
             .padding(.top, 8)
             .padding(.bottom, 20)
+        }
+    }
+
+    /// One card per pending review — shared by the phone column and the
+    /// regular-width grid.
+    private var cardViews: some View {
+        ForEach(model.cards) { card in
+            JournalCardRow(
+                card: card,
+                deciding: model.decidingId == card.id,
+                busy: model.decidingId != nil,
+                onAccept: { Task { await model.review(card, action: "accept") } },
+                onAmend: { amending = card },
+                onReject: { Task { await model.review(card, action: "reject") } })
         }
     }
 
@@ -345,7 +364,7 @@ private struct JournalCardRow: View {
             header
             if !card.title.isEmpty {
                 Text(card.title)
-                    .font(.subheadline.weight(.semibold))
+                    .font(.system(size: 19, weight: .semibold))
                     .multilineTextAlignment(card.title.readingAlignment)
                     .frame(maxWidth: .infinity, alignment: card.title.readingFrameAlignment)
                     .environment(\.layoutDirection, card.title.layoutDir)
@@ -353,7 +372,7 @@ private struct JournalCardRow: View {
             }
             if !card.body.isEmpty {
                 Text(card.body)
-                    .font(.subheadline)
+                    .font(.system(size: 17))
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(card.body.readingAlignment)
                     .frame(maxWidth: .infinity, alignment: card.body.readingFrameAlignment)
@@ -469,14 +488,17 @@ private struct JournalCardRow: View {
 /// the storyline is his to correct, so the body editor stays out of the way.
 private struct JournalAmendSheet: View {
     let card: JournalCard
-    let onSave: (String, String) -> Void
+    /// Returns whether the server accepted — false keeps the sheet open.
+    let onSave: (String, String) async -> Bool
 
     @State private var title: String
     /// NOT named `body` — a @State of that name shadows `View.body`.
     @State private var details: String
+    @State private var saving = false
+    @State private var saveError = ""
     @Environment(\.dismiss) private var dismiss
 
-    init(card: JournalCard, onSave: @escaping (String, String) -> Void) {
+    init(card: JournalCard, onSave: @escaping (String, String) async -> Bool) {
         self.card = card
         self.onSave = onSave
         _title = State(initialValue: card.title)
@@ -491,6 +513,13 @@ private struct JournalAmendSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                if !saveError.isEmpty {
+                    Section {
+                        Label(saveError, systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.orange)
+                    }
+                }
                 Section {
                     TextField("Title", text: $title, axis: .vertical)
                         .lineLimit(1...3)
@@ -518,12 +547,17 @@ private struct JournalAmendSheet: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button(card.isVerification ? "Confirm" : "Accept") {
-                        onSave(title.trimmingCharacters(in: .whitespacesAndNewlines), details)
-                        dismiss()
+                    Button(saving ? "Saving…" : (card.isVerification ? "Confirm" : "Accept")) {
+                        Task {
+                            saving = true
+                            let ok = await onSave(title.trimmingCharacters(in: .whitespacesAndNewlines), details)
+                            saving = false
+                            if ok { dismiss() }
+                            else { saveError = "That didn't go through — your edits are still here; try again." }
+                        }
                     }
                     .fontWeight(.semibold)
-                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(saving || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
         }

@@ -840,6 +840,10 @@ struct JournalView: View {
     @EnvironmentObject private var convo: Conversation
 
     private enum Screen { case day, month, search }
+    /// iPad/Mac = the MAIN work platform (doctrine §11): regular width gets
+    /// a persistent two-pane layout — month grid on the left, the day (or
+    /// search results) on the right — instead of full-screen mode swaps.
+    @Environment(\.horizontalSizeClass) private var hSize
     @State private var screen: Screen = .day
     @State private var selectedDay = JDates.cal.startOfDay(for: Date())
     /// First-of-month anchor for the month grid.
@@ -852,7 +856,11 @@ struct JournalView: View {
             VStack(spacing: 0) {
                 headerBar
                 searchBar
-                content
+                if hSize == .regular {
+                    regularSplit
+                } else {
+                    content
+                }
             }
             .background(ScarletBackground().ignoresSafeArea())
             .toolbar(.hidden, for: .navigationBar)
@@ -887,7 +895,15 @@ struct JournalView: View {
             await review.load()
         }
         .onAppear { convo.setFocus(focusLine) }
-        .onChange(of: selectedDay) { _, _ in convo.setFocus(focusLine) }
+        .onChange(of: selectedDay) { _, day in
+            convo.setFocus(focusLine)
+            // Regular width: the persistent month grid follows the day pane
+            // across month boundaries (stepping ← past the 1st).
+            if hSize == .regular,
+               !JDates.cal.isDate(day, equalTo: monthAnchor, toGranularity: .month) {
+                monthAnchor = day
+            }
+        }
         .onChange(of: screen) { _, _ in convo.setFocus(focusLine) }
     }
 
@@ -958,6 +974,48 @@ struct JournalView: View {
         guard !q.isEmpty else { return }
         screen = .search
         Task { await searchModel.search(q) }
+    }
+
+    // MARK: regular-width work surface (doctrine §11)
+
+    /// Month grid stays put on the left; picking a day updates the right
+    /// pane in place — nothing tears down, nothing swaps full-screen. The
+    /// right pane shows search results while a search is active.
+    private var regularSplit: some View {
+        HStack(spacing: 0) {
+            JournalMonthScreen(
+                model: monthModel,
+                anchor: $monthAnchor,
+                selectedDay: selectedDay,
+                onPick: { day in
+                    selectedDay = day
+                    screen = .day
+                },
+                onClose: { screen = .day })
+                .frame(width: 360)
+            Divider().overlay(Color.white.opacity(0.08))
+            Group {
+                if screen == .search {
+                    JournalSearchScreen(
+                        model: searchModel,
+                        onOpenDay: { key in
+                            if let d = JDates.parseDayKey(key) {
+                                selectedDay = d
+                                screen = .day
+                            }
+                        })
+                } else {
+                    JournalDayScreen(
+                        model: dayModel,
+                        review: review,
+                        day: selectedDay,
+                        onStep: { step($0) },
+                        onOpenMonth: { monthAnchor = selectedDay })
+                        .environmentObject(convo)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
     }
 
     // MARK: content switch
@@ -1661,14 +1719,14 @@ private struct JTimelineRow: View {
                     .foregroundStyle(item.tint)
                 if !item.title.isEmpty {
                     Text(item.title)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(dimmed ? .white.opacity(0.65) : .white)
                         .multilineTextAlignment(item.title.readingAlignment)
                         .environment(\.layoutDirection, item.title.layoutDir)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text(fallbackTitle)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.75))
                 }
                 Spacer(minLength: 0)
@@ -1717,7 +1775,7 @@ private struct JTimelineRow: View {
                 // On mapped rows this line doubles as the map's caption —
                 // duration · distance, straight under the snapshot.
                 Text(item.subtitle)
-                    .font(.system(size: 13))
+                    .font(.system(size: 15))
                     .foregroundStyle(.white.opacity(0.7))
                     .multilineTextAlignment(item.subtitle.readingAlignment)
                     .frame(maxWidth: .infinity, alignment: item.subtitle.readingFrameAlignment)
@@ -1785,6 +1843,8 @@ private struct JTimelineRow: View {
 /// 400-char excerpt); an episode fetches its full row (summary, people,
 /// place). Pushed on the Journal's single NavigationStack — never a sheet.
 private struct JItemDetailScreen: View {
+    /// Same shared reading-size dial the narrative uses (17pt floor holds).
+    @AppStorage("scarlet.readingSize") private var readingSize: Double = 17
     let item: JDayItem
     @State private var fullText = ""
     @State private var people: [String] = []
@@ -1829,7 +1889,7 @@ private struct JItemDetailScreen: View {
                     // per screen (TextDirection.swift rule).
                     ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, p in
                         Text(p)
-                            .font(.system(size: 15))
+                            .font(.system(size: max(17, readingSize)))
                             .foregroundStyle(.white.opacity(0.88))
                             .multilineTextAlignment(p.readingAlignment)
                             .frame(maxWidth: .infinity, alignment: p.readingFrameAlignment)
