@@ -34,6 +34,7 @@ struct SplitShell: View {
         case talk
         case inbox
         case journal
+        case active
         case calendar
         case chats
         case photos
@@ -51,6 +52,7 @@ struct SplitShell: View {
             case .talk: return "Talk"
             case .inbox: return "Inbox"
             case .journal: return "Journal"
+            case .active: return "Active"
             case .calendar: return "Calendar"
             case .chats: return "Chats"
             case .photos: return "Photos"
@@ -69,6 +71,7 @@ struct SplitShell: View {
             case .talk: return "waveform"
             case .inbox: return "envelope.fill"
             case .journal: return "book.closed.fill"
+            case .active: return "dot.radiowaves.left.and.right"
             case .calendar: return "calendar"
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .photos: return "photo.on.rectangle"
@@ -87,6 +90,7 @@ struct SplitShell: View {
             case .talk: return "1"
             case .inbox: return "2"
             case .journal: return "3"
+            case .active: return "a"
             case .calendar: return "4"
             case .chats: return "5"
             case .photos: return "6"
@@ -266,6 +270,10 @@ struct SplitShell: View {
         case .journal:
             // Self-contained NavigationStack (review cards + amend sheet).
             JournalView()
+                .environmentObject(convo)
+        case .active:
+            // The assignment monitor: in-flight / done / recurring.
+            ActiveView()
                 .environmentObject(convo)
         case .calendar:
             // Manages its own layout (week strip + agenda; detail is a sheet).
