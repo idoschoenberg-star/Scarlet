@@ -613,13 +613,38 @@ struct InboxView: View {
     @StateObject private var model = InboxModel()
     @EnvironmentObject private var convo: Conversation
     @State private var showCompose = false
+    /// iPad/Mac (design guide §11): the Inbox is a persistent list+reader
+    /// split at regular width — never a stretched phone stack.
+    @Environment(\.horizontalSizeClass) private var hSize
+    /// Regular width only: the id of the message open in the reading pane.
+    /// Selection-driven — opening a message never pushes over the list.
+    @State private var selectedMessageId: String?
 
     var body: some View {
+        Group {
+            if hSize == .regular {
+                regularSplit
+            } else {
+                compactStack
+            }
+        }
+        // .task re-runs every time this tab is selected → auto-refresh on
+        // tab appear; foreground return refreshes too.
+        .task { await model.load() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willEnterForegroundNotification)) { _ in
+            Task { await model.load() }
+        }
+    }
+
+    /// The iPhone presentation — the original NavigationStack-push flow,
+    /// byte-for-byte: list screen, reader pushed on top.
+    private var compactStack: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 headerBar
                 tabPills
-                content
+                content(selectable: false)
             }
             .background(OutlookStyle.background.ignoresSafeArea())
             // Scarlet lives at the bottom of the LIST screen only — part of
@@ -646,12 +671,72 @@ struct InboxView: View {
                 convo.setFocus(inboxBrowsingFocus(newTab))
             }
         }
-        // .task re-runs every time this tab is selected → auto-refresh on
-        // tab appear; foreground return refreshes too.
-        .task { await model.load() }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { await model.load() }
+    }
+
+    /// The iPad/Mac presentation (design guide §11 — MS Office anatomy): a
+    /// fixed-width message list on the leading edge, a hairline, and the
+    /// SAME reader the phone pushes, inline in the remaining area, driven by
+    /// List selection. The list never disappears; both swipe families keep
+    /// working on it. One `.sheet` per appeared view (Catalyst rule): only
+    /// one of the two body branches ever exists at a time.
+    private var regularSplit: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                headerBar
+                tabPills
+                content(selectable: true)
+            }
+            .frame(width: 400)
+            // Scarlet stays with the LIST column, as on the phone's list
+            // screen; the reading pane has its own action bar.
+            .safeAreaInset(edge: .bottom) {
+                ScarletPresenceView(convo: convo)
+                    .padding(.vertical, 6)
+            }
+            Divider().overlay(OutlookStyle.separator)
+            readerPane
+        }
+        .background(OutlookStyle.background.ignoresSafeArea())
+        .toolbar(.hidden, for: .navigationBar)
+        .reportsModalPresence(showCompose)
+        .sheet(isPresented: $showCompose) {
+            DraftView(seed: nil)
+                .environmentObject(convo)   // DraftView hard-requires it; match every other call site
+                .preferredColorScheme(.dark)
+        }
+        .onAppear { convo.setFocus(inboxBrowsingFocus(model.tab)) }
+        .onChange(of: model.tab) { _, newTab in
+            convo.setFocus(inboxBrowsingFocus(newTab))
+        }
+    }
+
+    /// The regular-width reading pane: the selected message in the existing
+    /// MailDetailView, constructed exactly like the push path (convo
+    /// re-injected — Catalyst drops @EnvironmentObject across boundaries).
+    /// `.id(message.id)` gives every message its own view identity so the
+    /// reader's `.task` fetch re-runs per selection instead of showing the
+    /// previous body. Archiving removes the row from `model.messages`, the
+    /// lookup fails, and the pane falls back to the empty state on its own.
+    @ViewBuilder
+    private var readerPane: some View {
+        if let selected = selectedMessageId,
+           let message = model.messages.first(where: { $0.id == selected }) {
+            MailDetailView(message: message, model: model,
+                           onClose: { selectedMessageId = nil })
+                .environmentObject(convo)
+                .id(message.id)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "envelope.open")
+                    .font(.system(size: 36))
+                    .foregroundStyle(OutlookStyle.textSecondary)
+                Text("Select a message")
+                    .font(.system(size: 17))
+                    .foregroundStyle(OutlookStyle.textSecondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(OutlookStyle.background)
         }
     }
 
@@ -740,7 +825,7 @@ struct InboxView: View {
     }
 
     @ViewBuilder
-    private var content: some View {
+    private func content(selectable: Bool) -> some View {
         if model.loading && model.messages.isEmpty {
             // Only reachable with no cache at all (true first run): content
             // could not exist yet, so the one spinner in the flow is here.
@@ -771,74 +856,115 @@ struct InboxView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            List {
-                if !model.errorText.isEmpty {
-                    Text(model.errorText)
-                        .font(.footnote)
-                        .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
-                        .listRowBackground(Color.clear)
-                }
-                ForEach(groups) { group in
-                    // Per-day headers, Outlook style: small caps, quiet gray.
-                    Text(group.title.uppercased())
-                        .font(.system(size: 12, weight: .semibold))
-                        .kerning(0.5)
-                        .foregroundStyle(OutlookStyle.textSecondary)
-                        .padding(.top, 12)
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                    ForEach(group.messages) { message in
-                        // ZStack + zero-opacity link: full NavigationLink
-                        // behavior without the disclosure chevron Outlook
-                        // doesn't have.
-                        OutlookArchiveSwipe(
-                            baseBackground: message.flagged
-                                ? OutlookStyle.flaggedRowTint : Color.clear,
-                            onArchive: { model.archive(message) }
-                        ) {
-                            ZStack {
-                                NavigationLink {
-                                    MailDetailView(message: message, model: model)
-                                        // Mac Catalyst drops @EnvironmentObject across
-                                        // the NavigationLink→destination boundary, so
-                                        // MailDetailView's `convo` traps
-                                        // (EnvironmentObject.error → SIGTRAP) on open.
-                                        // Re-inject like every DraftView call site.
-                                        .environmentObject(convo)
-                                } label: {
-                                    EmptyView()
-                                }
-                                .opacity(0)
-                                InboxRow(message: message, accent: OutlookStyle.accentBlue)
-                            }
-                        }
-                        .listRowSeparatorTint(OutlookStyle.separator)
-                        // Leading swipe stays Outlook's: orange Flag + Read/Unread.
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button {
-                                model.toggleFlag(message)
-                            } label: {
-                                Label(message.flagged ? "Unflag" : "Flag",
-                                      systemImage: message.flagged
-                                          ? "flag.slash.fill" : "flag.fill")
-                            }
-                            .tint(OutlookStyle.flagOrange)
-                            Button {
-                                model.toggleRead(message)
-                            } label: {
-                                Label(message.unread ? "Read" : "Unread",
-                                      systemImage: message.unread
-                                          ? "envelope.open.fill" : "envelope.badge.fill")
-                            }
-                            .tint(OutlookStyle.primaryBlue)
-                        }
-                    }
+            // One List body, two shells: at regular width the List carries the
+            // selection binding that drives the reading pane; on the phone it
+            // stays the plain push-flow List. (List(selection:) responds to
+            // row taps outside edit mode only on iPad/Mac — exactly where the
+            // selectable shell is used.)
+            Group {
+                if selectable {
+                    List(selection: $selectedMessageId) { listRows(selectable: true) }
+                } else {
+                    List { listRows(selectable: false) }
                 }
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .refreshable { await model.load() }
         }
+    }
+
+    /// The shared List content — error line, per-day headers, message rows.
+    @ViewBuilder
+    private func listRows(selectable: Bool) -> some View {
+        if !model.errorText.isEmpty {
+            Text(model.errorText)
+                .font(.footnote)
+                .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+                .listRowBackground(Color.clear)
+        }
+        ForEach(groups) { group in
+            // Per-day headers, Outlook style: small caps, quiet gray.
+            Text(group.title.uppercased())
+                .font(.system(size: 12, weight: .semibold))
+                .kerning(0.5)
+                .foregroundStyle(OutlookStyle.textSecondary)
+                .padding(.top, 12)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            ForEach(group.messages) { message in
+                messageRow(message, selectable: selectable)
+            }
+        }
+    }
+
+    /// One message line: the archive-swipe shell around the row face, with
+    /// the Outlook leading swipes on both shells. Compact wraps the row in a
+    /// zero-opacity NavigationLink (full push behavior without the disclosure
+    /// chevron Outlook doesn't have); regular tags the row for
+    /// List(selection:) so the reading pane follows the tap instead.
+    @ViewBuilder
+    private func messageRow(_ message: MailMessage, selectable: Bool) -> some View {
+        let row = OutlookArchiveSwipe(
+            baseBackground: rowBackground(message, selectable: selectable),
+            onArchive: { model.archive(message) }
+        ) {
+            if selectable {
+                InboxRow(message: message, accent: OutlookStyle.accentBlue)
+            } else {
+                ZStack {
+                    NavigationLink {
+                        MailDetailView(message: message, model: model)
+                            // Mac Catalyst drops @EnvironmentObject across
+                            // the NavigationLink→destination boundary, so
+                            // MailDetailView's `convo` traps
+                            // (EnvironmentObject.error → SIGTRAP) on open.
+                            // Re-inject like every DraftView call site.
+                            .environmentObject(convo)
+                    } label: {
+                        EmptyView()
+                    }
+                    .opacity(0)
+                    InboxRow(message: message, accent: OutlookStyle.accentBlue)
+                }
+            }
+        }
+        .listRowSeparatorTint(OutlookStyle.separator)
+        // Leading swipe stays Outlook's: orange Flag + Read/Unread.
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                model.toggleFlag(message)
+            } label: {
+                Label(message.flagged ? "Unflag" : "Flag",
+                      systemImage: message.flagged
+                          ? "flag.slash.fill" : "flag.fill")
+            }
+            .tint(OutlookStyle.flagOrange)
+            Button {
+                model.toggleRead(message)
+            } label: {
+                Label(message.unread ? "Read" : "Unread",
+                      systemImage: message.unread
+                          ? "envelope.open.fill" : "envelope.badge.fill")
+            }
+            .tint(OutlookStyle.primaryBlue)
+        }
+        if selectable {
+            row.tag(message.id)
+        } else {
+            row
+        }
+    }
+
+    /// Row ground: in the regular-width list the open message shows a quiet
+    /// Outlook-blue selection wash (OutlookArchiveSwipe owns
+    /// `listRowBackground`, which replaces the system highlight); selection
+    /// wins over the flagged whisper-tint.
+    private func rowBackground(_ message: MailMessage, selectable: Bool) -> Color {
+        if selectable && message.id == selectedMessageId {
+            return OutlookStyle.accentBlue.opacity(0.18)
+        }
+        return message.flagged ? OutlookStyle.flaggedRowTint : Color.clear
     }
 
     // MARK: date buckets (Outlook grouping: one section per day)
@@ -927,7 +1053,9 @@ struct InboxRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(senderName)
-                        .font(.system(size: 15, weight: message.unread ? .bold : .semibold))
+                        // Type floor (design guide): sender 17pt semibold —
+                        // density comes from layout, never smaller type.
+                        .font(.system(size: 17, weight: message.unread ? .bold : .semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -938,12 +1066,12 @@ struct InboxRow: View {
                     }
                     Spacer(minLength: 8)
                     Text(timeLabel)
-                        .font(.system(size: 12))
+                        .font(.system(size: 13))
                         .foregroundStyle(OutlookStyle.textSecondary)
                 }
                 HStack(spacing: 6) {
                     Text(message.subject)
-                        .font(.system(size: 14, weight: message.unread ? .semibold : .regular))
+                        .font(.system(size: 17, weight: message.unread ? .semibold : .regular))
                         .foregroundStyle(Color.white.opacity(message.unread ? 1.0 : 0.9))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -960,7 +1088,7 @@ struct InboxRow: View {
                     }
                 }
                 Text(message.preview)
-                    .font(.system(size: 13))
+                    .font(.system(size: 15))
                     .foregroundStyle(OutlookStyle.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -1008,6 +1136,11 @@ struct InboxRow: View {
 struct MailDetailView: View {
     let message: MailMessage
     @ObservedObject var model: InboxModel
+    /// How to leave the reader when it is NOT a push: the regular-width
+    /// reading pane passes a closure that clears the list selection (there
+    /// is nothing to dismiss inline). Defaulted to nil so the phone's
+    /// NavigationLink construction stays exactly as it was.
+    var onClose: (() -> Void)? = nil
     @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
 
@@ -1136,13 +1269,20 @@ struct MailDetailView: View {
                     .keyboardShortcut("r", modifiers: [])
                 Button("") {
                     model.archive(message)
-                    dismiss()
+                    closeReader()
                 }
                 .keyboardShortcut("e", modifiers: [])
             }
             .opacity(0)
             .accessibilityHidden(true)
         }
+    }
+
+    /// Leaves the reader: pops the push on the phone; clears the reading-pane
+    /// selection at regular width, where the reader is inline and `dismiss()`
+    /// has nothing to act on.
+    private func closeReader() {
+        if let onClose { onClose() } else { dismiss() }
     }
 
     /// One dismiss handler for the reader's single sheet: restore the
@@ -1379,7 +1519,7 @@ struct MailDetailView: View {
             // list root hides the system nav bar — so the only reliable exit is one
             // we draw ourselves. A reader you can act in but not leave is the bug
             // we're killing app-wide.
-            Button { dismiss() } label: {
+            Button { closeReader() } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 15, weight: .semibold))
@@ -1497,7 +1637,7 @@ struct MailDetailView: View {
             actionButton("Archive", icon: "archivebox.fill",
                          tint: OutlookStyle.archiveGreen) {
                 model.archive(message)
-                dismiss()
+                closeReader()
             }
             actionButton("Ask Scarlet", icon: "sparkles", tint: scarletRose) {
                 askScarlet()
@@ -1706,7 +1846,7 @@ struct MailBodyView: UIViewRepresentable {
            ("quit unexpectedly"). Render the message on a clean light page —
            stability first; a dark re-theme can return once verified safe. */
         html,body{margin:0;padding:12px;background:#fff;color:#111;\
-        font:16px -apple-system,system-ui,sans-serif;\
+        font:17px/1.5 -apple-system,system-ui,sans-serif;\
         -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
         img{max-width:100%!important;height:auto!important}\
         table{max-width:100%!important;table-layout:auto}\
