@@ -704,6 +704,15 @@ struct DeskView: View {
     /// dismissal restores the browsing focus only if this still owns it
     /// (InboxView's stale-guard pattern).
     @State private var openedFocus: String?
+    /// iPad/Mac (regular width) is a two-pane work surface — list on the
+    /// leading edge, reading/detail pane trailing (design guide §11: never a
+    /// stretched phone screen). Compact keeps the single-column phone flow.
+    @Environment(\.horizontalSizeClass) private var hSize
+    /// The note open in the regular-width reading pane (compact routes note
+    /// opening to the modal sheet instead).
+    @State private var selectedNote: DeskNote?
+    /// The reminder shown in the regular-width detail pane.
+    @State private var selectedReminderID: String?
 
     /// The active leaf's accent — blue in Reminders, yellow in Notes.
     private var leafAccent: Color {
@@ -714,8 +723,24 @@ struct DeskView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 headerBar
-                leafSwitcher
-                content
+                if hSize == .regular {
+                    // Regular width (iPad/Mac): the list keeps a readable
+                    // ~400pt column; the recovered width becomes the inline
+                    // reading/detail pane — no more stretched phone list.
+                    HStack(spacing: 0) {
+                        VStack(spacing: 0) {
+                            leafSwitcher
+                            content
+                        }
+                        .frame(width: 400)
+                        Divider().overlay(DeskUI.separator)
+                        trailingPane
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                } else {
+                    leafSwitcher
+                    content
+                }
             }
             .background(DeskUI.background.ignoresSafeArea())
             // Quick-add rides pinned above Scarlet's capsule; both are part
@@ -971,10 +996,16 @@ struct DeskView: View {
                         ) {
                             model.toggle(r)
                         }
+                        // Regular width: tapping the row (not the checkbox)
+                        // shows it in the trailing detail pane. Compact: no-op.
+                        .onTapGesture {
+                            guard hSize == .regular else { return }
+                            selectedReminderID = r.id
+                        }
                         // A just-added row glows briefly so the optimistic
-                        // insert is unmissable; everyone else keeps the card.
-                        .listRowBackground(r.id == model.highlightId
-                            ? DeskUI.blue.opacity(0.25) : DeskUI.card)
+                        // insert is unmissable; the pane's selection keeps a
+                        // quieter tint; everyone else keeps the card.
+                        .listRowBackground(reminderRowBackground(r))
                         .listRowSeparatorTint(DeskUI.separator)
                         // Separator starts at the leading TEXT edge, past
                         // the 32pt checkbox frame + 12pt gap (Reminders style).
@@ -1006,6 +1037,125 @@ struct DeskView: View {
         // EditButton) — iOS 17's List shows the drag handles when active.
         .environment(\.editMode, $remindersEditMode)
         .refreshable { await model.loadReminders() }
+    }
+
+    /// Highlight beats selection beats card — the optimistic-add glow is a
+    /// moment, the pane selection is a state.
+    private func reminderRowBackground(_ r: DeskReminder) -> Color {
+        if r.id == model.highlightId { return DeskUI.blue.opacity(0.25) }
+        if hSize == .regular && r.id == selectedReminderID {
+            return DeskUI.blue.opacity(0.15)
+        }
+        return DeskUI.card
+    }
+
+    // MARK: regular-width trailing pane (design guide §11)
+
+    /// The inline pane beside the list: the selected note's reading surface
+    /// (the SAME DeskNoteReader the compact sheet presents) or the selected
+    /// reminder's details; a calm empty state until something is picked.
+    @ViewBuilder
+    private var trailingPane: some View {
+        switch model.leaf {
+        case .notes:
+            if let note = selectedNote {
+                // .id resets the reader's fetch/state when the selection moves.
+                DeskNoteReader(note: note)
+                    .id(note.id)
+            } else {
+                panePlaceholder(icon: "note.text",
+                                text: "Select a note to read it here.")
+            }
+        case .reminders:
+            if let r = model.reminders.first(where: { $0.id == selectedReminderID }) {
+                reminderDetail(r)
+            } else {
+                panePlaceholder(icon: "checklist",
+                                text: "Select a reminder to see its details.")
+            }
+        }
+    }
+
+    private func panePlaceholder(icon: String, text: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 34))
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The selected reminder, read comfortably: big title (bidi-aware),
+    /// notes body, due/remind lines. The checkbox is live — same optimistic
+    /// toggle as the list row.
+    private func reminderDetail(_ r: DeskReminder) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top, spacing: 14) {
+                    Button {
+                        model.toggle(r)
+                    } label: {
+                        DeskCheckbox(done: r.done)
+                            .frame(width: 32, height: 32)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    VStack(alignment: .leading, spacing: 4) {
+                        if !r.priorityMarks.isEmpty {
+                            Text(r.priorityMarks)
+                                .font(.system(size: 17, weight: .bold))
+                                .foregroundStyle(DeskUI.orange)
+                        }
+                        Text(r.title)
+                            .font(.system(size: 24, weight: .bold))
+                            .foregroundStyle(r.done ? DeskUI.gray : Color.white)
+                            .multilineTextAlignment(r.title.readingAlignment)
+                            .frame(maxWidth: .infinity,
+                                   alignment: r.title.readingFrameAlignment)
+                            .textSelection(.enabled)
+                    }
+                }
+                if !r.notes.isEmpty {
+                    Text(r.notes)
+                        .font(.system(size: 17))
+                        .lineSpacing(5)
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(r.notes.readingAlignment)
+                        .frame(maxWidth: .infinity,
+                               alignment: r.notes.readingFrameAlignment)
+                        .textSelection(.enabled)
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    if let due = r.dueAt {
+                        detailStampRow(icon: "calendar",
+                                       text: DeskDates.dueChip(due),
+                                       tint: due < Date() ? DeskUI.red : DeskUI.gray)
+                    }
+                    if let remind = r.remindAt {
+                        detailStampRow(icon: "bell",
+                                       text: DeskDates.dueChip(remind),
+                                       tint: DeskUI.gray)
+                    }
+                }
+            }
+            .padding(24)
+        }
+    }
+
+    private func detailStampRow(icon: String, text: String, tint: Color) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 14))
+                .foregroundStyle(tint)
+            Text(text)
+                .font(.system(size: 15))
+                .foregroundStyle(tint)
+        }
     }
 
     // MARK: quick-add — Reminders' "＋ New Reminder" affordance, pinned
@@ -1177,7 +1327,10 @@ struct DeskView: View {
                         DeskNoteRow(note: note)
                     }
                     .buttonStyle(.plain)
-                    .listRowBackground(DeskUI.card)
+                    // Regular width: the note open in the reading pane keeps
+                    // a quiet amber tint so the selection is visible.
+                    .listRowBackground(hSize == .regular && selectedNote?.id == note.id
+                        ? DeskUI.yellow.opacity(0.14) : DeskUI.card)
                     .listRowSeparatorTint(DeskUI.separator)
                 }
             }
@@ -1224,11 +1377,17 @@ struct DeskView: View {
             + "\"\(note.title)\". He is reading it now."
     }
 
+    /// Regular width reads the note in the trailing pane (selection-driven,
+    /// no modal); compact keeps the sheet.
     private func open(_ note: DeskNote) {
         let f = noteFocus(note)
         openedFocus = f
         convo.setFocus(f)
-        activeSheet = .note(note)
+        if hSize == .regular {
+            withAnimation(.snappy(duration: 0.2)) { selectedNote = note }
+        } else {
+            activeSheet = .note(note)
+        }
     }
 
     /// Stale-guard (InboxView's MailDetailView pattern): restore the Desk
@@ -1239,6 +1398,31 @@ struct DeskView: View {
             convo.setFocus(browsingFocus)
         }
         openedFocus = nil
+    }
+}
+
+// MARK: - Checkbox
+
+/// Reminders' circle checkbox — empty: 1.5pt gray ring; done: filled accent
+/// circle with a white check. Shared by the list row and the regular-width
+/// detail pane so both draw the exact same control.
+struct DeskCheckbox: View {
+    let done: Bool
+
+    var body: some View {
+        ZStack {
+            if done {
+                Circle()
+                    .fill(DeskUI.blue)
+                Image(systemName: "checkmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white)
+            } else {
+                Circle()
+                    .strokeBorder(DeskUI.gray, lineWidth: 1.5)
+            }
+        }
+        .frame(width: 22, height: 22)
     }
 }
 
@@ -1257,7 +1441,7 @@ struct DeskReminderRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Button(action: onToggle) {
-                checkbox
+                DeskCheckbox(done: reminder.done)
                     // A comfortable 44pt-ish target without inflating the row.
                     .frame(width: 32, height: 32)
                     .contentShape(Rectangle())
@@ -1285,24 +1469,6 @@ struct DeskReminderRow: View {
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
-    }
-
-    /// Empty: 1.5pt gray ring. Done: filled accent circle, white check.
-    @ViewBuilder
-    private var checkbox: some View {
-        ZStack {
-            if reminder.done {
-                Circle()
-                    .fill(DeskUI.blue)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(.white)
-            } else {
-                Circle()
-                    .strokeBorder(DeskUI.gray, lineWidth: 1.5)
-            }
-        }
-        .frame(width: 22, height: 22)
     }
 
     /// Orange "!!!" / "!!" / "!" prefix, then the title — white while open,
@@ -1344,13 +1510,35 @@ struct DeskNoteRow: View {
 
 // MARK: - Note reading sheet
 
-/// The reader: fetches the note body on appearance (`op=note_read` with the
-/// title as the query) and shows it Apple-Notes style — black page, bold
-/// title as the first line, white 17pt system body. Queued or error from
-/// the Mac agent becomes the friendly asleep state.
+/// The compact-width note sheet: the shared reader inside a NavigationStack
+/// with a Done button (Esc closes it on iPad/Mac keyboards). Regular width
+/// renders DeskNoteReader inline in the trailing pane instead — no modal.
 struct DeskNoteSheet: View {
     let note: DeskNote
     @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            DeskNoteReader(note: note)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Done") { dismiss() }
+                            .tint(DeskUI.yellow)
+                            .keyboardShortcut(.cancelAction)
+                    }
+                }
+        }
+    }
+}
+
+/// The reader: fetches the note body on appearance (`op=note_read` with the
+/// title as the query) and shows it Apple-Notes style — black page, bold
+/// title as the first line, white 17pt system body. Queued or error from
+/// the Mac agent becomes the friendly asleep state. Shared by the compact
+/// sheet and the regular-width reading pane so both render the same page.
+struct DeskNoteReader: View {
+    let note: DeskNote
 
     @State private var loading = true
     @State private var text = ""
@@ -1360,44 +1548,44 @@ struct DeskNoteSheet: View {
     @State private var errorText = ""
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if loading {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("Asking your Mac…")
-                            .font(.footnote).foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if asleep {
-                    stateView(icon: "moon.zzz.fill",
-                              message: "Your home Mac is asleep — notes will load when it wakes.")
-                } else if !errorText.isEmpty {
-                    stateView(icon: "wifi.exclamationmark", message: errorText)
-                } else {
-                    reader
+        Group {
+            if loading {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("Asking your Mac…")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
-            }
-            .background(DeskUI.background.ignoresSafeArea())
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Done") { dismiss() }
-                        .tint(DeskUI.yellow)
-                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if asleep {
+                stateView(icon: "moon.zzz.fill",
+                          message: "Your home Mac is asleep — notes will load when it wakes.")
+            } else if !errorText.isEmpty {
+                stateView(icon: "wifi.exclamationmark", message: errorText)
+            } else {
+                reader
             }
         }
+        .background(DeskUI.background.ignoresSafeArea())
         .task { await load() }
+    }
+
+    private var displayedTitle: String {
+        shownTitle.isEmpty ? note.title : shownTitle
     }
 
     private var reader: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 // Notes puts the title as the bold first line of the page.
-                Text(shownTitle.isEmpty ? note.title : shownTitle)
+                // Hebrew titles/bodies hug the trailing edge (per-content
+                // direction, never a window-wide flip).
+                Text(displayedTitle)
                     .font(.system(size: 22, weight: .bold))
                     .foregroundStyle(.white)
                     .textSelection(.enabled)
+                    .multilineTextAlignment(displayedTitle.readingAlignment)
+                    .frame(maxWidth: .infinity,
+                           alignment: displayedTitle.readingFrameAlignment)
                 if !alsoMatched.isEmpty {
                     Text("Also matched: " + alsoMatched.joined(separator: ", "))
                         .font(.system(size: 12))
@@ -1408,7 +1596,9 @@ struct DeskNoteSheet: View {
                     .lineSpacing(6)
                     .foregroundStyle(.white)
                     .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(text.readingAlignment)
+                    .frame(maxWidth: .infinity,
+                           alignment: text.readingFrameAlignment)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
