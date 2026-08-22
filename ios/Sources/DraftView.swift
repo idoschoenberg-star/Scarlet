@@ -853,6 +853,12 @@ struct DraftView: View {
     /// Manual mode ("I'll write it myself" / "Edit myself"): the editor's
     /// text and whether the editor is the showing surface.
     @State private var manualText = ""
+    /// LEAVE-SAVES for the manual editor (doctrine §11, design sweep
+    /// 2026-08-22): his own typed words survive a sheet close/✕ — stashed
+    /// locally, restored the next time the manual editor opens, cleared on
+    /// submit. The server-side draft row already covers composed bodies;
+    /// this covers text that never reached the server.
+    private static let manualStashKey = "draftManualStash"
     @State private var editingManually = false
     @FocusState private var manualFocused: Bool
     /// Discard-with-undo (spec §2: frequent actions get undo, not dialogs):
@@ -911,6 +917,7 @@ struct DraftView: View {
                     // ⌨️ He writes it himself — the manual editor opens.
                     editingManually = true
                     manualFocused = true
+                    restoreManualStash()
                 } else {
                     // 🎙 (or the legacy pill): the input row collects the ask.
                     revisionFocused = true
@@ -920,6 +927,7 @@ struct DraftView: View {
                 case .manual:
                     editingManually = true
                     manualFocused = true
+                    restoreManualStash()
                 case .instructed:
                     // Mic/keyboard opens immediately; nothing composes until
                     // he says or types what the reply should say.
@@ -940,6 +948,10 @@ struct DraftView: View {
             }
         }
         .onDisappear {
+            let leftover = manualText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if editingManually && !leftover.isEmpty {
+                UserDefaults.standard.set(manualText, forKey: Self.manualStashKey)
+            }
             NotificationCenter.default.post(name: .scarletDraftSheetVisible,
                                             object: nil,
                                             userInfo: ["visible": false])
@@ -1434,8 +1446,16 @@ struct DraftView: View {
     /// compose; edit of an existing draft → verbatim revise. Either way the
     /// result comes BACK to the review screen — send stays a separate,
     /// explicit decision.
+    private func restoreManualStash() {
+        if manualText.isEmpty,
+           let saved = UserDefaults.standard.string(forKey: Self.manualStashKey), !saved.isEmpty {
+            manualText = saved
+        }
+    }
+
     private func submitManualText() {
         guard canSubmitManual else { return }
+        UserDefaults.standard.removeObject(forKey: Self.manualStashKey)
         let text = manualText.trimmingCharacters(in: .whitespacesAndNewlines)
         let verbatim = ReplyMode.verbatimInstruction(text)
         editingManually = false

@@ -1221,6 +1221,12 @@ struct ChatThreadView: View {
     @StateObject private var model: ChatThreadModel
     @EnvironmentObject private var convo: Conversation
     @State private var composeText = ""
+    /// LEAVE-SAVES (doctrine §11 hard invariant, design sweep 2026-08-22):
+    /// a half-typed reply must survive leaving the thread — including the
+    /// SplitShell section switch that destroys this view's @State. The draft
+    /// is mirrored to UserDefaults per chat and restored on return; cleared
+    /// the moment a send succeeds.
+    private var composeDraftKey: String { "chatDraft:\(channel.rawValue):\(chat.id)" }
     @FocusState private var composeFocused: Bool
     /// Guards the auto-scroll so a 20s reconcile that returns identical content
     /// doesn't yank the reader back to the bottom mid-scroll — only a genuinely
@@ -1285,11 +1291,21 @@ struct ChatThreadView: View {
         // the "recent messages" lines reflect what's actually on screen.
         .onAppear {
             convo.setFocus(threadFocus)
+            if composeText.isEmpty,
+               let saved = UserDefaults.standard.string(forKey: composeDraftKey), !saved.isEmpty {
+                composeText = saved
+            }
         }
         .onChange(of: model.loadStamp) { _, _ in
             convo.setFocus(threadFocus)
         }
         .onDisappear {
+            let draft = composeText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if draft.isEmpty {
+                UserDefaults.standard.removeObject(forKey: composeDraftKey)
+            } else {
+                UserDefaults.standard.set(composeText, forKey: composeDraftKey)
+            }
             model.stopPolling()
             // Voice-note hygiene: a closed thread never keeps playing audio.
             voicePlayer?.pause()
@@ -1694,6 +1710,7 @@ struct ChatThreadView: View {
                 instruction: typed
             ), .instructed)
             composeText = ""
+            UserDefaults.standard.removeObject(forKey: composeDraftKey)
             return
         }
         if let menuMode {
@@ -1736,7 +1753,7 @@ struct ChatThreadView: View {
             } else {
                 ok = await model.send(text)
             }
-            if ok { composeText = "" }
+            if ok { composeText = ""; UserDefaults.standard.removeObject(forKey: composeDraftKey) }
         }
     }
 

@@ -229,6 +229,10 @@ final class DeskModel: ObservableObject {
     /// Quick-add failures surface HERE — a small red line under the add bar,
     /// right where Ido is looking — never as an alert.
     @Published var addErrorText = ""
+    /// The exact text of a quick-add the server REJECTED — the view restores
+    /// it into the field so a failed add never costs him his typing
+    /// (leave-saves, design sweep 2026-08-22).
+    @Published var failedAddText = ""
     /// The just-added row's id: briefly tinted so the optimistic insert is
     /// unmissable at the top of Today.
     @Published var highlightId: String?
@@ -386,6 +390,7 @@ final class DeskModel: ObservableObject {
                 } else {
                     self.addErrorText = "Couldn't add \"\(t)\" — try again."
                 }
+                self.failedAddText = t
             }
         }
     }
@@ -1020,6 +1025,7 @@ struct DeskView: View {
                 quickAddBar
                 dictateReminderButton
             }
+            restoreFailedAdd
             if !model.addErrorText.isEmpty {
                 Text(model.addErrorText)
                     .font(.system(size: 12))
@@ -1095,6 +1101,19 @@ struct DeskView: View {
         guard !t.isEmpty else { return }
         model.add(t)
         quickAdd = ""
+    }
+
+    /// A rejected add puts his words back in the field (only if he hasn't
+    /// started typing something new) — never discarded with the error.
+    private var restoreFailedAdd: some View {
+        EmptyView()
+            .onChange(of: model.failedAddText) { _, failed in
+                guard !failed.isEmpty else { return }
+                if quickAdd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    quickAdd = failed
+                }
+                model.failedAddText = ""
+            }
     }
 
     // MARK: notes

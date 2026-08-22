@@ -483,6 +483,11 @@ private struct JournalAmendSheet: View {
         _details = State(initialValue: card.body)
     }
 
+    /// Anything typed beyond what the card already said.
+    private var hasChanges: Bool {
+        title != card.title || details != card.body
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -504,6 +509,10 @@ private struct JournalAmendSheet: View {
                 }
             }
             .navigationTitle(card.isVerification ? "Rename" : "Edit entry")
+            // LEAVE-SAVES (doctrine §11, design sweep 2026-08-22): a swipe-
+            // down with edits in the fields must not silently discard them —
+            // the sheet stays up until he chooses Accept or Cancel.
+            .interactiveDismissDisabled(hasChanges)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Cancel") { dismiss() }

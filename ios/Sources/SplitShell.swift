@@ -121,7 +121,12 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .journal, .calendar, .chats, .photos, .music, .library, .health, .desk]
+        // EVERY ShellSection except .settings belongs here — a section
+        // missing from this list has NO sidebar row and its keyboard
+        // shortcut never registers, making it unreachable on the MAIN work
+        // platform (the design sweep caught .news absent; .active nearly
+        // shipped with the same hole).
+        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk]
     }
 
     var body: some View {
@@ -230,6 +235,9 @@ struct SplitShell: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+        // The Catalyst pointer must read these as clickable (doctrine §11):
+        // .highlight gives the standard pill hover the system sidebar has.
+        .hoverEffect(.highlight)
         .keyboardShortcut(s.shortcutKey, modifiers: .command)
     }
 
