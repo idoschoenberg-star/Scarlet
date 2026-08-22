@@ -193,7 +193,9 @@ private struct InboxCache: Codable {
 @MainActor
 /// The server said WHO YOU ARE is wrong (401/403) — a different failure
 /// class from "the network is down", and it must never be rendered as one.
-struct ScarletAuthError: Error {}
+/// nonisolated init: the target compiles with default MainActor isolation,
+/// and this is thrown from a nonisolated static request path.
+struct ScarletAuthError: Error { nonisolated init() {} }
 
 final class InboxModel: ObservableObject {
     @Published var messages: [MailMessage] = []
