@@ -132,7 +132,12 @@ struct RootView: View {
     private static let talkFocus =
         "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
-    var body: some View {
+    // body was one ~150-line modifier chain; at that size the Swift type
+    // checker gives up ("unable to type-check this expression in reasonable
+    // time", build 299's first attempt). It is split into shellCore + thin
+    // closures that forward to named handlers below — same behavior, sane
+    // inference cost.
+    private var shellCore: some View {
         Group {
             if hSize == .regular {
                 SplitShell(convo: convo)
@@ -140,6 +145,10 @@ struct RootView: View {
                 phoneTabs
             }
         }
+    }
+
+    var body: some View {
+        shellCore
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
         // 1Password approval cards float at the ROOT so they appear over any
         // tab, any pushed detail, and a live call alike — an overlay, not a
@@ -164,36 +173,13 @@ struct RootView: View {
         // this shell (which owns the conversation) switches to Talk and hands
         // her the question — waking the conversation first if it isn't live.
         .onReceive(NotificationCenter.default.publisher(for: .scarletAskAboutEmail)) { note in
-            guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
-            tab = .talk
-            if convo.state == .idle {
-                convo.hasAutoStarted = true
-                convo.start(token: TokenStore.token ?? "")
-            }
-            Task { @MainActor in
-                // Give a cold socket a moment to come up before delivering.
-                var waited = 0
-                while convo.state == .connecting && waited < 40 {
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    waited += 1
-                }
-                convo.sendText(text)
-            }
+            handleAskAboutEmail(note)
         }
         // Scarlet started a draft by voice (compose_draft tool): open the
         // drafting table over whatever screen Ido is on. The sheet attaches
         // to the active server-side draft instead of composing its own.
         .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { note in
-            // A sheet already on screen IS this draft's window (attach mode) —
-            // record the id as live either way, and only the PRESENTATION is
-            // gated. Not recording it here was the false-interruption bug:
-            // he dismissed the sheet, the backstop found the still-active id
-            // it had never "seen", and re-opened it 2s later announcing an
-            // interruption that never happened. The dismissal stamp (not a
-            // permanent blind) is what keeps the backstop able to re-open on
-            // a real later revision.
-            if let id = note.object as? String { seenDrafts[id] = .live }
-            if !draftSheetOpen { voiceDraftPresented = true }
+            handleVoiceDraftStarted(note)
         }
         // The INSTANT Scarlet calls compose_draft (before the network round-trip):
         // capture his request and open the window immediately so it reacts the
@@ -214,15 +200,7 @@ struct RootView: View {
         // draft sheet is open, check for a fresh server-side draft and open it.
         // recoverActiveDraft() only opens ids not already seen, so a dismissed
         // draft is never reopened.
-        .task {
-            while !Task.isCancelled {
-                if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
-                // Badge counts ride the same heartbeat — the store's own
-                // stale-gate turns this into a ~30s poll, no extra timer.
-                await InboxCounts.shared.refreshIfStale()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
+        .task { await runDraftBackstopLoop() }
         .sheet(isPresented: $voiceDraftPresented, onDismiss: {
             voiceDraftIntent = nil
             stampDismissedDrafts()
@@ -233,48 +211,11 @@ struct RootView: View {
         }
         // Ambient focus: Talk at launch and whenever the tab returns to it;
         // switching to Inbox lets that hierarchy report itself.
-        .onAppear {
-            convo.setFocus(Self.talkFocus)
-            FlightRecorder.reportUncleanExitIfAny()
-            FlightRecorder.note(screen: "talk")
-            Task { await recoverActiveDraft() }
-            // Cold-launch "Talk to Scarlet": the intent may have fired before
-            // the observer above was listening, so drain the pending flag once.
-            if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
-            // Health sync must not depend on the Health TAB being opened —
-            // that left health_days stale for days and Scarlet answering
-            // "how many steps today" from an old row (CarPlay 2026-08-15).
-            // Register the HealthKit observers and push once at launch.
-            if HealthSync.shared.authorized {
-                Task { await HealthSync.shared.syncNow() }
-            }
-        }
+        .onAppear { handleAppear() }
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
         // Badges refresh immediately too: stale counts on wake read as lies.
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                Task { await recoverActiveDraft() }
-                Task { await InboxCounts.shared.refresh() }
-                // Fresh GPS fix to the backend so "here" answers (where am I,
-                // weather, directions) are minutes old, never a stale share.
-                LocationReporter.shared.report()
-                // Re-arm the trail: he may have granted Always from the
-                // Settings row since the last foreground, and a grant that
-                // lands while we're backgrounded has nothing else to start it.
-                LocationReporter.shared.startTrail()
-                // Same for the body: every return to the foreground pushes
-                // today's HealthKit numbers so the server row stays current —
-                // today's fast path first, then the full window behind it.
-                if HealthSync.shared.authorized {
-                    Task {
-                        await HealthSync.shared.syncToday()
-                        await HealthSync.shared.syncNow()
-                    }
-                }
-            }
-            FlightRecorder.note(screen: "phase:\(phase)")
-        }
+        .onChange(of: scenePhase) { _, phase in handleScenePhase(phase) }
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
         }
@@ -293,24 +234,7 @@ struct RootView: View {
         // Outlook flows to Scarlet as [FOCUS] — he speaks to the phone, the
         // draft opens here, and the approved reply lands back in Outlook.
         // Only on the Talk tab: inside the app, each screen owns its focus.
-        .task(id: deskPollKey) {
-            guard talkIsFrontmost else { return }
-            var lastSig = ""
-            while !Task.isCancelled {
-                if convo.state == .listening || convo.state == .speaking {
-                    if let desk = await Self.fetchMacFocus() {
-                        if desk.sig != lastSig {
-                            lastSig = desk.sig
-                            convo.setFocus(desk.focusText)
-                        }
-                    } else if lastSig != "" {
-                        lastSig = ""
-                        if talkIsFrontmost { convo.setFocus(Self.talkFocus) }
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-            }
-        }
+        .task(id: deskPollKey) { await runDeskFocusPoll() }
     }
 
     /// The iPhone presentation: the main tabs (5+ fold into More).
@@ -402,6 +326,108 @@ struct RootView: View {
     // and everything past it mutates SwiftUI @State (seenDrafts,
     // voiceDraftPresented) and touches `convo`. Pin the whole method to main.
     @MainActor
+    // MARK: body handlers (extracted so body's type-check stays tractable)
+
+    private func handleAskAboutEmail(_ note: Notification) {
+        guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
+        tab = .talk
+        if convo.state == .idle {
+            convo.hasAutoStarted = true
+            convo.start(token: TokenStore.token ?? "")
+        }
+        Task { @MainActor in
+            // Give a cold socket a moment to come up before delivering.
+            var waited = 0
+            while convo.state == .connecting && waited < 40 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                waited += 1
+            }
+            convo.sendText(text)
+        }
+    }
+
+    /// A sheet already on screen IS this draft's window (attach mode) —
+    /// record the id as live either way; only the PRESENTATION is gated.
+    /// Not recording it here was the false-interruption bug: he dismissed
+    /// the sheet, the backstop found the still-active id it had never
+    /// "seen", and re-opened it 2s later announcing an interruption that
+    /// never happened. The dismissal stamp (not a permanent blind) is what
+    /// keeps the backstop able to re-open on a real later revision.
+    private func handleVoiceDraftStarted(_ note: Notification) {
+        if let id = note.object as? String { seenDrafts[id] = .live }
+        if !draftSheetOpen { voiceDraftPresented = true }
+    }
+
+    private func runDraftBackstopLoop() async {
+        while !Task.isCancelled {
+            if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
+            // Badge counts ride the same heartbeat — the store's own
+            // stale-gate turns this into a ~30s poll, no extra timer.
+            await InboxCounts.shared.refreshIfStale()
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    private func handleAppear() {
+        convo.setFocus(Self.talkFocus)
+        FlightRecorder.reportUncleanExitIfAny()
+        FlightRecorder.note(screen: "talk")
+        Task { await recoverActiveDraft() }
+        // Cold-launch "Talk to Scarlet": the intent may have fired before
+        // the observer above was listening, so drain the pending flag once.
+        if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
+        // Health sync must not depend on the Health TAB being opened —
+        // that left health_days stale for days and Scarlet answering
+        // "how many steps today" from an old row (CarPlay 2026-08-15).
+        // Register the HealthKit observers and push once at launch.
+        if HealthSync.shared.authorized {
+            Task { await HealthSync.shared.syncNow() }
+        }
+    }
+
+    private func handleScenePhase(_ phase: ScenePhase) {
+        if phase == .active {
+            Task { await recoverActiveDraft() }
+            Task { await InboxCounts.shared.refresh() }
+            // Fresh GPS fix to the backend so "here" answers (where am I,
+            // weather, directions) are minutes old, never a stale share.
+            LocationReporter.shared.report()
+            // Re-arm the trail: he may have granted Always from the
+            // Settings row since the last foreground, and a grant that
+            // lands while we're backgrounded has nothing else to start it.
+            LocationReporter.shared.startTrail()
+            // Same for the body: every return to the foreground pushes
+            // today's HealthKit numbers so the server row stays current —
+            // today's fast path first, then the full window behind it.
+            if HealthSync.shared.authorized {
+                Task {
+                    await HealthSync.shared.syncToday()
+                    await HealthSync.shared.syncNow()
+                }
+            }
+        }
+        FlightRecorder.note(screen: "phase:\(phase)")
+    }
+
+    private func runDeskFocusPoll() async {
+        guard talkIsFrontmost else { return }
+        var lastSig = ""
+        while !Task.isCancelled {
+            if convo.state == .listening || convo.state == .speaking {
+                if let desk = await Self.fetchMacFocus() {
+                    if desk.sig != lastSig {
+                        lastSig = desk.sig
+                        convo.setFocus(desk.focusText)
+                    }
+                } else if lastSig != "" {
+                    lastSig = ""
+                    if talkIsFrontmost { convo.setFocus(Self.talkFocus) }
+                }
+            }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+        }
+    }
+
     /// Every draft marked live gets a dismissal stamp the moment its sheet
     /// leaves the screen — the timestamp the backstop compares revisions to.
     private func stampDismissedDrafts() {
