@@ -827,6 +827,11 @@ struct ChatsView: View {
     /// true → the "All" segment (unified list); false → a channel mirror.
     @State private var showingAll = true
     @EnvironmentObject private var convo: Conversation
+    /// §11 (MS-Office-grade iPad/Mac): at regular width the hub is a
+    /// persistent list+thread split — the selected chat's id drives the
+    /// inline trailing pane. Compact keeps the push flow untouched.
+    @Environment(\.horizontalSizeClass) private var hSize
+    @State private var selectedChatID: String?
 
     private let scarletRose = Color(red: 1, green: 0.35, blue: 0.42)
 
@@ -837,26 +842,12 @@ struct ChatsView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                headerBar
-                channelSwitcher
-                if showingAll {
-                    // Explicit re-injection: Catalyst drops the ancestor
-                    // environment across presentation boundaries and
-                    // SignalsListView reads `convo` — a missing injection
-                    // is a SIGTRAP on open (pre-flight gate enforces this).
-                    SignalsListView(model: signals)
-                        .environmentObject(convo)
+            Group {
+                if hSize == .regular {
+                    regularSplit
                 } else {
-                    content
+                    compactStack
                 }
-            }
-            .background(ScarletBackground().ignoresSafeArea())
-            // Scarlet lives at the bottom of the LIST screen only — a pushed
-            // thread (with its own compose bar) structurally replaces it.
-            .safeAreaInset(edge: .bottom) {
-                ScarletPresenceView(convo: convo)
-                    .padding(.vertical, 6)
             }
             // Custom header on the list screen; pushed threads keep the
             // system bar for Back (same pattern as InboxView).
@@ -869,6 +860,9 @@ struct ChatsView: View {
                 markMirrorsSeen()
             }
             .onChange(of: model.channel) { _, newChannel in
+                // A jid/handle/id from the previous channel can't resolve in
+                // the new one — clear the split-view selection with the switch.
+                selectedChatID = nil
                 convo.setFocus(chatsBrowsingFocus(newChannel))
                 markMirrorsSeen()
             }
@@ -886,6 +880,134 @@ struct ChatsView: View {
             await signals.load()
             await model.load()
             markMirrorsSeen()
+        }
+    }
+
+    /// iPhone (compact): the original phone drill-down, untouched — the list
+    /// screen with NavigationLink pushes into full-screen threads.
+    private var compactStack: some View {
+        VStack(spacing: 0) {
+            headerBar
+            channelSwitcher
+            if showingAll {
+                // Explicit re-injection: Catalyst drops the ancestor
+                // environment across presentation boundaries and
+                // SignalsListView reads `convo` — a missing injection
+                // is a SIGTRAP on open (pre-flight gate enforces this).
+                SignalsListView(model: signals)
+                    .environmentObject(convo)
+            } else {
+                channelContent(regular: false)
+            }
+        }
+        .background(ScarletBackground().ignoresSafeArea())
+        // Scarlet lives at the bottom of the LIST screen only — a pushed
+        // thread (with its own compose bar) structurally replaces it.
+        .safeAreaInset(edge: .bottom) {
+            ScarletPresenceView(convo: convo)
+                .padding(.vertical, 6)
+        }
+    }
+
+    /// iPad/Mac (regular, §11): persistent list+thread. The switcher + chat
+    /// list stay put in a 400pt leading column; the selected conversation
+    /// renders INLINE in the trailing pane — no push, no lost context.
+    private var regularSplit: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                headerBar
+                channelSwitcher
+                if showingAll {
+                    // Same explicit re-injection as compact (Catalyst
+                    // environment-drop trap; pre-flight gate enforces it).
+                    SignalsListView(model: signals)
+                        .environmentObject(convo)
+                } else {
+                    channelContent(regular: true)
+                }
+            }
+            .frame(width: 400)
+            // Scarlet stays under the LIST column only — the inline thread
+            // brings its own compose bar, exactly like the pushed one.
+            .safeAreaInset(edge: .bottom) {
+                ScarletPresenceView(convo: convo)
+                    .padding(.vertical, 6)
+            }
+            Divider()
+                .overlay(Color.white.opacity(0.12))
+            threadPane
+                .frame(maxWidth: .infinity)
+        }
+        .background(ScarletBackground().ignoresSafeArea())
+    }
+
+    /// The regular-width selection, resolved against the showing channel's
+    /// rows (ids are unique per channel — parseChats and the cache restore
+    /// both dedupe, which is what keeps the diffable List from trapping).
+    private var selectedChat: ChatSummary? {
+        guard let id = selectedChatID else { return nil }
+        return model.chats.first(where: { $0.id == id })
+    }
+
+    /// Trailing pane: the selected conversation inline, or the empty state.
+    /// `.id(...)` keys the thread view's identity to channel+chat so every
+    /// selection change rebuilds ChatThreadView (fresh @StateObject model,
+    /// fresh polling/focus lifecycle) instead of mutating a stale one.
+    @ViewBuilder
+    private var threadPane: some View {
+        if let chat = selectedChat {
+            VStack(spacing: 0) {
+                inlineThreadHeader(chat)
+                // Same explicit .environmentObject(convo) as the compact
+                // NavigationLink path — Catalyst drops @EnvironmentObject
+                // across structural boundaries and ChatThreadView reads
+                // `convo` (trap documented on the push path).
+                ChatThreadView(channel: model.channel, chat: chat)
+                    .environmentObject(convo)
+            }
+            .background(model.channel.threadBackground.ignoresSafeArea())
+            .id("\(model.channel.rawValue)|\(chat.id)")
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.white.opacity(0.25))
+                Text("No chat selected")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.6))
+                Text("Choose a conversation on the left to read and reply here.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.white.opacity(0.4))
+                    .multilineTextAlignment(.center)
+            }
+            .padding(28)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// The inline thread's identity bar — the split pane has no navigation
+    /// bar (the stack root hides it), so the chat's name/avatar live here,
+    /// on the channel's own bar surface like the pushed thread's chrome.
+    private func inlineThreadHeader(_ chat: ChatSummary) -> some View {
+        HStack(spacing: 10) {
+            ChatAvatarView(name: chat.name, avatar: chat.avatar, size: 30)
+            Text(chat.name)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 8)
+            Image(systemName: model.channel.icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(model.channel.accent)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+        .background(model.channel.barSurface)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 0.5)
         }
     }
 
@@ -1072,8 +1194,10 @@ struct ChatsView: View {
         !showingAll && model.channel == ch
     }
 
+    /// Loading / error / empty / list states for a channel mirror. `regular`
+    /// picks the list flavor: selection-driven (split view) vs. push-driven.
     @ViewBuilder
-    private var content: some View {
+    private func channelContent(regular: Bool) -> some View {
         if model.loading && model.chats.isEmpty {
             VStack(spacing: 10) {
                 ProgressView()
@@ -1102,18 +1226,25 @@ struct ChatsView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if regular {
+            regularChatList
         } else {
             chatList
         }
     }
 
+    /// The inline network-hiccup banner shared by both list flavors.
+    private var listErrorRow: some View {
+        Text(model.errorText)
+            .font(.footnote)
+            .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+            .listRowBackground(Color.clear)
+    }
+
     private var chatList: some View {
         List {
             if !model.errorText.isEmpty {
-                Text(model.errorText)
-                    .font(.footnote)
-                    .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
-                    .listRowBackground(Color.clear)
+                listErrorRow
             }
             ForEach(model.chats) { chat in
                 NavigationLink {
@@ -1128,6 +1259,29 @@ struct ChatsView: View {
                 }
                 .listRowBackground(Color.clear)
                 .listRowSeparatorTint(.white.opacity(0.12))
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .refreshable { await model.load() }
+    }
+
+    /// Regular width: the same rows, selection-driven (iOS 17 tap-to-select
+    /// outside edit mode) — no NavigationLink, the trailing pane reacts to
+    /// `selectedChatID`. Row ids are unique (dedupe contract above), which
+    /// is what keeps the diffable-backed List from trapping on selection.
+    private var regularChatList: some View {
+        List(selection: $selectedChatID) {
+            if !model.errorText.isEmpty {
+                listErrorRow
+            }
+            ForEach(model.chats) { chat in
+                ChatListRow(chat: chat, channel: model.channel)
+                    .tag(chat.id)
+                    .listRowBackground(
+                        selectedChatID == chat.id
+                            ? Color.white.opacity(0.10) : Color.clear)
+                    .listRowSeparatorTint(.white.opacity(0.12))
             }
         }
         .listStyle(.plain)
@@ -1166,7 +1320,7 @@ struct ChatListRow: View {
                         .foregroundStyle(.secondary)
                 }
                 Text(preview)
-                    .font(.system(size: 14))
+                    .font(.system(size: 15))
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -1783,8 +1937,9 @@ struct ChatThreadView: View {
 
 /// Teams mobile look: flat, LEFT-aligned, full-width blocks — never bubbles.
 /// 32pt initials avatar in the Teams purple family, name 13pt semibold
-/// (accent #7B83EB for "You") + time 11pt gray on one line, 15pt #E8E8E8
-/// text below; Ido's own messages sit on the #292929 hover-card surface.
+/// (accent #7B83EB for "You") + time 11pt gray on one line, 17pt #E8E8E8
+/// body text below (§11 work-platform legibility; the small labels stay
+/// small); Ido's own messages sit on the #292929 hover-card surface.
 struct TeamsMessageCell: View {
     let message: ChatMessage
     let accent: Color
@@ -1812,8 +1967,9 @@ struct TeamsMessageCell: View {
                     }
                 }
                 Text(message.text)
-                    .font(.system(size: 15))
+                    .font(.system(size: 17))
                     .foregroundStyle(ChatPalette.teamsText)
+                    .textSelection(.enabled)
                     .multilineTextAlignment(message.text.readingAlignment)
                     .environment(\.layoutDirection, message.text.layoutDir)
                     .frame(maxWidth: .infinity, alignment: message.text.readingFrameAlignment)
@@ -1934,6 +2090,7 @@ struct WhatsAppBubble: View {
             Text(message.text)
                 .font(.system(size: 16))
                 .foregroundStyle(ChatPalette.waText)
+                .textSelection(.enabled)
                 .multilineTextAlignment(message.text.readingAlignment)
                 .environment(\.layoutDirection, message.text.layoutDir)
             timeLine
@@ -1944,28 +2101,37 @@ struct WhatsAppBubble: View {
     }
 
     /// Photo bubble: tight 3pt padding around the image; optional caption
-    /// under it in the same bubble; same background/corner treatment.
+    /// under it in the same bubble; same background/corner treatment. The
+    /// photo itself is a real Button (voiceBubble pattern) — keyboard/pointer
+    /// accessible with a hover lift — and the caption stays selectable.
     private func mediaBubble(_ url: URL) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             senderLine
-            AsyncImage(url: url) { phase in
-                if let image = phase.image {
-                    image
-                        .resizable()
-                        .scaledToFill()
-                        .frame(maxWidth: 230, maxHeight: 300)
-                        .clipped()
-                        .clipShape(bubbleShape)
-                } else if phase.error != nil {
-                    mediaPlaceholder(height: 80, loading: false)
-                } else {
-                    mediaPlaceholder(height: 200, loading: true)
+            Button {
+                onImageTap?(url)
+            } label: {
+                AsyncImage(url: url) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: 230, maxHeight: 300)
+                            .clipped()
+                            .clipShape(bubbleShape)
+                    } else if phase.error != nil {
+                        mediaPlaceholder(height: 80, loading: false)
+                    } else {
+                        mediaPlaceholder(height: 200, loading: true)
+                    }
                 }
             }
+            .buttonStyle(.plain)
+            .hoverEffect(.lift)
             if !message.text.isEmpty {
                 Text(message.text)
                     .font(.system(size: 16))
                     .foregroundStyle(ChatPalette.waText)
+                    .textSelection(.enabled)
                     .multilineTextAlignment(message.text.readingAlignment)
                     .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.top, 2)
@@ -1975,8 +2141,6 @@ struct WhatsAppBubble: View {
         }
         .padding(3)
         .background(bubbleFill, in: bubbleShape)
-        .contentShape(bubbleShape)
-        .onTapGesture { onImageTap?(url) }
     }
 
     private func mediaPlaceholder(height: CGFloat, loading: Bool) -> some View {
@@ -1996,28 +2160,36 @@ struct WhatsAppBubble: View {
     }
 
     /// Video bubble: 230×160 dark card with a centered play glyph; optional
-    /// caption under it (same treatment as photo captions); tap → the thread
-    /// view's full-screen player sheet.
+    /// caption under it (same treatment as photo captions). The card is a
+    /// real Button (voiceBubble pattern) with a hover lift → the thread
+    /// view's full-screen player sheet; the caption stays selectable.
     private func videoBubble(_ url: URL) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             senderLine
-            ZStack {
-                bubbleShape
-                    .fill(Color.black.opacity(0.35))
-                VStack(spacing: 6) {
-                    Image(systemName: "play.circle.fill")
-                        .font(.system(size: 44))
-                        .foregroundStyle(.white)
-                    Text("Video")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.8))
+            Button {
+                onVideoTap?(url)
+            } label: {
+                ZStack {
+                    bubbleShape
+                        .fill(Color.black.opacity(0.35))
+                    VStack(spacing: 6) {
+                        Image(systemName: "play.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundStyle(.white)
+                        Text("Video")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.white.opacity(0.8))
+                    }
                 }
+                .frame(width: 230, height: 160)
             }
-            .frame(width: 230, height: 160)
+            .buttonStyle(.plain)
+            .hoverEffect(.lift)
             if !message.text.isEmpty {
                 Text(message.text)
                     .font(.system(size: 16))
                     .foregroundStyle(ChatPalette.waText)
+                    .textSelection(.enabled)
                     .multilineTextAlignment(message.text.readingAlignment)
                     .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.top, 2)
@@ -2027,8 +2199,6 @@ struct WhatsAppBubble: View {
         }
         .padding(3)
         .background(bubbleFill, in: bubbleShape)
-        .contentShape(bubbleShape)
-        .onTapGesture { onVideoTap?(url) }
     }
 
     /// Voice-note bubble: compact row — 30pt play/pause circle in WhatsApp
@@ -2235,6 +2405,7 @@ struct IMessageBubble: View {
                 Text(message.text)
                     .font(.system(size: 17))
                     .foregroundStyle(.white)
+                    .textSelection(.enabled)
                     .multilineTextAlignment(message.text.readingAlignment)
                     .environment(\.layoutDirection, message.text.layoutDir)
                     .padding(.horizontal, 12)
