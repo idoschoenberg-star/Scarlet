@@ -574,6 +574,18 @@ final class Conversation: ObservableObject {
 
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
+    /// True while ONE connect() attempt is in flight (mint → dial). The path
+    /// monitor and every external reconnect trigger must stand down behind it:
+    /// two racing connects supersede each other's socket, the ghost guard then
+    /// drops the loser's session.created, and nothing establishes — the
+    /// 2026-08-23 CarPlay drive minted 7 sessions that way and connected none.
+    private var connectInFlight = false
+    /// Consecutive dialed sockets that produced NO server event before the
+    /// establish watchdog fired. Reset on establishment and on a fresh
+    /// start(). ≥ 4 = this network cannot carry the voice socket right now:
+    /// the honest can't-reach status shows (CarPlay maps it off the spinner)
+    /// while the long-tail retry keeps working silently underneath.
+    private(set) var neverEstablishedStreak = 0
     private var reconnecting = false
     /// Consecutive failed reconnects — drives exponential backoff and the
     /// eventual give-up, so a dead network can't hammer the mint endpoint at a
@@ -839,6 +851,7 @@ final class Conversation: ObservableObject {
         interrupted = false
         endedByUser = false
         terminalStartFailure = false   // every fresh start earns a clean verdict
+        neverEstablishedStreak = 0     // same rule for the can't-reach verdict
         turnPhase = .idle
         // A fresh user-initiated session ALWAYS tries the primary engine
         // first: even if the last session ended on the ElevenLabs parachute,
@@ -1286,6 +1299,14 @@ final class Conversation: ObservableObject {
                 // socket: a dead one fails the pong and reconnects
                 // near-instantly; a healthy one is left alone.
                 guard let task = self.ws else {
+                    // Mid-connect (mint in flight, socket not yet dialed): the
+                    // attempt owns its own recovery. Firing an immediate
+                    // reconnect here is what double-minted 0.5s apart on
+                    // CarPlay attach and superseded every handshake.
+                    if self.connectInFlight {
+                        self.clientLog("path-change", "\(prev) → \(sig) — connect in flight, letting it finish")
+                        return
+                    }
                     self.clientLog("path-change", "\(prev) → \(sig) — no socket, reconnecting")
                     self.scheduleReconnect(reason: "network-path-change", immediate: true)
                     return
@@ -1815,6 +1836,12 @@ final class Conversation: ObservableObject {
     // MARK: signed URL + socket
 
     private func connect() async {
+        // Single-flight: exactly one attempt may be minting/dialing at a time.
+        // Cleared on every exit; the failure paths that request their own
+        // retry clear it BEFORE calling scheduleReconnect, so that retry
+        // isn't gated out by the guard this flag feeds.
+        connectInFlight = true
+        defer { connectInFlight = false }
         // Carry the conversation's language across the rebuild — the pin is
         // re-SEEDED into the new session below, not forgotten: the first
         // reply after a reconnect must not flip languages (2026-08-19
@@ -1881,6 +1908,7 @@ final class Conversation: ObservableObject {
                         pendingOutbound.removeAll()
                         return
                     }
+                    connectInFlight = false   // this attempt is over — let its retry through
                     if wantLive { scheduleReconnect(reason: "eleven-mint-failed-\(elStatus)") }
                     return
                 }
@@ -1904,7 +1932,11 @@ final class Conversation: ObservableObject {
                 // known surfaces, so old builds and the (not-yet-instrumented)
                 // Watch never poison the DOA metric. build lets DOA be sliced
                 // by version. Both best-effort and URL-safe.
-                mintString += "&surface=phone"
+                // The car is its own surface in the mint registry (the server
+                // already accepts "carplay") — without the split, the
+                // 2026-08-23 drive's establishment failures were
+                // indistinguishable from phone sessions.
+                mintString += onCarRoute ? "&surface=carplay" : "&surface=phone"
                 // MODEL CONTRACT (model-migration task): `mdl=1` promises the
                 // server that this build dials the model the MINT returns,
                 // instead of a name compiled into the URL. That promise is
@@ -1962,6 +1994,7 @@ final class Conversation: ObservableObject {
                         pendingOutbound.removeAll()
                         return
                     }
+                    connectInFlight = false   // this attempt is over — let its retry through
                     if wantLive { scheduleReconnect(reason: "mint-failed-\(httpStatus)") }
                     return
                 }
@@ -2035,9 +2068,13 @@ final class Conversation: ObservableObject {
             listen(task)
             bargeInMinted = mintedBarge   // what THIS session actually promised
             if mintedBarge { clientLog("barge-flag", "minted with ?barge=1 (echo-safe route)") }
-            state = .listening
-            turnPhase = .listening
-            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            // .listening is EARNED, not assumed: handle() flips it on the
+            // socket's FIRST server event. Claiming it here painted a live
+            // UI over a handshake still black-holing on the in-car network —
+            // the watchdog below bounds that wait instead. Everything sent
+            // before the flip rides URLSession's queue-until-open, exactly
+            // as it already did in the pre-open window.
+            armEstablishWatchdog(task)
             // A fresh socket knows nothing about the screen — replay the
             // current focus so a reconnect regains ambient context.
             if let focus = currentFocus {
@@ -2078,6 +2115,7 @@ final class Conversation: ObservableObject {
             // dictated, or shared while she was asleep/connecting. Exactly once.
             flushPendingOutbound()
         } catch {
+            connectInFlight = false   // this attempt is over — let its retry through
             if wantLive {
                 scheduleReconnect(reason: "connect-error: " + String(String(describing: error).prefix(120)))
             } else { status = "Couldn't connect — tap to retry."; state = .idle }
@@ -2130,6 +2168,29 @@ final class Conversation: ObservableObject {
         }
     }
 
+    /// Establishment watchdog: a dialed socket has ~12s to produce its FIRST
+    /// server event (session.created always leads). Bound to ONE task — the
+    /// same identity rule as listen()/pingNow — so a superseded socket's
+    /// timer can never touch its healthy successor. No cancellation
+    /// bookkeeping: on a healthy session the timer fires, sees the state has
+    /// left .connecting (or the socket was replaced), and does nothing.
+    private func armEstablishWatchdog(_ task: URLSessionWebSocketTask) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, self.wantLive, self.ws === task, self.state == .connecting else { return }
+            self.neverEstablishedStreak += 1
+            self.clientLog("never-established", "streak=\(self.neverEstablishedStreak)")
+            task.cancel(with: .goingAway, reason: nil)
+            self.scheduleReconnect(reason: "never-established")
+            if self.neverEstablishedStreak >= 4 {
+                // AFTER scheduleReconnect, which stamps "Reconnecting…" —
+                // the honest line is what must stay on screen. The retry
+                // ladder/long-tail keeps working silently underneath.
+                self.status = "Can't reach the voice service on this network — retrying in the background."
+            }
+        }
+    }
+
     /// Silent auto-reconnect, native edition of the web app's transport-drop
     /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
     /// `immediate` (the deaf-session cutover and the tier-2 parachute) skips
@@ -2137,6 +2198,10 @@ final class Conversation: ObservableObject {
     /// every audio send was still succeeding — so waiting helps nothing.
     private func scheduleReconnect(reason: String = "unspecified", immediate: Bool = false) {
         guard wantLive, !reconnecting else { return }
+        // An attempt is mid-flight: it reports its own failure (clearing the
+        // flag first), and its socket must not be superseded from outside —
+        // the supersede is what kept the CarPlay drive from ever establishing.
+        guard !connectInFlight else { clientLog("reconnect-skip", reason); return }
         clientLog("reconnect", reason)
         // Three straight failures on the premium engine → stop insisting and
         // fall over to the backup (≈6s in, not a minute of backoff). She must
@@ -2317,6 +2382,17 @@ final class Conversation: ObservableObject {
     // MARK: protocol
 
     private func handle(_ ev: [String: Any]) {
+        // ESTABLISHED (engine-agnostic): the first event on the LIVE socket —
+        // listen() already proved ws === task — is the establishment moment,
+        // and only now is .listening true. The queue in deliverUserMessage
+        // holds anything typed during the handshake; drain it here.
+        if state == .connecting, wantLive {
+            neverEstablishedStreak = 0
+            state = .listening
+            turnPhase = .listening
+            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            flushPendingOutbound()
+        }
         if engine == .openai { handleOpenAI(ev); return }
         switch ev["type"] as? String {
         case "conversation_initiation_metadata":

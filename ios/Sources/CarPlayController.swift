@@ -178,7 +178,14 @@ final class CarPlayController {
                 v = .connecting
                 scheduleRetry()
             }
-        case .connecting: v = .connecting
+        case .connecting:
+            // ≥ 4 dialed sockets with no first server event: this network
+            // can't carry the voice socket right now (2026-08-23 drive —
+            // "Connecting…" forever). The spinner would be a lie; the muted
+            // state's copy covers can't-connect (see the template above).
+            // The 60s long-tail keeps retrying silently, and a recovery
+            // re-renders through the state sink by itself.
+            v = convo.neverEstablishedStreak >= 4 ? .muted : .connecting
         case .listening:
             retryCount = 0   // a live session pays off the ladder
             // "Thinking" between his speech ending and her reply starting.
