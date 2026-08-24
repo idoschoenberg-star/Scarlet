@@ -125,6 +125,19 @@ struct SettingsView: View {
                     Text("Tap play to hear a sample. Changes apply from your next conversation.")
                 }
 
+                // Device Boundary: every paired device and Mac node, each
+                // wearing its personal/corporate tier, with relabel + revoke.
+                Section {
+                    NavigationLink {
+                        DevicesView()
+                            .background(ScarletBackground().ignoresSafeArea())
+                    } label: {
+                        Label("Devices", systemImage: "laptopcomputer.and.iphone")
+                    }
+                } footer: {
+                    Text("Every device signed in to Scarlet, and whether each is personal or company-managed. Personal sections stay tucked away on managed screens.")
+                }
+
                 Section {
                     Toggle("In the car: answer only when addressed", isOn: $addressGateOn)
                 } footer: {

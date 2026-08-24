@@ -566,6 +566,15 @@ final class HealthSync: ObservableObject {
     /// Health tab already has data — even offline. A missing or corrupt
     /// cache is simply an empty start.
     private func loadCache() {
+        // DEVICE BOUNDARY: a device Ido classified as CORPORATE keeps no
+        // health data on disk — purge any file left from before the label
+        // and start empty. (A still-unknown device only stops WRITING, in
+        // saveCache below, so a mislabeled personal phone loses nothing
+        // while the one-time question is pending.)
+        if DeviceBoundary.cachedTier == "corporate" {
+            try? FileManager.default.removeItem(at: Self.cacheURL)
+            return
+        }
         guard let data = try? Data(contentsOf: Self.cacheURL),
               let file = try? Self.cacheDecoder.decode(HealthCacheFile.self, from: data)
         else { return }
@@ -579,6 +588,15 @@ final class HealthSync: ObservableObject {
     }
 
     private func saveCache() {
+        // DEVICE BOUNDARY (fail-closed): on a corporate — or still-unknown —
+        // device, health data lives in memory only; nothing is persisted.
+        // An explicitly corporate device also sheds any pre-label file.
+        if DeviceBoundary.cachedTierIsCorporateEffective {
+            if DeviceBoundary.cachedTier == "corporate" {
+                try? FileManager.default.removeItem(at: Self.cacheURL)
+            }
+            return
+        }
         let file = HealthCacheFile(savedAt: lastUpdated ?? Date(),
                                    lastSync: lastSync,
                                    days: days,

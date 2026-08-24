@@ -107,6 +107,12 @@ struct RootView: View {
     /// SplitShell's frontmost section (regular width), mirrored via
     /// .scarletShellSection. On the phone `tab` is the truth instead.
     @State private var splitSection = "talk"
+    /// Device Boundary: the one-time tier question, presented as a
+    /// FULL-SCREEN COVER because this view's single Catalyst-safe .sheet
+    /// slot belongs to the draft window (one .sheet + one .fullScreenCover
+    /// on a view is the allowed pairing). Driven by DeviceBoundary's
+    /// published flag via onReceive so answering closes it by itself.
+    @State private var tierQuestionPresented = false
     @Environment(\.scenePhase) private var scenePhase
 
     /// Whether the Talk screen is what Ido is actually looking at, on either
@@ -209,6 +215,20 @@ struct RootView: View {
                 .environmentObject(convo)
                 .preferredColorScheme(.dark)
         }
+        // DEVICE BOUNDARY: the one-time "is this device company-managed?"
+        // question. DeviceBoundary raises the flag at most once per launch
+        // (device_me came back 'unknown'); answering or "Not now" clears it
+        // and this cover follows. Until answered the device renders as
+        // corporate — the fail-closed contract.
+        .fullScreenCover(isPresented: $tierQuestionPresented) {
+            DeviceTierQuestionView()
+        }
+        .onReceive(DeviceBoundary.shared.$needsClassification) { needs in
+            tierQuestionPresented = needs
+        }
+        // Launch refresh: adopt the server's tier for this device (and ask
+        // the one-time question when it is still unclassified).
+        .task { await DeviceBoundary.shared.refresh() }
         // Ambient focus: Talk at launch and whenever the tab returns to it;
         // switching to Inbox lets that hierarchy report itself.
         .onAppear { handleAppear() }
@@ -255,8 +275,16 @@ struct RootView: View {
             // storylines wait for his ruling (docs/JOURNAL_PROGRAM.md). Sits
             // right after Inbox: it is the OTHER inbox, and the two are the
             // pair he works through.
-            JournalView()
-                .environmentObject(convo)
+            // Corp-view profile (Device Boundary): on a corporate or
+            // still-unknown device the personal surfaces — Journal, Photos,
+            // Health — collapse to a quiet "Personal — tap to show" card;
+            // one tap reveals each for this session only. Work surfaces
+            // (Inbox, Calendar, Chats, drafting, Talk) are untouched.
+            PersonalSurface(section: "journal", title: "Your journal",
+                            icon: "book.closed.fill") {
+                JournalView()
+                    .environmentObject(convo)
+            }
                 .tabItem { Label("Journal", systemImage: "book.closed.fill") }
                 .tag(Tab.journal)
             // The Active board: what he asked Scarlet to do, in flight,
@@ -279,8 +307,11 @@ struct RootView: View {
             // Photos and Music fold into "More" with the rest of the tail —
             // first-class native screens at last (they lived only in the web
             // app before build 202).
-            PhotosView()
-                .environmentObject(convo)
+            PersonalSurface(section: "photos", title: "Your photos",
+                            icon: "photo.on.rectangle") {
+                PhotosView()
+                    .environmentObject(convo)
+            }
                 .tabItem { Label("Photos", systemImage: "photo.on.rectangle") }
                 .tag(Tab.photos)
             MusicView()
@@ -294,8 +325,11 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }
                 .tag(Tab.library)
-            HealthView()
-                .environmentObject(convo)
+            PersonalSurface(section: "health", title: "Your health",
+                            icon: "heart.fill") {
+                HealthView()
+                    .environmentObject(convo)
+            }
                 .tabItem { Label("Health", systemImage: "heart.fill") }
                 .tag(Tab.health)
             DeskView()

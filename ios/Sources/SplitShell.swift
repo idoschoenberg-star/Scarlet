@@ -277,8 +277,15 @@ struct SplitShell: View {
                 .environmentObject(convo)
         case .journal:
             // Self-contained NavigationStack (review cards + amend sheet).
-            JournalView()
-                .environmentObject(convo)
+            // Corp-view profile (Device Boundary): Journal / Photos / Health
+            // are personal surfaces — on a corporate or still-unknown device
+            // they collapse to the "Personal — tap to show" card, revealed
+            // per session. Same gate as the phone's tabs, one truth.
+            PersonalSurface(section: "journal", title: "Your journal",
+                            icon: "book.closed.fill") {
+                JournalView()
+                    .environmentObject(convo)
+            }
         case .active:
             // The assignment monitor: in-flight / done / recurring.
             ActiveView()
@@ -294,8 +301,11 @@ struct SplitShell: View {
                 .environmentObject(convo)
         case .photos:
             // Self-contained (grid + lightbox + forward sheet).
-            PhotosView()
-                .environmentObject(convo)
+            PersonalSurface(section: "photos", title: "Your photos",
+                            icon: "photo.on.rectangle") {
+                PhotosView()
+                    .environmentObject(convo)
+            }
         case .music:
             // Self-contained (library shelves, search, now-playing).
             MusicView()
@@ -308,8 +318,11 @@ struct SplitShell: View {
             LibraryView()
                 .environmentObject(convo)
         case .health:
-            HealthView()
-                .environmentObject(convo)
+            PersonalSurface(section: "health", title: "Your health",
+                            icon: "heart.fill") {
+                HealthView()
+                    .environmentObject(convo)
+            }
         case .desk:
             // Self-contained (Reminders + Apple Notes; serif reading sheet).
             DeskView()

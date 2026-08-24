@@ -54,12 +54,22 @@ struct UnlockView: View {
                 var req = URLRequest(url: AppConfig.unlockURL)
                 req.httpMethod = "POST"
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                req.httpBody = try JSONSerialization.data(withJSONObject: ["code": code])
+                // DEVICE BOUNDARY: pairing carries the device's identity so
+                // the registry shows a real name and platform. The TIER is
+                // deliberately absent here — it comes from the one-time
+                // guided question right after unlock (unknown renders as
+                // corporate until answered; fail-closed).
+                req.httpBody = try JSONSerialization.data(withJSONObject: [
+                    "code": code,
+                    "platform": DeviceBoundary.platformString,
+                    "device_name": DeviceBoundary.deviceName,
+                ])
                 let (data, _) = try await URLSession.shared.data(for: req)
                 let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let token = obj?["token"] as? String else {
                     error = "That's not it — try again."; return
                 }
+                DeviceBoundary.shared.noteUnlockTier(obj?["tier"] as? String)
                 session.setToken(token)
             } catch {
                 self.error = "Couldn't reach Scarlet — check your connection."

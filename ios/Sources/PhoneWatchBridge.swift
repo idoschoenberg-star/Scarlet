@@ -97,7 +97,15 @@ final class PhoneWatchBridge: NSObject, WCSessionDelegate {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(phoneToken, forHTTPHeaderField: "x-scarlet-token")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["label": "apple-watch"])
+        // Device Boundary: the watch never unlocks itself, so its identity
+        // rides this grant. `platform`/`device_name` are advisory — app-api's
+        // device_grant ignores unknown fields today; when it learns to stamp
+        // them the registry will show the wrist properly with no app change.
+        req.httpBody = try? JSONSerialization.data(withJSONObject: [
+            "label": "apple-watch",
+            "platform": "watchos",
+            "device_name": "Apple Watch",
+        ])
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
