@@ -239,6 +239,14 @@ final class WatchConversation {
     // deaf can't drive a hot mint/teardown loop. Deliberately NOT reset in
     // connect() — it must remember convictions ACROSS rebuilt sessions.
     private var recentDeafConvictions: [Date] = []
+    // Session-mint registry (2026-08-24, ported from the phone): the mint_id
+    // this session's mint returned, echoed back via op=session_alive so watch
+    // establishment is visible in telemetry — phase "established" on the
+    // first server event, phase "heard" on the first input event, each sent
+    // exactly once per socket.
+    private var currentMintId: String?
+    private var establishedBeaconSent = false
+    private var heardBeaconSent = false
     // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
     // connect used to reset state to .idle and start a SECOND connect — two
     // sockets raced, and the loser's failure path scheduled a reconnect that
@@ -296,6 +304,10 @@ final class WatchConversation {
 
     func start() {
         guard state == .idle, let token = TokenStore.token else { return }
+        // Fresh conversation ⇒ fresh ledger id (same rule as the phone): a
+        // reconnect mid-thread keeps grouping under the old id; a truly new
+        // start (empty transcript) begins a new conversation on the server.
+        if transcript.isEmpty { WatchTurnLogger.shared.sessionId = UUID().uuidString }
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectAttempts = 0
         endedByUser = false
@@ -331,6 +343,8 @@ final class WatchConversation {
     func end() {
         endedByUser = true
         wantLive = false
+        // The call's last words reach the ledger before the app can suspend.
+        WatchTurnLogger.shared.flushNow()
         LocationReporter.shared.stopLiveUpdates()
         reconnectTask?.cancel(); reconnectTask = nil
         replyWatchdog?.cancel(); replyWatchdog = nil
@@ -464,7 +478,11 @@ final class WatchConversation {
             // model the MINT returns rather than a name compiled in here, so a
             // server-side model move carries the watch with it instead of
             // leaving it on a stale name (a mismatched pair just hangs).
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1") ?? AppConfig.realtimeURL
+            // &surface=watch — the wrist joins the mint registry (2026-08-24:
+            // watch sessions were invisible in telemetry; the registry comment
+            // literally said they "never beacon"). The mint returns a mint_id
+            // and this session beacons established/heard like the phone does.
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch") ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -500,6 +518,13 @@ final class WatchConversation {
                 return
             }
             authFailStreak = 0   // a successful mint clears the strike count
+            // Session registry: the mint_id this session echoes back via
+            // op=session_alive (established on the first server event, heard
+            // on the first input event). nil-safe: a server that doesn't
+            // register watch mints returns no id and no beacon fires.
+            currentMintId = (obj?["mint_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            establishedBeaconSent = false
+            heardBeaconSent = false
             guard wantLive else { return }
             do { try await ensureAudio() } catch {
                 beacon("watch-audio-fail", String(describing: error).prefix(120).description + " " + routeSummary())
@@ -719,6 +744,10 @@ final class WatchConversation {
                 }
             } else {
                 transcript.removeAll()
+                // A stale thread is over — the ledger starts a new
+                // conversation too, so old and new never merge server-side.
+                WatchTurnLogger.shared.flushNow()
+                WatchTurnLogger.shared.sessionId = UUID().uuidString
                 // Released even though the replay is skipped for staleness —
                 // a held slot surviving here would re-inject a long-dead tool
                 // result into some future session's first turn.
@@ -834,6 +863,30 @@ final class WatchConversation {
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
         tapState.resetLoudSpeech()
+        // HEARD beacon: the server just proved it heard the wrist — stamp
+        // heard_at exactly once, same contract as the phone.
+        if !heardBeaconSent, let mintId = currentMintId {
+            heardBeaconSent = true
+            sendSessionAlive(mintId, phase: "heard")
+        }
+    }
+
+    /// Fire-and-forget liveness beacon to the session registry (same
+    /// endpoint + auth the phone uses; the patient mintSession because a
+    /// default session fails instantly on a half-woken wrist link).
+    private func sendSessionAlive(_ mintId: String, phase: String) {
+        guard let token = TokenStore.token,
+              var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return }
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "session_alive"))
+        comps.queryItems = items
+        guard let url = comps.url else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["mint_id": mintId, "phase": phase])
+        mintSession.dataTask(with: req).resume()
     }
 
     /// Repeating transport-level ping. WebSocket pings ride below the Realtime
@@ -913,6 +966,13 @@ final class WatchConversation {
 
     private func handleEvent(_ ev: [String: Any]) {
         let type = ev["type"] as? String ?? ""
+        // ESTABLISHED beacon: ANY server event proves the session came up
+        // (session.created is always first). Stamped once per socket — a mint
+        // with no established beacon is a true establishment failure.
+        if !establishedBeaconSent, let mintId = currentMintId {
+            establishedBeaconSent = true
+            sendSessionAlive(mintId, phase: "established")
+        }
         // Server-ear heartbeat: ANY input-side event (speech start/stop,
         // commit, transcription) is proof the server hears the wrist — stamp
         // the clock and forgive the accumulated loud-speech evidence. Matched
@@ -1062,6 +1122,11 @@ final class WatchConversation {
         lastLineAt = Date()
         transcript.append(Line(text: text, fromHer: fromHer))
         if transcript.count > 30 { transcript.removeFirst(transcript.count - 30) }
+        // THE FIX for the invisible-watch incident (2026-08-24): every
+        // finalized turn goes to the server ledger the moment it exists —
+        // his words as the server heard them, hers as she said them. The
+        // backend reconciler can only rescue a request it can see.
+        WatchTurnLogger.shared.log(role: fromHer ? "assistant" : "user", text: text)
     }
 
     // MARK: - tools

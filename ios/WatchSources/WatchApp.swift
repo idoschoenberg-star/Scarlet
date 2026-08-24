@@ -47,7 +47,15 @@ struct ScarletWatchApp: App {
                 if !unlocked { WatchBridge.shared.requestToken() }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .active { WatchConversation.shared.appBecameActive() }
+                if phase == .active {
+                    WatchConversation.shared.appBecameActive()
+                } else {
+                    // Leaving the foreground: watchOS may suspend (or kill)
+                    // us any moment — push any queued conversation turns to
+                    // the server ledger NOW (2026-08-24 invisible-watch
+                    // incident: unposted turns died with the app).
+                    WatchTurnLogger.shared.flushNow()
+                }
             }
         }
     }
