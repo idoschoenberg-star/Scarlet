@@ -188,7 +188,19 @@ struct RootView: View {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
         }
-        .sheet(isPresented: $voiceDraftPresented, onDismiss: { voiceDraftIntent = nil }) {
+        .sheet(isPresented: $voiceDraftPresented, onDismiss: {
+            voiceDraftIntent = nil
+            // Reliably clear the gate when THIS voice-draft sheet closes.
+            // draftSheetOpen was otherwise driven ONLY by DraftView's
+            // .onDisappear notification, and SwiftUI does not guarantee
+            // .onDisappear fires for a dismissing sheet (Ido 2026-08-26: a
+            // wire draft composed by voice never appeared — the previous
+            // voice draft's missed onDisappear left draftSheetOpen stuck true,
+            // which silently blocked both the compose notifications AND the 2s
+            // backstop for every later voice draft). onDismiss IS reliably
+            // called, so resetting here can never leave the gate wedged.
+            draftSheetOpen = false
+        }) {
             DraftView(seed: nil, attachToActive: true, voiceIntent: voiceDraftIntent)
                 .environmentObject(convo)
                 .preferredColorScheme(.dark)
