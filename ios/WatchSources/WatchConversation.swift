@@ -247,6 +247,16 @@ final class WatchConversation {
     private var currentMintId: String?
     private var establishedBeaconSent = false
     private var heardBeaconSent = false
+    // DEAF CIRCUIT (deep-QA 2026-08-28: the mint registry showed 722 watch
+    // mints in ONE day, 0 heard — the conviction→remint cycle ran unattended
+    // for ~8 hours at a ~40s cadence, burning battery and API against a
+    // DETERMINISTIC deafness that reminting never fixes). Three straight
+    // convictions with no server input event ever = proven-deterministic →
+    // hold TEN MINUTES between attempts instead of reminting hot, with the
+    // truth on screen. Never permanently dark (Ido's standing rule — the
+    // watch keeps trying); any heard audio resets the streak, full speed
+    // returns.
+    private var deafStreak = 0
     // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
     // connect used to reset state to .idle and start a SECOND connect — two
     // sockets raced, and the loser's failure path scheduled a reconnect that
@@ -674,10 +684,38 @@ final class WatchConversation {
                         self.recentDeafConvictions.removeAll { Date().timeIntervalSince($0) > 120 }
                         let fastPath = !self.recentDeafConvictions.contains { Date().timeIntervalSince($0) < 90 }
                         self.recentDeafConvictions.append(Date())
+                        self.deafStreak += 1
                         self.beacon("watch-deaf-session",
                                     "loud=\(String(format: "%.1f", loud))s peak=\(stats.peak) "
+                                    + "streak=\(self.deafStreak) "
                                     + "path=\(fastPath ? "fast" : "ladder") serverInput="
                                     + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
+                        // DEAF CIRCUIT: three straight convictions and the
+                        // server has never once acknowledged input — this is
+                        // deterministic, not transient. Reminting hot burned
+                        // 722 mints in a day; hold 10 minutes, say the truth,
+                        // keep the want (never permanently dark).
+                        if self.deafStreak >= 3, self.lastServerInputEventAt == nil {
+                            self.beacon("watch-deaf-circuit",
+                                        "streak=\(self.deafStreak) — holding 10min, " + self.routeSummary())
+                            // Tear the deaf socket down NOW — ten minutes of
+                            // streaming into a corpse is the exact waste this
+                            // circuit exists to stop.
+                            self.ws?.cancel(with: .goingAway, reason: nil)
+                            self.ws = nil
+                            self.replyWatchdog?.cancel(); self.replyWatchdog = nil
+                            self.syncGate()
+                            self.status = "Voice can't hear from the watch right now — I keep trying. Use the phone meanwhile."
+                            self.state = .connecting
+                            self.reconnectTask?.cancel()
+                            self.reconnectTask = Task { [weak self] in
+                                try? await Task.sleep(nanoseconds: 600_000_000_000)
+                                guard let self, self.wantLive, !Task.isCancelled else { return }
+                                self.reconnectAttempts = 0
+                                self.scheduleReconnect(immediate: true)
+                            }
+                            continue
+                        }
                         if fastPath {
                             self.reconnectAttempts = 0
                             self.scheduleReconnect(immediate: true)
@@ -863,6 +901,8 @@ final class WatchConversation {
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
         tapState.resetLoudSpeech()
+        // Heard = the ear works: the deaf circuit re-arms at full speed.
+        if deafStreak != 0 { deafStreak = 0; beacon("watch-ear-recovered", "server input event after deaf streak") }
         // HEARD beacon: the server just proved it heard the wrist — stamp
         // heard_at exactly once, same contract as the phone.
         if !heardBeaconSent, let mintId = currentMintId {

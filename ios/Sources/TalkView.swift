@@ -5,6 +5,7 @@ struct TalkView: View {
     @EnvironmentObject var session: AppSession
     @ObservedObject var convo: Conversation   // owned by RootView, survives tab switches
     @State private var showSettings = false
+    @State private var showDictate = false
     @State private var showType = false
     @State private var typed = ""
     @FocusState private var typeFocused: Bool
@@ -29,6 +30,18 @@ struct TalkView: View {
                         .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
                         .frame(width: 44, height: 44)
                     Spacer()
+                    // Dictate mode (Ido 2026-08-28): uninterrupted dictation
+                    // with live transcription — the keyboard+Wispr replacement.
+                    // Also reachable by long-pressing the orb.
+                    Button {
+                        if convo.state != .idle { convo.end() }
+                        showDictate = true
+                    } label: {
+                        Image(systemName: "waveform.badge.mic")
+                            .font(.system(size: 18))
+                            .foregroundStyle(.white.opacity(0.65))
+                            .frame(width: 44, height: 44)
+                    }
                     Button { showSettings = true } label: {
                         Image(systemName: "gearshape")
                             .font(.system(size: 18))
@@ -56,6 +69,14 @@ struct TalkView: View {
                     } else {
                         convo.stopSpeaking()
                     }
+                }
+                // Long-press = Dictate mode: she stays silent, he speaks as
+                // long as he likes, the words land on screen for editing.
+                // Any live conversation ends first (one audio owner at a time
+                // — the double-tap crash rule).
+                .onLongPressGesture(minimumDuration: 0.5) {
+                    if convo.state != .idle { convo.end() }
+                    showDictate = true
                 }
 
             // Wispr-Flow-style capture wave (Ido 2026-08-11): a strip of bars
@@ -200,8 +221,12 @@ struct TalkView: View {
         .onChange(of: typeFocused) { _, focused in
             if focused { convo.beginTyping() } else { convo.endTyping() }
         }
-        .reportsModalPresence(showSettings)
+        .reportsModalPresence(showSettings || showDictate)
         .sheet(isPresented: $showSettings) { SettingsView().preferredColorScheme(.dark) }
+        // Dictate rides the ONE allowed .fullScreenCover next to the one
+        // .sheet (Mac Catalyst single-sheet rule) — and full screen is right
+        // for it anyway: dictation is a mode, not a popover.
+        .fullScreenCover(isPresented: $showDictate) { DictateView() }
         // Auto-connect ONCE per app session: one press → talking. Coming back
         // from the Inbox tab must not restart (or end) a conversation — the
         // End button is the only way to hang up.
