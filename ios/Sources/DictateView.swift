@@ -398,15 +398,20 @@ private struct LevelStrip: View {
     var active: Bool
     private let bars = 24
 
+    private func barHeight(_ i: Int) -> CGFloat {
+        guard active else { return 3 }
+        let phase: Double = sin(Double(i) / Double(bars) * Double.pi)
+        let scaled: Double = Double(level) * 26.0 * (0.4 + 0.6 * phase)
+        return CGFloat(max(3.0, scaled))
+    }
+
     var body: some View {
         HStack(spacing: 3) {
             ForEach(0..<bars, id: \.self) { i in
-                let phase = sin(Double(i) / Double(bars) * .pi)
-                let h = active ? max(3, CGFloat(level) * 26 * (0.4 + 0.6 * phase)) : 3
                 RoundedRectangle(cornerRadius: 1.5)
-                    .fill(active ? Color(red: 0.98, green: 0.85, blue: 0.85) : .white.opacity(0.25))
-                    .frame(width: 3, height: h)
-                    .animation(.linear(duration: 0.08), value: h)
+                    .fill(active ? Color(red: 0.98, green: 0.85, blue: 0.85) : Color.white.opacity(0.25))
+                    .frame(width: 3, height: barHeight(i))
+                    .animation(.linear(duration: 0.08), value: level)
             }
         }
         .frame(height: 30)
