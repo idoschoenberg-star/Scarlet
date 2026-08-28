@@ -142,6 +142,11 @@ final class WatchConversation {
     private var reconnectTask: Task<Void, Never>?
     private var handledToolCalls = Set<String>()
     private var responseActive = false
+    /// IDLE-STANDBY clock (2026-08-28 deep-QA: with the wrist down, watchOS
+    /// killed the socket every ~37s and the app reconnected forever — 722
+    /// mints in a day). Stamped by every real engagement (arm, her speech,
+    /// a server input event, a fresh connect); read by the health tick.
+    private var lastEngagementAt = Date()
     private var needsResponseAfterDone = false
     // The always-answer net, ported from the phone: a wrist socket can die
     // WITHOUT the receive callback ever firing (NAT timeout while the screen
@@ -292,6 +297,15 @@ final class WatchConversation {
     private let tapState = TapState()
     private var playFormat: AVAudioFormat?
     private let wireRate: Double = 24000
+    /// WRIST PIPE FIX (2026-08-28 deep-QA, beacons pending=14): the BT-relay
+    /// upstream cannot carry 24kHz PCM16 (~60KB/s of JSON) — sends queued and
+    /// OpenAI never received enough audio to detect speech (764 mints / 5
+    /// heard in the registry). Capture now converts to 8 kHz and G.711
+    /// μ-law-encodes before base64 (~10KB/s upstream, telephone-grade —
+    /// right-sized for a wrist mic). The session is minted with `?fmt=ulaw`
+    /// so the server expects μ-law. PLAYBACK stays 24 kHz PCM16 (`wireRate`)
+    /// — downstream always worked.
+    private let captureWireRate: Double = 8000
     /// Echo gate: while her audio is queued/playing, mic frames are dropped so
     /// the watch speaker can't feed her own voice back into the turn.
     private var pendingBuffers = 0
@@ -408,6 +422,7 @@ final class WatchConversation {
                 // tap silences her ear.
                 micArmed = true
                 userMuted = false
+                lastEngagementAt = Date()
                 status = "Listening…"
             } else {
                 micArmed.toggle()
@@ -492,7 +507,7 @@ final class WatchConversation {
             // watch sessions were invisible in telemetry; the registry comment
             // literally said they "never beacon"). The mint returns a mint_id
             // and this session beacons established/heard like the phone does.
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch") ?? AppConfig.realtimeURL
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch&fmt=ulaw") ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -589,6 +604,7 @@ final class WatchConversation {
             lastServerInputEventAt = nil
             tapState.resetLoudSpeech()
             state = .listening
+            lastEngagementAt = Date()
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
             // Audio-flow verdict 8s in: did real sound leave the wrist?
@@ -656,6 +672,30 @@ final class WatchConversation {
                         self.sendStallTicks = 0
                         self.beacon("watch-sends-stalled", "dFrames=\(dFrames) dDropped=\(dDropped)")
                         self.scheduleReconnect()
+                        continue
+                    }
+                    // (3b) IDLE STANDBY (2026-08-28 deep-QA — the loop
+                    //     killer): tap-to-talk, mic unarmed, nothing playing,
+                    //     no response in flight, 90s since any engagement —
+                    //     there is NOTHING this socket is for, and with the
+                    //     wrist down watchOS kills it every ~37s anyway, so
+                    //     holding it open just burns battery and mints
+                    //     (722/day). Close gracefully; wrist-raise or a tap
+                    //     self-heals via appBecameActive (endedByUser stays
+                    //     false, so raising the wrist IS the intent).
+                    if self.mode == .tapToTalk, !self.micArmed,
+                       self.pendingBuffers == 0, self.state != .speaking,
+                       !self.responseActive,
+                       Date().timeIntervalSince(self.lastEngagementAt) > 90 {
+                        self.beacon("watch-standby", "idle 90s — socket closed; wrist-raise resumes")
+                        self.ws?.cancel(with: .goingAway, reason: nil)
+                        self.ws = nil
+                        self.replyWatchdog?.cancel(); self.replyWatchdog = nil
+                        self.reconnectTask?.cancel(); self.reconnectTask = nil
+                        self.syncGate()
+                        self.wantLive = false
+                        self.state = .idle
+                        self.status = "Tap to talk"
                         continue
                     }
                     // (4) DEAF SERVER EAR (QA runs 8/12/14/15/16/18): none of
@@ -900,6 +940,7 @@ final class WatchConversation {
     /// loud-speech ledger: acknowledged speech is not evidence of deafness.
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
+        lastEngagementAt = Date()
         tapState.resetLoudSpeech()
         // Heard = the ear works: the deaf circuit re-arms at full speed.
         if deafStreak != 0 { deafStreak = 0; beacon("watch-ear-recovered", "server input event after deaf streak") }
@@ -1431,7 +1472,7 @@ final class WatchConversation {
             beacon("watch-audio-noinput", routeSummary())
             throw NSError(domain: "ScarletWatchAudio", code: 1)
         }
-        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: wireRate,
+        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: captureWireRate,
                                    channels: 1, interleaved: true)!
         tapState.set(converter: AVAudioConverter(from: inFormat, to: target))
 
@@ -1456,7 +1497,7 @@ final class WatchConversation {
 
         input.removeTap(onBus: 0)
         let tapState = self.tapState
-        let wire = wireRate   // captured by value — the tap never touches self's state
+        let wire = captureWireRate   // captured by value — the tap never touches self's state
         // format: nil — the bus's LIVE format, same fix as the phone
         // (2026-08-15 background crashes: "Failed to create tap due to format
         // mismatch" when a Bluetooth route flap lands between reading
@@ -1489,6 +1530,10 @@ final class WatchConversation {
             // deaf-session ledger when the peak says real speech. One Double
             // add under the existing lock; nothing new runs per frame.
             tapState.note(peak: p, frameSeconds: Double(data.count / 2) / wire)
+            // μ-law encode (WRIST PIPE FIX): 8 kHz int16 → 1 byte/sample —
+            // with base64, ~10KB/s upstream instead of ~60KB/s. Peak math
+            // above ran on the int16 samples, so the beacons stay truthful.
+            let ulaw = Self.muLawEncode(data)
             Task { @MainActor [weak self] in
                 guard let self, self.ws != nil else { return }
                 // Backpressure cap (~0.5s of audio): a socket that stopped
@@ -1498,7 +1543,7 @@ final class WatchConversation {
                     self.droppedChunks += 1
                     return
                 }
-                self.sendAudio(data.base64EncodedString())
+                self.sendAudio(ulaw.base64EncodedString())
             }
         }
         try audioEngine.start()
@@ -1666,6 +1711,31 @@ final class WatchConversation {
         }
         guard out.frameLength > 0, let ch = out.int16ChannelData else { return nil }
         return Data(bytes: ch[0], count: Int(out.frameLength) * 2)
+    }
+
+    /// G.711 μ-law encode (the WRIST PIPE FIX's byte diet): 16-bit linear PCM
+    /// → 8-bit μ-law, the textbook algorithm (bias 0x84, clip 32635). One
+    /// byte per sample — with the 8 kHz capture rate this is ~6× fewer wire
+    /// bytes than 24 kHz PCM16. The session is minted `audio/pcmu`, so the
+    /// server decodes it natively.
+    private nonisolated static func muLawEncode(_ pcm: Data) -> Data {
+        var out = Data(capacity: pcm.count / 2)
+        pcm.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let samples = raw.bindMemory(to: Int16.self)
+            for sample in samples {
+                var s = Int32(sample)
+                let sign: UInt8 = s < 0 ? 0x80 : 0
+                if s < 0 { s = -s }
+                if s > 32635 { s = 32635 }
+                s += 0x84
+                var exponent: UInt8 = 7
+                var mask: Int32 = 0x4000
+                while exponent > 0 && (s & mask) == 0 { exponent -= 1; mask >>= 1 }
+                let mantissa = UInt8((s >> (Int32(exponent) + 3)) & 0x0F)
+                out.append(~(sign | (exponent << 4) | mantissa))
+            }
+        }
+        return out
     }
 
     private func playPCM(_ pcm: Data) {
