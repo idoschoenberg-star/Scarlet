@@ -441,6 +441,10 @@ final class WatchConversation {
     /// die without any callback ever firing, and returning early on ws != nil
     /// left him talking into the corpse until the next turn timed out.
     func appBecameActive() {
+        // A wrist-raise IS engagement (312): stamp the idle clock so the
+        // standby ladder measures from the moment he last looked, not from
+        // machine events.
+        lastEngagementAt = Date()
         // SELF-HEAL, mirroring the phone (2026-08-13): a session that gave up
         // (mint dead, audio failed mid-reconnect) dropped wantLive — and the
         // wrist then stayed dark until a manual tap he had no reason to make.
@@ -507,7 +511,12 @@ final class WatchConversation {
             // watch sessions were invisible in telemetry; the registry comment
             // literally said they "never beacon"). The mint returns a mint_id
             // and this session beacons established/heard like the phone does.
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch&fmt=ulaw") ?? AppConfig.realtimeURL
+            // &build= — the registry row proves WHICH binary is on the wrist
+            // (312, the stale-process incident: TestFlight said 311 while the
+            // wrist churned a weeks-old process whose bare "?defer=1" mints
+            // were the giveaway).
+            let buildNum = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "0"
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch&fmt=ulaw&build=" + buildNum) ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -604,7 +613,11 @@ final class WatchConversation {
             lastServerInputEventAt = nil
             tapState.resetLoudSpeech()
             state = .listening
-            lastEngagementAt = Date()
+            // NO lastEngagementAt stamp here (312, the churn-loop lesson): a
+            // connect is not engagement — automatic reconnects every ~40s
+            // were re-stamping this clock, so the 90s idle standby below
+            // could NEVER fire and the kill→reconnect cycle ran for hours.
+            // Engagement = the user (open, tap) or the server hearing him.
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
             // Audio-flow verdict 8s in: did real sound leave the wrist?
@@ -687,15 +700,7 @@ final class WatchConversation {
                        self.pendingBuffers == 0, self.state != .speaking,
                        !self.responseActive,
                        Date().timeIntervalSince(self.lastEngagementAt) > 90 {
-                        self.beacon("watch-standby", "idle 90s — socket closed; wrist-raise resumes")
-                        self.ws?.cancel(with: .goingAway, reason: nil)
-                        self.ws = nil
-                        self.replyWatchdog?.cancel(); self.replyWatchdog = nil
-                        self.reconnectTask?.cancel(); self.reconnectTask = nil
-                        self.syncGate()
-                        self.wantLive = false
-                        self.state = .idle
-                        self.status = "Tap to talk"
+                        self.enterStandby("idle 90s — socket closed; wrist-raise resumes")
                         continue
                     }
                     // (4) DEAF SERVER EAR (QA runs 8/12/14/15/16/18): none of
@@ -1032,7 +1037,25 @@ final class WatchConversation {
                 case .failure(let err):
                     self.ws = nil
                     self.beacon("watch-ws-fail", String(describing: err).prefix(160).description)
-                    if self.wantLive { self.scheduleReconnect() }
+                    // CHURN BREAKER (312): watchOS kills an idle socket ~35s
+                    // after wrist-down (POSIX 89). Reconnecting an IDLE
+                    // session just re-arms that kill timer — build 311 looped
+                    // kill→reconnect for hours, kept the audio engine hot,
+                    // and left wrist-raises landing in the dead window
+                    // ("Scarlet fails to open"). If the socket died while
+                    // nothing was happening — tap-to-talk, mic unarmed, no
+                    // reply pending or playing — stand down instead: a
+                    // wrist-raise (appBecameActive) or a tap reconnects in
+                    // ~2s, which is cheaper than a socket that is dead when
+                    // he looks anyway. Mid-conversation failures (mic armed,
+                    // reply in flight, audio playing) keep full reconnect.
+                    if self.mode == .tapToTalk, !self.micArmed,
+                       self.pendingBuffers == 0, self.state != .speaking,
+                       !self.responseActive {
+                        self.enterStandby("socket died idle — standing by; wrist-raise or tap resumes")
+                    } else if self.wantLive {
+                        self.scheduleReconnect()
+                    }
                 case .success(let message):
                     if case .string(let text) = message,
                        let data = text.data(using: .utf8),
@@ -1053,6 +1076,12 @@ final class WatchConversation {
         if !establishedBeaconSent, let mintId = currentMintId {
             establishedBeaconSent = true
             sendSessionAlive(mintId, phase: "established")
+            // Truthful connect beacon (312): the old "watch-connected" fired
+            // right after task.resume() — before ANY server proof — so 722
+            // phantom "connections" logged overnight while the registry
+            // showed zero established sessions. This one fires on the first
+            // real server event only.
+            beacon("watch-established", "first server event on this socket")
         }
         // Server-ear heartbeat: ANY input-side event (speech start/stop,
         // commit, transcription) is proof the server hears the wrist — stamp
@@ -1654,6 +1683,34 @@ final class WatchConversation {
             audioReady = false
         }
         syncGate()
+    }
+
+    /// STANDBY (312, the stale-process discovery): the silent keep-alive
+    /// render kept the PROCESS alive for days — watchOS then never swapped in
+    /// newly installed builds (the wrist churned on a weeks-old binary while
+    /// TestFlight said 311), and the mic indicator burned all night. Standby
+    /// releases audio COMPLETELY: engine stopped, session deactivated, mic
+    /// indicator off — watchOS may now suspend us, which is the point. A
+    /// wrist-raise (appBecameActive → start) or tap rebuilds everything from
+    /// scratch via ensureAudio (audioReady=false takes the full path), and a
+    /// suspended process gets replaced by the newest installed build on the
+    /// next launch.
+    private func enterStandby(_ reason: String) {
+        beacon("watch-standby", reason)
+        ws?.cancel(with: .goingAway, reason: nil)
+        ws = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        keepAliveTask?.cancel(); keepAliveTask = nil
+        keepAlivePlayer.stop()
+        player.stop()
+        audioEngine.stop()
+        audioReady = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        syncGate()
+        wantLive = false
+        state = .idle
+        status = "Tap to talk"
     }
 
     /// Loop 0.5s silent buffers on the muted keep-alive player so the audio
