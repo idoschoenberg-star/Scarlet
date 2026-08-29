@@ -612,7 +612,15 @@ struct SenderAvatar: View {
 struct InboxView: View {
     @StateObject private var model = InboxModel()
     @EnvironmentObject private var convo: Conversation
-    @State private var showCompose = false
+    /// ONE enum-driven sheet (the Catalyst one-sheet rule): fresh compose from
+    /// the pencil, or resume the live draft window from the Drafts section.
+    enum InboxSheet: String, Identifiable { case compose, resume; var id: String { rawValue } }
+    @State private var inboxSheet: InboxSheet?
+    /// Drafts section material (Ido 2026-08-29: "there has to be some kind of
+    /// draft section near the inbox... so I can return to it and see the
+    /// active draft at any time"): the live window + the saved shelf.
+    @State private var waitingDraft: DraftFlowAPI.WaitingDraft?
+    @State private var savedDrafts: [DraftFlowAPI.SavedDraftLite] = []
     /// iPad/Mac (design guide §11): the Inbox is a persistent list+reader
     /// split at regular width — never a stretched phone stack.
     @Environment(\.horizontalSizeClass) private var hSize
@@ -630,11 +638,23 @@ struct InboxView: View {
         }
         // .task re-runs every time this tab is selected → auto-refresh on
         // tab appear; foreground return refreshes too.
-        .task { await model.load() }
+        .task { await model.load(); await refreshDrafts() }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { await model.load() }
+            Task { await model.load(); await refreshDrafts() }
         }
+    }
+
+    /// Refresh the Drafts section: the active window + the saved shelf.
+    /// Best-effort — failures leave the previous section content standing.
+    private func refreshDrafts() async {
+        async let w = DraftFlowAPI.fetchWaiting()
+        async let s = DraftFlowAPI.fetchSaved()
+        let (waiting, saved) = await (w, s)
+        waitingDraft = waiting
+        // The live window also appears in neither list twice: a draft that is
+        // active is not "saved", and fetchSaved only returns parked rows.
+        savedDrafts = saved
     }
 
     /// The iPhone presentation — the original NavigationStack-push flow,
@@ -657,9 +677,11 @@ struct InboxView: View {
             // The Outlook-style header row replaces the system bar on the
             // list screen; pushed screens (reader) keep theirs for Back.
             .toolbar(.hidden, for: .navigationBar)
-            .reportsModalPresence(showCompose)
-            .sheet(isPresented: $showCompose) {
-                DraftView(seed: nil)
+            .reportsModalPresence(inboxSheet != nil)
+            .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
+                // resume: attach to the live window (draft_active) — the door
+                // back to the draft no matter where navigation went.
+                DraftView(attachToActive: which == .resume)
                     .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                     .preferredColorScheme(.dark)
             }
@@ -698,9 +720,11 @@ struct InboxView: View {
         }
         .background(OutlookStyle.background.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
-        .reportsModalPresence(showCompose)
-        .sheet(isPresented: $showCompose) {
-            DraftView(seed: nil)
+        .reportsModalPresence(inboxSheet != nil)
+        .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
+            // resume: attach to the live window (draft_active) — the door
+            // back to the draft no matter where navigation went.
+            DraftView(attachToActive: which == .resume)
                 .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                 .preferredColorScheme(.dark)
         }
@@ -758,7 +782,7 @@ struct InboxView: View {
             Spacer()
             // New mail: Scarlet drafts it in the native studio.
             Button {
-                showCompose = true
+                inboxSheet = .compose
             } label: {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 20, weight: .medium))
@@ -874,9 +898,88 @@ struct InboxView: View {
         }
     }
 
+    /// DRAFTS — pinned above the mail (Ido 2026-08-29): the live draft and
+    /// the saved shelf, one tap back into the studio from either width. A
+    /// draft can be out of sight, never out of reach. Renders nothing when
+    /// there are no drafts, so the inbox stays clean.
+    @ViewBuilder
+    private var draftsSection: some View {
+        if waitingDraft != nil || !savedDrafts.isEmpty {
+            Text("DRAFTS")
+                .font(.system(size: 12, weight: .semibold))
+                .kerning(0.5)
+                .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
+                .padding(.top, 12)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            if let w = waitingDraft {
+                draftRow(icon: "pencil.circle.fill",
+                         title: w.recipient.isEmpty ? draftChannelDisplayName(w.channel) : w.recipient,
+                         detail: "Active now — \(draftChannelDisplayName(w.channel))",
+                         active: true) {
+                    inboxSheet = .resume
+                }
+            }
+            ForEach(savedDrafts) { d in
+                draftRow(icon: "tray.full.fill",
+                         title: d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient,
+                         detail: d.subject.isEmpty ? d.preview : d.subject,
+                         active: false) {
+                    // Saved → live first (server-side pickup), then attach.
+                    Task {
+                        _ = await DraftFlowAPI.action(draftId: d.id, action: "pickup")
+                        await refreshDrafts()
+                        inboxSheet = .resume
+                    }
+                }
+            }
+        }
+    }
+
+    /// One Drafts row — directive #13 styling: white text on true black.
+    private func draftRow(icon: String, title: String, detail: String,
+                          active: Bool, tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 22))
+                    .foregroundStyle(active
+                        ? Color(red: 0.95, green: 0.45, blue: 0.5)
+                        : OutlookStyle.textSecondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(.system(size: 13))
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if active {
+                    Text("OPEN")
+                        .font(.system(size: 11, weight: .bold))
+                        .kerning(0.5)
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Capsule().fill(Color(red: 0.95, green: 0.45, blue: 0.5)))
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.black)
+    }
+
     /// The shared List content — error line, per-day headers, message rows.
     @ViewBuilder
     private func listRows(selectable: Bool) -> some View {
+        draftsSection
         if !model.errorText.isEmpty {
             Text(model.errorText)
                 .font(.footnote)

@@ -873,7 +873,9 @@ struct DraftView: View {
     private let scarletRed = Color(red: 0.75, green: 0.15, blue: 0.23)
     private let savedGreen = Color(red: 0.16, green: 0.55, blue: 0.32)
     private let outlookBlue = Color(red: 0.29, green: 0.62, blue: 1.0)
-    private let paper = Color(red: 0.96, green: 0.94, blue: 0.94)
+    // Directive #13 (Ido 2026-08-29): text surfaces are crisp WHITE on pure
+    // BLACK — no tinted paper, no translucency behind words.
+    private let paper = Color.white
 
     var body: some View {
         VStack(spacing: 14) {
@@ -1397,7 +1399,7 @@ struct DraftView: View {
                 .environment(\.layoutDirection, manualText.layoutDir)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(10)
-                .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 20))
+                .background(Color.black, in: RoundedRectangle(cornerRadius: 20))
                 .overlay(RoundedRectangle(cornerRadius: 20)
                     .stroke(.white.opacity(0.10), lineWidth: 1))
             HStack(spacing: 10) {
@@ -1482,7 +1484,7 @@ struct DraftView: View {
             VStack(alignment: .leading, spacing: 3) {
                 if !draft.subject.isEmpty {
                     paragraphLine(draft.subject, size: 17, weight: .semibold,
-                                  color: Color(red: 0.98, green: 0.92, blue: 0.92))
+                                  color: .white)
                         .padding(.bottom, 6)
                 }
                 // Render the body paragraph-by-paragraph; blank lines stay as gaps.
@@ -1499,8 +1501,8 @@ struct DraftView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 20))
-        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.10), lineWidth: 1))
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 20))
+        .overlay(RoundedRectangle(cornerRadius: 20).stroke(.white.opacity(0.14), lineWidth: 1))
         .overlay(alignment: .topTrailing) {
             // Only show a revision badge once he's actually revised — "v0" on a
             // first draft is meaningless noise.

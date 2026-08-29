@@ -229,6 +229,34 @@ enum DraftFlowAPI {
         )
     }
 
+    /// One parked draft on the saved shelf — the Inbox Drafts section's row
+    /// material (Ido 2026-08-29: the active draft must be reachable at any
+    /// time, and a parked one must be findable without knowing the compose
+    /// form hides a shelf).
+    struct SavedDraftLite: Identifiable {
+        let id: String
+        let channel: String
+        let recipient: String
+        let subject: String
+        let preview: String
+    }
+
+    /// The saved shelf (state 'saved'), newest first. Empty on error or an
+    /// older backend — the section simply doesn't render.
+    static func fetchSaved() async -> [SavedDraftLite] {
+        guard let data = try? await request("op=drafts_saved", method: "GET"),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rows = obj["drafts"] as? [[String: Any]] else { return [] }
+        return rows.compactMap { r in
+            guard let id = r["id"] as? String else { return nil }
+            return SavedDraftLite(id: id,
+                                  channel: (r["channel"] as? String) ?? "",
+                                  recipient: (r["recipient"] as? String) ?? "",
+                                  subject: (r["subject"] as? String) ?? "",
+                                  preview: String(((r["body"] as? String) ?? "").prefix(120)))
+        }
+    }
+
     // Same plumbing shape as DraftModel/ChatsAPI: apiBase + v=2 + x-scarlet-token.
     private static func request(_ query: String, method: String = "POST",
                                 body: [String: Any]? = nil) async throws -> Data {
