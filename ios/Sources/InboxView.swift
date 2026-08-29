@@ -681,7 +681,7 @@ struct InboxView: View {
             .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
                 // resume: attach to the live window (draft_active) — the door
                 // back to the draft no matter where navigation went.
-                DraftView(attachToActive: which == .resume)
+                DraftView(seed: nil, attachToActive: which == .resume)
                     .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                     .preferredColorScheme(.dark)
             }
@@ -724,7 +724,7 @@ struct InboxView: View {
         .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
             // resume: attach to the live window (draft_active) — the door
             // back to the draft no matter where navigation went.
-            DraftView(attachToActive: which == .resume)
+            DraftView(seed: nil, attachToActive: which == .resume)
                 .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                 .preferredColorScheme(.dark)
         }
