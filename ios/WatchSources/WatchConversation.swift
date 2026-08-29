@@ -140,6 +140,10 @@ final class WatchConversation {
     /// a row; a blip doesn't.
     private var authFailStreak = 0
     private var reconnectTask: Task<Void, Never>?
+    // First-start audio activation retries (313): '!act' right after a
+    // wrist-raise is transient — count the quick retries before we surface
+    // "Mic unavailable" for real. Reset on every successful connect.
+    private var audioStartRetries = 0
     private var handledToolCalls = Set<String>()
     private var responseActive = false
     /// IDLE-STANDBY clock (2026-08-28 deep-QA: with the wrist down, watchOS
@@ -573,7 +577,25 @@ final class WatchConversation {
                 if reconnectAttempts > 0 {
                     status = "Mic waking — retrying…"
                     scheduleReconnect()
+                } else if audioStartRetries < 3 {
+                    // 313 (the standby aftershock): now that standby really
+                    // DEACTIVATES the audio session, a wrist-raise re-activates
+                    // it — and watchOS refuses activation ('!act') for a
+                    // beat while the app is still waking. One failed attempt
+                    // used to mean a dead "Mic unavailable — try again" in
+                    // Ido's hand for a problem that self-resolves in under a
+                    // second. Retry the whole connect a few times first.
+                    audioStartRetries += 1
+                    status = "Mic waking…"
+                    beacon("watch-audio-retry", "first-start activation failed — retry \(audioStartRetries)/3")
+                    let tok = token
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 700_000_000)
+                        guard let self, self.wantLive, self.ws == nil else { return }
+                        await self.connect(token: tok)
+                    }
                 } else {
+                    audioStartRetries = 0
                     status = "Mic unavailable — try again"
                     state = .idle; wantLive = false
                 }
@@ -618,6 +640,7 @@ final class WatchConversation {
             // were re-stamping this clock, so the 90s idle standby below
             // could NEVER fire and the kill→reconnect cycle ran for hours.
             // Engagement = the user (open, tap) or the server hearing him.
+            audioStartRetries = 0
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
             // Audio-flow verdict 8s in: did real sound leave the wrist?
@@ -1702,15 +1725,24 @@ final class WatchConversation {
         replyWatchdog?.cancel(); replyWatchdog = nil
         reconnectTask?.cancel(); reconnectTask = nil
         keepAliveTask?.cancel(); keepAliveTask = nil
-        keepAlivePlayer.stop()
-        player.stop()
-        audioEngine.stop()
-        audioReady = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         syncGate()
         wantLive = false
         state = .idle
         status = "Tap to talk"
+        // Engine drop is DELAYED half a second (313): stopping it instantly
+        // let watchOS suspend the process before the standby beacon's POST
+        // finished — standby worked but looked invisible in telemetry. The
+        // guard re-checks that no tap/wrist-raise revived the session during
+        // the wait; if one did, the engine stays (that session owns it now).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !self.wantLive, self.state == .idle, self.ws == nil else { return }
+            self.keepAlivePlayer.stop()
+            self.player.stop()
+            self.audioEngine.stop()
+            self.audioReady = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     /// Loop 0.5s silent buffers on the muted keep-alive player so the audio
