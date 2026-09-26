@@ -380,19 +380,28 @@ final class DraftModel: ObservableObject {
     func pickup(_ id: String) {
         guard draftId == nil else { return }
         errorText = ""
+        // Phase FIRST, synchronously. This runs the instant the sheet appears
+        // and the pickup round-trip below takes real time; leaving phase at
+        // .idle until the response landed showed the new-mail FORM for a beat
+        // and then flipped to the draft — half of "opening a draft is sticky"
+        // (Ido 2026-09-26). The spinner belongs on screen from frame one.
+        phase = .writing
+        writingStartedAt = Date()
+        startPolling()
         Task {
             guard let data = try? await Self.request("op=draft_action", method: "POST",
                                                      body: ["id": id, "action": "pickup"]),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   (obj["ok"] as? Bool) == true else {
+                // Stand the spinner down — a wedged "writing…" that never
+                // resolves reads as a hang, which is the bug, not the fix.
+                stopPolling()
+                phase = .idle
                 errorText = "Couldn't pick that draft back up — try again."
                 return
             }
             savedShelf.removeAll { $0.id == id }
             draftId = id
-            phase = .writing
-            writingStartedAt = Date()
-            startPolling()
             if let d = try? await Self.fetchActive(), d.id == id { adopt(d) }
         }
     }
@@ -823,6 +832,11 @@ struct DraftView: View {
     /// Voice-attach mode: skip composing and adopt the active server draft
     /// (Scarlet's compose_draft tool already started it).
     var attachToActive: Bool = false
+    /// Resume-a-parked-draft mode: the saved-shelf row id to pick back up.
+    /// The pickup happens HERE, inside the presented sheet, not before it —
+    /// so the sheet appears on the tap and its own spinner covers the
+    /// round-trip (Ido 2026-09-26: "opening a draft is sticky").
+    var resumeSavedId: String? = nil
     /// The compose_draft tool arguments known locally the instant Scarlet made
     /// the call (recipient, instruction, channel) — used to paint the writing
     /// card immediately, before the server row lands.
@@ -837,6 +851,15 @@ struct DraftView: View {
     /// .instructed → the input row (mic/keyboard) collects the instruction
     /// first; .manual → Ido types the reply himself in the manual editor.
     var replyMode: ReplyMode? = nil
+
+    /// TRUE only in NEW-MAIL mode: no reply seed, no channel seed, not a voice
+    /// attach, and not a resumed parked draft. Four places used to spell this
+    /// out separately and each spelled it slightly differently — which is how
+    /// `resumeSavedId` would have shown the "fresh email" form over a draft it
+    /// was busy fetching. One definition, so a future mode cannot half-register.
+    private var isNewMailMode: Bool {
+        seed == nil && channelSeed == nil && !attachToActive && resumeSavedId == nil
+    }
 
     @StateObject private var model = DraftModel()
     @Environment(\.dismiss) private var dismiss
@@ -900,6 +923,11 @@ struct DraftView: View {
                                             userInfo: ["visible": true])
             if attachToActive {
                 model.attachToActive(intent: voiceIntent)
+            } else if let resumeSavedId {
+                // Parked draft, resumed from the Inbox Drafts section. The
+                // network work is deliberately inside the sheet so the tap
+                // presents immediately and this window's own spinner covers it.
+                model.pickup(resumeSavedId)
             } else if let channelSeed {
                 let instr = channelSeed.instruction
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1056,7 +1084,7 @@ struct DraftView: View {
         // Manual mode: he is typing his own words — his speech is NOT an
         // instruction, so no pre-draft line claims it.
         guard replyMode != .manual else { return nil }
-        guard channelSeed != nil || (seed == nil && !attachToActive)
+        guard channelSeed != nil || isNewMailMode
             || (seed != nil && replyMode == .instructed) else { return nil }
         let recipient = channelSeed?.recipient
             ?? (seed != nil ? recipientText : "not chosen yet")
@@ -1346,7 +1374,7 @@ struct DraftView: View {
             } else if (channelSeed != nil || (seed != nil && replyMode == .instructed))
                         && model.draft == nil {
                 Text("Tell Scarlet what to say").font(.footnote).foregroundStyle(.secondary)
-            } else if seed == nil && !attachToActive && model.draft == nil {
+            } else if isNewMailMode && model.draft == nil {
                 Text("A fresh email from your Amwell address").font(.footnote).foregroundStyle(.secondary)
             }
         }
@@ -1377,7 +1405,7 @@ struct DraftView: View {
             // 🎙 mode (chat pill or email reply) with no ask yet: the unified
             // input row below collects it — this is just the hint.
             channelHint
-        } else if seed == nil && !attachToActive && channelSeed == nil {
+        } else if isNewMailMode {
             newMailForm
         } else {
             Spacer()
@@ -1970,7 +1998,7 @@ struct DraftView: View {
         guard model.phase == .idle else { return false }
         if channelSeed != nil { return true }
         if seed != nil && replyMode == .instructed { return true }
-        if seed == nil && !attachToActive {
+        if isNewMailMode {
             return !newTo.trimmingCharacters(in: .whitespaces).isEmpty
         }
         return false

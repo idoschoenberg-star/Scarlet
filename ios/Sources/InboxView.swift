@@ -614,8 +614,33 @@ struct InboxView: View {
     @EnvironmentObject private var convo: Conversation
     /// ONE enum-driven sheet (the Catalyst one-sheet rule): fresh compose from
     /// the pencil, or resume the live draft window from the Drafts section.
-    enum InboxSheet: String, Identifiable { case compose, resume; var id: String { rawValue } }
+    /// `.resumeSaved` carries the parked draft's id so the PICKUP happens
+    /// inside the presented sheet instead of before it — the tap opens the
+    /// window instantly and DraftView's own spinner covers the round-trip.
+    enum InboxSheet: Identifiable {
+        case compose
+        case resume
+        case resumeSaved(String)
+        var id: String {
+            switch self {
+            case .compose: return "compose"
+            case .resume: return "resume"
+            case .resumeSaved(let draftId): return "saved-\(draftId)"
+            }
+        }
+        var attachesToActive: Bool { if case .resume = self { return true }; return false }
+        var savedDraftId: String? { if case .resumeSaved(let d) = self { return d }; return nil }
+    }
     @State private var inboxSheet: InboxSheet?
+    /// Multi-select over the saved drafts — same Select/Done + bottom-bar flow
+    /// as Active and the Library, so the three screens feel like one app
+    /// (Ido 2026-09-26: "a quick way to multi select and delete drafts").
+    @State private var selectingDrafts = false
+    @State private var selectedDraftIDs: Set<String> = []
+    /// Just-deleted drafts, held for the undo bar. `discard` keeps the row
+    /// server-side and `restore` brings it back, so undo is real, not a lie.
+    @State private var undoableDeletes: [DraftFlowAPI.SavedDraftLite] = []
+    @State private var deleteError = ""
     /// Drafts section material (Ido 2026-08-29: "there has to be some kind of
     /// draft section near the inbox... so I can return to it and see the
     /// active draft at any time"): the live window + the saved shelf.
@@ -639,6 +664,21 @@ struct InboxView: View {
         // .task re-runs every time this tab is selected → auto-refresh on
         // tab appear; foreground return refreshes too.
         .task { await model.load(); await refreshDrafts() }
+        // The saved pile emptied under an open selection — nothing to act on.
+        .onChange(of: savedDrafts.isEmpty) { _, empty in
+            if empty {
+                selectingDrafts = false
+                selectedDraftIDs = []
+            }
+        }
+        // The undo offer expires. Keeping it on screen indefinitely would
+        // imply a draft stays restorable forever; 8s matches how long the
+        // other transient confirmations live.
+        .task(id: undoableDeletes.map(\.id).joined()) {
+            guard !undoableDeletes.isEmpty else { return }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            undoableDeletes = []
+        }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
             Task { await model.load(); await refreshDrafts() }
@@ -671,8 +711,12 @@ struct InboxView: View {
             // its layout, so the pushed reader (with its own action bar)
             // structurally replaces it.
             .safeAreaInset(edge: .bottom) {
-                ScarletPresenceView(convo: convo)
-                    .padding(.vertical, 6)
+                VStack(spacing: 0) {
+                    if selectingDrafts { draftSelectionBar }
+                    if !undoableDeletes.isEmpty { draftUndoBar }
+                    ScarletPresenceView(convo: convo)
+                        .padding(.vertical, 6)
+                }
             }
             // The Outlook-style header row replaces the system bar on the
             // list screen; pushed screens (reader) keep theirs for Back.
@@ -681,7 +725,9 @@ struct InboxView: View {
             .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
                 // resume: attach to the live window (draft_active) — the door
                 // back to the draft no matter where navigation went.
-                DraftView(seed: nil, attachToActive: which == .resume)
+                DraftView(seed: nil,
+                          attachToActive: which.attachesToActive,
+                          resumeSavedId: which.savedDraftId)
                     .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                     .preferredColorScheme(.dark)
             }
@@ -712,8 +758,12 @@ struct InboxView: View {
             // Scarlet stays with the LIST column, as on the phone's list
             // screen; the reading pane has its own action bar.
             .safeAreaInset(edge: .bottom) {
-                ScarletPresenceView(convo: convo)
-                    .padding(.vertical, 6)
+                VStack(spacing: 0) {
+                    if selectingDrafts { draftSelectionBar }
+                    if !undoableDeletes.isEmpty { draftUndoBar }
+                    ScarletPresenceView(convo: convo)
+                        .padding(.vertical, 6)
+                }
             }
             Divider().overlay(OutlookStyle.separator)
             readerPane
@@ -724,7 +774,9 @@ struct InboxView: View {
         .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
             // resume: attach to the live window (draft_active) — the door
             // back to the draft no matter where navigation went.
-            DraftView(seed: nil, attachToActive: which == .resume)
+            DraftView(seed: nil,
+                      attachToActive: which.attachesToActive,
+                      resumeSavedId: which.savedDraftId)
                 .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                 .preferredColorScheme(.dark)
         }
@@ -905,14 +957,43 @@ struct InboxView: View {
     @ViewBuilder
     private var draftsSection: some View {
         if waitingDraft != nil || !savedDrafts.isEmpty {
-            Text("DRAFTS")
-                .font(.system(size: 12, weight: .semibold))
-                .kerning(0.5)
-                .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
-                .padding(.top, 12)
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-            if let w = waitingDraft {
+            HStack {
+                Text("DRAFTS")
+                    .font(.system(size: 12, weight: .semibold))
+                    .kerning(0.5)
+                    .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
+                Spacer()
+                // Select only appears once there is a saved pile to act on —
+                // the ACTIVE draft is never selectable (it is the one being
+                // written; it is discarded from inside the studio).
+                if !savedDrafts.isEmpty {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectingDrafts.toggle()
+                            if !selectingDrafts { selectedDraftIDs.removeAll() }
+                        }
+                    } label: {
+                        Text(selectingDrafts ? "Done" : "Select")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(selectingDrafts
+                                ? Color(red: 0.95, green: 0.45, blue: 0.5) : .white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 12)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            if !deleteError.isEmpty {
+                Text(deleteError)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .listRowBackground(Color.black)
+                    .listRowSeparator(.hidden)
+            }
+            // The live draft: hidden while selecting, so the one row that must
+            // NOT be swept up in a bulk delete cannot be tapped by accident.
+            if let w = waitingDraft, !selectingDrafts {
                 draftRow(icon: "pencil.circle.fill",
                          title: w.recipient.isEmpty ? draftChannelDisplayName(w.channel) : w.recipient,
                          detail: "Active now — \(draftChannelDisplayName(w.channel))",
@@ -921,17 +1002,167 @@ struct InboxView: View {
                 }
             }
             ForEach(savedDrafts) { d in
-                draftRow(icon: "tray.full.fill",
-                         title: d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient,
-                         detail: d.subject.isEmpty ? d.preview : d.subject,
-                         active: false) {
-                    // Saved → live first (server-side pickup), then attach.
-                    Task {
-                        _ = await DraftFlowAPI.action(draftId: d.id, action: "pickup")
-                        await refreshDrafts()
-                        inboxSheet = .resume
+                if selectingDrafts {
+                    Button {
+                        if selectedDraftIDs.contains(d.id) {
+                            selectedDraftIDs.remove(d.id)
+                        } else {
+                            selectedDraftIDs.insert(d.id)
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: selectedDraftIDs.contains(d.id)
+                                ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 22))
+                                .foregroundStyle(selectedDraftIDs.contains(d.id)
+                                    ? Color(red: 0.95, green: 0.45, blue: 0.5)
+                                    : .white.opacity(0.35))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                Text(d.subject.isEmpty ? d.preview : d.subject)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(OutlookStyle.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.black)
+                } else {
+                    draftRow(icon: "tray.full.fill",
+                             title: d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient,
+                             detail: d.subject.isEmpty ? d.preview : d.subject,
+                             active: false) {
+                        // The sheet opens NOW; the pickup runs inside it.
+                        inboxSheet = .resumeSaved(d.id)
+                    }
+                    // One-off delete without entering Select mode — the
+                    // fastest path when it is a single stale draft.
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) {
+                            deleteDrafts([d.id])
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// The Select-mode command bar: Select All / Deselect All and one
+    /// destructive action, matching Active's and the Library's bar.
+    private var draftSelectionBar: some View {
+        HStack(spacing: 12) {
+            Button(selectedDraftIDs.count == savedDrafts.count ? "Deselect All" : "Select All") {
+                if selectedDraftIDs.count == savedDrafts.count {
+                    selectedDraftIDs.removeAll()
+                } else {
+                    selectedDraftIDs = Set(savedDrafts.map(\.id))
+                }
+            }
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Button {
+                deleteDrafts(Array(selectedDraftIDs))
+            } label: {
+                Label("Delete\(selectedDraftIDs.isEmpty ? "" : " \(selectedDraftIDs.count)")",
+                      systemImage: "trash.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(Capsule().fill(selectedDraftIDs.isEmpty
+                        ? Color.white.opacity(0.12) : Color.red.opacity(0.85)))
+            }
+            .disabled(selectedDraftIDs.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    /// The undo bar. `discard` KEEPS the row server-side and `restore` brings
+    /// it back, so this is a real undo — which is what earns the right to
+    /// delete several drafts on one tap without a confirmation dialog.
+    private var draftUndoBar: some View {
+        HStack(spacing: 12) {
+            Text(undoableDeletes.count == 1
+                 ? "1 draft deleted"
+                 : "\(undoableDeletes.count) drafts deleted")
+                .font(.system(size: 15))
+                .foregroundStyle(.white)
+            Spacer()
+            Button("Undo") {
+                let back = undoableDeletes
+                undoableDeletes = []
+                deleteError = ""
+                Task {
+                    // The result is CHECKED, not discarded: the server refuses
+                    // `restore` with 409 while another draft is active (the
+                    // one-active-draft invariant). Ignoring that would leave
+                    // the Undo button looking like it worked while the drafts
+                    // stayed deleted — the exact class of quiet lie this
+                    // codebase keeps paying for.
+                    var failed = 0
+                    await withTaskGroup(of: Bool.self) { group in
+                        for d in back {
+                            group.addTask { await DraftFlowAPI.action(draftId: d.id, action: "restore") }
+                        }
+                        for await ok in group where !ok { failed += 1 }
+                    }
+                    await refreshDrafts()
+                    if failed > 0 {
+                        deleteError = failed == back.count
+                            ? "Couldn't restore — finish or discard the draft you have open, then try again."
+                            : "Restored \(back.count - failed) of \(back.count) — the rest need the open draft finished first."
+                    }
+                }
+            }
+            .font(.system(size: 16, weight: .bold))
+            .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    /// Delete drafts by id: optimistic removal (the list must feel instant),
+    /// concurrent `discard` calls, and an honest count when some refuse —
+    /// a draft that has already been sent cannot be deleted, and the server
+    /// says so rather than pretending.
+    private func deleteDrafts(_ ids: [String]) {
+        let targets = savedDrafts.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            savedDrafts.removeAll { ids.contains($0.id) }
+            selectedDraftIDs.subtract(ids)
+            if savedDrafts.isEmpty { selectingDrafts = false }
+        }
+        deleteError = ""
+        Task {
+            var failed = 0
+            await withTaskGroup(of: Bool.self) { group in
+                for t in targets {
+                    group.addTask { await DraftFlowAPI.action(draftId: t.id, action: "discard") }
+                }
+                for await ok in group where !ok { failed += 1 }
+            }
+            if failed > 0 {
+                deleteError = failed == targets.count
+                    ? "Couldn't delete \(failed == 1 ? "that draft" : "those drafts") — they're back in the list."
+                    : "Deleted \(targets.count - failed) of \(targets.count); the rest are back in the list."
+                // Whatever refused is restored to the list by the refresh —
+                // never leave a row hidden that still exists server-side.
+                await refreshDrafts()
+            } else {
+                undoableDeletes = targets
             }
         }
     }
