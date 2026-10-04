@@ -41,6 +41,7 @@ struct SplitShell: View {
         case library
         case health
         case desk
+        case estate
         case settings
 
         var id: String { rawValue }
@@ -57,6 +58,7 @@ struct SplitShell: View {
             case .library: return "Library"
             case .health: return "Health"
             case .desk: return "Desk"
+            case .estate: return "Estate"
             case .settings: return "Settings"
             }
         }
@@ -74,6 +76,7 @@ struct SplitShell: View {
             case .library: return "books.vertical.fill"
             case .health: return "heart.fill"
             case .desk: return "checklist"
+            case .estate: return "house.fill"
             case .settings: return "gearshape.fill"
             }
         }
@@ -91,6 +94,8 @@ struct SplitShell: View {
             case .library: return "7"
             case .health: return "8"
             case .desk: return "9"
+            // ⌘0…⌘9 are all taken; new sections use letters (as News uses ⌘N).
+            case .estate: return "e"
             case .settings: return "0"
             }
         }
@@ -113,7 +118,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk]
+        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate]
     }
 
     var body: some View {
@@ -280,6 +285,11 @@ struct SplitShell: View {
         case .desk:
             // Self-contained (Reminders + Apple Notes; serif reading sheet).
             DeskView()
+                .environmentObject(convo)
+        case .estate:
+            // Self-contained: list pane + detail pane at this width (Tickets ·
+            // Recurring · Suppliers · Payments · Homes).
+            EstateView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar. As a detail column there
