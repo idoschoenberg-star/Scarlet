@@ -42,6 +42,7 @@ struct SplitShell: View {
         case health
         case desk
         case estate
+        case travel
         case settings
 
         var id: String { rawValue }
@@ -59,6 +60,7 @@ struct SplitShell: View {
             case .health: return "Health"
             case .desk: return "Desk"
             case .estate: return "Estate"
+            case .travel: return "Travel"
             case .settings: return "Settings"
             }
         }
@@ -77,6 +79,7 @@ struct SplitShell: View {
             case .health: return "heart.fill"
             case .desk: return "checklist"
             case .estate: return "house.fill"
+            case .travel: return "airplane"
             case .settings: return "gearshape.fill"
             }
         }
@@ -96,6 +99,7 @@ struct SplitShell: View {
             case .desk: return "9"
             // ⌘0…⌘9 are all taken; new sections use letters (as News uses ⌘N).
             case .estate: return "e"
+            case .travel: return "t"
             case .settings: return "0"
             }
         }
@@ -118,7 +122,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate]
+        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate, .travel]
     }
 
     var body: some View {
@@ -290,6 +294,11 @@ struct SplitShell: View {
             // Self-contained: list pane + detail pane at this width (Tickets ·
             // Recurring · Suppliers · Payments · Homes).
             EstateView()
+                .environmentObject(convo)
+        case .travel:
+            // Self-contained: list pane + detail pane (Up next · Passes ·
+            // Reservations · Past).
+            TravelView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar. As a detail column there
