@@ -243,6 +243,7 @@ struct TravelView: View {
     @State private var activeSheet: TravelSheet?
     @State private var gatePass: TravelPass?
     @State private var selection: Selection?
+    @State private var pendingDelete: Selection?
 
     private var wide: Bool { hSize == .regular }
 
@@ -288,7 +289,36 @@ struct TravelView: View {
                 }
             }
             .fullScreenCover(item: $gatePass) { p in GatePassView(pass: p) }
+            .confirmationDialog(deleteTitle, isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }), titleVisibility: .visible) {
+                Button(pendingDeleteIsLeg ? "Remove flight" : "Remove booking", role: .destructive) {
+                    if let sel = pendingDelete { Task { _ = await remove(sel) } }
+                    pendingDelete = nil
+                }
+                Button("Cancel", role: .cancel) { pendingDelete = nil }
+            } message: {
+                Text(pendingDeleteIsLeg ? "Its boarding passes are removed too." : "It's removed from Travel.")
+            }
         }
+    }
+
+    private var pendingDeleteIsLeg: Bool { if case .leg = pendingDelete { return true }; return false }
+    private var deleteTitle: String {
+        switch pendingDelete {
+        case .leg(let id): return model.legs.first { $0.id == id }.map { "Remove \($0.flight) \($0.origin) → \($0.destination)?" } ?? "Remove this flight?"
+        case .reservation(let id): return model.reservations.first { $0.id == id }.map { "Remove \($0.title)?" } ?? "Remove this booking?"
+        case nil: return ""
+        }
+    }
+
+    /// Removes a flight (with its passes) or a booking; true when it went.
+    private func remove(_ sel: Selection) async -> Bool {
+        let r: [String: Any]?
+        switch sel {
+        case .leg(let id): r = await model.act("travel_leg_delete", ["id": id], success: "Flight removed")
+        case .reservation(let id): r = await model.act("travel_reservation_delete", ["id": id], success: "Booking removed")
+        }
+        if r != nil, selection == sel { selection = nil }
+        return r != nil
     }
 
     private var focusLine: String {
@@ -355,10 +385,24 @@ struct TravelView: View {
             }
             .buttonStyle(.plain)
             .listRowBackground(selection == sel ? TravelUI.card2 : TravelUI.bg)
+            .contextMenu { removeMenuItem(sel) }
+            .swipeActions(edge: .trailing) { removeSwipe(sel) }
         } else {
             NavigationLink { dest().background(TravelUI.bg.ignoresSafeArea()) } label: { content() }
                 .listRowBackground(TravelUI.bg)
+                .contextMenu { removeMenuItem(sel) }
+                .swipeActions(edge: .trailing) { removeSwipe(sel) }
         }
+    }
+
+    private func removeMenuItem(_ sel: Selection) -> some View {
+        Button(role: .destructive) { pendingDelete = sel } label: {
+            if case .leg = sel { Label("Remove flight", systemImage: "trash") } else { Label("Remove booking", systemImage: "trash") }
+        }
+    }
+
+    private func removeSwipe(_ sel: Selection) -> some View {
+        Button(role: .destructive) { pendingDelete = sel } label: { Label("Remove", systemImage: "trash") }
     }
 
     /// Flights and bookings in one timeline, grouped by day; anything that
@@ -522,6 +566,9 @@ struct TravelView: View {
                                  onWallet: { Task { await addToWallet(p) } }, onPDF: { Task { await openPDF(p) } })
                     }
                 }
+                TravelRemoveButton(title: "Remove flight", question: "Remove \(l.flight) \(l.origin) → \(l.destination)?",
+                                   message: "Its boarding passes are removed too.", popAfter: !wide) { await remove(.leg(l.id)) }
+                    .padding(.top, 8)
             }
             .padding(20)
         }
@@ -591,6 +638,9 @@ struct TravelView: View {
                     Button { activeSheet = .editReservation(r) } label: { Label("Edit", systemImage: "pencil") }.buttonStyle(.bordered)
                 }
                 if r.source == "email" { Text("Found in your email.").font(.system(size: 13)).foregroundColor(TravelUI.muted) }
+                TravelRemoveButton(title: "Remove booking", question: "Remove \(r.title)?",
+                                   message: "It's removed from Travel.", popAfter: !wide) { await remove(.reservation(r.id)) }
+                    .padding(.top, 8)
             }
             .padding(20)
         }
@@ -616,6 +666,26 @@ struct TravelView: View {
     }
 }
 
+/// Destructive action at the foot of a detail page. Lives inside the pushed
+/// page so that, on iPhone, it can pop back to the list once the item is gone.
+struct TravelRemoveButton: View {
+    let title: String, question: String, message: String, popAfter: Bool
+    let perform: () async -> Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirming = false
+
+    var body: some View {
+        Button(role: .destructive) { confirming = true } label: {
+            Label(title, systemImage: "trash").font(.system(size: 16, weight: .semibold))
+        }
+        .buttonStyle(.bordered).tint(.red)
+        .confirmationDialog(question, isPresented: $confirming, titleVisibility: .visible) {
+            Button(title, role: .destructive) { Task { if await perform(), popAfter { dismiss() } } }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text(message) }
+    }
+}
+
 // MARK: - Pass card + gate view
 
 struct PassCard: View {
@@ -625,37 +695,96 @@ struct PassCard: View {
     let onWallet: () -> Void
     let onPDF: () -> Void
 
+    private var flight: String { pass.flight.isEmpty ? leg.flight : pass.flight }
+    private var origin: String { pass.origin.isEmpty ? leg.origin : pass.origin }
+    private var destination: String { pass.destination.isEmpty ? leg.destination : pass.destination }
+    private var linear: Bool { pass.barcodeFormat.contains("PDF417") }
+
+    /// Laid out like the paper pass: who and which flight, the route in big
+    /// letters, the four facts in an even row, the barcode itself (tap to
+    /// enlarge for the gate), then Apple's own Wallet badge.
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(pass.passenger).font(TravelUI.title).foregroundColor(.white)
-                Spacer()
-                Text(pass.flight.isEmpty ? leg.flight : pass.flight).font(TravelUI.body.weight(.semibold)).foregroundColor(.white)
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 16) {
+                caption("Passenger", pass.passenger, size: 19)
+                Spacer(minLength: 8)
+                caption("Flight", flight, size: 19, trailing: true)
             }
-            HStack(spacing: 22) {
-                field("From", pass.origin.isEmpty ? leg.origin : pass.origin)
-                field("To", pass.destination.isEmpty ? leg.destination : pass.destination)
-                field("Seat", pass.seat.isEmpty ? "—" : pass.seat)
-                field("Boarding", pass.boarding.isEmpty ? "—" : pass.boarding)
-                if !pass.gate.isEmpty { field("Gate", pass.gate) }
+            HStack(spacing: 14) {
+                Text(origin).font(.system(size: 40, weight: .bold, design: .rounded))
+                Image(systemName: "airplane").font(.system(size: 22, weight: .semibold)).opacity(0.85)
+                Text(destination).font(.system(size: 40, weight: .bold, design: .rounded))
+                Spacer(minLength: 0)
             }
-            HStack(spacing: 10) {
-                if !pass.barcode.isEmpty {
-                    Button(action: onGate) { Label("Show at gate", systemImage: "qrcode") }.buttonStyle(.borderedProminent).tint(TravelUI.accent)
+            .foregroundColor(.white)
+            HStack(alignment: .top, spacing: 8) {
+                caption("Seat", pass.seat).frame(maxWidth: .infinity, alignment: .leading)
+                caption("Boarding", pass.boarding).frame(maxWidth: .infinity, alignment: .leading)
+                caption("Gate", pass.gate).frame(maxWidth: .infinity, alignment: .leading)
+                caption("Seq", pass.sequence).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if let img = Barcode.image(pass.barcode, format: pass.barcodeFormat) {
+                Button(action: onGate) {
+                    VStack(spacing: 8) {
+                        Image(uiImage: img).interpolation(.none).resizable().scaledToFit()
+                            .frame(width: linear ? 280 : 180, height: linear ? 90 : 180)
+                        Label("Tap to enlarge at the gate", systemImage: "arrow.up.left.and.arrow.down.right")
+                            .font(.system(size: 13, weight: .medium)).foregroundColor(.black.opacity(0.6))
+                    }
+                    .padding(.vertical, 16).frame(maxWidth: .infinity)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white))
                 }
-                if pass.hasPkpass { Button(action: onWallet) { Label("Add to Apple Wallet", systemImage: "wallet.pass.fill") }.buttonStyle(.bordered) }
-                if pass.hasPdf { Button(action: onPDF) { Label("PDF", systemImage: "doc.richtext") }.buttonStyle(.bordered) }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Boarding pass barcode for \(pass.passenger). Tap to show it full screen.")
+            }
+            if pass.hasPkpass || pass.hasPdf {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) { actions; Spacer(minLength: 0) }
+                    VStack(alignment: .leading, spacing: 10) { actions }
+                }
             }
         }
-        .padding(16)
+        .padding(18)
         .background(RoundedRectangle(cornerRadius: 16).fill(LinearGradient(colors: [Color(red: 0.04, green: 0.16, blue: 0.36), Color(red: 0.07, green: 0.24, blue: 0.52)], startPoint: .topLeading, endPoint: .bottomTrailing)))
     }
 
-    private func field(_ label: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label.uppercased()).font(.system(size: 11, weight: .semibold)).tracking(0.6).foregroundColor(.white.opacity(0.7))
-            Text(value).font(.system(size: 20, weight: .bold).monospacedDigit()).foregroundColor(.white)
+    @ViewBuilder private var actions: some View {
+        if pass.hasPkpass { WalletButton(action: onWallet).frame(width: 250, height: 48) }
+        if pass.hasPdf {
+            Button(action: onPDF) {
+                Label("Boarding pass PDF", systemImage: "doc.richtext")
+                    .font(.system(size: 16, weight: .semibold)).lineLimit(1).fixedSize()
+                    .padding(.horizontal, 18).frame(height: 48)
+                    .overlay(Capsule().stroke(Color.white.opacity(0.55), lineWidth: 1))
+            }
+            .buttonStyle(.plain).foregroundColor(.white)
         }
+    }
+
+    private func caption(_ label: String, _ value: String, size: CGFloat = 20, trailing: Bool = false) -> some View {
+        VStack(alignment: trailing ? .trailing : .leading, spacing: 3) {
+            Text(label.uppercased()).font(.system(size: 11, weight: .semibold)).tracking(0.6).foregroundColor(.white.opacity(0.68))
+            Text(value.isEmpty ? "—" : value).font(.system(size: size, weight: .bold).monospacedDigit()).foregroundColor(.white)
+                .multilineTextAlignment(trailing ? .trailing : .leading).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// Apple's own "Add to Apple Wallet" badge (PKAddPassButton) — the system
+/// artwork, localized and never truncated, instead of a home-made button.
+struct WalletButton: UIViewRepresentable {
+    let action: () -> Void
+    func makeCoordinator() -> Coordinator { Coordinator(action) }
+    func makeUIView(context: Context) -> PKAddPassButton {
+        let b = PKAddPassButton(addPassButtonStyle: .blackOutline)
+        b.addTarget(context.coordinator, action: #selector(Coordinator.tap), for: .touchUpInside)
+        return b
+    }
+    func updateUIView(_ view: PKAddPassButton, context: Context) { context.coordinator.action = action }
+    final class Coordinator: NSObject {
+        var action: () -> Void
+        init(_ action: @escaping () -> Void) { self.action = action }
+        @objc func tap() { action() }
     }
 }
 
