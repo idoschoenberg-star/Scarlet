@@ -190,7 +190,7 @@
   };
 
   var polls = 0, timer = null, last = null, auth = null, emailStage = 0, failures = 0;
-  var inflight = false, pollAgain = false, stopped = false, continued = false, backoffUntil = 0;
+  var inflight = false, pollAgain = false, stopped = false, continued = false, backoffUntil = 0, lostAnswer = false;
 
   var render = function (s) {
     last = s;
@@ -238,19 +238,22 @@
   // the default back-off). A retry says so (`retry:true`): this window's
   // earlier POST may have landed and its answer been lost, and the server
   // then re-mints the undelivered code for the same nonce instead of
-  // calling the request finished. A `consumed` on a retry means it could
-  // not; that is shown as a failure with a way back, never as "finished in
-  // another window" (the only window would be told to close on a lost code).
+  // calling the request finished. A received 429/503 proves nothing was
+  // minted, so only a failed or aborted fetch (and the Try-again button)
+  // marks the answer as lost. A `consumed` on a retry means the server could
+  // not re-issue; that is shown as a failure with a way back, never as
+  // "finished in another window" (the only window would be told to close on
+  // a lost code).
   var continueOnce = function (attempt) {
     var again = function (r) {
       var wait = RETRY_MS * (attempt + 1);
       if (r && r.retryAfter > 0) wait = Math.min(r.retryAfter * 1000, RETRY_MAX_MS);
       setTimeout(function () { continueOnce(attempt + 1); }, wait);
     };
-    api("/authorize/continue", "POST", { rid: rid, n: n, retry: attempt > 0 }, 20000).then(function (r) {
+    api("/authorize/continue", "POST", { rid: rid, n: n, retry: lostAnswer }, 20000).then(function (r) {
       if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
       if (r.status === 200 && r.body.consumed) {
-        if (attempt === 0) { doneElsewhere(); return; }
+        if (!lostAnswer) { doneElsewhere(); return; }
         failRetryable("Scarlet could not confirm the sign-in in this window. Try again, or start again from Claude.", "סקרלט לא הצליחה לאשר את הכניסה בחלון הזה. נסה שוב, או התחל מחדש מקלוד.");
         return;
       }
@@ -258,6 +261,7 @@
       if ((r.status === 429 || r.status === 503) && attempt < 2) { again(r); return; }
       failRetryable("Scarlet could not finish the sign-in. Try again, or start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. נסה שוב, או התחל מחדש מקלוד.");
     }).catch(function () {
+      lostAnswer = true;
       if (attempt < 2) { again(null); return; }
       failRetryable("Network error. Try again, or start again from Claude.", "שגיאת רשת. נסה שוב, או התחל מחדש מקלוד.");
     });
@@ -392,7 +396,7 @@
   $("btn-email-go").addEventListener("click", emailGo);
   // after a continue failure: this window already POSTed once, so the retry
   // says so and the server re-mints the code if it can
-  $("btn-retry").addEventListener("click", function () { $("btn-retry").classList.add("hidden"); show("view-done"); continueOnce(1); });
+  $("btn-retry").addEventListener("click", function () { lostAnswer = true; $("btn-retry").classList.add("hidden"); show("view-done"); continueOnce(1); });
 
   poll();
 })();
