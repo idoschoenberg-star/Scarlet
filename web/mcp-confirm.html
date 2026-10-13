@@ -1,0 +1,168 @@
+<!doctype html>
+<!--
+  Scarlet — Claude connector confirm page (2026-10-13, docs/MCP_SPEC.md §4.4,
+  Lane T-link). Opened from the Telegram message as
+    <this page>#k=<one-time key>&api=<index>
+  The key lives ONLY in the fragment: a link-preview fetcher issues a GET and
+  never sees it, and nothing here puts it in a URL (the fragment is stripped
+  from history as soon as it is read). The page first POSTs
+  {k, action:"peek"} to show the client host (the key is NOT consumed), then
+  {k, code} on Approve, which consumes it once. The 4-character code is the
+  one shown on the Claude sign-in screen in the STARTING browser — it is
+  never in the Telegram message and never returned by peek — so typing it
+  is the proof the approver has that screen in front of him (fixer
+  2026-10-13). `api` is an index into the allowlist below, never a free-form
+  URL.
+
+  API bases: index 0 is the production project ORIGIN (substituted
+  2026-10-13, same source as mcp-consent.html); index 1 is https://xvkiftdtdnyfjnagxdsk.supabase.co,
+  the STAGING origin (https://<staging-ref>.supabase.co, ref held only in
+  1Password), to be substituted in BOTH the CSP meta and the API_BASES
+  array; an unreplaced placeholder fails closed.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://zstkwjgtushnyegxkqeg.supabase.co https://xvkiftdtdnyfjnagxdsk.supabase.co; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light">
+<title>Scarlet — approve Claude</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { background: #f7f5f3; color: #1d1a19; }
+  body {
+    font-family: -apple-system, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Hebrew", sans-serif;
+    font-size: 17px; line-height: 1.5;
+    min-height: 100%;
+    padding: max(20px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center;
+  }
+  main { width: 100%; max-width: 440px; }
+  header { display: flex; align-items: center; gap: 10px; margin: 8px 0 22px; }
+  .mark { width: 34px; height: 34px; border-radius: 10px; background: #8e1230; color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 18px; }
+  header h1 { font-size: 19px; font-weight: 600; }
+  .card { background: #fff; border: 1px solid #e6e0dc; border-radius: 16px; padding: 22px 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  p { margin: 0 0 12px; }
+  p[dir="rtl"] { text-align: right; }
+  p[dir="ltr"] { text-align: left; }
+  .muted { color: #6b6361; font-size: 15px; }
+  .code { display: block; width: 100%; font: inherit; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 34px; letter-spacing: .28em; font-weight: 700; text-align: center; padding: 10px 0 8px; color: #8e1230; border: 1px solid #e6e0dc; border-radius: 12px; background: #fbfaf9; text-transform: uppercase; margin: 10px 0 6px; }
+  .code:focus { outline: 2px solid #8e1230; outline-offset: 2px; }
+  .code-label { text-align: center; font-size: 14px; color: #6b6361; margin-bottom: 14px; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; background: #f1ecea; font-size: 13px; color: #4b4441; }
+  button { width: 100%; font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 14px 16px; cursor: pointer; }
+  .primary { background: #8e1230; color: #fff; }
+  .primary:disabled { opacity: .55; cursor: default; }
+  .hidden { display: none !important; }
+  .status { margin-top: 16px; font-size: 15px; color: #4b4441; }
+  .error { color: #a0132f; }
+  footer { margin-top: 26px; font-size: 13px; color: #8a817e; text-align: center; }
+  @media (prefers-reduced-motion: no-preference) { .pulse { animation: pulse 1.6s ease-in-out infinite; } @keyframes pulse { 50% { opacity: .5; } } }
+</style>
+</head>
+<body>
+<main>
+  <header><div class="mark">S</div><h1>Scarlet</h1></header>
+
+  <section class="card" id="view-loading">
+    <p dir="ltr" lang="en" class="muted pulse">Checking this link…</p>
+    <p dir="rtl" lang="he" class="muted">בודקת את הקישור…</p>
+  </section>
+
+  <section class="card hidden" id="view-approve">
+    <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> is asking for <strong>read-only</strong> access to Scarlet. Type the 4-character code shown on the Claude sign-in screen in front of you:</p>
+    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט. הקלד את הקוד בן 4 התווים שמוצג על מסך הכניסה של קלוד שמולך:</p>
+    <input class="code" id="code" type="text" inputmode="latin" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="4" placeholder="····" aria-label="Match code">
+    <div class="code-label">Match code · קוד התאמה</div>
+    <button class="primary" id="btn-approve" disabled>Approve · אישור</button>
+    <p dir="ltr" lang="en" class="muted" style="margin-top:14px">No such screen in front of you? Close this page; the link expires by itself.</p>
+    <p dir="rtl" lang="he" class="muted">אין מסך כזה מולך? סגור את העמוד; תוקף הקישור יפוג מעצמו.</p>
+    <div class="status" id="status"></div>
+  </section>
+
+  <section class="card hidden" id="view-done">
+    <p dir="ltr" lang="en"><strong>Approved</strong> — go back to Claude; it finishes by itself.</p>
+    <p dir="rtl" lang="he"><strong>אושר</strong> — חזור לקלוד; זה מסתיים מעצמו.</p>
+  </section>
+
+  <section class="card hidden" id="view-error">
+    <p dir="ltr" lang="en" class="error" id="err-en"></p>
+    <p dir="rtl" lang="he" class="error" id="err-he"></p>
+  </section>
+
+  <footer>Scarlet · read-only connector · nothing is sent or changed</footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var API_BASES = ["https://zstkwjgtushnyegxkqeg.supabase.co", "https://xvkiftdtdnyfjnagxdsk.supabase.co"];
+  var FN_PATH = "/functions/v1/scarlet-mcp";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var show = function (id) {
+    ["view-loading", "view-approve", "view-done", "view-error"].forEach(function (v) { $(v).classList.toggle("hidden", v !== id); });
+  };
+  var fail = function (en, he) { $("err-en").textContent = en; $("err-he").textContent = he; show("view-error"); };
+  var INVALID_EN = "This link is not valid any more. Start again from Claude.";
+  var INVALID_HE = "הקישור הזה כבר לא תקף. התחל מחדש מקלוד.";
+
+  var frag = {};
+  (location.hash || "").replace(/^#/, "").split("&").forEach(function (kv) {
+    var i = kv.indexOf("="); if (i < 0) return;
+    frag[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+  });
+  var k = String(frag.k || "").toLowerCase();
+  var apiIndex = /^[01]$/.test(String(frag.api || "")) ? Number(frag.api) : 0;
+  var base = API_BASES[apiIndex];
+  if (!/^https:\/\/[a-z0-9.-]+$/i.test(base || "")) { fail("This page is not configured for that server.", "העמוד הזה לא מוגדר לשרת הזה."); return; }
+  if (!/^[0-9a-f]{32}$/.test(k)) { fail(INVALID_EN, INVALID_HE); return; }
+  var API = base + FN_PATH;
+  // The key has been read; keep it out of the tab URL and history from here on.
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+  var CODE_RE = /^[A-HJ-NP-Z2-9]{4}$/;
+
+  var post = function (body) {
+    return fetch(API + "/tg/approve", {
+      method: "POST", mode: "cors", credentials: "omit", cache: "no-store",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.text().then(function (t) { var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { status: r.status, body: j || {} }; });
+    });
+  };
+
+  // 1. peek: show the client host without consuming the key (never the code).
+  post({ k: k, action: "peek" }).then(function (r) {
+    if (r.status !== 200 || !r.body.ok) { fail(INVALID_EN, INVALID_HE); return; }
+    $("host-en").textContent = r.body.client_host || "client";
+    $("host-he").textContent = r.body.client_host || "client";
+    show("view-approve");
+    try { $("code").focus(); } catch (e) {}
+  }).catch(function () { fail("Network error; open the link again.", "שגיאת רשת; פתח את הקישור שוב."); });
+
+  var codeValue = function () { return String($("code").value || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); };
+  $("code").addEventListener("input", function () {
+    $("code").value = codeValue();
+    $("btn-approve").disabled = !CODE_RE.test(codeValue());
+    $("status").textContent = "";
+  });
+  $("code").addEventListener("keydown", function (e) { if (e.key === "Enter" && !$("btn-approve").disabled) $("btn-approve").click(); });
+
+  // 2. approve: the typed code + the key, consumed exactly once. A wrong
+  // code is the same generic refusal as a dead link (the server does not
+  // say which), so the only recovery is to start again from Claude.
+  $("btn-approve").addEventListener("click", function () {
+    var code = codeValue();
+    if (!CODE_RE.test(code)) return;
+    var b = $("btn-approve"); b.disabled = true; $("status").textContent = "Approving…";
+    post({ k: k, code: code }).then(function (r) {
+      if (r.status === 200 && r.body.ok) { show("view-done"); return; }
+      fail(INVALID_EN, INVALID_HE);
+    }).catch(function () { b.disabled = false; $("status").textContent = "Network error; try again."; });
+  });
+})();
+</script>
+</body>
+</html>

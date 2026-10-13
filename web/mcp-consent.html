@@ -1,0 +1,287 @@
+<!doctype html>
+<!--
+  Scarlet — Claude connector consent page (2026-10-13, docs/MCP_SPEC.md §4.4).
+
+  Static, no secrets. Opened by GET /authorize as
+    <this page>#rid=mar_…&n=<nonce>&api=<index>
+  Everything it needs travels in the FRAGMENT (never in CDN logs or a
+  Referer). `api` is an INDEX into the hardcoded allowlist below — a crafted
+  link can never point this page at a foreign server. The browser nonce `n`
+  is the credential on every call (the host is a shared CDN, so the Origin
+  alone proves nothing).
+
+  API bases: index 0 is the production project ORIGIN (substituted
+  2026-10-13 from the ref the terminal client, clients/terminal/scarlet,
+  talks to); index 1 is https://xvkiftdtdnyfjnagxdsk.supabase.co, the STAGING origin
+  (https://<staging-ref>.supabase.co — the ref lives only in 1Password as
+  STAGING_PROJECT_REF), to be substituted in BOTH the CSP meta and the
+  API_BASES array when staging soaks the connector. An unreplaced
+  placeholder is filtered out at runtime, so that index fails closed. Lane E (email OTP,
+  dormant) talks to <origin>/auth/v1, which the origin-level connect-src
+  already covers.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://zstkwjgtushnyegxkqeg.supabase.co https://xvkiftdtdnyfjnagxdsk.supabase.co; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light">
+<title>Scarlet — connect Claude</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { background: #f7f5f3; color: #1d1a19; }
+  body {
+    font-family: -apple-system, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans Hebrew", sans-serif;
+    font-size: 17px; line-height: 1.5;
+    min-height: 100%;
+    padding: max(20px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center;
+  }
+  main { width: 100%; max-width: 440px; }
+  header { display: flex; align-items: center; gap: 10px; margin: 8px 0 22px; }
+  .mark { width: 34px; height: 34px; border-radius: 10px; background: #8e1230; color: #fff; display: grid; place-items: center; font-weight: 700; font-size: 18px; }
+  header h1 { font-size: 19px; font-weight: 600; letter-spacing: .01em; }
+  .card { background: #fff; border: 1px solid #e6e0dc; border-radius: 16px; padding: 22px 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  p { margin: 0 0 12px; }
+  p[dir="rtl"] { text-align: right; }
+  p[dir="ltr"] { text-align: left; }
+  .muted { color: #6b6361; font-size: 15px; }
+  .code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 34px; letter-spacing: .28em; font-weight: 700; text-align: center; padding: 14px 0 6px; color: #8e1230; }
+  .code-label { text-align: center; font-size: 14px; color: #6b6361; margin-bottom: 14px; }
+  button { width: 100%; font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 14px 16px; cursor: pointer; }
+  .primary { background: #8e1230; color: #fff; }
+  .primary:disabled { opacity: .55; cursor: default; }
+  .secondary { background: transparent; color: #6b6361; margin-top: 10px; font-weight: 500; }
+  .stack > * + * { margin-top: 10px; }
+  input[type="text"], input[type="email"] { width: 100%; font: inherit; padding: 12px 14px; border: 1px solid #d8d0cb; border-radius: 12px; background: #fff; margin-bottom: 10px; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; background: #f1ecea; font-size: 13px; color: #4b4441; }
+  .hidden { display: none !important; }
+  .status { margin-top: 16px; font-size: 15px; color: #4b4441; }
+  .error { color: #a0132f; }
+  footer { margin-top: 26px; font-size: 13px; color: #8a817e; text-align: center; }
+  @media (prefers-reduced-motion: no-preference) { .pulse { animation: pulse 1.6s ease-in-out infinite; } @keyframes pulse { 50% { opacity: .5; } } }
+</style>
+</head>
+<body>
+<main>
+  <header><div class="mark">S</div><h1>Scarlet</h1></header>
+
+  <section class="card" id="view-loading">
+    <p dir="ltr" lang="en" class="muted pulse">Checking this request…</p>
+    <p dir="rtl" lang="he" class="muted">בודקת את הבקשה…</p>
+  </section>
+
+  <section class="card hidden" id="view-consent">
+    <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> asks for <strong>read-only</strong> access to Scarlet for <strong id="name-en">you</strong>: inbox, calendars, chats, homes, trips, memory, Library, news. Nothing can be sent or changed.</p>
+    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט עבור <strong id="name-he">אותך</strong>: דואר, יומנים, צ'אטים, בתים, נסיעות, זיכרון, ספרייה, חדשות. שום דבר לא יישלח ולא ישתנה.</p>
+    <p dir="ltr" lang="en" class="muted">Returns to: <span id="returns-en">claude.ai</span></p>
+    <div class="code" id="code">····</div>
+    <div class="code-label">Your code (you will type it on the Telegram page) · הקוד שלך (תקליד אותו בעמוד הטלגרם)</div>
+
+    <div id="handle-box" class="hidden">
+      <p dir="ltr" lang="en" class="muted">More than one Scarlet account exists. Type your Scarlet handle:</p>
+      <p dir="rtl" lang="he" class="muted">יש יותר מחשבון סקרלט אחד. הקלד את הכינוי שלך בסקרלט:</p>
+      <input type="text" id="handle" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="handle">
+    </div>
+
+    <div class="stack">
+      <button class="primary" id="btn-telegram">Confirm in Telegram · אישור בטלגרם</button>
+      <button class="secondary hidden" id="btn-email">Email me a code · שלחו לי קוד במייל</button>
+      <button class="secondary" id="btn-deny">Deny · דחייה</button>
+    </div>
+
+    <div id="email-box" class="hidden">
+      <input type="email" id="email" autocomplete="email" placeholder="email">
+      <input type="text" id="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="code from the email" class="hidden">
+      <button class="primary" id="btn-email-go">Send · שליחה</button>
+    </div>
+
+    <div class="status" id="status"></div>
+  </section>
+
+  <section class="card hidden" id="view-notified">
+    <p dir="ltr" lang="en">A confirmation link was sent to your Telegram. Open it there, type this code and press <strong>Approve</strong>:</p>
+    <p dir="rtl" lang="he">קישור אישור נשלח לטלגרם שלך. פתח אותו שם, הקלד את הקוד הזה ולחץ <strong>אישור</strong>:</p>
+    <div class="code" id="code2">····</div>
+    <p dir="ltr" lang="en" class="muted pulse" id="waiting-en">Waiting for your approval…</p>
+    <p dir="rtl" lang="he" class="muted">ממתינה לאישור שלך…</p>
+    <div class="stack">
+      <button class="secondary" id="btn-resend">Send again · שליחה חוזרת</button>
+      <button class="secondary" id="btn-deny2">Deny · דחייה</button>
+    </div>
+    <div class="status" id="status2"></div>
+  </section>
+
+  <section class="card hidden" id="view-done">
+    <p dir="ltr" lang="en"><strong>Approved.</strong> Returning to Claude…</p>
+    <p dir="rtl" lang="he"><strong>אושר.</strong> חוזרת לקלוד…</p>
+  </section>
+
+  <section class="card hidden" id="view-error">
+    <p dir="ltr" lang="en" id="err-en" class="error"></p>
+    <p dir="rtl" lang="he" id="err-he" class="error"></p>
+  </section>
+
+  <footer>Scarlet · read-only connector · nothing is sent or changed</footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  // ── allowlisted API bases (index from the fragment, never a free-form URL) ──
+  var API_BASES = ["https://zstkwjgtushnyegxkqeg.supabase.co", "https://xvkiftdtdnyfjnagxdsk.supabase.co"];
+  var FN_PATH = "/functions/v1/scarlet-mcp";
+  var POLL_MS = 1500, MAX_POLLS = 400;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var show = function (id) {
+    ["view-loading", "view-consent", "view-notified", "view-done", "view-error"].forEach(function (v) {
+      $(v).classList.toggle("hidden", v !== id);
+    });
+  };
+  var fail = function (en, he) { $("err-en").textContent = en; $("err-he").textContent = he; show("view-error"); };
+
+  // ── fragment ──
+  var frag = {};
+  (location.hash || "").replace(/^#/, "").split("&").forEach(function (kv) {
+    var i = kv.indexOf("="); if (i < 0) return;
+    frag[decodeURIComponent(kv.slice(0, i))] = decodeURIComponent(kv.slice(i + 1));
+  });
+  var rid = String(frag.rid || ""), n = String(frag.n || "");
+  var apiIndex = /^[01]$/.test(String(frag.api || "")) ? Number(frag.api) : 0;
+  var base = API_BASES[apiIndex];
+  if (!/^https:\/\/[a-z0-9.-]+$/i.test(base || "")) {
+    fail("This page is not configured for that server.", "העמוד הזה לא מוגדר לשרת הזה.");
+    return;
+  }
+  var API = base + FN_PATH;
+  if (!/^mar_[0-9a-f]{32}$/.test(rid) || !/^[0-9a-f]{32}$/.test(n)) {
+    fail("This page was opened without its key. Start again from Claude.", "העמוד נפתח בלי המפתח שלו. התחל מחדש מקלוד.");
+    return;
+  }
+  // The nonce never leaves the fragment except to the API: strip it from the
+  // tab URL and history now that it is read (a reload then shows the
+  // "opened without its key" message — the page is single-shot by design).
+  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+
+  var api = function (path, method, body) {
+    var opts = { method: method, headers: {}, mode: "cors", credentials: "omit", cache: "no-store" };
+    if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    return fetch(API + path, opts).then(function (r) {
+      return r.text().then(function (t) { var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { status: r.status, body: j || {} }; });
+    });
+  };
+
+  var polls = 0, timer = null, last = null, auth = null, emailStage = 0;
+
+  var render = function (s) {
+    last = s;
+    $("code").textContent = s.match_code || "····";
+    $("code2").textContent = s.match_code || "····";
+    $("host-en").textContent = s.client_host || "client";
+    $("host-he").textContent = s.client_host || "client";
+    $("returns-en").textContent = s.returns_to || "";
+    $("name-en").textContent = s.display_name || "you";
+    $("name-he").textContent = s.display_name || "אותך";
+    $("handle-box").classList.toggle("hidden", !s.needs_handle);
+    $("btn-email").classList.toggle("hidden", !s.email_lane);
+    if (s.auth) auth = s.auth;
+    $("btn-resend").classList.toggle("hidden", !s.can_notify);
+    if (s.paused) { fail("Scarlet's Claude connector is paused by its owner.", "המחבר של קלוד בסקרלט מושהה על ידי הבעלים."); stop(); return; }
+    if (s.not_provisioned) { fail("No Scarlet account is set up for this connector yet.", "עדיין לא הוגדר חשבון סקרלט למחבר הזה."); stop(); return; }
+    switch (s.status) {
+      case "pending": show("view-consent"); break;
+      case "notified": show("view-notified"); break;
+      case "approved":
+        show("view-done"); stop();
+        // POST the nonce (never in a URL) and follow the client redirect the server hands back.
+        api("/authorize/continue", "POST", { rid: rid, n: n }).then(function (r) {
+          if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
+          fail("Scarlet could not finish the sign-in. Start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. התחל מחדש מקלוד.");
+        }).catch(function () { fail("Network error; start again from Claude.", "שגיאת רשת; התחל מחדש מקלוד."); });
+        break;
+      case "consumed": show("view-done"); stop(); break;
+      case "denied": stop(); if (s.redirect) location.replace(s.redirect); else fail("Request denied.", "הבקשה נדחתה."); break;
+      default: stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד.");
+    }
+  };
+
+  var stop = function () { if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
+  var pollNow = function () { if (timer) clearTimeout(timer); timer = null; poll(); };
+  var poll = function () {
+    if (polls >= MAX_POLLS) return;
+    polls++;
+    api("/authorize/status?rid=" + encodeURIComponent(rid) + "&n=" + encodeURIComponent(n), "GET").then(function (r) {
+      if (r.status === 200) { render(r.body); if (polls < MAX_POLLS) timer = setTimeout(poll, POLL_MS); return; }
+      if (r.status === 429) { timer = setTimeout(poll, 10000); return; }
+      if (r.status === 403) { stop(); fail("This page was opened without its key. Start again from Claude.", "העמוד נפתח בלי המפתח שלו. התחל מחדש מקלוד."); return; }
+      if (r.status === 404 || r.status === 410) { stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד."); return; }
+      timer = setTimeout(poll, 5000);
+    }).catch(function () { timer = setTimeout(poll, 5000); });
+  };
+
+  var setStatus = function (id, en, isErr) { var el = $(id); el.textContent = en; el.classList.toggle("error", !!isErr); };
+
+  var notify = function (statusId) {
+    var body = { rid: rid, n: n };
+    var h = ($("handle").value || "").trim().toLowerCase();
+    if (!$("handle-box").classList.contains("hidden")) { if (!h) { setStatus(statusId, "Type your Scarlet handle first.", true); return; } body.handle = h; }
+    $("btn-telegram").disabled = true; $("btn-resend").disabled = true;
+    setStatus(statusId, "Sending…", false);
+    api("/authorize/notify", "POST", body).then(function (r) {
+      $("btn-telegram").disabled = false; $("btn-resend").disabled = false;
+      if (r.status === 200 && r.body.sent === false) { setStatus(statusId, "Already sent; check Telegram.", false); return; }
+      if (r.status === 200) { setStatus(statusId, "", false); pollNow(); return; }
+      if (r.body && r.body.error === "handle_required") { $("handle-box").classList.remove("hidden"); setStatus(statusId, "Type your Scarlet handle first.", true); return; }
+      if (r.body && r.body.error === "unknown_handle") { setStatus(statusId, "That handle is not known.", true); return; }
+      if (r.body && r.body.error === "no_telegram") { setStatus(statusId, "This account has no Telegram chat on file.", true); return; }
+      if (r.status === 410) { stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד."); return; }
+      setStatus(statusId, "Telegram did not accept the message; try again.", true);
+    }).catch(function () { $("btn-telegram").disabled = false; $("btn-resend").disabled = false; setStatus(statusId, "Network error; try again.", true); });
+  };
+
+  var deny = function () {
+    stop();
+    api("/authorize/deny", "POST", { rid: rid, n: n }).then(function (r) {
+      if (r.body && r.body.redirect) location.replace(r.body.redirect); else fail("Request denied.", "הבקשה נדחתה.");
+    }).catch(function () { fail("Request denied.", "הבקשה נדחתה."); });
+  };
+
+  // ── Lane E (dormant; shown only when the server says email_lane:true) ──
+  var emailGo = function () {
+    if (!auth) { setStatus("status", "Email sign-in is not enabled.", true); return; }
+    var email = ($("email").value || "").trim();
+    var hdr = { "Content-Type": "application/json", "apikey": auth.key, "Authorization": "Bearer " + auth.key };
+    if (emailStage === 0) {
+      if (!email) { setStatus("status", "Type your email first.", true); return; }
+      fetch(auth.url + "/otp", { method: "POST", headers: hdr, body: JSON.stringify({ email: email, create_user: false }) })
+        .then(function (r) { if (!r.ok) throw new Error("otp"); emailStage = 1; $("otp").classList.remove("hidden"); setStatus("status", "Check your email for the code.", false); })
+        .catch(function () { setStatus("status", "Could not send the email code.", true); });
+      return;
+    }
+    var token = ($("otp").value || "").trim();
+    if (!token) { setStatus("status", "Type the code from the email.", true); return; }
+    fetch(auth.url + "/verify", { method: "POST", headers: hdr, body: JSON.stringify({ type: "email", email: email, token: token }) })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!j || !j.access_token) throw new Error("verify");
+        return api("/authorize/approve", "POST", { rid: rid, n: n, supabase_jwt: j.access_token });
+      })
+      .then(function (r) { if (r.status === 200) { setStatus("status", "", false); pollNow(); } else setStatus("status", "This email is not linked to a Scarlet account.", true); })
+      .catch(function () { setStatus("status", "The code was not accepted.", true); });
+  };
+
+  $("btn-telegram").addEventListener("click", function () { notify("status"); });
+  $("btn-resend").addEventListener("click", function () { notify("status2"); });
+  $("btn-deny").addEventListener("click", deny);
+  $("btn-deny2").addEventListener("click", deny);
+  $("btn-email").addEventListener("click", function () { $("email-box").classList.toggle("hidden"); });
+  $("btn-email-go").addEventListener("click", emailGo);
+
+  poll();
+})();
+</script>
+</body>
+</html>
