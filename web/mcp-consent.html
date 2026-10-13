@@ -239,8 +239,8 @@
   // earlier POST may have landed and its answer been lost, and the server
   // then re-mints the undelivered code for the same nonce instead of
   // calling the request finished. A received 429/503 proves nothing was
-  // minted, so only a failed or aborted fetch (and the Try-again button)
-  // marks the answer as lost. A `consumed` on a retry means the server could
+  // minted, so only a failed or aborted fetch marks the answer as lost (the
+  // Try-again button keeps whatever the fetches established). A `consumed` on a retry means the server could
   // not re-issue; that is shown as a failure with a way back, never as
   // "finished in another window" (the only window would be told to close on
   // a lost code).
@@ -394,9 +394,11 @@
   $("btn-deny2").addEventListener("click", deny);
   $("btn-email").addEventListener("click", function () { $("email-box").classList.toggle("hidden"); });
   $("btn-email-go").addEventListener("click", emailGo);
-  // after a continue failure: this window already POSTed once, so the retry
-  // says so and the server re-mints the code if it can
-  $("btn-retry").addEventListener("click", function () { lostAnswer = true; $("btn-retry").classList.add("hidden"); show("view-done"); continueOnce(1); });
+  // after a continue failure: one more POST; `lostAnswer` stays whatever the
+  // fetches established (only a failed or aborted fetch sets it), so a retry
+  // after a RECEIVED failure can never ask to re-issue a code that another
+  // window may already have delivered
+  $("btn-retry").addEventListener("click", function () { $("btn-retry").classList.add("hidden"); show("view-done"); continueOnce(1); });
 
   poll();
 })();
