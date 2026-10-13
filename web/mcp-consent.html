@@ -70,13 +70,14 @@
 
   <section class="card" id="view-loading">
     <p dir="ltr" lang="en" class="muted pulse" id="loading-en">Checking this request…</p>
-    <p dir="rtl" lang="he" class="muted" id="loading-he">בודקת את הבקשה…</p>
+    <p dir="rtl" lang="he" class="muted pulse" id="loading-he">בודקת את הבקשה…</p>
   </section>
 
   <section class="card hidden" id="view-consent">
     <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> asks for <strong>read-only</strong> access to Scarlet for <strong id="name-en">you</strong>: inbox, calendars, chats, homes, trips, memory, Library, news. Nothing can be sent or changed.</p>
     <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט עבור <strong id="name-he">החשבון שלך</strong>: דואר, יומנים, צ'אטים, בתים, נסיעות, זיכרון, ספרייה, חדשות. שום דבר לא יישלח ולא ישתנה.</p>
     <p dir="ltr" lang="en" class="muted">Returns to: <span id="returns-en">claude.ai</span></p>
+    <p dir="rtl" lang="he" class="muted">חוזר אל: <span id="returns-he" dir="ltr">claude.ai</span></p>
     <div class="code" id="code">····</div>
     <div class="code-label"><span dir="ltr" lang="en">Your code (you will type it on the Telegram page)</span> · <span dir="rtl" lang="he">הקוד שלך (תקליד אותו בעמוד הטלגרם)</span></div>
 
@@ -88,7 +89,7 @@
 
     <div class="stack">
       <button class="primary" id="btn-telegram">Confirm in Telegram · אישור בטלגרם</button>
-      <button class="secondary hidden" id="btn-email">Email me a code · שלחו לי קוד במייל</button>
+      <button class="secondary hidden" id="btn-email">Email me a code · שלחי לי קוד במייל</button>
       <button class="secondary" id="btn-deny">Deny · דחייה</button>
     </div>
 
@@ -106,7 +107,7 @@
     <p dir="rtl" lang="he">קישור אישור נשלח לטלגרם שלך. פתח אותו שם, הקלד את הקוד הזה ולחץ <strong>אישור</strong>:</p>
     <div class="code" id="code2">····</div>
     <p dir="ltr" lang="en" class="muted pulse" id="waiting-en">Waiting for your approval…</p>
-    <p dir="rtl" lang="he" class="muted">ממתינה לאישור שלך…</p>
+    <p dir="rtl" lang="he" class="muted pulse">ממתינה לאישור שלך…</p>
     <div class="stack">
       <button class="secondary" id="btn-resend">Send again · שליחה חוזרת</button>
       <button class="secondary" id="btn-deny2">Deny · דחייה</button>
@@ -125,7 +126,7 @@
     <div class="stack"><button class="secondary hidden" id="btn-retry">Try again · נסה שוב</button></div>
   </section>
 
-  <footer>Scarlet · read-only connector · nothing is sent or changed</footer>
+  <footer><span dir="ltr" lang="en">Scarlet · read-only connector · nothing is sent or changed</span><br><span dir="rtl" lang="he">סקרלט · מחבר לקריאה בלבד · שום דבר לא נשלח ולא משתנה</span></footer>
 </main>
 
 <script>
@@ -159,6 +160,14 @@
   });
   var rid = String(frag.rid || ""), n = String(frag.n || "");
   var apiIndex = /^[01]$/.test(String(frag.api || "")) ? Number(frag.api) : 0;
+  // The nonce lives in this tab's sessionStorage (per tab, cleared with it,
+  // never in a URL): a reload — iOS evicts a tab while the user is in
+  // Telegram and reloads it on return — resumes instead of failing with
+  // "opened without its key". The stash is removed once the page commits.
+  var stashKey = "mcp:" + rid;
+  var stash = function (fn) { try { if (typeof sessionStorage !== "undefined") return fn(sessionStorage); } catch (e) {} return null; };
+  if (n) stash(function (st) { st.setItem(stashKey, n); });
+  else n = String(stash(function (st) { return st.getItem(stashKey); }) || "");
   var base = API_BASES[apiIndex];
   if (!/^https:\/\/[a-z0-9.-]+$/i.test(base || "")) {
     fail("This page is not configured for that server.", "העמוד הזה לא מוגדר לשרת הזה.");
@@ -172,7 +181,15 @@
   // The nonce never leaves the fragment except to the API: strip it from the
   // tab URL and history now that it is read (a reload then shows the
   // "opened without its key" message — the page is single-shot by design).
-  try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+  try { history.replaceState(null, "", location.pathname + location.search + "#rid=" + rid + "&api=" + apiIndex); } catch (e) {}
+  // this page instance: sent with every continue, so a re-issue after a lost
+  // answer is granted only to the instance whose own code went undelivered
+  var inst = (function () {
+    var bytes = new Uint8Array(16);
+    try { crypto.getRandomValues(bytes); } catch (e) { for (var k = 0; k < 16; k++) bytes[k] = Math.floor(Math.random() * 256); }
+    var out = ""; for (var k2 = 0; k2 < 16; k2++) out += ("0" + bytes[k2].toString(16)).slice(-2);
+    return out;
+  })();
 
   // Every request carries a deadline: a stalled connection rejects like a
   // network error instead of holding the page (and its buttons) hostage.
@@ -199,6 +216,7 @@
     $("host-en").textContent = s.client_host || "client";
     $("host-he").textContent = s.client_host || "client";
     $("returns-en").textContent = s.returns_to || "";
+    $("returns-he").textContent = s.returns_to || "";
     $("name-en").textContent = s.display_name || "you";
     $("name-he").textContent = s.display_name || "החשבון שלך";
     $("handle-box").classList.toggle("hidden", !s.needs_handle);
@@ -222,7 +240,7 @@
     }
   };
 
-  var stop = function () { stopped = true; if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
+  var stop = function () { stopped = true; if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; stash(function (st) { st.removeItem(stashKey); }); };
   // Another instance of this page (the sign-in link opened twice) consumed
   // the request first, or this one loaded after it was already consumed: the
   // sign-in finished in the other window, so this one says so instead of
@@ -250,7 +268,7 @@
       if (r && r.retryAfter > 0) wait = Math.min(r.retryAfter * 1000, RETRY_MAX_MS);
       setTimeout(function () { continueOnce(attempt + 1); }, wait);
     };
-    api("/authorize/continue", "POST", { rid: rid, n: n, retry: lostAnswer }, 20000).then(function (r) {
+    api("/authorize/continue", "POST", { rid: rid, n: n, i: inst, retry: lostAnswer }, 20000).then(function (r) {
       if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
       if (r.status === 200 && r.body.consumed) {
         if (!lostAnswer) { doneElsewhere(); return; }
@@ -304,7 +322,7 @@
       if (r.status === 403) { stop(); fail("This page was opened without its key. Start again from Claude.", "העמוד נפתח בלי המפתח שלו. התחל מחדש מקלוד."); return; }
       if (r.status === 404 || r.status === 410) { stop(); fail(EXPIRED_EN, EXPIRED_HE); return; }
       failures++;
-      if (r.status === 503 && r.body && r.body.error === "unavailable") { stillTrying(DARK_EN + " Still trying…", DARK_HE + " ממשיכה לנסות…"); schedule(DARK_MS, false); return; }
+      if (r.status === 503 && r.body && r.body.error === "unavailable") { stillTrying("Scarlet's connector is not available right now; still trying…", "המחבר של סקרלט לא זמין כרגע; ממשיכה לנסות…"); schedule(DARK_MS, false); return; }
       if (failures >= 3) stillTrying("Scarlet is not answering right now; still trying…", "סקרלט לא עונה כרגע; ממשיכה לנסות…");
       schedule(ERR_MS, false);
     }).catch(function () {
@@ -347,21 +365,31 @@
       if (r.body && r.body.error === "no_telegram") { setStatus(statusId, "This account has no Telegram chat on file.", "לחשבון הזה אין צ'אט טלגרם רשום.", true); return; }
       if (r.status === 410) { stop(); fail(EXPIRED_EN, EXPIRED_HE); return; }
       if (r.status === 503 && r.body && r.body.error === "unavailable") { setStatus(statusId, DARK_EN, DARK_HE, true); return; }
-      setStatus(statusId, "Telegram did not accept the message; try again.", "טלגרם לא קיבל את ההודעה; נסה שוב.", true);
+      if (r.status === 409) { setStatus(statusId, "Already handled; refreshing…", "כבר טופל; מרעננת…", false); pollNow(); return; }
+      if (r.status === 503) { setStatus(statusId, "Scarlet is busy; try again.", "סקרלט עסוקה; נסה שוב.", true); return; }
+      setStatus(statusId, "Could not send; try again.", "לא הצלחתי לשלוח; נסה שוב.", true);
     }).catch(function () { done(); setStatus(statusId, "Network error; try again.", "שגיאת רשת; נסה שוב.", true); });
   };
 
+  var denying = false;
   var deny = function () {
-    if (stopped) return;
-    stop();
+    if (stopped || denying) return;
+    denying = true;
     $("btn-deny").disabled = true; $("btn-deny2").disabled = true;
+    var statusId = $("view-notified").classList.contains("hidden") ? "status" : "status2";
+    var back = function (en, he) { denying = false; $("btn-deny").disabled = false; $("btn-deny2").disabled = false; setStatus(statusId, en, he, true); };
     api("/authorize/deny", "POST", { rid: rid, n: n }).then(function (r) {
       // the request was consumed by another instance a moment earlier: its
       // code is on its way to Claude, and this window must not send a
       // contradicting "denied" after it
       if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
-      if (r.body && r.body.redirect) location.replace(r.body.redirect); else fail("Request denied.", "הבקשה נדחתה.");
-    }).catch(function () { fail("Request denied.", "הבקשה נדחתה."); });
+      if (r.status === 200 && r.body.redirect) { stop(); location.replace(r.body.redirect); return; }
+      if (r.status === 200) { stop(); fail("Request denied.", "הבקשה נדחתה."); return; }
+      // nothing was recorded: say so, keep polling (a denial that did land
+      // shows up as `denied` on the next poll)
+      if (r.status === 503 && r.body && r.body.error === "unavailable") { back(DARK_EN, DARK_HE); return; }
+      back("Could not record the denial; try again or close this window.", "לא הצלחתי לרשום את הדחייה; נסה שוב או סגור את החלון.");
+    }).catch(function () { back("Could not record the denial; try again or close this window.", "לא הצלחתי לרשום את הדחייה; נסה שוב או סגור את החלון."); });
   };
 
   // ── Lane E (dormant; shown only when the server says email_lane:true) ──
@@ -373,7 +401,7 @@
       if (!email) { setStatus("status", "Type your email first.", "הקלד קודם את המייל שלך.", true); return; }
       fetch(auth.url + "/otp", { method: "POST", headers: hdr, body: JSON.stringify({ email: email, create_user: false }) })
         .then(function (r) { if (!r.ok) throw new Error("otp"); emailStage = 1; $("otp").classList.remove("hidden"); setStatus("status", "Check your email for the code.", "בדוק את המייל לקוד.", false); })
-        .catch(function () { setStatus("status", "Could not send the email code.", "לא הצלחנו לשלוח את קוד המייל.", true); });
+        .catch(function () { setStatus("status", "Could not send the email code.", "לא הצלחתי לשלוח את קוד המייל.", true); });
       return;
     }
     var token = ($("otp").value || "").trim();
