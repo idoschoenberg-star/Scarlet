@@ -133,7 +133,7 @@
   // ── allowlisted API bases (index from the fragment, never a free-form URL) ──
   var API_BASES = ["https://zstkwjgtushnyegxkqeg.supabase.co", "https://xvkiftdtdnyfjnagxdsk.supabase.co"];
   var FN_PATH = "/functions/v1/scarlet-mcp";
-  var POLL_MS = 1500, MAX_POLLS = 400;
+  var POLL_MS = 1500, MAX_POLLS = 400, RETRY_MS = 1500;
 
   var $ = function (id) { return document.getElementById(id); };
   var show = function (id) {
@@ -175,6 +175,7 @@
   };
 
   var polls = 0, timer = null, last = null, auth = null, emailStage = 0;
+  var inflight = false, pollAgain = false, stopped = false, continued = false, backoffUntil = 0;
 
   var render = function (s) {
     last = s;
@@ -195,13 +196,10 @@
       case "pending": show("view-consent"); break;
       case "notified": show("view-notified"); break;
       case "approved":
+        if (continued) break;
+        continued = true;
         show("view-done"); stop();
-        // POST the nonce (never in a URL) and follow the client redirect the server hands back.
-        api("/authorize/continue", "POST", { rid: rid, n: n }).then(function (r) {
-          if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
-          if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
-          fail("Scarlet could not finish the sign-in. Start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. התחל מחדש מקלוד.");
-        }).catch(function () { fail("Network error; start again from Claude.", "שגיאת רשת; התחל מחדש מקלוד."); });
+        continueOnce(0);
         break;
       case "consumed": doneElsewhere(); break;
       case "denied": stop(); if (s.redirect) location.replace(s.redirect); else fail("Request denied.", "הבקשה נדחתה."); break;
@@ -209,27 +207,65 @@
     }
   };
 
-  var stop = function () { if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
-  // A second instance of this page (Safari on Mac opened it twice for one
-  // request, Spike A 2026-10-13) loses the continue race or first sees the
-  // request already consumed: the sign-in finished in the other window, so
-  // this one says so instead of failing. Fixed text only — never server data.
+  var stop = function () { stopped = true; if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
+  // Another instance of this page (the sign-in link opened twice) lost the
+  // continue race, or this one loaded after the request was already
+  // consumed: the sign-in finished in the other window, so this one says so
+  // instead of failing. Fixed text only — never server data.
   var doneElsewhere = function () {
     show("view-done"); stop();
     $("done-en").innerHTML = "<strong>Approved.</strong> The sign-in finished in another window — you can close this one.";
     $("done-he").innerHTML = "<strong>אושר.</strong> הכניסה הושלמה בחלון אחר — אפשר לסגור את החלון הזה.";
   };
-  var pollNow = function () { if (timer) clearTimeout(timer); timer = null; poll(); };
+  // POST the nonce (never in a URL) and follow the client redirect the
+  // server hands back — exactly once per page instance (`continued`). A 429,
+  // a 503 or a network error is retried twice with a short back-off before
+  // the page gives up: the request is still approved on the server, so a
+  // retry is what completes the sign-in.
+  var continueOnce = function (attempt) {
+    var again = function () { setTimeout(function () { continueOnce(attempt + 1); }, RETRY_MS * (attempt + 1)); };
+    api("/authorize/continue", "POST", { rid: rid, n: n }).then(function (r) {
+      if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
+      if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
+      if ((r.status === 429 || r.status === 503) && attempt < 2) { again(); return; }
+      fail("Scarlet could not finish the sign-in. Start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. התחל מחדש מקלוד.");
+    }).catch(function () {
+      if (attempt < 2) { again(); return; }
+      fail("Network error; start again from Claude.", "שגיאת רשת; התחל מחדש מקלוד.");
+    });
+  };
+  // One poll chain per page, whatever the buttons do: a fetch in flight is
+  // never doubled (`inflight`; asking to poll sooner only shortens the next
+  // wait), and nothing is rendered after the page has committed to continue
+  // or deny (`stopped`). Spike A (2026-10-13): pressing "Confirm in
+  // Telegram" while a status poll was in flight forked the loop into two
+  // chains that both reached `approved` and both POSTed continue.
+  var pollNow = function () {
+    if (stopped) return;
+    // a fetch in flight, or a 429/error back-off: the next poll happens when
+    // it is due; asking again only shortens the wait after that
+    if (inflight || Date.now() < backoffUntil) { pollAgain = true; return; }
+    if (timer) clearTimeout(timer); timer = null; poll();
+  };
+  var schedule = function (ms, soonOk) {
+    if (stopped || polls >= MAX_POLLS) return;
+    if (timer) clearTimeout(timer);
+    var wait = (soonOk && pollAgain) ? 0 : ms; pollAgain = false;
+    backoffUntil = soonOk ? 0 : Date.now() + ms;
+    timer = setTimeout(poll, wait);
+  };
   var poll = function () {
-    if (polls >= MAX_POLLS) return;
-    polls++;
+    if (stopped || inflight || polls >= MAX_POLLS) return;
+    polls++; inflight = true; timer = null; pollAgain = false;
     api("/authorize/status?rid=" + encodeURIComponent(rid) + "&n=" + encodeURIComponent(n), "GET").then(function (r) {
-      if (r.status === 200) { render(r.body); if (polls < MAX_POLLS) timer = setTimeout(poll, POLL_MS); return; }
-      if (r.status === 429) { timer = setTimeout(poll, 10000); return; }
+      inflight = false;
+      if (stopped) return;
+      if (r.status === 200) { render(r.body); schedule(POLL_MS, true); return; }
+      if (r.status === 429) { schedule(10000, false); return; }
       if (r.status === 403) { stop(); fail("This page was opened without its key. Start again from Claude.", "העמוד נפתח בלי המפתח שלו. התחל מחדש מקלוד."); return; }
       if (r.status === 404 || r.status === 410) { stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד."); return; }
-      timer = setTimeout(poll, 5000);
-    }).catch(function () { timer = setTimeout(poll, 5000); });
+      schedule(5000, false);
+    }).catch(function () { inflight = false; if (!stopped) schedule(5000, false); });
   };
 
   var setStatus = function (id, en, isErr) { var el = $(id); el.textContent = en; el.classList.toggle("error", !!isErr); };
