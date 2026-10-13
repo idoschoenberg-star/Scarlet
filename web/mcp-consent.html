@@ -115,8 +115,8 @@
   </section>
 
   <section class="card hidden" id="view-done">
-    <p dir="ltr" lang="en"><strong>Approved.</strong> Returning to Claude…</p>
-    <p dir="rtl" lang="he"><strong>אושר.</strong> חוזרת לקלוד…</p>
+    <p dir="ltr" lang="en" id="done-en"><strong>Approved.</strong> Returning to Claude…</p>
+    <p dir="rtl" lang="he" id="done-he"><strong>אושר.</strong> חוזרת לקלוד…</p>
   </section>
 
   <section class="card hidden" id="view-error">
@@ -199,16 +199,26 @@
         // POST the nonce (never in a URL) and follow the client redirect the server hands back.
         api("/authorize/continue", "POST", { rid: rid, n: n }).then(function (r) {
           if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
+          if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
           fail("Scarlet could not finish the sign-in. Start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. התחל מחדש מקלוד.");
         }).catch(function () { fail("Network error; start again from Claude.", "שגיאת רשת; התחל מחדש מקלוד."); });
         break;
-      case "consumed": show("view-done"); stop(); break;
+      case "consumed": doneElsewhere(); break;
       case "denied": stop(); if (s.redirect) location.replace(s.redirect); else fail("Request denied.", "הבקשה נדחתה."); break;
       default: stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד.");
     }
   };
 
   var stop = function () { if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
+  // A second instance of this page (Safari on Mac opened it twice for one
+  // request, Spike A 2026-10-13) loses the continue race or first sees the
+  // request already consumed: the sign-in finished in the other window, so
+  // this one says so instead of failing. Fixed text only — never server data.
+  var doneElsewhere = function () {
+    show("view-done"); stop();
+    $("done-en").innerHTML = "<strong>Approved.</strong> The sign-in finished in another window — you can close this one.";
+    $("done-he").innerHTML = "<strong>אושר.</strong> הכניסה הושלמה בחלון אחר — אפשר לסגור את החלון הזה.";
+  };
   var pollNow = function () { if (timer) clearTimeout(timer); timer = null; poll(); };
   var poll = function () {
     if (polls >= MAX_POLLS) return;
