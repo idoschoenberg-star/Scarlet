@@ -69,16 +69,16 @@
   <header><div class="mark">S</div><h1>Scarlet</h1></header>
 
   <section class="card" id="view-loading">
-    <p dir="ltr" lang="en" class="muted pulse">Checking this request…</p>
-    <p dir="rtl" lang="he" class="muted">בודקת את הבקשה…</p>
+    <p dir="ltr" lang="en" class="muted pulse" id="loading-en">Checking this request…</p>
+    <p dir="rtl" lang="he" class="muted" id="loading-he">בודקת את הבקשה…</p>
   </section>
 
   <section class="card hidden" id="view-consent">
     <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> asks for <strong>read-only</strong> access to Scarlet for <strong id="name-en">you</strong>: inbox, calendars, chats, homes, trips, memory, Library, news. Nothing can be sent or changed.</p>
-    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט עבור <strong id="name-he">אותך</strong>: דואר, יומנים, צ'אטים, בתים, נסיעות, זיכרון, ספרייה, חדשות. שום דבר לא יישלח ולא ישתנה.</p>
+    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט עבור <strong id="name-he">החשבון שלך</strong>: דואר, יומנים, צ'אטים, בתים, נסיעות, זיכרון, ספרייה, חדשות. שום דבר לא יישלח ולא ישתנה.</p>
     <p dir="ltr" lang="en" class="muted">Returns to: <span id="returns-en">claude.ai</span></p>
     <div class="code" id="code">····</div>
-    <div class="code-label">Your code (you will type it on the Telegram page) · הקוד שלך (תקליד אותו בעמוד הטלגרם)</div>
+    <div class="code-label"><span dir="ltr" lang="en">Your code (you will type it on the Telegram page)</span> · <span dir="rtl" lang="he">הקוד שלך (תקליד אותו בעמוד הטלגרם)</span></div>
 
     <div id="handle-box" class="hidden">
       <p dir="ltr" lang="en" class="muted">More than one Scarlet account exists. Type your Scarlet handle:</p>
@@ -122,6 +122,7 @@
   <section class="card hidden" id="view-error">
     <p dir="ltr" lang="en" id="err-en" class="error"></p>
     <p dir="rtl" lang="he" id="err-he" class="error"></p>
+    <div class="stack"><button class="secondary hidden" id="btn-retry">Try again · נסה שוב</button></div>
   </section>
 
   <footer>Scarlet · read-only connector · nothing is sent or changed</footer>
@@ -133,7 +134,10 @@
   // ── allowlisted API bases (index from the fragment, never a free-form URL) ──
   var API_BASES = ["https://zstkwjgtushnyegxkqeg.supabase.co", "https://xvkiftdtdnyfjnagxdsk.supabase.co"];
   var FN_PATH = "/functions/v1/scarlet-mcp";
-  var POLL_MS = 1500, MAX_POLLS = 400, RETRY_MS = 1500;
+  var POLL_MS = 1500, MAX_POLLS = 400, RETRY_MS = 1500, RETRY_MAX_MS = 10000, FETCH_MS = 15000, ERR_MS = 5000, DARK_MS = 15000;
+  var DARK_EN = "Scarlet's connector is not available right now. Try again in a few minutes.";
+  var DARK_HE = "המחבר של סקרלט לא זמין כרגע. נסה שוב בעוד כמה דקות.";
+  var EXPIRED_EN = "Request expired — start again from Claude.", EXPIRED_HE = "פג תוקף הבקשה — התחל מחדש מקלוד.";
 
   var $ = function (id) { return document.getElementById(id); };
   var show = function (id) {
@@ -141,7 +145,11 @@
       $(v).classList.toggle("hidden", v !== id);
     });
   };
-  var fail = function (en, he) { $("err-en").textContent = en; $("err-he").textContent = he; show("view-error"); };
+  var fail = function (en, he) { $("btn-retry").classList.add("hidden"); $("err-en").textContent = en; $("err-he").textContent = he; show("view-error"); };
+  // After the page has itself committed to continue, a failure keeps a way
+  // back: the request stays approved on the server for its window, so one
+  // more POST is what completes the sign-in — never "start again" alone.
+  var failRetryable = function (en, he) { fail(en, he); $("btn-retry").classList.remove("hidden"); };
 
   // ── fragment ──
   var frag = {};
@@ -166,15 +174,22 @@
   // "opened without its key" message — the page is single-shot by design).
   try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
 
-  var api = function (path, method, body) {
+  // Every request carries a deadline: a stalled connection rejects like a
+  // network error instead of holding the page (and its buttons) hostage.
+  var api = function (path, method, body, timeoutMs) {
     var opts = { method: method, headers: {}, mode: "cors", credentials: "omit", cache: "no-store" };
     if (body) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
+    var ctl = (typeof AbortController === "function") ? new AbortController() : null;
+    if (ctl) opts.signal = ctl.signal;
+    var t = setTimeout(function () { if (ctl) ctl.abort(); }, timeoutMs || FETCH_MS);
     return fetch(API + path, opts).then(function (r) {
-      return r.text().then(function (t) { var j = null; try { j = t ? JSON.parse(t) : null; } catch (e) {} return { status: r.status, body: j || {} }; });
-    });
+      var ra = 0;
+      try { ra = Number(r.headers.get("Retry-After")) || 0; } catch (e) {}
+      return r.text().then(function (txt) { var j = null; try { j = txt ? JSON.parse(txt) : null; } catch (e) {} return { status: r.status, body: j || {}, retryAfter: ra }; });
+    }).then(function (res) { clearTimeout(t); return res; }, function (e) { clearTimeout(t); throw e; });
   };
 
-  var polls = 0, timer = null, last = null, auth = null, emailStage = 0;
+  var polls = 0, timer = null, last = null, auth = null, emailStage = 0, failures = 0;
   var inflight = false, pollAgain = false, stopped = false, continued = false, backoffUntil = 0;
 
   var render = function (s) {
@@ -185,7 +200,7 @@
     $("host-he").textContent = s.client_host || "client";
     $("returns-en").textContent = s.returns_to || "";
     $("name-en").textContent = s.display_name || "you";
-    $("name-he").textContent = s.display_name || "אותך";
+    $("name-he").textContent = s.display_name || "החשבון שלך";
     $("handle-box").classList.toggle("hidden", !s.needs_handle);
     $("btn-email").classList.toggle("hidden", !s.email_lane);
     if (s.auth) auth = s.auth;
@@ -203,35 +218,48 @@
         break;
       case "consumed": doneElsewhere(); break;
       case "denied": stop(); if (s.redirect) location.replace(s.redirect); else fail("Request denied.", "הבקשה נדחתה."); break;
-      default: stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד.");
+      default: stop(); fail(EXPIRED_EN, EXPIRED_HE);
     }
   };
 
   var stop = function () { stopped = true; if (timer) clearTimeout(timer); timer = null; polls = MAX_POLLS; };
-  // Another instance of this page (the sign-in link opened twice) lost the
-  // continue race, or this one loaded after the request was already
-  // consumed: the sign-in finished in the other window, so this one says so
-  // instead of failing. Fixed text only — never server data.
+  // Another instance of this page (the sign-in link opened twice) consumed
+  // the request first, or this one loaded after it was already consumed: the
+  // sign-in finished in the other window, so this one says so instead of
+  // failing. Fixed text only — never server data.
   var doneElsewhere = function () {
     show("view-done"); stop();
     $("done-en").innerHTML = "<strong>Approved.</strong> The sign-in finished in another window — you can close this one.";
     $("done-he").innerHTML = "<strong>אושר.</strong> הכניסה הושלמה בחלון אחר — אפשר לסגור את החלון הזה.";
   };
   // POST the nonce (never in a URL) and follow the client redirect the
-  // server hands back — exactly once per page instance (`continued`). A 429,
-  // a 503 or a network error is retried twice with a short back-off before
-  // the page gives up: the request is still approved on the server, so a
-  // retry is what completes the sign-in.
+  // server hands back — once per page instance (`continued`), retried twice
+  // on a 429, a 503 or a network failure (the server's Retry-After wins over
+  // the default back-off). A retry says so (`retry:true`): this window's
+  // earlier POST may have landed and its answer been lost, and the server
+  // then re-mints the undelivered code for the same nonce instead of
+  // calling the request finished. A `consumed` on a retry means it could
+  // not; that is shown as a failure with a way back, never as "finished in
+  // another window" (the only window would be told to close on a lost code).
   var continueOnce = function (attempt) {
-    var again = function () { setTimeout(function () { continueOnce(attempt + 1); }, RETRY_MS * (attempt + 1)); };
-    api("/authorize/continue", "POST", { rid: rid, n: n }).then(function (r) {
+    var again = function (r) {
+      var wait = RETRY_MS * (attempt + 1);
+      if (r && r.retryAfter > 0) wait = Math.min(r.retryAfter * 1000, RETRY_MAX_MS);
+      setTimeout(function () { continueOnce(attempt + 1); }, wait);
+    };
+    api("/authorize/continue", "POST", { rid: rid, n: n, retry: attempt > 0 }, 20000).then(function (r) {
       if (r.status === 200 && r.body.redirect) { location.replace(r.body.redirect); return; }
-      if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
-      if ((r.status === 429 || r.status === 503) && attempt < 2) { again(); return; }
-      fail("Scarlet could not finish the sign-in. Start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. התחל מחדש מקלוד.");
+      if (r.status === 200 && r.body.consumed) {
+        if (attempt === 0) { doneElsewhere(); return; }
+        failRetryable("Scarlet could not confirm the sign-in in this window. Try again, or start again from Claude.", "סקרלט לא הצליחה לאשר את הכניסה בחלון הזה. נסה שוב, או התחל מחדש מקלוד.");
+        return;
+      }
+      if (r.status === 503 && r.body && r.body.error === "unavailable") { failRetryable(DARK_EN, DARK_HE); return; }
+      if ((r.status === 429 || r.status === 503) && attempt < 2) { again(r); return; }
+      failRetryable("Scarlet could not finish the sign-in. Try again, or start again from Claude.", "סקרלט לא הצליחה לסיים את הכניסה. נסה שוב, או התחל מחדש מקלוד.");
     }).catch(function () {
-      if (attempt < 2) { again(); return; }
-      fail("Network error; start again from Claude.", "שגיאת רשת; התחל מחדש מקלוד.");
+      if (attempt < 2) { again(null); return; }
+      failRetryable("Network error. Try again, or start again from Claude.", "שגיאת רשת. נסה שוב, או התחל מחדש מקלוד.");
     });
   };
   // One poll chain per page, whatever the buttons do: a fetch in flight is
@@ -248,11 +276,18 @@
     if (timer) clearTimeout(timer); timer = null; poll();
   };
   var schedule = function (ms, soonOk) {
-    if (stopped || polls >= MAX_POLLS) return;
+    if (stopped) return;
+    if (polls >= MAX_POLLS) { stop(); fail(EXPIRED_EN, EXPIRED_HE); return; }
     if (timer) clearTimeout(timer);
     var wait = (soonOk && pollAgain) ? 0 : ms; pollAgain = false;
     backoffUntil = soonOk ? 0 : Date.now() + ms;
     timer = setTimeout(poll, wait);
+  };
+  var stillTrying = function (en, he) {
+    // only the first card (nothing rendered yet) changes its text: a user
+    // already looking at the code keeps it
+    if (last !== null) return;
+    $("loading-en").textContent = en; $("loading-he").textContent = he; show("view-loading");
   };
   var poll = function () {
     if (stopped || inflight || polls >= MAX_POLLS) return;
@@ -260,63 +295,93 @@
     api("/authorize/status?rid=" + encodeURIComponent(rid) + "&n=" + encodeURIComponent(n), "GET").then(function (r) {
       inflight = false;
       if (stopped) return;
-      if (r.status === 200) { render(r.body); schedule(POLL_MS, true); return; }
+      if (r.status === 200) { failures = 0; render(r.body); schedule(POLL_MS, true); return; }
       if (r.status === 429) { schedule(10000, false); return; }
       if (r.status === 403) { stop(); fail("This page was opened without its key. Start again from Claude.", "העמוד נפתח בלי המפתח שלו. התחל מחדש מקלוד."); return; }
-      if (r.status === 404 || r.status === 410) { stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד."); return; }
-      schedule(5000, false);
-    }).catch(function () { inflight = false; if (!stopped) schedule(5000, false); });
+      if (r.status === 404 || r.status === 410) { stop(); fail(EXPIRED_EN, EXPIRED_HE); return; }
+      failures++;
+      if (r.status === 503 && r.body && r.body.error === "unavailable") { stillTrying(DARK_EN + " Still trying…", DARK_HE + " ממשיכה לנסות…"); schedule(DARK_MS, false); return; }
+      if (failures >= 3) stillTrying("Scarlet is not answering right now; still trying…", "סקרלט לא עונה כרגע; ממשיכה לנסות…");
+      schedule(ERR_MS, false);
+    }).catch(function () {
+      inflight = false;
+      if (stopped) return;
+      failures++;
+      if (failures >= 3) stillTrying("Scarlet is not answering right now; still trying…", "סקרלט לא עונה כרגע; ממשיכה לנסות…");
+      schedule(ERR_MS, false);
+    });
   };
 
-  var setStatus = function (id, en, isErr) { var el = $(id); el.textContent = en; el.classList.toggle("error", !!isErr); };
+  // Bilingual status line: two isolated runs, each with its own direction.
+  var setStatus = function (id, en, he, isErr) {
+    var el = $(id); el.textContent = "";
+    if (en || he) {
+      var a = document.createElement("span"); a.setAttribute("dir", "ltr"); a.setAttribute("lang", "en"); a.textContent = en;
+      var b = document.createElement("span"); b.setAttribute("dir", "rtl"); b.setAttribute("lang", "he"); b.textContent = he;
+      el.appendChild(a); el.appendChild(document.createTextNode(" · ")); el.appendChild(b);
+    }
+    el.classList.toggle("error", !!isErr);
+  };
 
   var notify = function (statusId) {
+    if (stopped) return;
     var body = { rid: rid, n: n };
     var h = ($("handle").value || "").trim().toLowerCase();
-    if (!$("handle-box").classList.contains("hidden")) { if (!h) { setStatus(statusId, "Type your Scarlet handle first.", true); return; } body.handle = h; }
+    if (!$("handle-box").classList.contains("hidden")) { if (!h) { setStatus(statusId, "Type your Scarlet handle first.", "הקלד קודם את הכינוי שלך בסקרלט.", true); return; } body.handle = h; }
     $("btn-telegram").disabled = true; $("btn-resend").disabled = true;
-    setStatus(statusId, "Sending…", false);
-    api("/authorize/notify", "POST", body).then(function (r) {
-      $("btn-telegram").disabled = false; $("btn-resend").disabled = false;
-      if (r.status === 200 && r.body.sent === false) { setStatus(statusId, "Already sent; check Telegram.", false); return; }
-      if (r.status === 200) { setStatus(statusId, "", false); pollNow(); return; }
-      if (r.body && r.body.error === "handle_required") { $("handle-box").classList.remove("hidden"); setStatus(statusId, "Type your Scarlet handle first.", true); return; }
-      if (r.body && r.body.error === "unknown_handle") { setStatus(statusId, "That handle is not known.", true); return; }
-      if (r.body && r.body.error === "no_telegram") { setStatus(statusId, "This account has no Telegram chat on file.", true); return; }
-      if (r.status === 410) { stop(); fail("Request expired — start again from Claude.", "פג תוקף הבקשה — התחל מחדש מקלוד."); return; }
-      setStatus(statusId, "Telegram did not accept the message; try again.", true);
-    }).catch(function () { $("btn-telegram").disabled = false; $("btn-resend").disabled = false; setStatus(statusId, "Network error; try again.", true); });
+    setStatus(statusId, "Sending…", "שולחת…", false);
+    var done = function () { $("btn-telegram").disabled = false; $("btn-resend").disabled = false; };
+    api("/authorize/notify", "POST", body, 20000).then(function (r) {
+      done();
+      if (r.status === 200 && r.body.sent === false) { setStatus(statusId, "Already sent; check Telegram.", "כבר נשלח; בדוק בטלגרם.", false); return; }
+      // the server answers the same way whether or not a message really went
+      // out (nothing about the account is revealed to a stranger), so the hint
+      // covers the quiet cases without naming them
+      if (r.status === 200) { setStatus(statusId, "Sent. If nothing arrives in Telegram within a minute, send again.", "נשלח. אם לא מגיע כלום לטלגרם תוך דקה, שלח שוב.", false); pollNow(); return; }
+      if (r.body && r.body.error === "handle_required") { $("handle-box").classList.remove("hidden"); setStatus(statusId, "Type your Scarlet handle first.", "הקלד קודם את הכינוי שלך בסקרלט.", true); return; }
+      if (r.body && r.body.error === "unknown_handle") { setStatus(statusId, "That handle is not known.", "הכינוי הזה לא מוכר.", true); return; }
+      if (r.body && r.body.error === "no_telegram") { setStatus(statusId, "This account has no Telegram chat on file.", "לחשבון הזה אין צ'אט טלגרם רשום.", true); return; }
+      if (r.status === 410) { stop(); fail(EXPIRED_EN, EXPIRED_HE); return; }
+      if (r.status === 503 && r.body && r.body.error === "unavailable") { setStatus(statusId, DARK_EN, DARK_HE, true); return; }
+      setStatus(statusId, "Telegram did not accept the message; try again.", "טלגרם לא קיבל את ההודעה; נסה שוב.", true);
+    }).catch(function () { done(); setStatus(statusId, "Network error; try again.", "שגיאת רשת; נסה שוב.", true); });
   };
 
   var deny = function () {
+    if (stopped) return;
     stop();
+    $("btn-deny").disabled = true; $("btn-deny2").disabled = true;
     api("/authorize/deny", "POST", { rid: rid, n: n }).then(function (r) {
+      // the request was consumed by another instance a moment earlier: its
+      // code is on its way to Claude, and this window must not send a
+      // contradicting "denied" after it
+      if (r.status === 200 && r.body.consumed) { doneElsewhere(); return; }
       if (r.body && r.body.redirect) location.replace(r.body.redirect); else fail("Request denied.", "הבקשה נדחתה.");
     }).catch(function () { fail("Request denied.", "הבקשה נדחתה."); });
   };
 
   // ── Lane E (dormant; shown only when the server says email_lane:true) ──
   var emailGo = function () {
-    if (!auth) { setStatus("status", "Email sign-in is not enabled.", true); return; }
+    if (!auth) { setStatus("status", "Email sign-in is not enabled.", "כניסה במייל לא מופעלת.", true); return; }
     var email = ($("email").value || "").trim();
     var hdr = { "Content-Type": "application/json", "apikey": auth.key, "Authorization": "Bearer " + auth.key };
     if (emailStage === 0) {
-      if (!email) { setStatus("status", "Type your email first.", true); return; }
+      if (!email) { setStatus("status", "Type your email first.", "הקלד קודם את המייל שלך.", true); return; }
       fetch(auth.url + "/otp", { method: "POST", headers: hdr, body: JSON.stringify({ email: email, create_user: false }) })
-        .then(function (r) { if (!r.ok) throw new Error("otp"); emailStage = 1; $("otp").classList.remove("hidden"); setStatus("status", "Check your email for the code.", false); })
-        .catch(function () { setStatus("status", "Could not send the email code.", true); });
+        .then(function (r) { if (!r.ok) throw new Error("otp"); emailStage = 1; $("otp").classList.remove("hidden"); setStatus("status", "Check your email for the code.", "בדוק את המייל לקוד.", false); })
+        .catch(function () { setStatus("status", "Could not send the email code.", "לא הצלחנו לשלוח את קוד המייל.", true); });
       return;
     }
     var token = ($("otp").value || "").trim();
-    if (!token) { setStatus("status", "Type the code from the email.", true); return; }
+    if (!token) { setStatus("status", "Type the code from the email.", "הקלד את הקוד מהמייל.", true); return; }
     fetch(auth.url + "/verify", { method: "POST", headers: hdr, body: JSON.stringify({ type: "email", email: email, token: token }) })
       .then(function (r) { return r.json(); })
       .then(function (j) {
         if (!j || !j.access_token) throw new Error("verify");
         return api("/authorize/approve", "POST", { rid: rid, n: n, supabase_jwt: j.access_token });
       })
-      .then(function (r) { if (r.status === 200) { setStatus("status", "", false); pollNow(); } else setStatus("status", "This email is not linked to a Scarlet account.", true); })
-      .catch(function () { setStatus("status", "The code was not accepted.", true); });
+      .then(function (r) { if (r.status === 200) { setStatus("status", "", "", false); pollNow(); } else setStatus("status", "This email is not linked to a Scarlet account.", "המייל הזה לא מקושר לחשבון סקרלט.", true); })
+      .catch(function () { setStatus("status", "The code was not accepted.", "הקוד לא התקבל.", true); });
   };
 
   $("btn-telegram").addEventListener("click", function () { notify("status"); });
@@ -325,6 +390,9 @@
   $("btn-deny2").addEventListener("click", deny);
   $("btn-email").addEventListener("click", function () { $("email-box").classList.toggle("hidden"); });
   $("btn-email-go").addEventListener("click", emailGo);
+  // after a continue failure: this window already POSTed once, so the retry
+  // says so and the server re-mints the code if it can
+  $("btn-retry").addEventListener("click", function () { $("btn-retry").classList.add("hidden"); show("view-done"); continueOnce(1); });
 
   poll();
 })();
