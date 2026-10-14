@@ -72,8 +72,8 @@
   </section>
 
   <section class="card hidden" id="view-approve">
-    <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> is asking for <strong>read-only</strong> access to Scarlet. Type the 4-character code shown on the Claude sign-in screen in front of you:</p>
-    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה <strong>לקריאה בלבד</strong> לסקרלט. הקלד את הקוד בן 4 התווים שמוצג על מסך הכניסה של קלוד שמולך:</p>
+    <p dir="ltr" lang="en"><span id="host-en" class="pill">claude.ai</span> is asking for access to Scarlet (<strong>read and act</strong>): your inbox, calendars, chats, homes, trips, memory, Library, news — and drafts in your voice, the estate and travel desks, reminders, WhatsApp. Sends happen only when you say so in Claude. Type the 4-character code shown on the Claude sign-in screen in front of you:</p>
+    <p dir="rtl" lang="he"><span id="host-he" class="pill">claude.ai</span> מבקש גישה לסקרלט (<strong>קריאה ופעולה</strong>): הדואר, היומנים, הצ'אטים, הבתים, הנסיעות, הזיכרון, הספרייה והחדשות — וגם טיוטות בקול שלך, דסק האחוזה ודסק הנסיעות, תזכורות, וואטסאפ. שליחה מתבצעת רק כשתאשר זאת בקלוד. הקלד את הקוד בן 4 התווים שמוצג על מסך הכניסה של קלוד שמולך:</p>
     <input class="code" id="code" type="text" inputmode="latin" autocomplete="one-time-code" autocapitalize="characters" spellcheck="false" maxlength="4" placeholder="····" aria-label="Match code">
     <div class="code-label">Match code · קוד התאמה</div>
     <button class="primary" id="btn-approve" disabled>Approve · אישור</button>
@@ -92,7 +92,7 @@
     <p dir="rtl" lang="he" class="error" id="err-he"></p>
   </section>
 
-  <footer>Scarlet · read-only connector · nothing is sent or changed</footer>
+  <footer><span dir="ltr" lang="en">Scarlet · Claude connector · acts only on your word</span><br><span dir="rtl" lang="he">סקרלט · מחבר קלוד · פועלת רק על פי מילתך</span></footer>
 </main>
 
 <script>
