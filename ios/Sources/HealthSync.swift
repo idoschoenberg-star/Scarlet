@@ -173,6 +173,12 @@ final class HealthSync: ObservableObject {
 
     private let store = HKHealthStore()
     private static let authorizedKey = "scarlet.healthAuthorized"
+    /// Bumped whenever `readTypes()` grows. A device that granted an older
+    /// set is asked once more (in the foreground) so the Health sheet shows
+    /// the NEW types; HealthKit itself only lists types never asked before.
+    /// 2 = the Noom bridge (dietary, water, glucose, body mass, mindful).
+    private static let readTypesVersion = 2
+    private static let readTypesVersionKey = "scarlet.healthReadTypesVersion"
 
     /// Observer machinery (doctrine #1).
     private var observerQueries: [HKObserverQuery] = []
@@ -211,7 +217,13 @@ final class HealthSync: ObservableObject {
         for id in quantities {
             if let t = HKObjectType.quantityType(forIdentifier: id) { read.insert(t) }
         }
-        let categories: [HKCategoryTypeIdentifier] = [.sleepAnalysis, .appleStandHour]
+        // The Noom bridge (and any other app that writes these): what he eats
+        // and drinks, his glucose, the weight other apps record, mindful
+        // minutes. Read only; see `DayMetricSpec.all`.
+        for spec in DayMetricSpec.all {
+            if let t = HKObjectType.quantityType(forIdentifier: spec.id) { read.insert(t) }
+        }
+        let categories: [HKCategoryTypeIdentifier] = [.sleepAnalysis, .appleStandHour, .mindfulSession]
         for id in categories {
             if let t = HKObjectType.categoryType(forIdentifier: id) { read.insert(t) }
         }
@@ -235,10 +247,27 @@ final class HealthSync: ObservableObject {
         if ok {
             authorized = true
             UserDefaults.standard.set(true, forKey: Self.authorizedKey)
+            UserDefaults.standard.set(Self.readTypesVersion, forKey: Self.readTypesVersionKey)
             startObserving()
         } else {
             errorText = "Couldn't open the Health access sheet — try again."
         }
+    }
+
+    /// Re-ask once when the read set grew since the device's last grant.
+    /// Foreground only (the sheet needs a window); non-fatal either way: a
+    /// declined type simply returns no samples.
+    private func askForNewTypesIfNeeded() async {
+        guard authorized,
+              UserDefaults.standard.integer(forKey: Self.readTypesVersionKey) < Self.readTypesVersion,
+              UIApplication.shared.applicationState == .active else { return }
+        let ok: Bool = await withCheckedContinuation { cont in
+            store.requestAuthorization(toShare: nil, read: Self.readTypes()) { granted, _ in
+                cont.resume(returning: granted)
+            }
+        }
+        if ok { UserDefaults.standard.set(Self.readTypesVersion, forKey: Self.readTypesVersionKey) }
+        FlightRecorder.telemetry(kind: "health_sync", detail: ["read_types_v": Self.readTypesVersion, "asked": ok])
     }
 
     // MARK: real-time observers (doctrine #1)
@@ -251,7 +280,8 @@ final class HealthSync: ObservableObject {
         guard available, authorized, !observing else { return }
         observing = true
         var types: [HKSampleType] = []
-        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned] {
+        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned,
+                   .dietaryEnergyConsumed, .dietaryWater] {
             if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
         }
         if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(t) }
@@ -311,6 +341,7 @@ final class HealthSync: ObservableObject {
             Self.noteOnce("skip-locked")
             return
         }
+        await askForNewTypesIfNeeded()
         startObserving()
         syncing = true
         errorText = ""
@@ -359,6 +390,10 @@ final class HealthSync: ObservableObject {
             newDays.append(d)
         }
 
+        // The day metrics (the Noom bridge): one wire row per day that HAS
+        // samples — a day without a meal logged is absent, never a zero.
+        let dayMetrics = await readDayMetrics(from: windowStart, to: now)
+
         // Workouts of the window, newest first, with routes + avg HR.
         let hkWorkouts = await fetchWorkouts(from: windowStart, to: now)
         var newWorkouts: [HealthWorkout] = []
@@ -385,7 +420,8 @@ final class HealthSync: ObservableObject {
         var pushResult = "ok"
         do {
             try await Self.push(days: newDays.map(Self.wireDay),
-                                workouts: newWorkouts.map(Self.wireWorkout))
+                                workouts: newWorkouts.map(Self.wireWorkout),
+                                metrics: dayMetrics)
             lastSync = Date()
         } catch {
             errorText = "Synced locally — couldn't reach the server."
@@ -398,6 +434,7 @@ final class HealthSync: ObservableObject {
             "today_kcal": newDays.last?.activeKcal ?? -1,
             "days": newDays.count,
             "workouts": newWorkouts.count,
+            "day_metrics": dayMetrics.count,
             "push": pushResult,
         ])
 
@@ -559,6 +596,86 @@ final class HealthSync: ObservableObject {
                 let q = HKSampleQuery(sampleType: type, predicate: predicate,
                                       limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { _, samples, _ in
                     cont.resume(returning: (samples as? [HKCategorySample]) ?? [])
+                }
+                store.execute(q)
+            }
+        }
+    }
+
+    /// The day metrics: per type, per local day, the merged value (HealthKit
+    /// de-duplicates overlapping sources for cumulative types by the user's
+    /// source priority) plus the names of the apps that wrote it that day,
+    /// so the desk can say "from Noom". Mindful minutes come from category
+    /// samples. Each query is independent and non-fatal.
+    private func readDayMetrics(from start: Date, to end: Date) async -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for spec in DayMetricSpec.all {
+            let byDay = await dailyStatsWithSources(spec, from: start, to: end)
+            for (day, v) in byDay.sorted(by: { $0.key < $1.key }) {
+                guard v.value.isFinite, v.value >= 0 else { continue }
+                out.append([
+                    "date": Self.dayKey.string(from: day),
+                    "metric": spec.metric,
+                    "value": (v.value * 100).rounded() / 100,
+                    "unit": spec.unitLabel,
+                    "sources": v.sources,
+                ])
+            }
+        }
+        // Mindful minutes (Noom writes these): summed per day.
+        let cal = Calendar.current
+        let mindful = await categorySamples(.mindfulSession, from: start, to: end)
+        var mindfulByDay: [Date: (min: Double, sources: Set<String>)] = [:]
+        for s in mindful {
+            let day = cal.startOfDay(for: s.startDate)
+            var e = mindfulByDay[day] ?? (min: 0, sources: [])
+            e.min += max(0, s.endDate.timeIntervalSince(s.startDate) / 60)
+            e.sources.insert(s.sourceRevision.source.name)
+            mindfulByDay[day] = e
+        }
+        for (day, e) in mindfulByDay.sorted(by: { $0.key < $1.key }) where e.min > 0 {
+            out.append([
+                "date": Self.dayKey.string(from: day),
+                "metric": "mindful_min",
+                "value": e.min.rounded(),
+                "unit": "min",
+                "sources": Array(e.sources).sorted(),
+            ])
+        }
+        return out
+    }
+
+    /// Like `dailyStats`, with `.separateBySource` so each day also names the
+    /// apps behind it. The value is still the merged total / average / most
+    /// recent the Health app itself shows.
+    private func dailyStatsWithSources(_ spec: DayMetricSpec, from start: Date,
+                                       to end: Date) async -> [Date: (value: Double, sources: [String])] {
+        guard let type = HKObjectType.quantityType(forIdentifier: spec.id) else { return [:] }
+        let anchor = Calendar.current.startOfDay(for: start)
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end,
+                                                    options: .strictStartDate)
+        let options = spec.options.union(.separateBySource)
+        let unit = spec.unit
+        let store = self.store
+        return await hkTimeout(fallback: [:]) {
+            await withCheckedContinuation { cont in
+                let q = HKStatisticsCollectionQuery(quantityType: type,
+                                                    quantitySamplePredicate: predicate,
+                                                    options: options,
+                                                    anchorDate: anchor,
+                                                    intervalComponents: DateComponents(day: 1))
+                q.initialResultsHandler = { _, collection, _ in
+                    var out: [Date: (value: Double, sources: [String])] = [:]
+                    collection?.enumerateStatistics(from: anchor, to: end) { stat, _ in
+                        let qty: HKQuantity?
+                        if spec.options.contains(.cumulativeSum) { qty = stat.sumQuantity() }
+                        else if spec.options.contains(.mostRecent) { qty = stat.mostRecentQuantity() }
+                        else { qty = stat.averageQuantity() }
+                        guard let qty else { return }
+                        let names = Set((stat.sources ?? []).map { $0.name })
+                        out[stat.startDate] = (qty.doubleValue(for: unit), Array(names).sorted())
+                    }
+                    cont.resume(returning: out)
                 }
                 store.execute(q)
             }
@@ -820,10 +937,12 @@ final class HealthSync: ObservableObject {
         return req
     }
 
-    private static func push(days: [[String: Any]], workouts: [[String: Any]]) async throws {
+    private static func push(days: [[String: Any]], workouts: [[String: Any]],
+                             metrics: [[String: Any]]) async throws {
         let req = try makeRequest(op: "health_push", body: [
             "days": days,
             "workouts": workouts,
+            "metrics": metrics,
         ])
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
@@ -933,4 +1052,40 @@ final class HealthSync: ObservableObject {
         if let s = any as? String, let v = Double(s) { return v }
         return 0
     }
+}
+
+
+// MARK: - The day metrics (the Noom bridge)
+
+/// One HealthKit quantity the app reads per day and pushes as a `metrics`
+/// wire row {date, metric, value, unit, sources}. The `metric` names are the
+/// backend's own catalogue (`_shared/health_apple_metrics.ts`): a name the
+/// server does not know is dropped there, so both lists change together.
+struct DayMetricSpec {
+    let id: HKQuantityTypeIdentifier
+    let metric: String
+    let unit: HKUnit
+    let unitLabel: String
+    let options: HKStatisticsOptions
+
+    private static let mg = HKUnit.gramUnit(with: .milli)
+    static let all: [DayMetricSpec] = [
+        // What he eats — Noom's meals land as dietary samples.
+        .init(id: .dietaryEnergyConsumed, metric: "calories", unit: .kilocalorie(), unitLabel: "kcal", options: .cumulativeSum),
+        .init(id: .dietaryProtein, metric: "protein_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietaryCarbohydrates, metric: "carbs_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietaryFatTotal, metric: "fat_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietaryFatSaturated, metric: "fat_sat_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietaryFiber, metric: "fiber_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietarySugar, metric: "sugar_g", unit: .gram(), unitLabel: "g", options: .cumulativeSum),
+        .init(id: .dietarySodium, metric: "sodium_mg", unit: mg, unitLabel: "mg", options: .cumulativeSum),
+        .init(id: .dietaryPotassium, metric: "potassium_mg", unit: mg, unitLabel: "mg", options: .cumulativeSum),
+        .init(id: .dietaryCholesterol, metric: "cholesterol_mg", unit: mg, unitLabel: "mg", options: .cumulativeSum),
+        .init(id: .dietaryCaffeine, metric: "caffeine_mg", unit: mg, unitLabel: "mg", options: .cumulativeSum),
+        // What he drinks.
+        .init(id: .dietaryWater, metric: "water_ml", unit: .literUnit(with: .milli), unitLabel: "ml", options: .cumulativeSum),
+        // Measurements other apps record (Noom writes glucose and weight).
+        .init(id: .bloodGlucose, metric: "glucose_mgdl", unit: HKUnit(from: "mg/dL"), unitLabel: "mg/dL", options: .discreteAverage),
+        .init(id: .bodyMass, metric: "apple_weight_kg", unit: .gramUnit(with: .kilo), unitLabel: "kg", options: .mostRecent),
+    ]
 }
