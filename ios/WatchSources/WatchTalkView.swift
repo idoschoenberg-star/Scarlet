@@ -5,6 +5,7 @@ import SwiftUI
 /// mode switch (tap-to-talk vs continuous) and End.
 struct WatchTalkView: View {
     @State private var convo = WatchConversation.shared
+    @State private var recorder = WatchMeetingRecorder.shared
     /// Auto-start is a LAUNCH behavior only: onAppear also fires on the way
     /// back from Settings, and restarting there would resurrect a session he
     /// explicitly ended.
@@ -24,7 +25,16 @@ struct WatchTalkView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 10) {
-                    Button(action: { convo.orbTapped() }) {
+                    if recorder.isRecording, let at = recorder.startedAt {
+                        // The meeting recorder owns the mic: one red line, one Stop.
+                        Button(action: { recorder.stop() }) {
+                            Label { Text(timerInterval: at...Date.distantFuture, countsDown: false).monospacedDigit() } icon: {
+                                Image(systemName: "stop.circle.fill")
+                            }
+                        }
+                        .tint(.red)
+                    }
+                    Button(action: { if !recorder.isRecording { convo.orbTapped() } }) {
                         ZStack {
                             Circle()
                                 .fill(orbColor.gradient)
@@ -38,7 +48,7 @@ struct WatchTalkView: View {
                     .buttonStyle(.plain)
                     .animation(.easeInOut(duration: 0.25), value: convo.state)
 
-                    Text(convo.status)
+                    Text(recorder.isRecording ? "Recording a meeting" : (recorder.status.isEmpty ? convo.status : recorder.status))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -65,10 +75,21 @@ struct WatchTalkView: View {
             .onAppear {
                 guard !didAutoStart else { return }
                 didAutoStart = true
-                if convo.state == .idle { convo.start() }
+                if convo.state == .idle && !recorder.isRecording { convo.start() }
             }
             .navigationTitle("Scarlet")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    // The meeting recorder (commission 2026-11-07).
+                    Button(action: {
+                        if !recorder.isRecording && convo.state != .idle { convo.end() }
+                        recorder.toggle()
+                    }) {
+                        Image(systemName: recorder.isRecording ? "stop.circle.fill" : "record.circle")
+                            .foregroundStyle(.red)
+                    }
+                    .accessibilityLabel(recorder.isRecording ? "Stop recording" : "Record meeting")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     NavigationLink(destination: WatchSettingsView()) {
                         Image(systemName: "gearshape")

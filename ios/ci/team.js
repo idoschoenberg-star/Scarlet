@@ -42,6 +42,19 @@ function api(method, path, body) {
     console.error("created watch bundle id", WATCH);
   }
 
+  // The phone recorder's widget extension (Live Activity + Control),
+  // 2026-11-14: its own App ID under the app's. Idempotent.
+  const REC = BUNDLE + ".recorder";
+  const rg = await api("GET", "/v1/bundleIds?filter[identifier]=" + encodeURIComponent(REC) + "&limit=1");
+  let haveRec = false;
+  try { const j = JSON.parse(rg.b); haveRec = !!(j.data && j.data.find((b) => b.attributes.identifier === REC)); } catch (e) {}
+  if (!haveRec) {
+    const c = await api("POST", "/v1/bundleIds",
+      { data: { type: "bundleIds", attributes: { identifier: REC, name: "ScarletRecorder", platform: "IOS" } } });
+    if (c.s >= 300) { console.error("recorder bundleId create failed:", c.s, c.b.slice(0, 500)); process.exit(1); }
+    console.error("created recorder bundle id", REC);
+  }
+
   // Revoke leftover distribution certs from previous ephemeral runners: their
   // private keys died with the runner, and the account caps distribution certs,
   // so without this the pipeline bricks itself after a couple of runs.
@@ -61,7 +74,8 @@ function api(method, path, body) {
     const j = JSON.parse(profs.b);
     for (const p of (j.data || [])) {
       if ((p.attributes.name || "").startsWith("ScarletTalk AppStore") ||
-          (p.attributes.name || "").startsWith("ScarletWatch AppStore")) {
+          (p.attributes.name || "").startsWith("ScarletWatch AppStore") ||
+          (p.attributes.name || "").startsWith("ScarletRecorder AppStore")) {
         const d = await api("DELETE", "/v1/profiles/" + p.id);
         console.error("deleted stale profile", p.attributes.name, "->", d.s);
       }

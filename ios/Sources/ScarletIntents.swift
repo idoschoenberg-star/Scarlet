@@ -85,5 +85,36 @@ struct ScarletAppShortcuts: AppShortcutsProvider {
             shortTitle: "Talk to Scarlet",
             systemImageName: "waveform"
         )
+        // The phone recorder (commission 2026-11-07): start and stop without
+        // opening the app. Every phrase must carry the app name ("Talk").
+        AppShortcut(
+            intent: StartMeetingRecordingIntent(),
+            phrases: [
+                "Start recording with \(.applicationName)",
+                "\(.applicationName) start recording",
+                "Record my meeting with \(.applicationName)",
+                "Start a meeting recording in \(.applicationName)",
+            ],
+            shortTitle: "Record meeting",
+            systemImageName: "record.circle"
+        )
+        AppShortcut(
+            intent: StopMeetingRecordingIntent(),
+            phrases: [
+                "Stop recording with \(.applicationName)",
+                "\(.applicationName) stop recording",
+                "Stop the meeting recording in \(.applicationName)",
+            ],
+            shortTitle: "Stop recording",
+            systemImageName: "stop.circle"
+        )
+        AppShortcut(
+            intent: ToggleMeetingRecordingIntent(),
+            phrases: [
+                "Toggle meeting recording in \(.applicationName)",
+            ],
+            shortTitle: "Record meeting (start or stop)",
+            systemImageName: "mic.circle"
+        )
     }
 }
