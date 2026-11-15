@@ -24,7 +24,7 @@ struct MeetingRecordingAttributes: ActivityAttributes {
 }
 
 /// "Start recording" — Siri, Shortcuts, the Action button.
-struct StartMeetingRecordingIntent: AudioRecordingIntent {
+struct StartMeetingRecordingIntent: AudioRecordingIntent, LiveActivityIntent {
     static var title: LocalizedStringResource = "Start recording a meeting"
     static var description = IntentDescription("Scarlet records the meeting with the screen locked and files it when you stop.")
     static var openAppWhenRun: Bool = false
@@ -57,7 +57,7 @@ struct StopMeetingRecordingIntent: AudioRecordingIntent, LiveActivityIntent {
 
 /// One button for the Action button and the Control: starts when idle,
 /// stops when recording.
-struct ToggleMeetingRecordingIntent: AudioRecordingIntent {
+struct ToggleMeetingRecordingIntent: AudioRecordingIntent, LiveActivityIntent {
     static var title: LocalizedStringResource = "Record meeting (start or stop)"
     static var description = IntentDescription("Starts recording a meeting, or stops the one that is recording.")
     static var openAppWhenRun: Bool = false

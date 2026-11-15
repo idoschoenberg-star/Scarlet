@@ -28,6 +28,7 @@ final class MeetingRecorder: ObservableObject {
     private var writer: ChunkWriter?
     private var activity: Activity<MeetingRecordingAttributes>?
     private var consent: String?
+    private var starting = false
     private var progressObserver: NSObjectProtocol?
     private var sessionObservers: [NSObjectProtocol] = []
 
@@ -44,13 +45,17 @@ final class MeetingRecorder: ObservableObject {
 
     func start(about: String?) async throws -> String {
         if let _ = sid { return "Already recording." }
+        if starting { return "Starting the recording." }
+        starting = true
+        defer { starting = false }
         guard TokenStore.token != nil else { return "Scarlet isn't signed in on this phone yet. Open Talk once and unlock it." }
         if Conversation.shared.state != .idle { return "You're in a live conversation with Scarlet. End it first, then start the recording." }
 
+        // Siri still owns the audio while it hands the intent over (it has
+        // just listened and is about to speak the answer), so the session can
+        // refuse for a moment and the input can report a dead 0 Hz format.
+        // Retry briefly instead of failing; never install a tap on a dead bus.
         let session = AVAudioSession.sharedInstance()
-        // Built-in mic on purpose (no Bluetooth input): the room, not an earbud.
-        try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
-        try session.setActive(true)
         if #available(iOS 17.0, *) {
             if AVAudioApplication.shared.recordPermission == .undetermined {
                 _ = await AVAudioApplication.requestRecordPermission()
@@ -58,6 +63,22 @@ final class MeetingRecorder: ObservableObject {
             guard AVAudioApplication.shared.recordPermission == .granted else {
                 return "Talk doesn't have the microphone. Allow it in Settings, Talk, Microphone."
             }
+        }
+        var lastError: Error?
+        var live = false
+        for attempt in 0..<6 {
+            if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+            do {
+                // Built-in mic on purpose (no Bluetooth input): the room, not an earbud.
+                try session.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+                try session.setActive(true)
+                live = session.isInputAvailable
+                if live { break }
+            } catch { lastError = error }
+        }
+        guard live else {
+            if let lastError { NSLog("meeting recorder: audio session refused: \(lastError)") }
+            return "The microphone isn't available right now. Try again in a moment."
         }
 
         let now = Date()
@@ -69,36 +90,37 @@ final class MeetingRecorder: ObservableObject {
                                chunks: 0, started: false, finished: false)
         MeetingUploader.writeMeta(meta)
 
-        let eng = AVAudioEngine()
-        let input = eng.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            try? FileManager.default.removeItem(at: MeetingUploader.folder(id))
-            return "The microphone isn't available right now."
-        }
+        // The Live Activity first: an audio-recording intent is expected to
+        // show one as the recording begins.
+        startActivity(sid: id, startedAt: now)
+
         let w = ChunkWriter(sid: id) { seq in
             Task { @MainActor in
                 if var m = MeetingUploader.readMeta(id) { m.chunks = max(m.chunks, seq); MeetingUploader.writeMeta(m) }
                 await MeetingUploader.shared.kick()
             }
         }
+        let eng = AVAudioEngine()
+        var started = false
         do {
-            try w.open(format: format)
-            input.installTap(onBus: 0, bufferSize: 4096, format: format) { buf, _ in w.append(buf) }
-            eng.prepare()
-            try eng.start()
+            try w.open()
+            for attempt in 0..<6 {
+                if attempt > 0 { try? await Task.sleep(nanoseconds: 400_000_000) }
+                if MicTap.start(engine: eng, writer: w) { started = true; break }
+            }
+            if !started { throw NSError(domain: "ScarletRecorder", code: 2, userInfo: [NSLocalizedDescriptionKey: "microphone format unavailable"]) }
         } catch {
-            input.removeTap(onBus: 0)
+            MicTap.stop(engine: eng)
             _ = w.close()
             try? FileManager.default.removeItem(at: MeetingUploader.folder(id))
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
-            throw error
+            if let a = activity { await a.end(nil, dismissalPolicy: .immediate); activity = nil }
+            return "The microphone isn't available right now. Try again in a moment."
         }
 
         engine = eng; writer = w; sid = id; startedAt = now
         uploadedMinutes = 0; pendingMinutes = 0
         watchAudioSession()
-        startActivity(sid: id, startedAt: now)
         await MeetingUploader.shared.kick()   // op=start goes now, so the server knows
 
         var line = "Recording. Say stop recording when you're done."
@@ -109,8 +131,7 @@ final class MeetingRecorder: ObservableObject {
     func stop() async -> String {
         guard let id = sid, let started = startedAt else { return "Nothing is recording." }
         let bg = UIApplication.shared.beginBackgroundTask(withName: "meeting-upload-tail")
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop()
+        if let eng = engine { MicTap.stop(engine: eng) }
         let last = writer?.close() ?? 0
         engine = nil; writer = nil
         sessionObservers.forEach { NotificationCenter.default.removeObserver($0) }
@@ -188,13 +209,10 @@ final class MeetingRecorder: ObservableObject {
         guard let eng = engine, let w = writer, sid != nil else { return }
         if eng.isRunning { return }
         try? AVAudioSession.sharedInstance().setActive(true)
-        let input = eng.inputNode
-        input.removeTap(onBus: 0)
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0 else { return }
-        w.rotate(format: format)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { buf, _ in w.append(buf) }
-        try? eng.start()
+        MicTap.stop(engine: eng)
+        // The writer converts whatever the new route delivers into the
+        // minute file's fixed format, so no file rotation is needed.
+        _ = MicTap.start(engine: eng, writer: w)
     }
 
     // MARK: launch
@@ -225,58 +243,107 @@ enum RecorderBridge {
     static func isRecording() async -> Bool { await MeetingRecorder.shared.isRecording }
 }
 
-/// Writes the tap's buffers into one AAC file per minute, on its own queue.
+/// Installs and removes the recorder's tap, outside the main actor: the tap
+/// block runs on the audio thread and must not inherit main-actor isolation.
+enum MicTap {
+    /// false when the input is not live yet (Siri still holding it, a call).
+    nonisolated static func start(engine: AVAudioEngine, writer: ChunkWriter) -> Bool {
+        let input = engine.inputNode
+        let hw = input.inputFormat(forBus: 0)
+        guard hw.sampleRate > 0, hw.channelCount > 0 else { return false }
+        input.removeTap(onBus: 0)   // never stack taps: a second install crashes
+        // format: nil binds the tap to the bus's live format at install time,
+        // so a route change between a read and the install (Siri releasing
+        // the audio, a Bluetooth handoff) can never raise the uncatchable
+        // "format mismatch" exception. The writer converts each buffer.
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { buf, _ in writer.append(buf) }
+        engine.prepare()
+        do { try engine.start() } catch { input.removeTap(onBus: 0); return false }
+        return true
+    }
+
+    nonisolated static func stop(engine: AVAudioEngine) {
+        engine.inputNode.removeTap(onBus: 0)
+        if engine.isRunning { engine.stop() }
+    }
+}
+
+/// Writes the tap's buffers into one AAC file per minute. Every minute file
+/// has ONE fixed format (16 kHz mono, plenty for speech), and each buffer is
+/// converted into it, so a buffer in another format (a new route, Siri's
+/// session) can never reach the file.
 final class ChunkWriter: @unchecked Sendable {
+    static let fileFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+
     private let sid: String
     private let q = DispatchQueue(label: "scarlet.meeting.writer")
     private let onMinute: (Int) -> Void
     private var file: AVAudioFile?
     private var seq = 0
     private var frames: AVAudioFramePosition = 0
-    private var perMinute: AVAudioFramePosition = 0
-    private var format: AVAudioFormat?
+    private let perMinute = AVAudioFramePosition(16_000 * 60)
+    private var converter: AVAudioConverter?
+    private var converterIn: AVAudioFormat?
+    private let convertLock = NSLock()
 
     init(sid: String, onMinute: @escaping (Int) -> Void) {
         self.sid = sid
         self.onMinute = onMinute
     }
 
-    func open(format: AVAudioFormat) throws {
-        self.format = format
+    func open() throws {
         try q.sync { try openNext() }
     }
 
     private func openNext() throws {
-        guard let f = format else { return }
         seq += 1
         frames = 0
-        perMinute = AVAudioFramePosition(f.sampleRate * 60)
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: f.sampleRate,
-            AVNumberOfChannelsKey: Int(f.channelCount),
-            AVEncoderBitRateKey: 48_000 * Int(f.channelCount),
+            AVSampleRateKey: 16_000,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 32_000,
         ]
         file = try AVAudioFile(forWriting: MeetingUploader.chunkURL(sid, seq), settings: settings,
-                               commonFormat: f.commonFormat, interleaved: f.isInterleaved)
+                               commonFormat: .pcmFormatFloat32, interleaved: false)
     }
 
+    /// Called on the tap's thread. The tap's buffer is only valid during the
+    /// callback, so it is copied (converted) before the hop to the queue.
     func append(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.frameLength > 0, buffer.format.sampleRate > 0 else { return }
+        convertLock.lock()
+        let converted = convert(buffer)
+        convertLock.unlock()
+        guard let out = converted else { return }
         q.async { [self] in
             guard let file else { return }
-            do { try file.write(from: buffer) } catch { return }
-            frames += AVAudioFramePosition(buffer.frameLength)
+            do { try file.write(from: out) } catch { return }
+            frames += AVAudioFramePosition(out.frameLength)
             if frames >= perMinute { closeCurrent(); try? openNext() }
         }
     }
 
-    /// A new format after a route change: close this minute early, open the next.
-    func rotate(format: AVAudioFormat) {
-        q.sync { [self] in
-            closeCurrent()
-            self.format = format
-            try? openNext()
+    private func convert(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        let target = ChunkWriter.fileFormat
+        if converter == nil || converterIn != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: target)
+            converterIn = buffer.format
         }
+        guard let c = converter else { return nil }
+        let ratio = target.sampleRate / buffer.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 256
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: cap) else { return nil }
+        var fed = false
+        var err: NSError?
+        let status = c.convert(to: out, error: &err) { _, st in
+            if fed { st.pointee = .noDataNow; return nil }
+            fed = true
+            st.pointee = .haveData
+            return buffer
+        }
+        if status == .error || out.frameLength == 0 { return nil }
+        return out
     }
 
     private func closeCurrent() {
