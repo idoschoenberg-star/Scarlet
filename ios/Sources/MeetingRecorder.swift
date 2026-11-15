@@ -168,12 +168,26 @@ final class MeetingRecorder: ObservableObject {
         }
     }
 
+    /// An audio-recording intent must leave a Live Activity behind: the
+    /// 2026-11-15 Siri crash was an App Intents assertion right after a start
+    /// whose activity did not come up. Every outcome is reported, so the next
+    /// one names its cause.
     private func startActivity(sid: String, startedAt: Date) {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        let enabled = ActivityAuthorizationInfo().areActivitiesEnabled
         let state = MeetingRecordingAttributes.ContentState(startedAt: startedAt, recording: true, uploadedMinutes: 0,
                                                             pendingMinutes: 0, finished: false, consent: consent)
-        activity = try? Activity.request(attributes: MeetingRecordingAttributes(sid: sid),
-                                         content: .init(state: state, staleDate: nil), pushType: nil)
+        var failure = ""
+        do {
+            activity = try Activity.request(attributes: MeetingRecordingAttributes(sid: sid),
+                                            content: .init(state: state, staleDate: nil), pushType: nil)
+        } catch {
+            failure = String(describing: error)
+        }
+        FlightRecorder.telemetry(kind: "recorder_activity", detail: [
+            "sid": sid, "enabled": enabled, "started": activity != nil,
+            "error": String(failure.prefix(300)),
+            "app_state": UIApplication.shared.applicationState == .active ? "active" : "background",
+        ])
     }
 
     private func updateActivity(recording: Bool, finished: Bool) async {
@@ -238,7 +252,11 @@ final class MeetingRecorder: ObservableObject {
 
 /// What the intents call in the app's process.
 enum RecorderBridge {
-    static func start(about: String?) async throws -> String { try await MeetingRecorder.shared.start(about: about) }
+    static func start(about: String?) async throws -> String {
+        let line = try await MeetingRecorder.shared.start(about: about)
+        FlightRecorder.telemetry(kind: "recorder_intent", detail: ["op": "start", "line": line])
+        return line
+    }
     static func stop() async -> String { await MeetingRecorder.shared.stop() }
     static func isRecording() async -> Bool { await MeetingRecorder.shared.isRecording }
 }
