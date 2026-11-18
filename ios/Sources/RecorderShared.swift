@@ -1,6 +1,7 @@
 import ActivityKit
 import AppIntents
 import Foundation
+import WidgetKit
 
 // Compiled into BOTH the app and the ScarletRecorderWidgets extension: the
 // Live Activity's attributes and the three recorder intents. The extension
@@ -88,5 +89,13 @@ enum RecorderSignal {
     /// state both processes can read.
     static func activityRecording() -> Bool {
         Activity<MeetingRecordingAttributes>.activities.contains { $0.content.state.recording && $0.activityState == .active }
+    }
+}
+
+/// The Control Center / Lock Screen control's kind, and its refresh.
+enum RecorderControl {
+    static let kind = "com.idoschoenberg.scarlettalk.record-meeting"
+    static func reload() {
+        if #available(iOS 18.0, *) { ControlCenter.shared.reloadControls(ofKind: kind) }
     }
 }

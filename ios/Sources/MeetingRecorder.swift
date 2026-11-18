@@ -135,6 +135,7 @@ final class MeetingRecorder: ObservableObject {
         engine = eng; writer = w; sid = id; startedAt = now
         uploadedMinutes = 0; pendingMinutes = 0
         watchAudioSession()
+        RecorderControl.reload()
         await MeetingUploader.shared.kick()   // op=start goes now, so the server knows
 
         var line = "Recording. Say stop recording when you're done."
@@ -162,6 +163,7 @@ final class MeetingRecorder: ObservableObject {
         }
         sid = nil; startedAt = nil
         await updateActivity(recording: false, finished: false)
+        RecorderControl.reload()
         await MeetingUploader.shared.kick()
         // Give the tail a minute to land while iOS lets us run; whatever is
         // left goes at the next launch.
@@ -254,6 +256,7 @@ final class MeetingRecorder: ObservableObject {
             st.recording = false
             await a.end(.init(state: st, staleDate: nil), dismissalPolicy: .immediate)
         }
+        RecorderControl.reload()
     }
 
     /// A recording the app was killed in the middle of: its last minute was

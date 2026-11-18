@@ -131,12 +131,25 @@ struct UploadLine: View {
 
 struct RecordMeetingControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
-        StaticControlConfiguration(kind: "com.idoschoenberg.scarlettalk.record-meeting") {
+        StaticControlConfiguration(kind: RecorderControl.kind, provider: RecordingStateProvider()) { recording in
+            // One button whose face says what a tap does: "Record meeting"
+            // when idle, a red "Stop recording" while a meeting records.
             ControlWidgetButton(action: ToggleMeetingRecordingIntent()) {
-                Label("Record meeting", systemImage: "record.circle")
+                if recording {
+                    Label("Stop recording", systemImage: "stop.circle.fill")
+                } else {
+                    Label("Record meeting", systemImage: "record.circle")
+                }
             }
         }
         .displayName("Record meeting")
-        .description("Start or stop recording a meeting for Scarlet.")
+        .description("Tap to start recording a meeting for Scarlet; tap again to stop.")
     }
+}
+
+/// The control's face follows the recorder's Live Activity, the state both
+/// processes can read; the app reloads the control on every start and stop.
+struct RecordingStateProvider: ControlValueProvider {
+    var previewValue: Bool { false }
+    func currentValue() async throws -> Bool { RecorderSignal.activityRecording() }
 }
