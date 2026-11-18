@@ -71,3 +71,22 @@ struct ToggleMeetingRecordingIntent: AudioRecordingIntent, LiveActivityIntent {
         return .result(dialog: IntentDialog(stringLiteral: try await RecorderBridge.start(about: nil)))
     }
 }
+
+/// The cross-process stop (2026-11-18: the Live Activity's Stop and the Lock
+/// Screen control did nothing). Whichever process iOS runs a recorder intent
+/// in, a stop is also posted as a Darwin notification, which the app, the one
+/// process that holds the microphone, always hears while it records.
+enum RecorderSignal {
+    static let stopName = "com.idoschoenberg.scarlettalk.recorder.stop"
+
+    static func postStop() {
+        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                             CFNotificationName(stopName as CFString), nil, nil, true)
+    }
+
+    /// True when a recorder Live Activity is up and still recording: the
+    /// state both processes can read.
+    static func activityRecording() -> Bool {
+        Activity<MeetingRecordingAttributes>.activities.contains { $0.content.state.recording && $0.activityState == .active }
+    }
+}

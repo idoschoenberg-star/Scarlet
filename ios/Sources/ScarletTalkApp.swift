@@ -57,6 +57,7 @@ struct ScarletTalkApp: App {
                     UnlockView().environmentObject(session)
                 }
             }
+            .overlay(alignment: .top) { RecordingBar() }
             .preferredColorScheme(.dark)
         }
     }

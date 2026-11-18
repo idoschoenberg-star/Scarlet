@@ -2,6 +2,7 @@ import ActivityKit
 import AVFoundation
 import CoreLocation
 import Foundation
+import SwiftUI
 import UIKit
 
 /// The phone recorder (commission 2026-11-07, "the capture layer"): record a
@@ -33,8 +34,21 @@ final class MeetingRecorder: ObservableObject {
     private var sessionObservers: [NSObjectProtocol] = []
 
     var isRecording: Bool { sid != nil }
+    /// The card this process owns (set before `sid` while a start is under way).
+    var liveActivitySid: String? { activity?.attributes.sid }
 
     private init() {
+        // A stop posted from any process (the widget extension, a control).
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), nil, { _, _, _, _, _ in
+            Task { @MainActor in
+                guard MeetingRecorder.shared.isRecording else {
+                    await MeetingRecorder.endStaleActivities(keeping: MeetingRecorder.shared.liveActivitySid)
+                    return
+                }
+                let line = await MeetingRecorder.shared.stop()
+                FlightRecorder.telemetry(kind: "recorder_intent", detail: ["op": "stop", "via": "signal", "line": line])
+            }
+        }, RecorderSignal.stopName as CFString, nil, .deliverImmediately)
         progressObserver = NotificationCenter.default.addObserver(forName: .meetingUploadProgress, object: nil, queue: .main) { [weak self] n in
             let info = n.userInfo ?? [:]
             Task { @MainActor in self?.progress(info) }
@@ -129,7 +143,10 @@ final class MeetingRecorder: ObservableObject {
     }
 
     func stop() async -> String {
-        guard let id = sid, let started = startedAt else { return "Nothing is recording." }
+        guard let id = sid, let started = startedAt else {
+            await MeetingRecorder.endStaleActivities(keeping: liveActivitySid)
+            return "Nothing is recording."
+        }
         let bg = UIApplication.shared.beginBackgroundTask(withName: "meeting-upload-tail")
         if let eng = engine { MicTap.stop(engine: eng) }
         let last = writer?.close() ?? 0
@@ -231,10 +248,22 @@ final class MeetingRecorder: ObservableObject {
 
     // MARK: launch
 
+    static func endStaleActivities(keeping sid: String?) async {
+        for a in Activity<MeetingRecordingAttributes>.activities where a.attributes.sid != sid {
+            var st = a.content.state
+            st.recording = false
+            await a.end(.init(state: st, staleDate: nil), dismissalPolicy: .immediate)
+        }
+    }
+
     /// A recording the app was killed in the middle of: its last minute was
     /// never closed (an AAC file without its index is unreadable), so it is
     /// dropped and the rest is finished and uploaded.
     static func recoverOrphans() {
+        _ = MeetingRecorder.shared   // registers the cross-process stop observer
+        // A card left by a recording this process does not own (the app was
+        // killed mid-recording) would keep counting forever: end it.
+        Task { await endStaleActivities(keeping: MeetingRecorder.shared.liveActivitySid) }
         let root = MeetingUploader.root
         let sids = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
         for s in sids {
@@ -257,7 +286,11 @@ enum RecorderBridge {
         FlightRecorder.telemetry(kind: "recorder_intent", detail: ["op": "start", "line": line])
         return line
     }
-    static func stop() async -> String { await MeetingRecorder.shared.stop() }
+    static func stop() async -> String {
+        let line = await MeetingRecorder.shared.stop()
+        FlightRecorder.telemetry(kind: "recorder_intent", detail: ["op": "stop", "via": "intent", "line": line])
+        return line
+    }
     static func isRecording() async -> Bool { await MeetingRecorder.shared.isRecording }
 }
 
@@ -409,4 +442,50 @@ enum ConsentRule {
 
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
+/// The live recording bar (2026-11-18: tapping the Dynamic Island opened Talk
+/// on a screen with no Stop). Shown above every screen while a meeting
+/// records, so the island, the Lock Screen card and the app icon all land on
+/// a visible Stop.
+struct RecordingBar: View {
+    @ObservedObject private var rec = MeetingRecorder.shared
+    @State private var stopping = false
+
+    var body: some View {
+        if rec.isRecording, let started = rec.startedAt {
+            HStack(spacing: 12) {
+                Image(systemName: "record.circle.fill").foregroundStyle(.red)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Recording").font(.headline)
+                        Text(timerInterval: started...Date.distantFuture, countsDown: false)
+                            .font(.headline.monospacedDigit())
+                    }
+                    Text(rec.uploadedMinutes > 0 ? "Uploaded \(rec.uploadedMinutes) min" : "First minute uploads at 1:00")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    stopping = true
+                    Task {
+                        let line = await MeetingRecorder.shared.stop()
+                        FlightRecorder.telemetry(kind: "recorder_intent", detail: ["op": "stop", "via": "app", "line": line])
+                        stopping = false
+                    }
+                } label: {
+                    Label(stopping ? "Stopping" : "Stop", systemImage: "stop.fill")
+                        .font(.headline)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(stopping)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .padding(.horizontal, 12)
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
 }
