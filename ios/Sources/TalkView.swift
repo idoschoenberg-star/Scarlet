@@ -38,6 +38,11 @@ struct TalkView: View {
                 }
             }
             .padding(.top, 8)
+            .workNowLifecycle()
+
+            // "Scarlet is working on": draws nothing while nothing is open,
+            // so the Talk screen is unchanged until she takes an order.
+            WorkNowStrip()
 
             // The orb shrinks the moment the keyboard is up, so her written
             // reply always has room — the whole point of "answering silently".

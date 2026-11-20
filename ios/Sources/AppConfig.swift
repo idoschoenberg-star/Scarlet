@@ -12,6 +12,22 @@ enum AppConfig {
     static func toolURL(_ name: String) -> URL {
         URL(string: "\(apiBase)/realtime-session?tool=\(name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? name)")!
     }
+
+    /// The region the database lives in. A function the platform starts near
+    /// the caller (Frankfurt or Zurich from Israel) pays an ocean for every
+    /// query it makes; asked to run beside the database it pays one long hop
+    /// instead (speed design, W6 Phase B, section 2 items 1 and 2: the tool
+    /// endpoint measured a median 458 ms beside the database and 4,979 ms
+    /// from Frankfurt). A region name, never a secret.
+    static let dbRegion = "us-west-2"
+
+    /// Pin one request to the database's region (Supabase regional
+    /// invocation: the `x-region` header moves where the function runs).
+    /// Used on the session mint and on every tool call, the two paths whose
+    /// functions make several queries per request.
+    static func pinToDatabaseRegion(_ req: inout URLRequest) {
+        req.setValue(dbRegion, forHTTPHeaderField: "x-region")
+    }
 }
 
 /// The per-device token, held in the Keychain (survives reinstalls-off, never

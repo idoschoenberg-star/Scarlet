@@ -1648,6 +1648,7 @@ final class Conversation: ObservableObject {
                 var req = URLRequest(url: mintURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+                AppConfig.pinToDatabaseRegion(&req)
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -2365,6 +2366,7 @@ final class Conversation: ObservableObject {
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+            AppConfig.pinToDatabaseRegion(&req)
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
             let (data, resp) = try await URLSession.shared.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -2552,6 +2554,9 @@ final class Conversation: ObservableObject {
             // Face-ID approval card immediately instead of waiting for a poll
             // (the card expires in ~3 minutes; every second of lag is felt).
             if name == "request_secret" { SecretApprovalsModel.shared.refresh() }
+            // An order just went through THIS device: show it on the
+            // "Scarlet is working on" card now, not at the next poll.
+            if name == "commission_claude" || name == "delegate_task" { WorkNowModel.shared.refresh() }
         }
     }
 

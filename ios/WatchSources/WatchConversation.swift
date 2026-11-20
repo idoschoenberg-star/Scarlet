@@ -464,6 +464,7 @@ final class WatchConversation {
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+            AppConfig.pinToDatabaseRegion(&req)
             let (data, resp) = try await mintSession.data(for: req)
             guard connectEpoch == epoch else { return }
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -1104,6 +1105,7 @@ final class WatchConversation {
                 req.httpMethod = "POST"
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 req.setValue(TokenStore.token ?? "", forHTTPHeaderField: "x-scarlet-token")
+                AppConfig.pinToDatabaseRegion(&req)
                 req.httpBody = try JSONSerialization.data(withJSONObject: params)
                 let (data, resp) = try await toolSession.data(for: req)
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
