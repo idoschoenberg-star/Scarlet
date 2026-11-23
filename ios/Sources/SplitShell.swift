@@ -46,6 +46,7 @@ struct SplitShell: View {
         case estate
         case travel
         case shopping
+        case finance
         case settings
 
         var id: String { rawValue }
@@ -67,6 +68,7 @@ struct SplitShell: View {
             case .estate: return "Estate"
             case .travel: return "Travel"
             case .shopping: return "Shopping"
+            case .finance: return "Finance"
             case .settings: return "Settings"
             }
         }
@@ -89,6 +91,7 @@ struct SplitShell: View {
             case .estate: return "house.fill"
             case .travel: return "airplane"
             case .shopping: return "cart.fill"
+            case .finance: return "creditcard.fill"
             case .settings: return "gearshape.fill"
             }
         }
@@ -113,6 +116,8 @@ struct SplitShell: View {
             case .travel: return "t"
             // Shopping, ⌘B (Buy).
             case .shopping: return "b"
+            // Ido's answer of 2026-10-25: Finance, ⌘M.
+            case .finance: return "m"
             case .settings: return "0"
             }
         }
@@ -140,7 +145,7 @@ struct SplitShell: View {
         // shortcut never registers, making it unreachable on the MAIN work
         // platform (the design sweep caught .news absent; .active nearly
         // shipped with the same hole).
-        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk, .estate, .travel, .shopping]
+        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk, .estate, .travel, .shopping, .finance]
     }
 
     var body: some View {
@@ -356,6 +361,11 @@ struct SplitShell: View {
             // the way · Lists · Watches). One tap is his yes to the line; the
             // store page opens and he presses Buy there. Nothing here buys.
             ShoppingView()
+        case .finance:
+            // Self-contained: seven leaves over the Finance Desk's ledger
+            // (Overview · Transactions · Open · Recurring · Documents ·
+            // Wires · Sitting). Records his word; never pays or cancels.
+            FinanceView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar. As a detail column there
