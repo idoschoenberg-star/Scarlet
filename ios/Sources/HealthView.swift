@@ -137,6 +137,7 @@ private func workoutFocus(_ w: HealthWorkout) -> String {
     if w.distanceM > 0 { line += ", \(HealthFmt.distance(w.distanceM))" }
     if w.kcal > 0 { line += ", \(w.kcal) kcal" }
     if w.avgHR > 0 { line += ", avg HR \(w.avgHR)" }
+    if w.elevationGainM > 0 { line += ", +\(w.elevationGainM) m climbed" }
     line += w.route.isEmpty ? "." : ". He is looking at its route map."
     return line
 }
@@ -487,6 +488,17 @@ struct HealthView: View {
                 HStack(spacing: 10) {
                     sleepPill
                     weightPill
+                }
+                if period == .today, sync.todaySnapshot.flightsClimbed > 0 {
+                    HStack(spacing: 6) {
+                        Image(systemName: "figure.stairs")
+                        Text(sync.todaySnapshot.flightsClimbed == 1
+                             ? "1 flight climbed"
+                             : "\(sync.todaySnapshot.flightsClimbed) flights climbed")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
         }
@@ -1158,6 +1170,7 @@ struct HealthView: View {
         var bits: [String] = [
             "today \(s.steps.formatted()) steps, \(s.activeKcal) kcal, "
                 + "\(s.exerciseMin) exercise min"
+                + (s.flightsClimbed > 0 ? ", \(s.flightsClimbed) flights climbed" : "")
         ]
         if let n = latestNight {
             var sleepBit = "last night \(HealthFmt.minutes(n.total))"
@@ -1547,6 +1560,13 @@ private struct WorkoutDetailSheet: View {
             }
             if workout.kcal > 0 {
                 statTile("Active energy", "\(workout.kcal) kcal", "flame.fill")
+            }
+            // Only shown when there IS a climb: a "0 m" tile would read as
+            // "this route was flat", which is a different claim from "no
+            // altitude was recorded".
+            if workout.elevationGainM > 0 {
+                statTile("Elevation gain", "\(workout.elevationGainM) m",
+                         "mountain.2.fill")
             }
             if workout.avgHR > 0 {
                 statTile("Avg heart rate", "\(workout.avgHR) bpm", "heart.fill")

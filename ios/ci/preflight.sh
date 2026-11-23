@@ -89,7 +89,11 @@ for f in files:
             # to 0 (end of args), then keep consuming blank lines and lines whose
             # stripped code starts with '.' (the modifier chain).
             block = []
-            depth = 0
+            # depth starts at 1: the matched '(' itself is excluded from the
+            # scan below (col+1), so it must be pre-counted — without this,
+            # every MULTI-LINE construction read as closed-on-line-one and
+            # its modifier chain was never scanned (false FATAL, 2026-08-21).
+            depth = 1
             started = False
             j = i
             col = m.end() - 1  # index of '('

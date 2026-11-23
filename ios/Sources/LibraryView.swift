@@ -1,3 +1,4 @@
+import AVKit
 import Foundation
 import SwiftUI
 import UIKit
@@ -69,6 +70,19 @@ enum LibraryKind: String {
         case .audio: return "waveform"
         case .link: return "link"
         case .file: return "doc"
+        }
+    }
+
+    /// Short human label for the rows' and pane's metadata line.
+    var label: String {
+        switch self {
+        case .pdf: return "PDF"
+        case .html: return "Page"
+        case .image: return "Image"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .link: return "Link"
+        case .file: return "File"
         }
     }
 
@@ -290,16 +304,36 @@ struct LibraryView: View {
     /// `.sheet(item:)` modifiers crash the Mac on tapping an item. Enum-driven.
     enum LibrarySheet: Identifiable {
         case photo(WAPhotoItem), video(WAVideoItem), file(PreviewFile), web(LibraryWebItem)
+        /// Regular width only: the native share sheet for a pane-rendered PDF
+        /// — it rides the SAME single sheet slot, never a second modifier.
+        case share(ShareFileItem)
         var id: String {
             switch self {
             case .photo(let i): return "photo-\(i.id)"
             case .video(let i): return "video-\(i.id)"
             case .file(let f): return "file-\(f.id)"
             case .web(let w): return "web-\(w.id)"
+            case .share(let f): return "share-\(f.id)"
             }
         }
     }
     @State private var activeSheet: LibrarySheet?
+    /// iPad/Mac (regular width) is a two-pane work surface — the shelf list
+    /// keeps a readable column and the selected item renders in a persistent
+    /// trailing preview pane (design guide §11). Compact keeps the sheets.
+    @Environment(\.horizontalSizeClass) private var hSize
+    /// What the regular-width preview pane is showing: the item plus the
+    /// same viewer payload the compact sheet would present.
+    struct LibraryInlineSelection: Identifiable {
+        let item: LibraryItem
+        let sheet: LibrarySheet
+        var id: String { sheet.id }
+    }
+    @State private var inlineSelection: LibraryInlineSelection?
+    /// Handle to the pane's live WKWebView so Share can render it to a PDF
+    /// (same document-not-link rule as the web sheet — Ido 2026-08-14).
+    @StateObject private var paneWebHolder = WebViewHolder()
+    @State private var paneRendering = false
     /// Row currently downloading (its chevron swaps to a spinner).
     @State private var downloadingID: String?
     /// The exact focus line last claimed for an open artifact; the sheets'
@@ -320,8 +354,24 @@ struct LibraryView: View {
         NavigationStack {
             VStack(spacing: 0) {
                 headerBar
-                shelfSwitcher
-                content
+                if hSize == .regular {
+                    // Regular width (iPad/Mac): a readable ~420pt shelf
+                    // column with the persistent preview pane beside it —
+                    // no more stretched phone list.
+                    HStack(spacing: 0) {
+                        VStack(spacing: 0) {
+                            shelfSwitcher
+                            content
+                        }
+                        .frame(width: 420)
+                        Divider().overlay(Color.white.opacity(0.12))
+                        previewPane
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                } else {
+                    shelfSwitcher
+                    content
+                }
             }
             .background(ScarletBackground().ignoresSafeArea())
             // Scarlet lives at the bottom of the list screen, part of its
@@ -348,10 +398,17 @@ struct LibraryView: View {
                 // silently act on the OTHER shelf's rows.
                 selecting = false
                 selectedIDs = []
+                // Neither does the preview pane: its item belongs to the
+                // shelf that just left the screen.
+                inlineSelection = nil
             }
-            // ONE sheet for every viewer kind (see LibrarySheet).
+            // ONE sheet for every viewer kind (see LibrarySheet). The
+            // dismissed-share case at regular width leaves focus alone — the
+            // item is still open in the preview pane.
             .reportsModalPresence(activeSheet != nil)
-            .sheet(item: $activeSheet, onDismiss: { restoreBrowsingFocus() }) { sheet in
+            .sheet(item: $activeSheet, onDismiss: {
+                if inlineSelection == nil { restoreBrowsingFocus() }
+            }) { sheet in
                 switch sheet {
                 case .photo(let item):
                     WAPhotoView(item: item)
@@ -397,6 +454,11 @@ struct LibraryView: View {
                 case .web(let item):
                     LibraryWebSheet(item: item)
                         .preferredColorScheme(.dark)
+                case .share(let f):
+                    // The pane's share-as-PDF lands here (regular width) —
+                    // AirDrop, WhatsApp, Mail, Save to Files.
+                    ActivityShareSheet(items: [f.url])
+                        .presentationDetents([.medium, .large])
                 }
             }
             .confirmationDialog(
@@ -614,7 +676,7 @@ struct LibraryView: View {
                     // the Amwell inbox — the app-wide OutlookArchiveSwipe
                     // (full-bleed green bar, 45% commit, row flies off).
                     OutlookArchiveSwipe(
-                        baseBackground: Color.clear,
+                        baseBackground: rowBackground(item),
                         onArchive: { model.setArchived(item, archived: true) }
                     ) {
                         Button {
@@ -637,7 +699,7 @@ struct LibraryView: View {
                         LibraryRow(item: item, downloading: downloadingID == item.id)
                     }
                     .buttonStyle(.plain)
-                    .listRowBackground(Color.clear)
+                    .listRowBackground(rowBackground(item))
                     .listRowSeparatorTint(.white.opacity(0.12))
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                         swipeButtons(item)
@@ -701,6 +763,180 @@ struct LibraryView: View {
         }
     }
 
+    // MARK: regular-width preview pane (design guide §11)
+
+    /// Regular width: the row open in the preview pane keeps a quiet rose
+    /// tint so the selection is visible.
+    private func rowBackground(_ item: LibraryItem) -> Color {
+        hSize == .regular && inlineSelection?.item.id == item.id
+            ? scarletRose.opacity(0.12) : Color.clear
+    }
+
+    /// The persistent trailing pane: the selected deliverable rendered with
+    /// the SAME viewer surfaces the compact sheets use (image canvas,
+    /// video player, QuickLook, LibraryWebView) under a normal pane bar —
+    /// title, metadata, share, close — instead of the floating overlays.
+    @ViewBuilder
+    private var previewPane: some View {
+        if let sel = inlineSelection {
+            VStack(spacing: 0) {
+                paneBar(sel)
+                Divider().overlay(Color.white.opacity(0.12))
+                paneContent(sel.sheet)
+                    // Reset the viewer's state whenever the selection moves.
+                    .id(sel.id)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "books.vertical")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.secondary)
+                Text("Select a deliverable to preview it here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding(32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// The pane's normal toolbar: title + kind/date metadata on the leading
+    /// side, share and close on the trailing side.
+    private func paneBar(_ sel: LibraryInlineSelection) -> some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(sel.item.title)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(paneMetadata(sel.item))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            Spacer(minLength: 8)
+            paneShareButton(sel)
+            Button {
+                inlineSelection = nil
+                restoreBrowsingFocus()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(.white.opacity(0.08)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close preview")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private func paneMetadata(_ item: LibraryItem) -> String {
+        var parts = [item.kind.label]
+        if let date = item.createdAt {
+            parts.append(LibraryRow.relative.localizedString(for: date, relativeTo: Date()))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Share, per viewer kind. Media and downloaded documents share the real
+    /// bytes via ShareLink; a web page renders to a PDF first (document, not
+    /// a dying signed link — Ido 2026-08-14) and rides the view's ONE sheet.
+    @ViewBuilder
+    private func paneShareButton(_ sel: LibraryInlineSelection) -> some View {
+        switch sel.sheet {
+        case .photo(let i):
+            paneShareLink(i.url)
+        case .video(let i):
+            paneShareLink(i.url)
+        case .file(let f):
+            paneShareLink(f.url)
+        case .web(let w):
+            Button {
+                sharePaneWebPDF(w)
+            } label: {
+                if paneRendering {
+                    ProgressView()
+                        .frame(width: 30, height: 30)
+                } else {
+                    paneShareGlyph
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(paneRendering)
+            .accessibilityLabel("Share as PDF")
+        case .share:
+            EmptyView()   // share is sheet-only, never an inline selection
+        }
+    }
+
+    private func paneShareLink(_ url: URL) -> some View {
+        ShareLink(item: url) { paneShareGlyph }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Share")
+    }
+
+    private var paneShareGlyph: some View {
+        Image(systemName: "square.and.arrow.up")
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.85))
+            .frame(width: 30, height: 30)
+            .background(Circle().fill(.white.opacity(0.08)))
+    }
+
+    private func sharePaneWebPDF(_ w: LibraryWebItem) {
+        guard let web = paneWebHolder.web, !paneRendering else { return }
+        paneRendering = true
+        Task { @MainActor in
+            defer { paneRendering = false }
+            let file = await renderWebPDF(web, title: w.title, fallback: w.url)
+            activeSheet = .share(file)
+        }
+    }
+
+    /// The selected item's viewer, inline — the same rendering surfaces the
+    /// compact sheets present, minus the modal chrome.
+    @ViewBuilder
+    private func paneContent(_ sheet: LibrarySheet) -> some View {
+        switch sheet {
+        case .photo(let item):
+            ZStack {
+                Color.black
+                AsyncImage(url: item.url) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .scaledToFit()
+                    } else if phase.error != nil {
+                        VStack(spacing: 8) {
+                            Image(systemName: "photo")
+                                .font(.system(size: 36))
+                            Text("Couldn't load this image")
+                                .font(.footnote)
+                        }
+                        .foregroundStyle(.white.opacity(0.55))
+                    } else {
+                        ProgressView()
+                            .tint(.white)
+                    }
+                }
+            }
+        case .video(let item):
+            LibraryInlinePlayer(url: item.url)
+        case .file(let file):
+            QuickLookPreview(url: file.url)
+        case .web(let item):
+            LibraryWebView(url: item.url, forceHTML: item.forceHTML, holder: paneWebHolder)
+                .background(Color.white)
+        case .share:
+            EmptyView()   // never an inline selection
+        }
+    }
+
     // MARK: opening (per-kind viewers)
 
     private func open(_ item: LibraryItem) {
@@ -710,19 +946,28 @@ struct LibraryView: View {
         }
         switch item.kind {
         case .image:
-            claimFocus(item)
-            activeSheet = .photo(WAPhotoItem(url: url))
+            present(.photo(WAPhotoItem(url: url)), for: item)
         case .video, .audio:
-            claimFocus(item)
-            activeSheet = .video(WAVideoItem(url: url))
+            present(.video(WAVideoItem(url: url)), for: item)
         case .html, .link:
-            claimFocus(item)
             // For an HTML artifact, FORCE text/html rendering — object storage
             // often serves uploaded .html as text/plain (raw source shows) or
             // octet-stream (blank/download). A plain link keeps normal loading.
-            activeSheet = .web(LibraryWebItem(url: url, title: item.title, forceHTML: item.kind == .html))
+            present(.web(LibraryWebItem(url: url, title: item.title, forceHTML: item.kind == .html)),
+                    for: item)
         case .pdf, .file:
             openDocument(item, url: url)
+        }
+    }
+
+    /// Route a ready viewer payload: at regular width the persistent preview
+    /// pane IS the presentation (no modal); compact presents the sheet.
+    private func present(_ sheet: LibrarySheet, for item: LibraryItem) {
+        claimFocus(item)
+        if hSize == .regular {
+            inlineSelection = LibraryInlineSelection(item: item, sheet: sheet)
+        } else {
+            activeSheet = sheet
         }
     }
 
@@ -745,8 +990,7 @@ struct LibraryView: View {
                 guard !data.isEmpty else { throw URLError(.zeroByteResource) }
                 let dest = Self.tempFileURL(for: item)
                 try data.write(to: dest, options: .atomic)
-                claimFocus(item)
-                activeSheet = .file(PreviewFile(url: dest))
+                present(.file(PreviewFile(url: dest)), for: item)
             } catch {
                 model.errorText = "Couldn't download \"\(item.title)\" — try again."
             }
@@ -841,17 +1085,28 @@ struct LibraryView: View {
 
 // MARK: - Row
 
-/// One shelf row: 44pt kind tile, two-line title, two-line description,
-/// relative date, trailing chevron (spinner while its file downloads).
+/// One shelf row: 44pt kind tile, two-line title, two-line description, a
+/// kind · relative-date metadata caption, trailing chevron (spinner while
+/// its file downloads). Body sizes are work-platform legible (17pt title,
+/// 15pt description — design guide §11); only the caption stays small.
 struct LibraryRow: View {
     let item: LibraryItem
     var downloading: Bool = false
 
-    private static let relative: RelativeDateTimeFormatter = {
+    /// Shared with the regular-width pane's metadata line.
+    static let relative: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
         f.unitsStyle = .short
         return f
     }()
+
+    private var metadataLine: String {
+        var parts = [item.kind.label]
+        if let date = item.createdAt {
+            parts.append(Self.relative.localizedString(for: date, relativeTo: Date()))
+        }
+        return parts.joined(separator: " · ")
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -866,22 +1121,20 @@ struct LibraryRow: View {
             .padding(.top, 2)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(.white)
                     .lineLimit(2)
                     .truncationMode(.tail)
                 if !item.description.isEmpty {
                     Text(item.description)
-                        .font(.system(size: 13))
+                        .font(.system(size: 15))
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .truncationMode(.tail)
                 }
-                if let date = item.createdAt {
-                    Text(Self.relative.localizedString(for: date, relativeTo: Date()))
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.4))
-                }
+                Text(metadataLine)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.4))
             }
             Spacer(minLength: 8)
             if downloading {
@@ -966,20 +1219,52 @@ struct LibraryWebSheet: View {
         rendering = true
         Task { @MainActor in
             defer { rendering = false }
-            do {
-                let data = try await web.pdf(configuration: WKPDFConfiguration())
-                let safe = item.title.replacingOccurrences(of: "[/\\\\:]", with: "-", options: .regularExpression)
-                let name = (safe.isEmpty ? "Scarlet Report" : safe).prefix(60)
-                let tmp = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("\(name).pdf")
-                try data.write(to: tmp, options: .atomic)
-                shareFile = ShareFileItem(url: tmp)
-            } catch {
-                // Render failed (page still loading, huge page) — the link is
-                // better than a dead end, even if it expires.
-                shareFile = ShareFileItem(url: item.url)
+            shareFile = await renderWebPDF(web, title: item.title, fallback: item.url)
+        }
+    }
+}
+
+/// Render the live web view to a temp PDF for sharing. On failure (page
+/// still loading, huge page) the original link comes back instead — better
+/// than a dead end, even if it expires. Shared by the compact web sheet and
+/// the regular-width preview pane.
+@MainActor
+private func renderWebPDF(_ web: WKWebView, title: String, fallback: URL) async -> ShareFileItem {
+    do {
+        let data = try await web.pdf(configuration: WKPDFConfiguration())
+        let safe = title.replacingOccurrences(of: "[/\\\\:]", with: "-", options: .regularExpression)
+        let name = (safe.isEmpty ? "Scarlet Report" : safe).prefix(60)
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(name).pdf")
+        try data.write(to: tmp, options: .atomic)
+        return ShareFileItem(url: tmp)
+    } catch {
+        return ShareFileItem(url: fallback)
+    }
+}
+
+// MARK: - Inline video/audio player (regular-width pane)
+
+/// The pane's player: the same VideoPlayer surface WAVideoView presents
+/// modally, minus the modal chrome — autoplays on appear, pauses when the
+/// selection moves away (the pane .id() re-creates it per item).
+struct LibraryInlinePlayer: View {
+    let url: URL
+    @State private var player: AVPlayer? = nil
+
+    var body: some View {
+        ZStack {
+            Color.black
+            if let player {
+                VideoPlayer(player: player)
             }
         }
+        .onAppear {
+            let p = AVPlayer(url: url)
+            player = p
+            p.play()
+        }
+        .onDisappear { player?.pause() }
     }
 }
 

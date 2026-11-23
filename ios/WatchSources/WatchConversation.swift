@@ -140,8 +140,17 @@ final class WatchConversation {
     /// a row; a blip doesn't.
     private var authFailStreak = 0
     private var reconnectTask: Task<Void, Never>?
+    // First-start audio activation retries (313): '!act' right after a
+    // wrist-raise is transient — count the quick retries before we surface
+    // "Mic unavailable" for real. Reset on every successful connect.
+    private var audioStartRetries = 0
     private var handledToolCalls = Set<String>()
     private var responseActive = false
+    /// IDLE-STANDBY clock (2026-08-28 deep-QA: with the wrist down, watchOS
+    /// killed the socket every ~37s and the app reconnected forever — 722
+    /// mints in a day). Stamped by every real engagement (arm, her speech,
+    /// a server input event, a fresh connect); read by the health tick.
+    private var lastEngagementAt = Date()
     private var needsResponseAfterDone = false
     // The always-answer net, ported from the phone: a wrist socket can die
     // WITHOUT the receive callback ever firing (NAT timeout while the screen
@@ -239,6 +248,24 @@ final class WatchConversation {
     // deaf can't drive a hot mint/teardown loop. Deliberately NOT reset in
     // connect() — it must remember convictions ACROSS rebuilt sessions.
     private var recentDeafConvictions: [Date] = []
+    // Session-mint registry (2026-08-24, ported from the phone): the mint_id
+    // this session's mint returned, echoed back via op=session_alive so watch
+    // establishment is visible in telemetry — phase "established" on the
+    // first server event, phase "heard" on the first input event, each sent
+    // exactly once per socket.
+    private var currentMintId: String?
+    private var establishedBeaconSent = false
+    private var heardBeaconSent = false
+    // DEAF CIRCUIT (deep-QA 2026-08-28: the mint registry showed 722 watch
+    // mints in ONE day, 0 heard — the conviction→remint cycle ran unattended
+    // for ~8 hours at a ~40s cadence, burning battery and API against a
+    // DETERMINISTIC deafness that reminting never fixes). Three straight
+    // convictions with no server input event ever = proven-deterministic →
+    // hold TEN MINUTES between attempts instead of reminting hot, with the
+    // truth on screen. Never permanently dark (Ido's standing rule — the
+    // watch keeps trying); any heard audio resets the streak, full speed
+    // returns.
+    private var deafStreak = 0
     // Duplicate-connect guard (2026-08-13): wrist-raise during an in-flight
     // connect used to reset state to .idle and start a SECOND connect — two
     // sockets raced, and the loser's failure path scheduled a reconnect that
@@ -274,6 +301,15 @@ final class WatchConversation {
     private let tapState = TapState()
     private var playFormat: AVAudioFormat?
     private let wireRate: Double = 24000
+    /// WRIST PIPE FIX (2026-08-28 deep-QA, beacons pending=14): the BT-relay
+    /// upstream cannot carry 24kHz PCM16 (~60KB/s of JSON) — sends queued and
+    /// OpenAI never received enough audio to detect speech (764 mints / 5
+    /// heard in the registry). Capture now converts to 8 kHz and G.711
+    /// μ-law-encodes before base64 (~10KB/s upstream, telephone-grade —
+    /// right-sized for a wrist mic). The session is minted with `?fmt=ulaw`
+    /// so the server expects μ-law. PLAYBACK stays 24 kHz PCM16 (`wireRate`)
+    /// — downstream always worked.
+    private let captureWireRate: Double = 8000
     /// Echo gate: while her audio is queued/playing, mic frames are dropped so
     /// the watch speaker can't feed her own voice back into the turn.
     private var pendingBuffers = 0
@@ -296,6 +332,10 @@ final class WatchConversation {
 
     func start() {
         guard state == .idle, let token = TokenStore.token else { return }
+        // Fresh conversation ⇒ fresh ledger id (same rule as the phone): a
+        // reconnect mid-thread keeps grouping under the old id; a truly new
+        // start (empty transcript) begins a new conversation on the server.
+        if transcript.isEmpty { WatchTurnLogger.shared.sessionId = UUID().uuidString }
         reconnectTask?.cancel(); reconnectTask = nil
         reconnectAttempts = 0
         endedByUser = false
@@ -331,6 +371,8 @@ final class WatchConversation {
     func end() {
         endedByUser = true
         wantLive = false
+        // The call's last words reach the ledger before the app can suspend.
+        WatchTurnLogger.shared.flushNow()
         LocationReporter.shared.stopLiveUpdates()
         reconnectTask?.cancel(); reconnectTask = nil
         replyWatchdog?.cancel(); replyWatchdog = nil
@@ -384,6 +426,7 @@ final class WatchConversation {
                 // tap silences her ear.
                 micArmed = true
                 userMuted = false
+                lastEngagementAt = Date()
                 status = "Listening…"
             } else {
                 micArmed.toggle()
@@ -402,6 +445,10 @@ final class WatchConversation {
     /// die without any callback ever firing, and returning early on ws != nil
     /// left him talking into the corpse until the next turn timed out.
     func appBecameActive() {
+        // A wrist-raise IS engagement (312): stamp the idle clock so the
+        // standby ladder measures from the moment he last looked, not from
+        // machine events.
+        lastEngagementAt = Date()
         // SELF-HEAL, mirroring the phone (2026-08-13): a session that gave up
         // (mint dead, audio failed mid-reconnect) dropped wantLive — and the
         // wrist then stayed dark until a manual tap he had no reason to make.
@@ -460,7 +507,20 @@ final class WatchConversation {
             // ?defer=1 — this build drives response.create itself (the
             // patience window; same as the phone), so the mint suppresses
             // the VAD auto-response.
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1") ?? AppConfig.realtimeURL
+            // &mdl=1 — the wrist joins the model contract too: it dials the
+            // model the MINT returns rather than a name compiled in here, so a
+            // server-side model move carries the watch with it instead of
+            // leaving it on a stale name (a mismatched pair just hangs).
+            // &surface=watch — the wrist joins the mint registry (2026-08-24:
+            // watch sessions were invisible in telemetry; the registry comment
+            // literally said they "never beacon"). The mint returns a mint_id
+            // and this session beacons established/heard like the phone does.
+            // &build= — the registry row proves WHICH binary is on the wrist
+            // (312, the stale-process incident: TestFlight said 311 while the
+            // wrist churned a weeks-old process whose bare "?defer=1" mints
+            // were the giveaway).
+            let buildNum = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? "0"
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1&surface=watch&fmt=ulaw&build=" + buildNum) ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -469,15 +529,20 @@ final class WatchConversation {
             guard connectEpoch == epoch else { return }
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let mintedModel = (obj?["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? "gpt-realtime"
+            let socketURL = "wss://api.openai.com/v1/realtime?model="
+                + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
-                  let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                  let url = URL(string: socketURL) else {
                 if httpStatus == 401 || httpStatus == 403 {
                     authFailStreak += 1
                     if authFailStreak >= 2 {
                         // Two consecutive rejections = the token is really
                         // dead (revoked/expired) — sign out for real.
                         TokenStore.token = nil
-                        status = "Sign in again"
+                        NotificationCenter.default.post(name: .scarletWatchTokenCleared, object: nil)
+                        status = "Setting up again…"
                         state = .idle; wantLive = false
                     } else {
                         // First rejection: could be a transient validation
@@ -492,6 +557,13 @@ final class WatchConversation {
                 return
             }
             authFailStreak = 0   // a successful mint clears the strike count
+            // Session registry: the mint_id this session echoes back via
+            // op=session_alive (established on the first server event, heard
+            // on the first input event). nil-safe: a server that doesn't
+            // register watch mints returns no id and no beacon fires.
+            currentMintId = (obj?["mint_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            establishedBeaconSent = false
+            heardBeaconSent = false
             guard wantLive else { return }
             do { try await ensureAudio() } catch {
                 beacon("watch-audio-fail", String(describing: error).prefix(120).description + " " + routeSummary())
@@ -506,7 +578,25 @@ final class WatchConversation {
                 if reconnectAttempts > 0 {
                     status = "Mic waking — retrying…"
                     scheduleReconnect()
+                } else if audioStartRetries < 3 {
+                    // 313 (the standby aftershock): now that standby really
+                    // DEACTIVATES the audio session, a wrist-raise re-activates
+                    // it — and watchOS refuses activation ('!act') for a
+                    // beat while the app is still waking. One failed attempt
+                    // used to mean a dead "Mic unavailable — try again" in
+                    // Ido's hand for a problem that self-resolves in under a
+                    // second. Retry the whole connect a few times first.
+                    audioStartRetries += 1
+                    status = "Mic waking…"
+                    beacon("watch-audio-retry", "first-start activation failed — retry \(audioStartRetries)/3")
+                    let tok = token
+                    Task { @MainActor [weak self] in
+                        try? await Task.sleep(nanoseconds: 700_000_000)
+                        guard let self, self.wantLive, self.ws == nil else { return }
+                        await self.connect(token: tok)
+                    }
                 } else {
+                    audioStartRetries = 0
                     status = "Mic unavailable — try again"
                     state = .idle; wantLive = false
                 }
@@ -546,6 +636,12 @@ final class WatchConversation {
             lastServerInputEventAt = nil
             tapState.resetLoudSpeech()
             state = .listening
+            // NO lastEngagementAt stamp here (312, the churn-loop lesson): a
+            // connect is not engagement — automatic reconnects every ~40s
+            // were re-stamping this clock, so the 90s idle standby below
+            // could NEVER fire and the kill→reconnect cycle ran for hours.
+            // Engagement = the user (open, tap) or the server hearing him.
+            audioStartRetries = 0
             beacon("watch-connected", "attempt=\(reconnectAttempts)")
             startLivenessPings()
             // Audio-flow verdict 8s in: did real sound leave the wrist?
@@ -615,6 +711,22 @@ final class WatchConversation {
                         self.scheduleReconnect()
                         continue
                     }
+                    // (3b) IDLE STANDBY (2026-08-28 deep-QA — the loop
+                    //     killer): tap-to-talk, mic unarmed, nothing playing,
+                    //     no response in flight, 90s since any engagement —
+                    //     there is NOTHING this socket is for, and with the
+                    //     wrist down watchOS kills it every ~37s anyway, so
+                    //     holding it open just burns battery and mints
+                    //     (722/day). Close gracefully; wrist-raise or a tap
+                    //     self-heals via appBecameActive (endedByUser stays
+                    //     false, so raising the wrist IS the intent).
+                    if self.mode == .tapToTalk, !self.micArmed,
+                       self.pendingBuffers == 0, self.state != .speaking,
+                       !self.responseActive,
+                       Date().timeIntervalSince(self.lastEngagementAt) > 90 {
+                        self.enterStandby("idle 90s — socket closed; wrist-raise resumes")
+                        continue
+                    }
                     // (4) DEAF SERVER EAR (QA runs 8/12/14/15/16/18): none of
                     //    the guards above can fire because every send SUCCEEDS
                     //    — yet the server emits no input_audio_buffer.* or
@@ -641,10 +753,38 @@ final class WatchConversation {
                         self.recentDeafConvictions.removeAll { Date().timeIntervalSince($0) > 120 }
                         let fastPath = !self.recentDeafConvictions.contains { Date().timeIntervalSince($0) < 90 }
                         self.recentDeafConvictions.append(Date())
+                        self.deafStreak += 1
                         self.beacon("watch-deaf-session",
                                     "loud=\(String(format: "%.1f", loud))s peak=\(stats.peak) "
+                                    + "streak=\(self.deafStreak) "
                                     + "path=\(fastPath ? "fast" : "ladder") serverInput="
                                     + (self.lastServerInputEventAt.map { "\(Int(Date().timeIntervalSince($0)))s-ago" } ?? "never"))
+                        // DEAF CIRCUIT: three straight convictions and the
+                        // server has never once acknowledged input — this is
+                        // deterministic, not transient. Reminting hot burned
+                        // 722 mints in a day; hold 10 minutes, say the truth,
+                        // keep the want (never permanently dark).
+                        if self.deafStreak >= 3, self.lastServerInputEventAt == nil {
+                            self.beacon("watch-deaf-circuit",
+                                        "streak=\(self.deafStreak) — holding 10min, " + self.routeSummary())
+                            // Tear the deaf socket down NOW — ten minutes of
+                            // streaming into a corpse is the exact waste this
+                            // circuit exists to stop.
+                            self.ws?.cancel(with: .goingAway, reason: nil)
+                            self.ws = nil
+                            self.replyWatchdog?.cancel(); self.replyWatchdog = nil
+                            self.syncGate()
+                            self.status = "Voice can't hear from the watch right now — I keep trying. Use the phone meanwhile."
+                            self.state = .connecting
+                            self.reconnectTask?.cancel()
+                            self.reconnectTask = Task { [weak self] in
+                                try? await Task.sleep(nanoseconds: 600_000_000_000)
+                                guard let self, self.wantLive, !Task.isCancelled else { return }
+                                self.reconnectAttempts = 0
+                                self.scheduleReconnect(immediate: true)
+                            }
+                            continue
+                        }
                         if fastPath {
                             self.reconnectAttempts = 0
                             self.scheduleReconnect(immediate: true)
@@ -711,6 +851,10 @@ final class WatchConversation {
                 }
             } else {
                 transcript.removeAll()
+                // A stale thread is over — the ledger starts a new
+                // conversation too, so old and new never merge server-side.
+                WatchTurnLogger.shared.flushNow()
+                WatchTurnLogger.shared.sessionId = UUID().uuidString
                 // Released even though the replay is skipped for staleness —
                 // a held slot surviving here would re-inject a long-dead tool
                 // result into some future session's first turn.
@@ -825,7 +969,34 @@ final class WatchConversation {
     /// loud-speech ledger: acknowledged speech is not evidence of deafness.
     private func noteServerInputEvent() {
         lastServerInputEventAt = Date()
+        lastEngagementAt = Date()
         tapState.resetLoudSpeech()
+        // Heard = the ear works: the deaf circuit re-arms at full speed.
+        if deafStreak != 0 { deafStreak = 0; beacon("watch-ear-recovered", "server input event after deaf streak") }
+        // HEARD beacon: the server just proved it heard the wrist — stamp
+        // heard_at exactly once, same contract as the phone.
+        if !heardBeaconSent, let mintId = currentMintId {
+            heardBeaconSent = true
+            sendSessionAlive(mintId, phase: "heard")
+        }
+    }
+
+    /// Fire-and-forget liveness beacon to the session registry (same
+    /// endpoint + auth the phone uses; the patient mintSession because a
+    /// default session fails instantly on a half-woken wrist link).
+    private func sendSessionAlive(_ mintId: String, phase: String) {
+        guard let token = TokenStore.token,
+              var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false) else { return }
+        var items = comps.queryItems ?? []
+        items.append(URLQueryItem(name: "op", value: "session_alive"))
+        comps.queryItems = items
+        guard let url = comps.url else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["mint_id": mintId, "phase": phase])
+        mintSession.dataTask(with: req).resume()
     }
 
     /// Repeating transport-level ping. WebSocket pings ride below the Realtime
@@ -890,7 +1061,25 @@ final class WatchConversation {
                 case .failure(let err):
                     self.ws = nil
                     self.beacon("watch-ws-fail", String(describing: err).prefix(160).description)
-                    if self.wantLive { self.scheduleReconnect() }
+                    // CHURN BREAKER (312): watchOS kills an idle socket ~35s
+                    // after wrist-down (POSIX 89). Reconnecting an IDLE
+                    // session just re-arms that kill timer — build 311 looped
+                    // kill→reconnect for hours, kept the audio engine hot,
+                    // and left wrist-raises landing in the dead window
+                    // ("Scarlet fails to open"). If the socket died while
+                    // nothing was happening — tap-to-talk, mic unarmed, no
+                    // reply pending or playing — stand down instead: a
+                    // wrist-raise (appBecameActive) or a tap reconnects in
+                    // ~2s, which is cheaper than a socket that is dead when
+                    // he looks anyway. Mid-conversation failures (mic armed,
+                    // reply in flight, audio playing) keep full reconnect.
+                    if self.mode == .tapToTalk, !self.micArmed,
+                       self.pendingBuffers == 0, self.state != .speaking,
+                       !self.responseActive {
+                        self.enterStandby("socket died idle — standing by; wrist-raise or tap resumes")
+                    } else if self.wantLive {
+                        self.scheduleReconnect()
+                    }
                 case .success(let message):
                     if case .string(let text) = message,
                        let data = text.data(using: .utf8),
@@ -905,6 +1094,19 @@ final class WatchConversation {
 
     private func handleEvent(_ ev: [String: Any]) {
         let type = ev["type"] as? String ?? ""
+        // ESTABLISHED beacon: ANY server event proves the session came up
+        // (session.created is always first). Stamped once per socket — a mint
+        // with no established beacon is a true establishment failure.
+        if !establishedBeaconSent, let mintId = currentMintId {
+            establishedBeaconSent = true
+            sendSessionAlive(mintId, phase: "established")
+            // Truthful connect beacon (312): the old "watch-connected" fired
+            // right after task.resume() — before ANY server proof — so 722
+            // phantom "connections" logged overnight while the registry
+            // showed zero established sessions. This one fires on the first
+            // real server event only.
+            beacon("watch-established", "first server event on this socket")
+        }
         // Server-ear heartbeat: ANY input-side event (speech start/stop,
         // commit, transcription) is proof the server hears the wrist — stamp
         // the clock and forgive the accumulated loud-speech evidence. Matched
@@ -1054,6 +1256,11 @@ final class WatchConversation {
         lastLineAt = Date()
         transcript.append(Line(text: text, fromHer: fromHer))
         if transcript.count > 30 { transcript.removeFirst(transcript.count - 30) }
+        // THE FIX for the invisible-watch incident (2026-08-24): every
+        // finalized turn goes to the server ledger the moment it exists —
+        // his words as the server heard them, hers as she said them. The
+        // backend reconciler can only rescue a request it can see.
+        WatchTurnLogger.shared.log(role: fromHer ? "assistant" : "user", text: text)
     }
 
     // MARK: - tools
@@ -1319,7 +1526,7 @@ final class WatchConversation {
             beacon("watch-audio-noinput", routeSummary())
             throw NSError(domain: "ScarletWatchAudio", code: 1)
         }
-        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: wireRate,
+        let target = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: captureWireRate,
                                    channels: 1, interleaved: true)!
         tapState.set(converter: AVAudioConverter(from: inFormat, to: target))
 
@@ -1344,7 +1551,7 @@ final class WatchConversation {
 
         input.removeTap(onBus: 0)
         let tapState = self.tapState
-        let wire = wireRate   // captured by value — the tap never touches self's state
+        let wire = captureWireRate   // captured by value — the tap never touches self's state
         // format: nil — the bus's LIVE format, same fix as the phone
         // (2026-08-15 background crashes: "Failed to create tap due to format
         // mismatch" when a Bluetooth route flap lands between reading
@@ -1377,6 +1584,10 @@ final class WatchConversation {
             // deaf-session ledger when the peak says real speech. One Double
             // add under the existing lock; nothing new runs per frame.
             tapState.note(peak: p, frameSeconds: Double(data.count / 2) / wire)
+            // μ-law encode (WRIST PIPE FIX): 8 kHz int16 → 1 byte/sample —
+            // with base64, ~10KB/s upstream instead of ~60KB/s. Peak math
+            // above ran on the int16 samples, so the beacons stay truthful.
+            let ulaw = Self.muLawEncode(data)
             Task { @MainActor [weak self] in
                 guard let self, self.ws != nil else { return }
                 // Backpressure cap (~0.5s of audio): a socket that stopped
@@ -1386,7 +1597,7 @@ final class WatchConversation {
                     self.droppedChunks += 1
                     return
                 }
-                self.sendAudio(data.base64EncodedString())
+                self.sendAudio(ulaw.base64EncodedString())
             }
         }
         try audioEngine.start()
@@ -1499,6 +1710,43 @@ final class WatchConversation {
         syncGate()
     }
 
+    /// STANDBY (312, the stale-process discovery): the silent keep-alive
+    /// render kept the PROCESS alive for days — watchOS then never swapped in
+    /// newly installed builds (the wrist churned on a weeks-old binary while
+    /// TestFlight said 311), and the mic indicator burned all night. Standby
+    /// releases audio COMPLETELY: engine stopped, session deactivated, mic
+    /// indicator off — watchOS may now suspend us, which is the point. A
+    /// wrist-raise (appBecameActive → start) or tap rebuilds everything from
+    /// scratch via ensureAudio (audioReady=false takes the full path), and a
+    /// suspended process gets replaced by the newest installed build on the
+    /// next launch.
+    private func enterStandby(_ reason: String) {
+        beacon("watch-standby", reason)
+        ws?.cancel(with: .goingAway, reason: nil)
+        ws = nil
+        replyWatchdog?.cancel(); replyWatchdog = nil
+        reconnectTask?.cancel(); reconnectTask = nil
+        keepAliveTask?.cancel(); keepAliveTask = nil
+        syncGate()
+        wantLive = false
+        state = .idle
+        status = "Tap to talk"
+        // Engine drop is DELAYED half a second (313): stopping it instantly
+        // let watchOS suspend the process before the standby beacon's POST
+        // finished — standby worked but looked invisible in telemetry. The
+        // guard re-checks that no tap/wrist-raise revived the session during
+        // the wait; if one did, the engine stays (that session owns it now).
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, !self.wantLive, self.state == .idle, self.ws == nil else { return }
+            self.keepAlivePlayer.stop()
+            self.player.stop()
+            self.audioEngine.stop()
+            self.audioReady = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
+    }
+
     /// Loop 0.5s silent buffers on the muted keep-alive player so the audio
     /// engine renders CONTINUOUSLY — the condition for watchOS background
     /// audio to keep the app (and its WebSocket) alive through wrist-down.
@@ -1554,6 +1802,31 @@ final class WatchConversation {
         }
         guard out.frameLength > 0, let ch = out.int16ChannelData else { return nil }
         return Data(bytes: ch[0], count: Int(out.frameLength) * 2)
+    }
+
+    /// G.711 μ-law encode (the WRIST PIPE FIX's byte diet): 16-bit linear PCM
+    /// → 8-bit μ-law, the textbook algorithm (bias 0x84, clip 32635). One
+    /// byte per sample — with the 8 kHz capture rate this is ~6× fewer wire
+    /// bytes than 24 kHz PCM16. The session is minted `audio/pcmu`, so the
+    /// server decodes it natively.
+    private nonisolated static func muLawEncode(_ pcm: Data) -> Data {
+        var out = Data(capacity: pcm.count / 2)
+        pcm.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let samples = raw.bindMemory(to: Int16.self)
+            for sample in samples {
+                var s = Int32(sample)
+                let sign: UInt8 = s < 0 ? 0x80 : 0
+                if s < 0 { s = -s }
+                if s > 32635 { s = 32635 }
+                s += 0x84
+                var exponent: UInt8 = 7
+                var mask: Int32 = 0x4000
+                while exponent > 0 && (s & mask) == 0 { exponent -= 1; mask >>= 1 }
+                let mantissa = UInt8((s >> (Int32(exponent) + 3)) & 0x0F)
+                out.append(~(sign | (exponent << 4) | mantissa))
+            }
+        }
+        return out
     }
 
     private func playPCM(_ pcm: Data) {

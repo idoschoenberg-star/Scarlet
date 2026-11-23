@@ -48,6 +48,14 @@ final class NavigationChain: ObservableObject {
     private var chain: StoredChain?
     private var observer: NSObjectProtocol?
 
+    /// The chain's OWN location source (P19): the arrival watch used to ride
+    /// only .scarletLocationFix, which stops the moment the voice session
+    /// ends — a session death mid-drive silently killed the leg-2 handoff.
+    /// Armed with the chain, stopped with it; hundred-meter accuracy is
+    /// plenty for a 600 m arrival radius and cheap on battery.
+    private let chainManager = CLLocationManager()
+    private lazy var chainDelegate = ChainLocationDelegate()
+
     private init() {
         // Resume a chain that was mid-drive when the app restarted.
         if let data = UserDefaults.standard.data(forKey: Self.storeKey),
@@ -71,10 +79,17 @@ final class NavigationChain: ObservableObject {
             chain = StoredChain(legs: legs, nextIndex: 1, startedAt: Date())
             persist()
             startWatching()
-            // Provisional = delivered quietly, no permission dialog — the
-            // fallback works on first use without interrupting the drive.
-            UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .sound, .provisional]) { _, _ in }
+            // REAL alerts, not .provisional (P19): provisional delivery is
+            // quiet — no lock-screen banner, no sound — which defeated the
+            // leg-2 fallback's whole purpose. Check current settings first so
+            // an already-decided status never re-prompts mid-drive.
+            let center = UNUserNotificationCenter.current()
+            center.getNotificationSettings { settings in
+                if settings.authorizationStatus == .notDetermined
+                    || settings.authorizationStatus == .provisional {
+                    center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                }
+            }
         } else {
             clear()
         }
@@ -89,6 +104,18 @@ final class NavigationChain: ObservableObject {
     // MARK: arrival watch
 
     private func startWatching() {
+        // Own source first — check(at:) de-dupes, so both feeds are safe.
+        chainManager.delegate = chainDelegate
+        chainManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        let auth = chainManager.authorizationStatus
+        if auth == .authorizedAlways {
+            // Requires UIBackgroundModes:[location] (present) AND Always —
+            // setting it under While-Using would throw the fixes away on lock.
+            chainManager.allowsBackgroundLocationUpdates = true
+        }
+        if auth == .authorizedAlways || auth == .authorizedWhenInUse {
+            chainManager.startUpdatingLocation()
+        }
         guard observer == nil else { return }
         observer = NotificationCenter.default.addObserver(
             forName: .scarletLocationFix, object: nil, queue: .main
@@ -99,11 +126,13 @@ final class NavigationChain: ObservableObject {
     }
 
     private func stopWatching() {
+        chainManager.stopUpdatingLocation()
+        chainManager.allowsBackgroundLocationUpdates = false
         if let o = observer { NotificationCenter.default.removeObserver(o) }
         observer = nil
     }
 
-    private func check(at loc: CLLocation) {
+    fileprivate func check(at loc: CLLocation) {
         guard var c = chain, c.nextIndex < c.legs.count else { stopWatching(); return }
         if Date().timeIntervalSince(c.startedAt) > Self.maxAge { clear(); return }
         let target = c.legs[c.nextIndex - 1]   // the stop we're driving to now
@@ -134,6 +163,10 @@ final class NavigationChain: ObservableObject {
         content.title = "Continue to \(next.name)"
         content.body = "Tap to resume navigation in Apple Maps."
         content.sound = .default
+        // Breaks through Driving Focus — leg 2 is exactly the moment a
+        // focus mode would otherwise swallow the handoff (needs the Time
+        // Sensitive Notifications entitlement; degrades to .active without).
+        content.interruptionLevel = .timeSensitive
         content.userInfo = ["open_url": next.mapsURL]
         let req = UNNotificationRequest(identifier: "nav-chain-\(next.name)",
                                         content: content, trigger: nil)
@@ -159,5 +192,16 @@ final class NavigationChain: ObservableObject {
     private func persist() {
         guard let c = chain, let data = try? JSONEncoder().encode(c) else { return }
         UserDefaults.standard.set(data, forKey: Self.storeKey)
+    }
+}
+
+/// Delegate for the chain's own manager. A separate plain object (the
+/// LocationReporter/TrailDelegate pattern) so the @MainActor chain never has
+/// to satisfy the nonisolated CLLocationManagerDelegate requirements itself;
+/// fixes hop to the main actor before touching the chain.
+private final class ChainLocationDelegate: NSObject, CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.last else { return }
+        Task { @MainActor in NavigationChain.shared.check(at: loc) }
     }
 }

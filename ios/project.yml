@@ -134,6 +134,18 @@ targets:
         # doesn't include the entitlement", the App ID capability got dropped —
         # re-check it in the portal before touching this line.
         com.apple.developer.carplay-voice-based-conversation: true
+        # Time Sensitive Notifications — lets the NavigationChain leg-2
+        # handoff break through Driving Focus (interruptionLevel =
+        # Time-sensitive notifications entitlement DEFERRED (2026-08-21):
+        # build 32483603352 failed at codesign because the ScarletTalk App ID
+        # does not carry the Time Sensitive Notifications capability, and the
+        # public App Store Connect API cannot enable it (capabilityType enum
+        # has no value for it — portal-UI only, verified against the live
+        # API's 409 response). Without the entitlement, .timeSensitive
+        # interruption levels degrade silently to .active — alerts still
+        # deliver, they just don't break through Focus. To restore: enable
+        # the capability on the App ID in the developer portal, then re-add:
+        #   com.apple.developer.usernotifications.time-sensitive: true
 
   # The phone recorder's surfaces outside the app (commission 2026-11-07,
   # build 2026-11-14): the Live Activity (Lock Screen, Dynamic Island, the

@@ -33,6 +33,8 @@ struct SplitShell: View {
     enum ShellSection: String, CaseIterable, Identifiable {
         case talk
         case inbox
+        case journal
+        case active
         case calendar
         case chats
         case photos
@@ -51,6 +53,8 @@ struct SplitShell: View {
             switch self {
             case .talk: return "Talk"
             case .inbox: return "Inbox"
+            case .journal: return "Journal"
+            case .active: return "Active"
             case .calendar: return "Calendar"
             case .chats: return "Chats"
             case .photos: return "Photos"
@@ -70,6 +74,8 @@ struct SplitShell: View {
             switch self {
             case .talk: return "waveform"
             case .inbox: return "envelope.fill"
+            case .journal: return "book.closed.fill"
+            case .active: return "dot.radiowaves.left.and.right"
             case .calendar: return "calendar"
             case .chats: return "bubble.left.and.bubble.right.fill"
             case .photos: return "photo.on.rectangle"
@@ -89,14 +95,16 @@ struct SplitShell: View {
             switch self {
             case .talk: return "1"
             case .inbox: return "2"
-            case .calendar: return "3"
-            case .chats: return "4"
-            case .photos: return "5"
-            case .music: return "6"
+            case .journal: return "3"
+            case .active: return "a"
+            case .calendar: return "4"
+            case .chats: return "5"
+            case .photos: return "6"
+            case .music: return "7"
             case .news: return "n"
-            case .library: return "7"
-            case .health: return "8"
-            case .desk: return "9"
+            case .library: return "8"
+            case .health: return "9"
+            case .desk: return "d"
             // ⌘0…⌘9 are all taken; new sections use letters (as News uses ⌘N).
             case .estate: return "e"
             case .travel: return "t"
@@ -122,7 +130,12 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate, .travel]
+        // EVERY ShellSection except .settings belongs here — a section
+        // missing from this list has NO sidebar row and its keyboard
+        // shortcut never registers, making it unreachable on the MAIN work
+        // platform (the design sweep caught .news absent; .active nearly
+        // shipped with the same hole).
+        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk, .estate, .travel]
     }
 
     var body: some View {
@@ -152,6 +165,15 @@ struct SplitShell: View {
         // report their own from their onAppears, exactly as on the phone).
         .onChange(of: section) { _, newSection in
             if newSection == .talk { convo.setFocus(Self.talkFocus) }
+            // Tell RootView what is frontmost: its desk-focus poll must not
+            // clobber a non-Talk pane's own [FOCUS] (the `tab` guard it uses
+            // on the phone is inert at regular width).
+            NotificationCenter.default.post(name: .scarletShellSection,
+                                            object: String(describing: newSection))
+        }
+        .onAppear {
+            NotificationCenter.default.post(name: .scarletShellSection,
+                                            object: String(describing: section))
         }
     }
 
@@ -222,6 +244,9 @@ struct SplitShell: View {
             .contentShape(RoundedRectangle(cornerRadius: 12))
         }
         .buttonStyle(.plain)
+        // The Catalyst pointer must read these as clickable (doctrine §11):
+        // .highlight gives the standard pill hover the system sidebar has.
+        .hoverEffect(.highlight)
         .keyboardShortcut(s.shortcutKey, modifiers: .command)
     }
 
@@ -259,6 +284,21 @@ struct SplitShell: View {
             // becomes the big reading pane. Zero rewrites.
             InboxView()
                 .environmentObject(convo)
+        case .journal:
+            // Self-contained NavigationStack (review cards + amend sheet).
+            // Corp-view profile (Device Boundary): Journal / Photos / Health
+            // are personal surfaces — on a corporate or still-unknown device
+            // they collapse to the "Personal — tap to show" card, revealed
+            // per session. Same gate as the phone's tabs, one truth.
+            PersonalSurface(section: "journal", title: "Your journal",
+                            icon: "book.closed.fill") {
+                JournalView()
+                    .environmentObject(convo)
+            }
+        case .active:
+            // The assignment monitor: in-flight / done / recurring.
+            ActiveView()
+                .environmentObject(convo)
         case .calendar:
             // Manages its own layout (week strip + agenda; detail is a sheet).
             CalendarView()
@@ -270,8 +310,11 @@ struct SplitShell: View {
                 .environmentObject(convo)
         case .photos:
             // Self-contained (grid + lightbox + forward sheet).
-            PhotosView()
-                .environmentObject(convo)
+            PersonalSurface(section: "photos", title: "Your photos",
+                            icon: "photo.on.rectangle") {
+                PhotosView()
+                    .environmentObject(convo)
+            }
         case .music:
             // Self-contained (library shelves, search, now-playing).
             MusicView()
@@ -284,8 +327,11 @@ struct SplitShell: View {
             LibraryView()
                 .environmentObject(convo)
         case .health:
-            HealthView()
-                .environmentObject(convo)
+            PersonalSurface(section: "health", title: "Your health",
+                            icon: "heart.fill") {
+                HealthView()
+                    .environmentObject(convo)
+            }
         case .desk:
             // Self-contained (Reminders + Apple Notes; serif reading sheet).
             DeskView()

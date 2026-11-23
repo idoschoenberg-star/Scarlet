@@ -135,6 +135,14 @@ final class Conversation: ObservableObject {
     }
     private var lastSpeechStoppedAt = Date.distantPast
     private var lastResponseCreatedAt = Date.distantPast
+    /// Transcript length at the moment his turn closed. Transcription is
+    /// ASYNC and routinely lands AFTER her reply's transcript — appending in
+    /// arrival order put his words BELOW the answer they prompted. His line
+    /// inserts at this mark instead, i.e. before anything that landed after
+    /// his turn closed. (Under ?defer=1 her response can't even be created
+    /// until the patience window fires, so at speech_stopped/committed this
+    /// mark reliably precedes her whole reply.)
+    private var transcriptMarkAtTurnClose = 0
     /// THE PATIENCE WINDOW (2026-08-14, Ido: "she loses patience and just
     /// barges in" mid-dictation, and the truncated rest never registers).
     /// This build mints with ?defer=1 — the server's VAD still detects and
@@ -207,6 +215,23 @@ final class Conversation: ObservableObject {
     /// playPCM's delta path drops them until a DIFFERENT item id appears.
     private var truncatedItemId: String?
     private var drainedAudioFrames = 0
+    /// Frames RECEIVED for the current assistant item (drained ≤ received).
+    /// drained/received is the honest fraction of her answer he actually
+    /// heard when a barge-in cuts playback — what the on-screen transcript
+    /// must be trimmed to. ElevenLabs sends agent_response_correction with
+    /// her exact spoken words; OpenAI has no such event, so the proportional
+    /// cut is the best truth available (Ido 2026-08-11: the text box must
+    /// never keep words she never voiced).
+    private var receivedAudioFrames = 0
+    /// Whether the current item's full transcript already reached the screen.
+    /// Decides WHERE the barge-in trim applies: to the line already shown, or
+    /// to the transcript.done still in flight (pendingTranscriptTrimFraction).
+    private var assistantTranscriptLanded = false
+    /// Armed by a barge-in flush when her line hasn't landed yet; the next
+    /// output_audio_transcript.done applies it. Cleared on response.created
+    /// so a cancelled response that never sends its transcript can't trim a
+    /// healthy future reply.
+    private var pendingTranscriptTrimFraction: Double?
     /// One free retry for a failed/incomplete response when there is no
     /// queued text to re-send (finding #5): the spoken turn is still in the
     /// conversation, so a bare response.create recovers it. Reset on every
@@ -220,6 +245,34 @@ final class Conversation: ObservableObject {
     /// Recent conversation items outweigh 36k-char instructions, so the pin
     /// wins where prose lost. nil until his first utterance each session.
     private var pinnedLanguage: String?
+
+    // MARK: address gating (multi-speaker car cabin, 2026-08-19)
+    /// When her last reply stopped being AUDIBLE / the last deliberate
+    /// interaction happened. The follow-up window runs from
+    /// max(lastEngagedAt, playbackDeadline).
+    private var lastEngagedAt = Date.distantPast
+    /// speech_stopped held a gate-cold turn; awaiting committed's item_id.
+    private var gatePendingHold = false
+    private var gateHoldFailOpen: DispatchWorkItem?
+    /// Committed items held for their transcript verdict.
+    private var gateHeldItems = Set<String>()
+    /// Ambient speech_started cancelled a pending create for IDO'S engaged
+    /// turn — if the ambient turn is gate-IGNORED, that create must be
+    /// re-scheduled (panel: otherwise his question silently dies and the
+    /// pre-armed empty-placeholder watchdog reconnect-storms).
+    private var gateInterruptedPendingCreate = false
+
+    private var addressGateActive: Bool {
+        GateSettings.enabled && drivingMode && engine == .openai
+    }
+    private func gateSignals(transcript: String?) -> AddressGate.Signals {
+        .init(inCar: drivingMode,
+              speakingNow: responseActive || pendingBuffers > 0,
+              secondsSinceEngaged: Date().timeIntervalSince(max(lastEngagedAt, playbackDeadline)),
+              otherAudioPlaying: AVAudioSession.sharedInstance().isOtherAudioPlaying,
+              transcript: transcript)
+    }
+    private func noteEngagement() { lastEngagedAt = Date() }
 
     /// Detect the utterance's language by script. Hebrew letters → "he".
     /// ARABIC script ALSO → "he" (2026-08-12: the transcriber sometimes
@@ -444,15 +497,23 @@ final class Conversation: ObservableObject {
         pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        stopAudio()
+        stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
+        turnPhase = .idle
+        terminalStartFailure = true   // both engines down — a car retry loop can't fix a vendor burst
         status = "Voice temporarily unavailable — try again in a minute."
     }
 
     struct Line: Identifiable { let id = UUID(); let text: String; let fromHer: Bool }
 
     @Published var state: State = .idle
+    /// Typed turn phase for surfaces that must not compare status STRINGS
+    /// (CarPlay's thinking state broke on any copy tweak). Set at the same
+    /// points the strings are set; `.thinking` covers "his turn closed, her
+    /// reply not yet audible".
+    enum TurnPhase { case idle, listening, thinking, speaking }
+    @Published private(set) var turnPhase: TurnPhase = .idle
     @Published var status = "Waking her up…"
     @Published var transcript: [Line] = []
     @Published var micOn = true
@@ -471,6 +532,17 @@ final class Conversation: ObservableObject {
     /// `MicSettings.shared.level` for the Settings sheet, which doesn't hold a
     /// reference to this live instance.
     @Published var inputLevel: Float = 0
+    /// Set when the chosen input wouldn't start and we dropped to the built-in
+    /// mic (task #49). Shown as a banner on the Talk screen and cleared by a
+    /// tap — a silent switch to a different microphone is its own bug.
+    @Published var micFallbackNote: String?
+    /// The device we fell back FROM, for the banner's wording.
+    private var micFellBackFrom: String?
+    /// The Realtime model this session is actually running on — whatever the
+    /// mint handed back. Recorded so the client log says which model a session
+    /// used, and a model rollout can be read off real sessions rather than
+    /// assumed.
+    private var activeModel = "gpt-realtime"
 
     /// Set by TalkView on its first appearance so tab switches never
     /// re-trigger the auto-connect. Not published — pure bookkeeping.
@@ -478,11 +550,42 @@ final class Conversation: ObservableObject {
 
     private var ws: URLSessionWebSocketTask?
     private lazy var wsSession = URLSession(configuration: .default)
+    /// Mint and tool calls used URLSession.shared — the 60s default meant a
+    /// hung mint mid-reconnect or a hung tool proxy was a full minute of dead
+    /// air. Mirror the Watch: wait for connectivity (a link mid-handoff is
+    /// not a failure), but cap the whole task so a hang becomes a retry.
+    /// resourceTimeout is task-lifetime — right for these one-shot POSTs,
+    /// fatal for the WebSocket, which keeps its default session above.
+    private static func patientSession(resourceTimeout: TimeInterval) -> URLSession {
+        let c = URLSessionConfiguration.default
+        c.waitsForConnectivity = true
+        c.timeoutIntervalForResource = resourceTimeout
+        return URLSession(configuration: c)
+    }
+    /// 20s: the server mint can add whole seconds under cold start and the
+    /// budget absorbs a radio wake, but a reconnect must fail into the
+    /// backoff ladder fast enough that the cutover budget survives.
+    private let mintSession = Conversation.patientSession(resourceTimeout: 20)
+    /// 30s: tools may legitimately be slow (search, mail), but past that the
+    /// turn is dead air — fail so the model can say "that's taking too long".
+    private let toolSession = Conversation.patientSession(resourceTimeout: 30)
     private var token = ""
     private var outputRate: Double = 24000   // OpenAI Realtime speaks 24 kHz PCM16
 
     // Reconnect discipline: one loop at a time, only while the user wants live.
     private var wantLive = false
+    /// True while ONE connect() attempt is in flight (mint → dial). The path
+    /// monitor and every external reconnect trigger must stand down behind it:
+    /// two racing connects supersede each other's socket, the ghost guard then
+    /// drops the loser's session.created, and nothing establishes — the
+    /// 2026-08-23 CarPlay drive minted 7 sessions that way and connected none.
+    private var connectInFlight = false
+    /// Consecutive dialed sockets that produced NO server event before the
+    /// establish watchdog fired. Reset on establishment and on a fresh
+    /// start(). ≥ 4 = this network cannot carry the voice socket right now:
+    /// the honest can't-reach status shows (CarPlay maps it off the spinner)
+    /// while the long-tail retry keeps working silently underneath.
+    private(set) var neverEstablishedStreak = 0
     private var reconnecting = false
     /// Consecutive failed reconnects — drives exponential backoff and the
     /// eventual give-up, so a dead network can't hammer the mint endpoint at a
@@ -529,6 +632,11 @@ final class Conversation: ObservableObject {
     /// session is declared stalled. Signs of life (first audio/text/tool
     /// event) cancel it — so a long tool run doesn't trip it, only silence.
     private let replyWatchdogSeconds: UInt64 = 25
+    /// First watchdog fire tries a SOFT recovery before any teardown — a
+    /// wedged VAD turn or slow reply costs one nudge (or one extra window),
+    /// never a mid-dialogue restart with amnesia (2026-08-19 CarPlay:
+    /// three sessions in one drive).
+    private var replyWatchdogNudged = false
     private var livenessTask: Task<Void, Never>?
 
     // Transport visibility (2026-08-11 death-loop hunt): every reconnect and
@@ -661,8 +769,17 @@ final class Conversation: ObservableObject {
     private var echoRisk: Bool {
         if chatMode || !speakerOn { return false }   // her voice is silent
         if sealedEarRoute { return false }           // her voice can't reach the mic
+        if voiceProcessingActive { return false }    // hardware AEC strips her voice (flag-gated trial)
         return pendingBuffers > 0 || Date() < speechTailUntil
     }
+
+    /// Apple's Voice-Processing I/O (hardware AEC/AGC/NS) is engaged on the
+    /// input node — full duplex is safe because the cabin speakers' playback
+    /// is stripped from the cabin mic. DARK by default: only true when the
+    /// `scarlet.vpio.enabled` trial flag is on AND the enable call succeeded
+    /// on a car route (see buildAudioGraph). Build-218 echo-loop history —
+    /// never widen without on-device measurement in a real car.
+    private var voiceProcessingActive = false
 
     /// True when EVERY live output is sealed in/against Ido's ear — wired
     /// headphones, a Bluetooth headset (AirPods run the HFP hands-free
@@ -706,6 +823,21 @@ final class Conversation: ObservableObject {
     /// as "your voice is being captured".
     var micStreaming: Bool { micOn && !echoRisk && (state == .listening || state == .speaking) }
 
+    // MARK: barge-in return path (tasks #54/#90, Ido 2026-08-20)
+
+    /// Routes where minting with ?barge=1 (server interrupt_response:true)
+    /// is safe: sealed-ear (headphones/AirPods — her voice can't reach the
+    /// mic) and CarPlay (the work order's echo-safe list). NEVER the open
+    /// iPhone speaker — the 2026-08-12 disaster is what the flag does to an
+    /// open-air route without voice processing.
+    private var bargeInEligibleRoute: Bool { sealedEarRoute || onCarRoute }
+    /// Whether the LIVE session was minted with ?barge=1 — the flag is a
+    /// client promise, so the client must know what it promised. Route
+    /// changes that flip eligibility are DEFERRED to the next mint (safe→
+    /// unsafe is already covered: the echo gate stops streaming her
+    /// playback back, so no speech_started can fire from her own voice).
+    private var bargeInMinted = false
+
     // MARK: lifecycle
 
     func start(token: String) {
@@ -724,6 +856,9 @@ final class Conversation: ObservableObject {
         // every audio buffer of this one — a fresh start reclaims the session.
         interrupted = false
         endedByUser = false
+        terminalStartFailure = false   // every fresh start earns a clean verdict
+        neverEstablishedStreak = 0     // same rule for the can't-reach verdict
+        turnPhase = .idle
         // A fresh user-initiated session ALWAYS tries the primary engine
         // first: even if the last session ended on the ElevenLabs parachute,
         // the burst that convicted OpenAI has usually passed by the next
@@ -763,7 +898,13 @@ final class Conversation: ObservableObject {
         // push today's HealthKit numbers now so she isn't reading a row from
         // the last time the Health tab was opened. No-ops while the phone is
         // locked (HealthKit is sealed then) or when Health was never granted.
-        Task { await HealthSync.shared.syncNow() }
+        // TODAY first and fast (five single-day sums, one row pushed) so
+        // "how many steps today" is answered from a number seconds old — the
+        // full 14-day window behind it can take its time.
+        Task {
+            await HealthSync.shared.syncToday()
+            await HealthSync.shared.syncNow()
+        }
         Task { await connect() }
         observeInterruptions()
         // Live message ANNOUNCEMENTS are OFF (Ido 2026-08-12: "I don't need
@@ -881,6 +1022,21 @@ final class Conversation: ObservableObject {
                     self.reconnectAttempts = 0
                     self.scheduleReconnect(reason: "born-deaf-soft-speech", immediate: true)
                 }
+                // Proactive quiet-boundary rotation (2026-08-19): OpenAI
+                // enforces a server-side session lifetime cap that eventually
+                // drops the socket mid-sentence. Rotate at a QUIET boundary
+                // well before the cap — the P4 handover carries language +
+                // context, so the rebuild is invisible instead of an amnesia
+                // cut mid-answer. Rides the existing 10s tick, never a new timer.
+                if self.engine == .openai, self.state == .listening,
+                   Date().timeIntervalSince(self.connectedAt) > 50 * 60,
+                   self.pendingBuffers == 0, !self.responseActive,
+                   !self.serverHearsSpeech, !self.holdingForUserSpeech,
+                   Date().timeIntervalSince(self.lastSpeechStartedAt) > 5 {
+                    self.clientLog("session-rotate", "quiet-boundary rebuild before vendor lifetime cap")
+                    self.reconnectAttempts = 0
+                    self.scheduleReconnect(reason: "session-rotate", immediate: true)
+                }
                 // Recovery off the ElevenLabs parachute lands here: the probe
                 // armed openAIRecovered, and this tick is the quiet-boundary
                 // check that performs the actual switch (no-op otherwise).
@@ -970,6 +1126,12 @@ final class Conversation: ObservableObject {
     /// readable so CarPlay's self-restart also respects his End.
     private(set) var endedByUser = false
 
+    /// A start failed for a reason RETRYING cannot fix (mic permission
+    /// denied, 401/403 mint, both voice engines down). CarPlay's retry
+    /// ladder reads this to show an honest terminal state instead of
+    /// feeding an endless start→fail loop. Cleared by every fresh start().
+    private(set) var terminalStartFailure = false
+
     func end() {
         endedByUser = true
         wantLive = false
@@ -986,10 +1148,19 @@ final class Conversation: ObservableObject {
         pathMonitor?.cancel(); pathMonitor = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
-        stopAudio()
+        stopAudio(deactivateSession: true)   // the call is over — release the hardware (radio hand-off inside)
         endBackgroundAssertion()
         state = .idle
+        turnPhase = .idle
         status = "Ended. Tap Start (or the orb) when you want me back."
+    }
+
+    /// System-initiated teardown (CarPlay unplug, etc.) — same shutdown as
+    /// end(), but it is NOT Ido's choice: self-heal and the car's own
+    /// auto-revival stay armed.
+    func endBySystem() {
+        end()
+        endedByUser = false
     }
 
     // MARK: background survival (locked screen in the car)
@@ -1041,6 +1212,7 @@ final class Conversation: ObservableObject {
     /// (one shared session); the car screen itself cannot take touches under
     /// Apple's voice-conversation template.
     func stopSpeaking() {
+        noteEngagement()   // a deliberate interaction — he is engaged with her
         guard state == .speaking || pendingBuffers > 0 || responseActive else { return }
         if engine == .openai, responseActive {
             send(["type": "response.cancel"])
@@ -1126,8 +1298,34 @@ final class Conversation: ObservableObject {
                 guard let prev, prev != sig, sig != "down" else { return }
                 guard Date().timeIntervalSince(self.lastPathReconnectAt) > 30 else { return }
                 self.lastPathReconnectAt = Date()
-                self.clientLog("path-change", "\(prev) → \(sig) — preemptive reconnect")
-                self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                // VERIFY, don't assume (2026-08-19 CarPlay: healthy sessions
+                // were being restarted mid-dialogue on every interface flip).
+                // A changed interface SET does not prove the socket died —
+                // sockets routinely survive Wi-Fi-assist flips. Ping the live
+                // socket: a dead one fails the pong and reconnects
+                // near-instantly; a healthy one is left alone.
+                guard let task = self.ws else {
+                    // Mid-connect (mint in flight, socket not yet dialed): the
+                    // attempt owns its own recovery. Firing an immediate
+                    // reconnect here is what double-minted 0.5s apart on
+                    // CarPlay attach and superseded every handshake.
+                    if self.connectInFlight {
+                        self.clientLog("path-change", "\(prev) → \(sig) — connect in flight, letting it finish")
+                        return
+                    }
+                    self.clientLog("path-change", "\(prev) → \(sig) — no socket, reconnecting")
+                    self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                    return
+                }
+                self.clientLog("path-change", "\(prev) → \(sig) — verifying socket with ping")
+                task.sendPing { [weak self] error in
+                    guard error != nil else { return }   // pong OK — the socket survived the handoff
+                    Task { @MainActor in
+                        guard let self, self.wantLive, self.ws === task else { return }
+                        self.clientLog("path-change", "ping failed after path change — reconnecting")
+                        self.scheduleReconnect(reason: "network-path-change", immediate: true)
+                    }
+                }
             }
         }
         mon.start(queue: DispatchQueue.global(qos: .utility))
@@ -1337,6 +1535,7 @@ final class Conversation: ObservableObject {
     /// path requeues the text and rebuilds the socket, so the question is
     /// re-asked on the fresh session instead of vanishing.
     private func sendUserMessage(_ text: String, createResponse: Bool = true) {
+        noteEngagement()   // a typed/system turn is a deliberate interaction
         awaitingReplyText = text
         armReplyWatchdog()
         let payload: [String: Any] = engine == .eleven
@@ -1392,6 +1591,31 @@ final class Conversation: ObservableObject {
 
     private func replyWatchdogFired() {
         guard wantLive else { return }
+        if engine == .openai, !replyWatchdogNudged, ws != nil {
+            replyWatchdogNudged = true
+            // If he may STILL be speaking (VAD open or speech started
+            // recently), do NOT clear his uncommitted audio or force a reply
+            // mid-utterance (2026-08-14 barge-in bug). Extend one window.
+            if serverHearsSpeech || Date().timeIntervalSince(lastSpeechStartedAt) < 5 {
+                clientLog("reply-watchdog-nudge", "speech may be ongoing — extending window, no clear/create")
+                armReplyWatchdog()
+                return
+            }
+            clientLog("reply-watchdog-nudge",
+                      "no reply in \(replyWatchdogSeconds)s — soft recovery before any teardown")
+            pendingResponseCreate?.cancel(); pendingResponseCreate = nil
+            if responseActive {
+                deferResponse(.itemBacked)
+            } else if let text = awaitingReplyText, !text.isEmpty {
+                // Only nudge when a REAL committed/typed turn awaits a reply.
+                // The empty-string placeholder means no committed item exists —
+                // an input-less response.create would invent a turn (225 class).
+                send(["type": "response.create"])
+            }
+            armReplyWatchdog()   // one more window; a second silence reconnects
+            return
+        }
+        replyWatchdogNudged = false
         // Total silence for the whole window — the session is stalled or the
         // socket is dead. Hold the question when its text is known (a spoken
         // turn's watchdog can be armed before its transcript arrives — then
@@ -1407,6 +1631,7 @@ final class Conversation: ObservableObject {
     /// Her first response event for the outstanding turn — the reply is coming,
     /// stand the watchdog down.
     private func noteSignsOfLife() {
+        replyWatchdogNudged = false   // life returned — the soft rung re-arms
         guard awaitingReplyText != nil || replyWatchdog != nil else { return }
         awaitingReplyText = nil
         replyWatchdog?.cancel(); replyWatchdog = nil
@@ -1544,6 +1769,43 @@ final class Conversation: ObservableObject {
         }
     }
 
+    /// The compact handover injected into every rebuilt session BEFORE it
+    /// can speak: continuation contract, the LANGUAGE he was speaking, his
+    /// last turn (answered NOW only on a self-heal rebuild), and the recent
+    /// exchange. Built purely from state the singleton already holds.
+    private func makeHandoverContext(language: String?, selfHeal: Bool) -> String {
+        var parts: [String] = []
+        parts.append("[FOCUS] Connection renewed mid-conversation (transport drop or forced rebuild). This is a CONTINUATION of the SAME conversation — do not greet, do not reset, do not re-introduce yourself, never mention the reconnect.")
+        if let lang = language {
+            parts.append(lang == "he"
+                ? "LANGUAGE: Ido was speaking HEBREW — continue in Hebrew unless his next words are clearly English."
+                : "LANGUAGE: Ido was speaking ENGLISH — continue in English unless his next words are clearly Hebrew.")
+        }
+        if selfHeal,
+           let lastAsk = transcript.last(where: { !$0.fromHer })?.text, !lastAsk.isEmpty {
+            parts.append("HIS LAST TURN: \"\(lastAsk.prefix(300))\" — if it was not fully answered before the drop, answer it now without making him re-ask.")
+        }
+        // 16 REAL lines × 400 chars, not 6 × 200: a rebuilt session restored
+        // from a keyhole answered mid-dialogue questions from amnesia. Emoji
+        // status lines (radio/music/call cards) are UI, not conversation —
+        // they used to eat most of the tiny window.
+        let statusMarks = ["📻", "🎵", "📞", "🎧"]
+        let recent = transcript
+            .filter { line in !statusMarks.contains(where: { line.text.hasPrefix($0) }) }
+            .suffix(16)
+            .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(400) }
+            .joined(separator: "\n")
+        if !recent.isEmpty { parts.append("Recent exchange:\n" + recent) }
+        // What her tools just FOUND survives the rebuild too — facts she
+        // already reported must not need a re-lookup (or get re-invented).
+        let toolLines = recentToolResults
+            .filter { Date().timeIntervalSince($0.at) < 600 }
+            .map { "\($0.name): \($0.summary)" }
+            .joined(separator: "\n")
+        if !toolLines.isEmpty { parts.append("Recent tool results (already delivered — reuse, don't re-run):\n" + toolLines) }
+        return parts.joined(separator: "\n")
+    }
+
     // MARK: car / eyes-free driving mode
 
     /// Re-derive `drivingMode` from the live route and, when appropriate, tell
@@ -1580,21 +1842,34 @@ final class Conversation: ObservableObject {
     // MARK: signed URL + socket
 
     private func connect() async {
-        // A NEW session has no language pin — forget the old one so the first
-        // utterance re-pins. Keeping the stale value made the client skip the
-        // pin ("unchanged") and the fresh session drifted into Hebrew mid-reply
-        // after every reconnect (audio-e2e runs 34–35; the production
-        // language-mixing class of build 225).
+        // Single-flight: exactly one attempt may be minting/dialing at a time.
+        // Cleared on every exit; the failure paths that request their own
+        // retry clear it BEFORE calling scheduleReconnect, so that retry
+        // isn't gated out by the guard this flag feeds.
+        connectInFlight = true
+        defer { connectInFlight = false }
+        // Carry the conversation's language across the rebuild — the pin is
+        // re-SEEDED into the new session below, not forgotten: the first
+        // reply after a reconnect must not flip languages (2026-08-19
+        // CarPlay, 21:12:20 boundary). The nil reset still makes the first
+        // utterance re-pin mechanically (audio-e2e runs 34–35).
+        let handoverLanguage = pinnedLanguage
         pinnedLanguage = nil
         // A patience-window timer from the OLD session must never fire a
         // response.create into this fresh, empty one (she'd speak first).
         pendingResponseCreate?.cancel()
         pendingResponseCreate = nil
+        // Gate hygiene: held items/holds belong to the DEAD socket's ids.
+        // lastEngagedAt deliberately survives (it's the singleton's memory —
+        // a silent self-heal must not mint a fresh open-mic window).
+        gatePendingHold = false; gateHoldFailOpen?.cancel(); gateHoldFailOpen = nil
+        gateHeldItems.removeAll(); gateInterruptedPendingCreate = false
         // Mic gate: without record permission the engine can never start, so
         // reconnecting would loop forever. Ask once; if denied, stop cleanly with
         // a message that points at Settings instead of spinning "Reconnecting…".
         guard await ensureMicPermission() else {
             status = "Microphone access is off — turn it on in Settings to talk."
+            terminalStartFailure = true   // retrying cannot grant a permission
             state = .idle; wantLive = false
             reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
             pendingOutbound.removeAll()
@@ -1603,11 +1878,14 @@ final class Conversation: ObservableObject {
         do {
             // ── Mint per engine ──
             let socketRequest: URLRequest
+            // Barge-in promise evaluated per mint, from the route truth at
+            // THIS moment (refreshed below for the OpenAI branch).
+            var mintedBarge = false
             if engine == .eleven {
                 var req = URLRequest(url: AppConfig.elevenURL)
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await mintSession.data(for: req)
                 // 402 = the quota gate said the premium voice is out of
                 // credits BEFORE a doomed socket — fall over immediately.
                 // Unless ElevenLabs IS the tier-2 parachute: OpenAI just
@@ -1620,10 +1898,24 @@ final class Conversation: ObservableObject {
                     await connect()
                     return
                 }
-                let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let elStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 guard let signed = obj?["signed_url"] as? String, let url = URL(string: signed) else {
-                    status = "Couldn't start — try again."; state = .idle; wantLive = false
-                    pendingOutbound.removeAll()   // no session is coming — don't replay stale text later
+                    // Mirror the OpenAI branch: a bad token is terminal;
+                    // everything else (cold start, 429, 5xx, malformed body)
+                    // is TRANSIENT — retry through the normal backoff and
+                    // KEEP the queued text. Hard-idling here destroyed live
+                    // ElevenLabs sessions (and their queued dictation) on a
+                    // single relay blip.
+                    if elStatus == 401 || elStatus == 403 {
+                        status = "Couldn't start — sign in again from Settings."
+                        terminalStartFailure = true
+                        state = .idle; wantLive = false
+                        pendingOutbound.removeAll()
+                        return
+                    }
+                    connectInFlight = false   // this attempt is over — let its retry through
+                    if wantLive { scheduleReconnect(reason: "eleven-mint-failed-\(elStatus)") }
                     return
                 }
                 socketRequest = URLRequest(url: url)
@@ -1646,7 +1938,30 @@ final class Conversation: ObservableObject {
                 // known surfaces, so old builds and the (not-yet-instrumented)
                 // Watch never poison the DOA metric. build lets DOA be sliced
                 // by version. Both best-effort and URL-safe.
-                mintString += "&surface=phone"
+                // The car is its own surface in the mint registry (the server
+                // already accepts "carplay") — without the split, the
+                // 2026-08-23 drive's establishment failures were
+                // indistinguishable from phone sessions.
+                mintString += onCarRoute ? "&surface=carplay" : "&surface=phone"
+                // MODEL CONTRACT (model-migration task): `mdl=1` promises the
+                // server that this build dials the model the MINT returns,
+                // instead of a name compiled into the URL. That promise is
+                // what lets the model move server-side without a flag day —
+                // and what guarantees mint and socket can never disagree (a
+                // mismatched pair just hangs; proved 2026-08-16). Builds
+                // without the flag stay pinned to the legacy model forever.
+                mintString += "&mdl=1"
+                // BARGE-IN RETURN PATH (tasks #54/#90): ?barge=1 makes the
+                // mint set interrupt_response:true for THIS session. Sent
+                // ONLY on echo-safe routes (headphones/AirPods, CarPlay) —
+                // never the open iPhone speaker. The client's half of the
+                // promise: cut local playback + truncate on speech_started
+                // (see the handler) so a barge never replays a stale tail.
+                refreshSealedEarRoute()
+                if bargeInEligibleRoute {
+                    mintedBarge = true
+                    mintString += "&barge=1"
+                }
                 if let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
                     mintString += "&build=" + b
                 }
@@ -1655,15 +1970,25 @@ final class Conversation: ObservableObject {
                 req.httpMethod = "POST"
                 req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
                 AppConfig.pinToDatabaseRegion(&req)
-                let (data, resp) = try await URLSession.shared.data(for: req)
+                let (data, resp) = try await mintSession.data(for: req)
                 let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 // Registry id for the alive beacon — captured before the socket
                 // opens so the first server event can echo it. nil is fine
                 // (older server / mint hiccup): the beacon simply no-ops.
                 currentMintId = obj?["mint_id"] as? String
+                // The model the server actually minted this session with. It
+                // is the ONLY correct value for the socket URL. The fallback
+                // is the legacy name the server serves anyone who did not
+                // send mdl=1, so an old/partial response still connects.
+                let mintedModel = (obj?["model"] as? String).flatMap {
+                    $0.isEmpty ? nil : $0
+                } ?? "gpt-realtime"
+                activeModel = mintedModel
+                let socketURL = "wss://api.openai.com/v1/realtime?model="
+                    + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)
                 guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
-                      let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                      let url = URL(string: socketURL) else {
                     // A bad token is terminal; everything else (cold start,
                     // 429, 5xx, malformed body) is TRANSIENT — retry through
                     // the normal backoff and KEEP the queued text. Hard-idling
@@ -1671,10 +1996,12 @@ final class Conversation: ObservableObject {
                     // machinery was holding.
                     if httpStatus == 401 || httpStatus == 403 {
                         status = "Couldn't start — sign in again from Settings."
+                        terminalStartFailure = true   // a bad token needs Ido, not a retry
                         state = .idle; wantLive = false
                         pendingOutbound.removeAll()
                         return
                     }
+                    connectInFlight = false   // this attempt is over — let its retry through
                     if wantLive { scheduleReconnect(reason: "mint-failed-\(httpStatus)") }
                     return
                 }
@@ -1701,7 +2028,7 @@ final class Conversation: ObservableObject {
             do {
                 try ensureAudio()
             } catch where !interrupted {
-                status = "Can't reach the microphone right now. Check it's free (not held by another app) and try again."
+                status = "No microphone would start — even the built-in one. Check nothing else is holding it, or pick another input in Settings › Microphone."
                 state = .idle; wantLive = false
                 reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false
                 pendingOutbound.removeAll()
@@ -1712,7 +2039,7 @@ final class Conversation: ObservableObject {
             // Connected: a real socket is up. Clear the backoff counter and
             // stale send accounting from the previous socket's corpse.
             connectedAt = Date()   // BEFORE the beacon, so session_secs is sane
-            clientLog("connected", "attempt=\(reconnectAttempts)")
+            clientLog("connected", "attempt=\(reconnectAttempts) model=\(activeModel)")
             reconnectAttempts = 0
             audioSendsInFlight = 0
             handledToolCalls.removeAll()
@@ -1735,6 +2062,7 @@ final class Conversation: ObservableObject {
             // stays — it is the tier-2 trigger's memory across rebuilds.)
             if engine == .openai { elFallbackActive = false }
             responseActive = false
+            replyWatchdogNudged = false   // fresh socket — the soft rung is armed again
             needsResponseAfterDone = false
             pinnedLanguage = nil   // fresh session — re-pin from his first words
             lastNoiseModeSent = "near_field"   // the minted default; only a CHANGE sends session.update
@@ -1745,8 +2073,15 @@ final class Conversation: ObservableObject {
                 send(["type": "conversation_initiation_client_data"])
             }
             listen(task)
-            state = .listening
-            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            bargeInMinted = mintedBarge   // what THIS session actually promised
+            if mintedBarge { clientLog("barge-flag", "minted with ?barge=1 (echo-safe route)") }
+            // .listening is EARNED, not assumed: handle() flips it on the
+            // socket's FIRST server event. Claiming it here painted a live
+            // UI over a handshake still black-holing on the in-car network —
+            // the watchdog below bounds that wait instead. Everything sent
+            // before the flip rides URLSession's queue-until-open, exactly
+            // as it already did in the pre-open window.
+            armEstablishWatchdog(task)
             // A fresh socket knows nothing about the screen — replay the
             // current focus so a reconnect regains ambient context.
             if let focus = currentFocus {
@@ -1754,12 +2089,15 @@ final class Conversation: ObservableObject {
             }
             if resumedSession {
                 resumedSession = false
-                // Recent transcript lines ride along so the renewed session
-                // keeps the thread instead of greeting him like a stranger.
-                let recent = transcript.suffix(6)
-                    .map { ($0.fromHer ? "Scarlet: " : "Ido: ") + $0.text.prefix(200) }
-                    .joined(separator: "\n")
-                sendContext("[FOCUS] Connection renewed mid-conversation (the previous session hit a transport drop or time cap). This is a CONTINUATION — do not greet, do not reset. Recent exchange:\n" + recent)
+                // Answer-the-open-question only on SELF-HEAL rebuilds — on a
+                // user-initiated reopen hours later it would collide with the
+                // presence-pulse contract ("ONE short word… never a recap")
+                // and spontaneously re-answer a stale question.
+                sendContext(makeHandoverContext(language: handoverLanguage,
+                                                selfHeal: !wantPresencePulse))
+                // Re-seed the mechanical pin so pinLanguage() treats the
+                // carried language as current.
+                if let lang = handoverLanguage { pinnedLanguage = lang }
             }
             // PRESENCE PULSE (Ido 2026-08-15: "she immediately says hi,
             // showing she has a pulse"): only when HE opened the session
@@ -1784,6 +2122,7 @@ final class Conversation: ObservableObject {
             // dictated, or shared while she was asleep/connecting. Exactly once.
             flushPendingOutbound()
         } catch {
+            connectInFlight = false   // this attempt is over — let its retry through
             if wantLive {
                 scheduleReconnect(reason: "connect-error: " + String(String(describing: error).prefix(120)))
             } else { status = "Couldn't connect — tap to retry."; state = .idle }
@@ -1836,6 +2175,29 @@ final class Conversation: ObservableObject {
         }
     }
 
+    /// Establishment watchdog: a dialed socket has ~12s to produce its FIRST
+    /// server event (session.created always leads). Bound to ONE task — the
+    /// same identity rule as listen()/pingNow — so a superseded socket's
+    /// timer can never touch its healthy successor. No cancellation
+    /// bookkeeping: on a healthy session the timer fires, sees the state has
+    /// left .connecting (or the socket was replaced), and does nothing.
+    private func armEstablishWatchdog(_ task: URLSessionWebSocketTask) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, self.wantLive, self.ws === task, self.state == .connecting else { return }
+            self.neverEstablishedStreak += 1
+            self.clientLog("never-established", "streak=\(self.neverEstablishedStreak)")
+            task.cancel(with: .goingAway, reason: nil)
+            self.scheduleReconnect(reason: "never-established")
+            if self.neverEstablishedStreak >= 4 {
+                // AFTER scheduleReconnect, which stamps "Reconnecting…" —
+                // the honest line is what must stay on screen. The retry
+                // ladder/long-tail keeps working silently underneath.
+                self.status = "Can't reach the voice service on this network — retrying in the background."
+            }
+        }
+    }
+
     /// Silent auto-reconnect, native edition of the web app's transport-drop
     /// handler. Single-flight; audio graph stays up, only the socket rebuilds.
     /// `immediate` (the deaf-session cutover and the tier-2 parachute) skips
@@ -1843,6 +2205,10 @@ final class Conversation: ObservableObject {
     /// every audio send was still succeeding — so waiting helps nothing.
     private func scheduleReconnect(reason: String = "unspecified", immediate: Bool = false) {
         guard wantLive, !reconnecting else { return }
+        // An attempt is mid-flight: it reports its own failure (clearing the
+        // flag first), and its socket must not be superseded from outside —
+        // the supersede is what kept the CarPlay drive from ever establishing.
+        guard !connectInFlight else { clientLog("reconnect-skip", reason); return }
         clientLog("reconnect", reason)
         // Three straight failures on the premium engine → stop insisting and
         // fall over to the backup (≈6s in, not a minute of backoff). She must
@@ -2023,6 +2389,17 @@ final class Conversation: ObservableObject {
     // MARK: protocol
 
     private func handle(_ ev: [String: Any]) {
+        // ESTABLISHED (engine-agnostic): the first event on the LIVE socket —
+        // listen() already proved ws === task — is the establishment moment,
+        // and only now is .listening true. The queue in deliverUserMessage
+        // holds anything typed during the handshake; drain it here.
+        if state == .connecting, wantLive {
+            neverEstablishedStreak = 0
+            state = .listening
+            turnPhase = .listening
+            status = micOn ? "Listening…" : "Mic off — tap Mic to talk"
+            flushPendingOutbound()
+        }
         if engine == .openai { handleOpenAI(ev); return }
         switch ev["type"] as? String {
         case "conversation_initiation_metadata":
@@ -2062,6 +2439,7 @@ final class Conversation: ObservableObject {
                 // him, he knows it — his words appear as a bubble, the status
                 // flips, and the phone taps. Never again "did she get that?".
                 status = "Got it — on it…"
+                if state == .listening { turnPhase = .thinking }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // A SPOKEN turn the server heard gets the same always-answer
                 // guarantee as a typed one: if no reply ever starts, the
@@ -2128,6 +2506,8 @@ final class Conversation: ObservableObject {
                 if id != currentAssistantItemId {
                     currentAssistantItemId = id
                     drainedAudioFrames = 0
+                    receivedAudioFrames = 0
+                    assistantTranscriptLanded = false
                 }
             }
             if let b64 = ev["delta"] as? String { playPCM(base64: b64) }
@@ -2136,6 +2516,7 @@ final class Conversation: ObservableObject {
             // the full conversation, so every input that landed before this
             // moment is covered by it — a deferred create would only make her
             // re-answer the same thing (the 225 double-answer/translation bug).
+            pendingTranscriptTrimFraction = nil   // the cancelled item never sent its transcript
             responseActive = true
             needsResponseAfterDone = false
             lastResponseCreatedAt = Date()
@@ -2143,17 +2524,26 @@ final class Conversation: ObservableObject {
             noteSignsOfLife()
         case "response.done":
             responseActive = false
+            noteEngagement()   // her reply just landed — the follow-up window opens
             let rstatus = ((ev["response"] as? [String: Any])?["status"] as? String) ?? "completed"
             if rstatus == "cancelled", deferredResponseReason == .vadSpeech {
-                // Cancelled = Ido cut her off (barge-in or Stop). Semantic VAD
-                // creates the response for his NEW turn itself (create_response
-                // is on) — a deferred create here would race that one and then
-                // re-fire input-less at ITS done: the 225 double-answer bug in
-                // a new coat. Drop the deferral; his next turn answers itself.
-                // ONLY for a vad-speech deferral, though: an ITEM-backed one
-                // (typed turn, tool output, system item) has no VAD turn coming
-                // to answer it — keep it, and the create below fires as usual.
+                // Cancelled = Ido cut her off (barge-in or Stop). The old rule
+                // dropped the deferral outright — correct in the auto-response
+                // era, when semantic VAD would create the reply for his new
+                // turn itself. This build mints ?defer=1: the client is the
+                // ONLY party that ever creates responses, so a dropped
+                // deferral was a turn NOBODY answered — short barge-in turns
+                // went silent until the watchdog forced a full reconnect.
+                // If his turn already closed (speech_stopped fired while the
+                // dying response was still active — the exact race that set
+                // this deferral), re-enter the patience window now. If he is
+                // still mid-speech, drop it: his own speech_stopped schedules
+                // the create, and creating early would answer half a sentence.
                 needsResponseAfterDone = false
+                if !serverHearsSpeech {
+                    clientLog("patience", "cancelled response — re-arming create for his closed turn")
+                    schedulePatienceCreate()
+                }
             }
             if rstatus != "completed" && rstatus != "cancelled" {
                 // Failed/incomplete response: the always-answer net catches it
@@ -2184,18 +2574,80 @@ final class Conversation: ObservableObject {
             noteSignsOfLife()
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
+                // A barge-in flush may have cut this answer before its text
+                // ever reached the screen — land only what he heard.
+                if let f = pendingTranscriptTrimFraction {
+                    pendingTranscriptTrimFraction = nil
+                    if let heard = Self.trimToHeard(t, fraction: f) {
+                        transcript.append(.init(text: heard, fromHer: true))
+                        TurnLogger.shared.log(role: "assistant", text: heard)
+                    }
+                    assistantTranscriptLanded = true
+                    break
+                }
                 transcript.append(.init(text: t, fromHer: true))
+                assistantTranscriptLanded = true
                 TurnLogger.shared.log(role: "assistant", text: t)
             }
         case "conversation.item.input_audio_transcription.completed":
             if let t = (ev["transcript"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                !t.isEmpty {
-                transcript.append(.init(text: t, fromHer: false))
+                let itemId = ev["item_id"] as? String
+                if let itemId, gateHeldItems.remove(itemId) != nil {
+                    let verdict = AddressGate.decide(gateSignals(transcript: t), config: GateSettings.config)
+                    if case .ignore(let why) = verdict {
+                        // Journal it (the ledger still captures the cabin),
+                        // purge it from her context, stay silent. Never arm
+                        // the reply watchdog for a turn we chose not to answer.
+                        TurnLogger.shared.log(role: "ambient", text: t)
+                        send(["type": "conversation.item.delete", "item_id": itemId])
+                        clientLog("gate-ignored", "\(why) — \(String(t.prefix(80)))")
+                        if state == .listening, micOn { status = "Listening…" }
+                        // PANEL FIX — the interplay hole: if this ambient turn
+                        // had trampled HIS pending create (speech_started
+                        // cancelled it and armed the "" placeholder), restore
+                        // his turn instead of leaving it to die + watchdog-storm.
+                        if gateInterruptedPendingCreate {
+                            gateInterruptedPendingCreate = false
+                            if awaitingReplyText == "" { awaitingReplyText = nil }  // disarm placeholder
+                            schedulePatienceCreate()   // answer his real question
+                        } else if awaitingReplyText == "" {
+                            awaitingReplyText = nil    // placeholder was for THIS ignored turn
+                        }
+                        break
+                    }
+                    // Addressed (or engagement re-warmed while held): answer
+                    // the already-committed turn NOW.
+                    gateInterruptedPendingCreate = false
+                    noteEngagement()
+                    clientLog("gate-answered", "addressed while cold")
+                    transcript.append(.init(text: t, fromHer: false))
+                    TurnLogger.shared.log(role: "user", text: t)
+                    pinLanguage(from: t)
+                    status = "Got it — on it…"
+                    if state == .listening { turnPhase = .thinking }
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    awaitingReplyText = t
+                    if responseActive { deferResponse(.itemBacked) }
+                    else { send(["type": "response.create"]); armReplyWatchdog() }
+                    break
+                }
+                // Conversation order, not arrival order: land his line at
+                // the mark recorded when his turn closed, so it sits ABOVE
+                // the reply it prompted even when transcription lags her.
+                let insertAt = min(transcriptMarkAtTurnClose, transcript.count)
+                if insertAt < transcript.count {
+                    transcript.insert(.init(text: t, fromHer: false), at: insertAt)
+                } else {
+                    transcript.append(.init(text: t, fromHer: false))
+                }
+                transcriptMarkAtTurnClose = insertAt + 1   // a second late line stays in order
                 TurnLogger.shared.log(role: "user", text: t)
                 // Mirror his language mechanically: detect what he ACTUALLY
                 // spoke and pin the session to it the moment it changes.
                 pinLanguage(from: t)
                 status = "Got it — on it…"
+                if state == .listening { turnPhase = .thinking }
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 // Transcription is ASYNC and routinely lands AFTER the reply.
                 // Arming the watchdog here regardless tore down a healthy
@@ -2210,6 +2662,15 @@ final class Conversation: ObservableObject {
                 }
             }
         case "conversation.item.input_audio_transcription.failed":
+            if let id = ev["item_id"] as? String, gateHeldItems.remove(id) != nil {
+                clientLog("gate-ignored", "transcription failed while held — discarded")
+                if state == .listening, micOn { status = "Listening…" }
+                if gateInterruptedPendingCreate {
+                    gateInterruptedPendingCreate = false
+                    if awaitingReplyText == "" { awaitingReplyText = nil }
+                    schedulePatienceCreate()
+                }
+            }
             clientLog("transcription-failed",
                       String(describing: ev["error"] ?? "unknown").prefix(160).description)
         case "input_audio_buffer.speech_started":
@@ -2233,7 +2694,12 @@ final class Conversation: ObservableObject {
             // his utterance always completes and semantic VAD closes the turn
             // normally (the 08-12 disaster was the opposite shape:
             // SERVER-initiated cancel plus a gated mic).
-            if pendingBuffers > 0, sealedEarRoute {
+            // Also on a ?barge=1 session on an (eligible) car route: the
+            // server may already be truncating its side — the LOCAL player
+            // and queue must stop the same instant, and flushPlayback's
+            // conversation.item.truncate reports the true played-ms. A tail
+            // left queued would replay stale audio later ("she talks over me").
+            if pendingBuffers > 0, sealedEarRoute || (bargeInMinted && bargeInEligibleRoute) {
                 if responseActive { send(["type": "response.cancel"]) }
                 flushPlayback()
                 clientLog("barge-in", "speech_started during playback — cut her audio")
@@ -2246,6 +2712,9 @@ final class Conversation: ObservableObject {
             // no end), NOTHING else would ever create a reply — the watchdog
             // is what turns that infinite silence into the normal
             // reconnect-and-recover ladder.
+            if addressGateActive, pendingResponseCreate != nil {
+                gateInterruptedPendingCreate = true   // may be ambient trampling HIS turn
+            }
             if let pending = pendingResponseCreate {
                 pending.cancel()
                 pendingResponseCreate = nil
@@ -2253,29 +2722,68 @@ final class Conversation: ObservableObject {
                 armReplyWatchdog()
                 clientLog("patience", "he resumed — pending reply cancelled, stall net armed")
             }
-            if state == .listening, micOn { status = "Hearing you…" }
+            if state == .listening, micOn { status = "Hearing you…"; turnPhase = .listening }
         case "input_audio_buffer.speech_stopped":
             serverHearsSpeech = false
             lastSpeechStoppedAt = Date()
+            transcriptMarkAtTurnClose = transcript.count
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
             // The reply is now OURS to request (?defer=1 mint — no VAD
             // auto-response). Schedule it behind the patience window; the
             // watchdog arms when the create is actually sent.
             if responseActive {
                 deferResponse(.vadSpeech)
+            } else if addressGateActive,
+                      !AddressGate.engaged(gateSignals(transcript: nil), config: GateSettings.config) {
+                // GATE-COLD: she wasn't just talking with him — this may be
+                // his wife, a passenger, or the documentary. Hold the reply;
+                // committed's item_id + the transcript verdict decide.
+                gatePendingHold = true
+                gateHoldFailOpen?.cancel()
+                let w = DispatchWorkItem { [weak self] in
+                    guard let self, self.gatePendingHold else { return }
+                    // committed never arrived — fail OPEN, answer as today.
+                    self.gatePendingHold = false
+                    self.schedulePatienceCreate()
+                }
+                gateHoldFailOpen = w
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: w)
             } else {
                 schedulePatienceCreate()
             }
-            if state == .listening { status = "Thinking…" }
+            if state == .listening {
+                // A held turn truthfully stays "Listening" — the car orb must
+                // never show Thinking for a turn she chose not to answer.
+                status = gatePendingHold ? "Listening…" : "Thinking…"
+                turnPhase = gatePendingHold ? .listening : .thinking
+            }
         case "input_audio_buffer.committed":
             serverHearsSpeech = false
+            transcriptMarkAtTurnClose = transcript.count
             releaseHeldPlayback()   // his turn is closed — her held answer plays now
-            if responseActive {
+            if gatePendingHold {
+                gatePendingHold = false
+                gateHoldFailOpen?.cancel(); gateHoldFailOpen = nil
+                if let id = ev["item_id"] as? String {
+                    gateHeldItems.insert(id)
+                    if gateHeldItems.count > 50, let any = gateHeldItems.first { gateHeldItems.remove(any) }
+                    clientLog("gate-hold", "cold turn held for transcript verdict")
+                } else {
+                    schedulePatienceCreate()   // can't track it → fail open
+                }
+            } else if responseActive {
                 deferResponse(.vadSpeech)
             } else if pendingResponseCreate == nil {
-                // Defensive: a commit with no scheduled create (some VAD
-                // paths skip speech_stopped) must still get answered.
-                schedulePatienceCreate()
+                // Defensive path (some VAD paths skip speech_stopped) — a
+                // commit with no scheduled create must still get answered,
+                // unless the gate says it's a cold, trackable turn.
+                if addressGateActive, let id = ev["item_id"] as? String,
+                   !AddressGate.engaged(gateSignals(transcript: nil), config: GateSettings.config) {
+                    gateHeldItems.insert(id)
+                    clientLog("gate-hold", "cold turn held (no speech_stopped)")
+                } else {
+                    schedulePatienceCreate()
+                }
             }
         case "response.function_call_arguments.done":
             noteSignsOfLife()
@@ -2374,7 +2882,7 @@ final class Conversation: ObservableObject {
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
             AppConfig.pinToDatabaseRegion(&req)
             req.httpBody = try JSONSerialization.data(withJSONObject: params)
-            let (data, resp) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await toolSession.data(for: req)
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code < 200 || code > 299 {
                 clientLog("tool-http", "\(name) status=\(code)")
@@ -2538,11 +3046,20 @@ final class Conversation: ObservableObject {
     }
 
     /// OpenAI Realtime function-call entry (the backup engine).
+    /// The last few tool results, kept for reconnect handover: a rebuilt
+    /// session that just searched his mail / checked his calendar must not
+    /// forget WHAT IT FOUND the moment the socket flips (a normal drive used
+    /// to wipe this repeatedly — she re-ran the same lookups or, worse,
+    /// answered from nothing).
+    private var recentToolResults: [(at: Date, name: String, summary: String)] = []
+
     private func runToolOpenAI(name: String, callId: String, argsJSON: String) {
         let params = (try? JSONSerialization.jsonObject(with: Data(argsJSON.utf8))) as? [String: Any] ?? [:]
         preToolCues(name: name, params: params)
         Task {
             let out = await performTool(name: name, params: params)
+            recentToolResults.append((Date(), name, String(out.prefix(300))))
+            if recentToolResults.count > 5 { recentToolResults.removeFirst() }
             send(["type": "conversation.item.create",
                   "item": ["type": "function_call_output", "call_id": callId,
                            "output": cappedToolResult(name, out)]])
@@ -2864,14 +3381,108 @@ final class Conversation: ObservableObject {
 
     /// Idempotent: builds the audio graph exactly once; later calls just make
     /// sure the engine is running.
+    ///
+    /// AUTO-FALLBACK (task #49, root-caused 2026-08-16): on the Mac his default
+    /// input is an RME Babyface Pro — a 14-channel USB interface whose capture
+    /// init fails outright, so the graph build threw, Talk said "can't reach the
+    /// microphone" and the Start button was dead with no way forward. A mic that
+    /// won't start is never a dead end now: we drop to the BUILT-IN mic, rebuild,
+    /// and say so in the UI. Silent success on the wrong device would be worse
+    /// than the failure, so the fallback always announces itself.
     private func ensureAudio() throws {
         if audioReady {
             if !audioEngine.isRunning { try audioEngine.start() }
             return
         }
+        do {
+            try buildAudioGraph()
+        } catch {
+            // An INTERRUPTION (Spotify, a phone call) makes the input format
+            // read dead for reasons that have nothing to do with which device
+            // is selected — falling back there would throw away his RME pick
+            // over a transient. The interruption's .ended handler rebuilds.
+            guard !interrupted else { throw error }
+            guard forceBuiltInMic() else { throw error }
+            // Tear the half-built graph down before trying again — a second
+            // installTap on a live bus is an uncatchable NSException.
+            tearDownPartialGraph()
+            do {
+                try buildAudioGraph()
+            } catch {
+                // The built-in mic failed too: this is a real audio outage, not
+                // a bad device choice. Undo the forced override so his saved
+                // pick survives, and let the caller surface the failure.
+                micFellBackFrom = nil
+                throw error
+            }
+            micFallbackNote = micFellBackFrom.map {
+                "“\($0)” wouldn't start — using the built-in microphone instead. Change it in Settings › Microphone."
+            } ?? "That microphone wouldn't start — using the built-in one instead."
+            clientLog("mic-fallback", "from=\(micFellBackFrom ?? "?") to=builtin")
+        }
+    }
+
+    /// Undo a graph build that threw partway. `stopAudio()` can't do this job:
+    /// it guards on `audioReady`, which the failed build never set — so a tap
+    /// installed just before the throw would survive into the retry, and the
+    /// second installTap on that bus is an uncatchable NSException.
+    private func tearDownPartialGraph() {
+        audioEngine.inputNode.removeTap(onBus: 0)
+        os_unfair_lock_lock(audioStateLock)
+        converter = nil
+        os_unfair_lock_unlock(audioStateLock)
+        audioEngine.stop()
+        audioReady = false
+    }
+
+    /// Point the session at the built-in microphone and clear the saved input
+    /// choice, so the Settings picker shows the truth and the next session
+    /// starts on a device that works. Returns false when there is nothing to
+    /// fall back TO — already on the built-in mic, or no built-in mic exists —
+    /// in which case the original failure stands.
+    private func forceBuiltInMic() -> Bool {
+        let s = AVAudioSession.sharedInstance()
+        let inputs = s.availableInputs ?? []
+        guard let builtIn = inputs.first(where: { $0.portType == .builtInMic }) else { return false }
+        let current = s.currentRoute.inputs.first
+        let m = MicSettings.shared
+        // Nothing to gain from "falling back" to the device we already failed on.
+        if m.preferredInputUID == nil, current?.portType == .builtInMic { return false }
+        micFellBackFrom = m.preferredInputName ?? current?.portName
+        m.selectInput(nil)          // forget the broken pick — Settings shows reality
+        // His CHANNEL choice is left alone: it only means anything on a
+        // multichannel device, and the tap already clamps the index to the
+        // live buffer's channel count — so it costs nothing here and is still
+        // right the moment he re-selects the interface.
+        try? s.setPreferredInput(builtIn)
+        m.activeInputName = builtIn.portName
+        return true
+    }
+
+    /// Builds the capture/playback graph. Split out of `ensureAudio` so the
+    /// built-in-mic retry above can run the exact same build twice.
+    private func buildAudioGraph() throws {
         try startAudioSession()
 
         let input = audioEngine.inputNode
+        // CarPlay: Apple's Voice-Processing I/O gives hardware AEC/AGC/NS so
+        // the cabin speakers' playback is stripped from the cabin mic — full
+        // duplex (real barge-in) becomes safe. MUST run before the format
+        // read and the tap install: enabling it changes the input format.
+        // DARK until measured in a real car (build-218 echo-loop risk on
+        // high-latency wireless routes): flip scarlet.vpio.enabled to trial.
+        let wantVP = onCarRoute && UserDefaults.standard.bool(forKey: "scarlet.vpio.enabled")
+        if input.isVoiceProcessingEnabled != wantVP {
+            do {
+                try input.setVoiceProcessingEnabled(wantVP)
+                voiceProcessingActive = wantVP
+            } catch {
+                voiceProcessingActive = false
+                clientLog("vp-io", "setVoiceProcessingEnabled(\(wantVP)) failed: \(error.localizedDescription) — staying half-duplex")
+            }
+        } else {
+            voiceProcessingActive = wantVP && input.isVoiceProcessingEnabled
+        }
         let inFormat = input.outputFormat(forBus: 0)
         // While another app owns the audio session (an interruption in
         // progress, e.g. Spotify mid-handoff) the input node can report a dead
@@ -3269,8 +3880,10 @@ final class Conversation: ObservableObject {
         let frames = buf.frameLength
         if !player.isPlaying { player.play() }
         state = .speaking
+        turnPhase = .speaking
         status = speakerOn ? "Scarlet is speaking…" : "Answering silently — read below"
         pendingBuffers += 1
+        receivedAudioFrames += Int(frames)
         // Duration at the CURRENT engine's play rate, never a hard-coded
         // 24000: buffers are minted in playFormat (= outputRate), and on the
         // ElevenLabs fallback that is 16 kHz — dividing by 24k there ran the
@@ -3281,7 +3894,13 @@ final class Conversation: ObservableObject {
         // to play at full volume simultaneously); the last buffer's drain
         // restores the music.
         RadioPlayer.shared.duck(true)
-        player.scheduleBuffer(buf) { [weak self] in
+        // .dataPlayedBack, NOT the default .dataConsumed: the default fires
+        // when the engine has RENDERED the buffer, not when sound left the
+        // car speakers — on wireless CarPlay / BT A2DP the downstream output
+        // latency meant pendingBuffers hit 0 while her voice was still
+        // audible in the cabin, the mic reopened, and her own TTS tail
+        // streamed to the server as "Ido speaking" (phantom turns).
+        player.scheduleBuffer(buf, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 // She's done only when the LAST queued buffer drains — the
@@ -3293,15 +3912,38 @@ final class Conversation: ObservableObject {
                     // phantom user turn. 0.6s (was 0.35): loudspeaker now runs
                     // WITHOUT a voice-processing mode, so this client gate is
                     // the only echo protection — the wider tail is its price.
-                    self.speechTailUntil = Date().addingTimeInterval(0.6)
-                    RadioPlayer.shared.duck(false)
+                    // Plus a small fixed margin for BT stacks that under-report
+                    // output latency. .dataPlayedBack already accounts for
+                    // reported latency — do NOT add outputLatency here
+                    // (double-count = deaf window after replies).
+                    self.speechTailUntil = Date().addingTimeInterval(0.6 + 0.25)
                     if self.state == .speaking {
                         self.state = .listening
+                        self.turnPhase = .listening
                         if self.micOn { self.status = "Listening…" }
                     }
+                    // AFTER the state flip: duck(false) reads state to pick
+                    // the in-car listening tier (0.5) vs full volume.
+                    RadioPlayer.shared.duck(false)
                 }
             }
         }
+    }
+
+    /// The heard prefix of an interrupted answer, cut at a word boundary,
+    /// with an ellipsis marking the interruption. nil = nothing was heard
+    /// (drop the line). Near-complete playback (≥98%) keeps the full text.
+    private static func trimToHeard(_ t: String, fraction: Double) -> String? {
+        guard fraction < 0.98 else { return t }
+        guard fraction > 0.02 else { return nil }
+        let cut = max(1, Int((Double(t.count) * fraction).rounded()))
+        var head = String(t.prefix(cut))
+        if let sp = head.range(of: " ", options: .backwards), fraction < 0.9 {
+            head = String(head[..<sp.lowerBound])
+        }
+        head = head.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !head.isEmpty else { return nil }
+        return head + " …"
     }
 
     private func flushPlayback() {
@@ -3321,6 +3963,24 @@ final class Conversation: ObservableObject {
             send(["type": "conversation.item.truncate",
                   "item_id": itemId, "content_index": 0, "audio_end_ms": heardMs])
             clientLog("truncate", "item=\(itemId) heard=\(heardMs)ms")
+            // Mirror the truncation on the SCREEN (the OpenAI half of
+            // ElevenLabs' agent_response_correction): server context now
+            // holds only the heard words — the text box must match, not keep
+            // the full answer she never finished voicing.
+            let fraction = receivedAudioFrames > 0
+                ? min(1, Double(drainedAudioFrames) / Double(receivedAudioFrames)) : 1
+            if assistantTranscriptLanded {
+                if let idx = transcript.lastIndex(where: { $0.fromHer && !$0.text.hasPrefix("📻")
+                        && !$0.text.hasPrefix("🎵") && !$0.text.hasPrefix("📞") }) {
+                    if let heard = Self.trimToHeard(transcript[idx].text, fraction: fraction) {
+                        transcript[idx] = .init(text: heard, fromHer: true)
+                    } else {
+                        transcript.remove(at: idx)   // cut before a word landed
+                    }
+                }
+            } else {
+                pendingTranscriptTrimFraction = fraction
+            }
             // Deltas for the truncated item may still be in flight from the
             // server — remember it so playPCM drops the stragglers instead of
             // resuming the cut answer garbled (the AirPods barge-in half-fix).
@@ -3331,18 +3991,20 @@ final class Conversation: ObservableObject {
         pendingBuffers = 0
         speechTailUntil = Date.distantPast
         playbackDeadline = .distantPast
-        RadioPlayer.shared.duck(false)
         // Only her-speaking transitions back to listening. Forcing .listening
         // from ANY state let an interruption during a reconnect fake a live
         // session (nil socket, "Listening…" status) — or resurrect End-state
         // UI from idle.
         if state == .speaking {
             state = .listening
+            turnPhase = .listening
             if micOn { status = "Listening…" }
         }
+        // AFTER the state flip: duck(false) reads state for the in-car tier.
+        RadioPlayer.shared.duck(false)
     }
 
-    private func stopAudio() {
+    private func stopAudio(deactivateSession: Bool = false) {
         guard audioReady else { return }
         // The held-overlap queue holds buffers in the OLD play format — a
         // graph rebuilt at a new rate must never schedule them (format
@@ -3363,7 +4025,19 @@ final class Conversation: ObservableObject {
         playbackDeadline = .distantPast
         audioEngine.stop()
         audioReady = false
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        // Release the hardware ONLY when the call is over — a mid-call graph
+        // rebuild must keep the session claimed, or every rebuild bounces the
+        // car route and un-ducks/re-ducks other audio.
+        if deactivateSession {
+            if RadioPlayer.shared.playing {
+                // Radio owns the session now — hand it a playback-only
+                // category instead of deactivating out from under its AVPlayer
+                // (background-capable, silent-switch-immune).
+                try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+            } else {
+                try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            }
+        }
     }
 
     // MARK: interruptions — the flow guarantee
@@ -3485,11 +4159,27 @@ final class Conversation: ObservableObject {
                     // through the port override and stuttered the audio.
                     let s = AVAudioSession.sharedInstance()
                     if s.mode != self.sessionMode(car: self.onCarRoute)
-                        || self.onCarRoute != self.lastAppliedCar {
+                        || self.onCarRoute != self.lastAppliedCar
+                        || self.audioEngine.inputNode.isVoiceProcessingEnabled
+                           != (self.onCarRoute && UserDefaults.standard.bool(forKey: "scarlet.vpio.enabled")) {
                         self.applyOutputRoute()
+                        self.rebuildAudioGraph()
                     }
                     self.refreshSealedEarRoute()
                     self.syncNoiseReductionForRoute()
+                    // Barge-in flag re-evaluation on EVERY route change: the
+                    // promise must track the route. Deferred to the next mint
+                    // rather than a mid-session remint — safe→unsafe is
+                    // already covered (the echo gate stops streaming her
+                    // playback back, so her voice can't trip the server);
+                    // unsafe→safe merely lacks server-side interrupt until
+                    // the next rebuild (the sealed-ear client cut still works).
+                    if self.engine == .openai, self.ws != nil,
+                       self.bargeInEligibleRoute != self.bargeInMinted {
+                        self.clientLog("barge-flag", self.bargeInEligibleRoute
+                            ? "route now echo-safe — ?barge=1 arms at the next mint"
+                            : "route no longer echo-safe — flag parks until the next mint (echo gate covers)")
+                    }
                     self.logAudioState("route-change")
                 }
                 // Plugging into (or out of) the car flips eyes-free driving mode;

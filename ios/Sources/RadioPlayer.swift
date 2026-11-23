@@ -22,10 +22,16 @@ final class RadioPlayer: ObservableObject {
     func play(name: String, url: URL) {
         // One player at a time; a new station replaces the old mid-stream.
         player?.pause()
-        // Outside a live Scarlet call the session may be inactive — a plain
-        // activate is enough (the call's own config wins when a call is live;
-        // radio rides the same session either way).
-        try? AVAudioSession.sharedInstance().setActive(true)
+        // Outside a live Scarlet call the radio needs a REAL playback
+        // category: on the default .soloAmbient it dies on screen lock
+        // despite UIBackgroundModes:[audio] and obeys the silent switch.
+        // When a call is live, the call's own .playAndRecord config wins —
+        // never clobber it from here.
+        let s = AVAudioSession.sharedInstance()
+        if Conversation.shared.state == .idle {
+            try? s.setCategory(.playback, mode: .default)   // background-capable, silent-switch-immune
+        }
+        try? s.setActive(true)
         let p = AVPlayer(url: url)
         p.play()
         player = p
@@ -48,7 +54,13 @@ final class RadioPlayer: ObservableObject {
 
     func resume() {
         guard player != nil else { return }
-        try? AVAudioSession.sharedInstance().setActive(true)
+        // Same category rule as play(): a resume outside a live call must
+        // not ride .soloAmbient (dies on lock); a live call's config wins.
+        let s = AVAudioSession.sharedInstance()
+        if Conversation.shared.state == .idle {
+            try? s.setCategory(.playback, mode: .default)
+        }
+        try? s.setActive(true)
         player?.play()
         playing = true
         updateNowPlaying()
@@ -69,9 +81,30 @@ final class RadioPlayer: ObservableObject {
 
     /// Scarlet's voice ducks the radio and the last drained buffer restores
     /// it — the two must never fight at full volume (voice-only audit).
+    /// Intermediate tier (2026-08-19 CarPlay): while she LISTENS in the car,
+    /// a radio at 1.0 plays straight into the unprocessed cabin mic — a
+    /// direct feeder of media-as-user-turns. Hold ~0.5 there. Honest note:
+    /// this reduces, not eliminates, media-triggered turns — the full fix is
+    /// AEC (vp-io trial) + the address gate.
     func duck(_ on: Bool) {
         guard playing else { return }
-        player?.volume = on ? 0.15 : 1.0
+        if on { player?.volume = 0.15; return }
+        let convo = Conversation.shared
+        let inCar = AVAudioSession.sharedInstance().currentRoute.outputs
+            .contains { $0.portType == .carAudio }
+        player?.volume = (inCar && convo.state == .listening && convo.micOn) ? 0.5 : 1.0
+    }
+
+    /// Re-assert the radio's now-playing if a station is loaded (CarPlay's
+    /// speaking overlay hands the widget back through this) — the car's
+    /// audio screen keeps live radio metadata instead of going blank on
+    /// every state flicker.
+    func reassertNowPlaying() {
+        guard !stationName.isEmpty else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            return
+        }
+        updateNowPlaying()
     }
 
     /// Apply an fm_radio tool result (the voice lane) — the server resolved
