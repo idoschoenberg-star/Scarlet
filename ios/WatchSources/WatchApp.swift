@@ -24,6 +24,8 @@ struct ScarletWatchApp: App {
         // Bring the phone-token bridge up first: if the iPhone app is already
         // unlocked, the token lands before Ido ever sees the unlock screen.
         WatchBridge.shared.activate()
+        // The meeting recorder: send whatever a killed or offline recording left.
+        WatchMeetingRecorder.recoverOrphans()
     }
 
     var body: some Scene {

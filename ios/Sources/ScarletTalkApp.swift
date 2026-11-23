@@ -42,6 +42,9 @@ struct ScarletTalkApp: App {
         FlightRecorder.installCrashHandlers()
         // Hand the device token to a paired Apple Watch (no-op without one).
         PhoneWatchBridge.shared.start()
+        // The phone recorder: finish and upload anything a killed or
+        // offline recording left on disk.
+        MeetingRecorder.recoverOrphans()
     }
 
     var body: some Scene {
@@ -54,6 +57,7 @@ struct ScarletTalkApp: App {
                     UnlockView().environmentObject(session)
                 }
             }
+            .overlay(alignment: .top) { RecordingBar() }
             .preferredColorScheme(.dark)
         }
     }

@@ -3,7 +3,9 @@ name: ScarletTalk
 options:
   bundleIdPrefix: com.idoschoenberg
   deploymentTarget:
-    iOS: "17.0"
+    # 18.0 since 2026-11-14: the phone recorder's AudioRecordingIntent and its
+    # Control (ControlWidget) are iOS 18 APIs.
+    iOS: "18.0"
     watchOS: "10.0"
   createIntermediateGroups: true
 
@@ -30,6 +32,8 @@ targets:
       # one TestFlight upload carries both; the watch app still declares
       # WKRunsIndependentlyOfCompanionApp and runs standalone on cellular.
       - target: ScarletWatch
+      # The phone recorder's Live Activity and Control (2026-11-14).
+      - target: ScarletRecorderWidgets
     sources:
       - path: Sources
     settings:
@@ -87,7 +91,9 @@ targets:
               - UISceneConfigurationName: CarPlay
                 UISceneClassName: CPTemplateApplicationScene
                 UISceneDelegateClassName: "$(PRODUCT_MODULE_NAME).CarPlaySceneDelegate"
-        NSMicrophoneUsageDescription: "Scarlet listens when you talk to her."
+        NSMicrophoneUsageDescription: "Scarlet listens when you talk to her, and records the meetings you ask her to record."
+        # The phone recorder's lock-screen card ("Recording · 00:14:32 · uploaded").
+        NSSupportsLiveActivities: true
         # Hands-free launch via the "Talk to Scarlet" App Intent. Pure AppIntents
         # need NO com.apple.developer.siri entitlement (that would require the
         # provisioning profile to carry it, breaking CI signing) — only this
@@ -129,6 +135,36 @@ targets:
         # re-check it in the portal before touching this line.
         com.apple.developer.carplay-voice-based-conversation: true
 
+  # The phone recorder's surfaces outside the app (commission 2026-11-07,
+  # build 2026-11-14): the Live Activity (Lock Screen, Dynamic Island, the
+  # Watch's Smart Stack) and the "Record meeting" Control (Lock Screen,
+  # Control Center, Action button). The recorder itself and every intent run
+  # in the app; RecorderShared.swift is compiled into both targets.
+  ScarletRecorderWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: WidgetSources
+      - path: Sources/RecorderShared.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.idoschoenberg.scarlettalk.recorder
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        "CODE_SIGN_IDENTITY[sdk=iphoneos*]": "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "ScarletRecorder AppStore"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SKIP_INSTALL: YES
+    info:
+      path: WidgetSources/Info.plist
+      properties:
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleDisplayName: Talk Recorder
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+        ITSAppUsesNonExemptEncryption: false
+
   # Scarlet on the wrist — same server brain, one-orb UI. Standalone on
   # cellular (leave the phone at home); the token arrives from the iPhone
   # over WatchConnectivity, or via one-time code entry.
@@ -144,6 +180,9 @@ targets:
       # wrist-only sessions feed the SAME op=location store, so "here" answers
       # track his movement instead of an hour-old phone fix.
       - path: Sources/LocationReporter.swift
+      # The meeting recorder's upload pipe (2026-11-14): the Watch records
+      # and uploads on its own, the same door as the phone.
+      - path: Sources/MeetingUpload.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.idoschoenberg.scarlettalk.watchkitapp

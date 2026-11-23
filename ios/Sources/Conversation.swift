@@ -710,6 +710,12 @@ final class Conversation: ObservableObject {
 
     func start(token: String) {
         guard state == .idle else { return }
+        // The meeting recorder owns the mic while it runs (its own engine);
+        // the two never share it.
+        if MeetingRecorder.shared.isRecording {
+            status = "Recording a meeting. Stop the recording first."
+            return
+        }
         // Kill any pending reconnect from a prior session so it can't wake a
         // second socket alongside this fresh one.
         reconnectTask?.cancel(); reconnectTask = nil; reconnecting = false

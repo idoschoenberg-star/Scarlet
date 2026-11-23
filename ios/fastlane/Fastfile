@@ -7,6 +7,9 @@ PROFILE_NAME = "ScarletTalk AppStore"
 # profiles before this lane runs.
 WATCH_BUNDLE_ID = "com.idoschoenberg.scarlettalk.watchkitapp"
 WATCH_PROFILE_NAME = "ScarletWatch AppStore"
+# The phone recorder's widget extension (Live Activity + Control), 2026-11-14.
+RECORDER_BUNDLE_ID = "com.idoschoenberg.scarlettalk.recorder"
+RECORDER_PROFILE_NAME = "ScarletRecorder AppStore"
 
 platform :ios do
   desc "Build Scarlet Talk (+ watch app) and push to TestFlight"
@@ -87,14 +90,24 @@ platform :ios do
     )
     watch_profile_name = lane_context[SharedValues::SIGH_NAME] || WATCH_PROFILE_NAME
 
+    get_provisioning_profile(
+      api_key: key,
+      app_identifier: RECORDER_BUNDLE_ID,
+      provisioning_name: RECORDER_PROFILE_NAME,
+      ignore_profiles_with_different_name: true,
+      force: true
+    )
+    recorder_profile_name = lane_context[SharedValues::SIGH_NAME] || RECORDER_PROFILE_NAME
+
     # The archive signs each target by the PROVISIONING_PROFILE_SPECIFIER in
     # project.yml — canonical names only. team.js deletes stale same-named
     # profiles every run precisely so sigh can recreate these exact names; if
     # a rename still slipped through, fail HERE with the real story instead of
     # a cryptic codesign error mid-archive.
-    if profile_name != PROFILE_NAME || watch_profile_name != WATCH_PROFILE_NAME
+    if profile_name != PROFILE_NAME || watch_profile_name != WATCH_PROFILE_NAME ||
+       recorder_profile_name != RECORDER_PROFILE_NAME
       UI.user_error!("Provisioning profile name drifted (got '#{profile_name}' / " \
-                     "'#{watch_profile_name}') — stale profiles squatting on the canonical " \
+                     "'#{watch_profile_name}' / '#{recorder_profile_name}') — stale profiles squatting on the canonical " \
                      "names; team.js cleanup should have removed them. Re-run the workflow.")
     end
 
@@ -113,7 +126,8 @@ platform :ios do
         teamID: ENV["DEVELOPMENT_TEAM"],
         provisioningProfiles: {
           BUNDLE_ID => profile_name,
-          WATCH_BUNDLE_ID => watch_profile_name
+          WATCH_BUNDLE_ID => watch_profile_name,
+          RECORDER_BUNDLE_ID => recorder_profile_name
         }
       }
     )
