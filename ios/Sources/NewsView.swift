@@ -396,6 +396,13 @@ private struct NewsFiltersSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                if !saveError.isEmpty {
+                    Section {
+                        Label(saveError, systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.orange)
+                    }
+                }
                 Section("Topics of interest") {
                     ForEach(topics, id: \.self) { t in
                         HStack {
@@ -445,15 +452,30 @@ private struct NewsFiltersSheet: View {
         newTopic = ""
     }
 
+    @State private var saveError = ""
+
     @MainActor
     private func save() async {
         saving = true
         defer { saving = false }
+        saveError = ""
         let sources = prefs.map { p in
             ["source": p.id, "lane": p.lane, "enabled": p.enabled, "weight": p.weight] as [String: Any]
         }
-        _ = try? await NewsView.request("op=news_prefs", method: "POST",
-                                        body: ["sources": sources, "topics": topics])
-        dismiss()
+        // LEAVE-SAVES (design sweep 2026-08-22): a failed save keeps the
+        // sheet open with his edits and says so — dismissing regardless
+        // silently discarded every toggle he just set.
+        do {
+            let data = try await NewsView.request("op=news_prefs", method: "POST",
+                                                  body: ["sources": sources, "topics": topics])
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            guard (obj?["ok"] as? Bool) == true else {
+                saveError = (obj?["error"] as? String) ?? "The save didn't go through — your changes are still here, try again."
+                return
+            }
+            dismiss()
+        } catch {
+            saveError = "Couldn't reach Scarlet — your changes are still here, try again."
+        }
     }
 }

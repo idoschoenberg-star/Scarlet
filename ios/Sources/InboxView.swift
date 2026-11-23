@@ -21,6 +21,14 @@ extension Notification.Name {
     /// Posted by Conversation when the compose_draft voice tool starts a
     /// draft; RootView presents the drafting sheet in attach mode.
     static let scarletVoiceDraftStarted = Notification.Name("scarletVoiceDraftStarted")
+    /// Posted after the server rejects this device's token twice in a row
+    /// (revoked/rotated) — RootView signs the session out so the unlock
+    /// screen appears, instead of every screen lying "check your connection".
+    static let scarletAuthExpired = Notification.Name("scarletAuthExpired")
+    /// Posted by SplitShell whenever its sidebar section changes, carrying the
+    /// section name as a String — RootView's desk-focus poll needs to know
+    /// what is ACTUALLY frontmost at regular width, where `tab` is inert.
+    static let scarletShellSection = Notification.Name("scarletShellSection")
     /// Posted by Conversation the INSTANT a compose_draft tool call arrives —
     /// before the network round-trip — carrying [channel, recipient,
     /// instruction, subject]. RootView opens the drafting sheet immediately and
@@ -183,10 +191,19 @@ private struct InboxCache: Codable {
 // MARK: - Model
 
 @MainActor
+/// The server said WHO YOU ARE is wrong (401/403) — a different failure
+/// class from "the network is down", and it must never be rendered as one.
+/// nonisolated init: the target compiles with default MainActor isolation,
+/// and this is thrown from a nonisolated static request path.
+struct ScarletAuthError: Error { nonisolated init() {} }
+
 final class InboxModel: ObservableObject {
     @Published var messages: [MailMessage] = []
     @Published var loading = false
     @Published var errorText = ""
+    /// Consecutive 401/403s from the inbox ops — two in a row means the
+    /// device key is really dead, not blinking.
+    private var consecutiveAuthFailures = 0
     /// Focused | Other pill. Switch via `setTab`, which reloads.
     @Published var tab: MailTab = .focused
     /// When the current tab's rows last came back from the server (the cache
@@ -305,6 +322,19 @@ final class InboxModel: ObservableObject {
             cache.set(rows: fetched, stamp: Date(), for: tab)
             lastUpdated = cache.stamp(for: tab)
             persistCache()
+            consecutiveAuthFailures = 0
+        } catch is ScarletAuthError {
+            guard generation == loadGeneration else { return }
+            // The token is being rejected, not the network. ONE 401 can be a
+            // transient server-side validation blip (2026-08-15, the Watch),
+            // so the sign-out fires on the second consecutive rejection; the
+            // banner is honest immediately. Cached rows stay visible — with
+            // their "updated …" stamp — as clearly stale content.
+            consecutiveAuthFailures += 1
+            errorText = "The server no longer accepts this device's key — unlock again."
+            if consecutiveAuthFailures >= 2 {
+                NotificationCenter.default.post(name: .scarletAuthExpired, object: nil)
+            }
         } catch {
             guard generation == loadGeneration else { return }
             errorText = "Couldn't reach the inbox — check your connection."
@@ -471,6 +501,7 @@ final class InboxModel: ObservableObject {
         }
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            if http.statusCode == 401 || http.statusCode == 403 { throw ScarletAuthError() }
             throw URLError(.badServerResponse)
         }
         return data
@@ -581,29 +612,122 @@ struct SenderAvatar: View {
 struct InboxView: View {
     @StateObject private var model = InboxModel()
     @EnvironmentObject private var convo: Conversation
-    @State private var showCompose = false
+    /// ONE enum-driven sheet (the Catalyst one-sheet rule): fresh compose from
+    /// the pencil, or resume the live draft window from the Drafts section.
+    /// `.resumeSaved` carries the parked draft's id so the PICKUP happens
+    /// inside the presented sheet instead of before it — the tap opens the
+    /// window instantly and DraftView's own spinner covers the round-trip.
+    enum InboxSheet: Identifiable {
+        case compose
+        case resume
+        case resumeSaved(String)
+        var id: String {
+            switch self {
+            case .compose: return "compose"
+            case .resume: return "resume"
+            case .resumeSaved(let draftId): return "saved-\(draftId)"
+            }
+        }
+        var attachesToActive: Bool { if case .resume = self { return true }; return false }
+        var savedDraftId: String? { if case .resumeSaved(let d) = self { return d }; return nil }
+    }
+    @State private var inboxSheet: InboxSheet?
+    /// Multi-select over the saved drafts — same Select/Done + bottom-bar flow
+    /// as Active and the Library, so the three screens feel like one app
+    /// (Ido 2026-09-26: "a quick way to multi select and delete drafts").
+    @State private var selectingDrafts = false
+    @State private var selectedDraftIDs: Set<String> = []
+    /// Just-deleted drafts, held for the undo bar. `discard` keeps the row
+    /// server-side and `restore` brings it back, so undo is real, not a lie.
+    @State private var undoableDeletes: [DraftFlowAPI.SavedDraftLite] = []
+    @State private var deleteError = ""
+    /// Drafts section material (Ido 2026-08-29: "there has to be some kind of
+    /// draft section near the inbox... so I can return to it and see the
+    /// active draft at any time"): the live window + the saved shelf.
+    @State private var waitingDraft: DraftFlowAPI.WaitingDraft?
+    @State private var savedDrafts: [DraftFlowAPI.SavedDraftLite] = []
+    /// iPad/Mac (design guide §11): the Inbox is a persistent list+reader
+    /// split at regular width — never a stretched phone stack.
+    @Environment(\.horizontalSizeClass) private var hSize
+    /// Regular width only: the id of the message open in the reading pane.
+    /// Selection-driven — opening a message never pushes over the list.
+    @State private var selectedMessageId: String?
 
     var body: some View {
+        Group {
+            if hSize == .regular {
+                regularSplit
+            } else {
+                compactStack
+            }
+        }
+        // .task re-runs every time this tab is selected → auto-refresh on
+        // tab appear; foreground return refreshes too.
+        .task { await model.load(); await refreshDrafts() }
+        // The saved pile emptied under an open selection — nothing to act on.
+        .onChange(of: savedDrafts.isEmpty) { _, empty in
+            if empty {
+                selectingDrafts = false
+                selectedDraftIDs = []
+            }
+        }
+        // The undo offer expires. Keeping it on screen indefinitely would
+        // imply a draft stays restorable forever; 8s matches how long the
+        // other transient confirmations live.
+        .task(id: undoableDeletes.map(\.id).joined()) {
+            guard !undoableDeletes.isEmpty else { return }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            undoableDeletes = []
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.willEnterForegroundNotification)) { _ in
+            Task { await model.load(); await refreshDrafts() }
+        }
+    }
+
+    /// Refresh the Drafts section: the active window + the saved shelf.
+    /// Best-effort — failures leave the previous section content standing.
+    private func refreshDrafts() async {
+        async let w = DraftFlowAPI.fetchWaiting()
+        async let s = DraftFlowAPI.fetchSaved()
+        let (waiting, saved) = await (w, s)
+        waitingDraft = waiting
+        // The live window also appears in neither list twice: a draft that is
+        // active is not "saved", and fetchSaved only returns parked rows.
+        savedDrafts = saved
+    }
+
+    /// The iPhone presentation — the original NavigationStack-push flow,
+    /// byte-for-byte: list screen, reader pushed on top.
+    private var compactStack: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 headerBar
                 tabPills
-                content
+                content(selectable: false)
             }
             .background(OutlookStyle.background.ignoresSafeArea())
             // Scarlet lives at the bottom of the LIST screen only — part of
             // its layout, so the pushed reader (with its own action bar)
             // structurally replaces it.
             .safeAreaInset(edge: .bottom) {
-                ScarletPresenceView(convo: convo)
-                    .padding(.vertical, 6)
+                VStack(spacing: 0) {
+                    if selectingDrafts { draftSelectionBar }
+                    if !undoableDeletes.isEmpty { draftUndoBar }
+                    ScarletPresenceView(convo: convo)
+                        .padding(.vertical, 6)
+                }
             }
             // The Outlook-style header row replaces the system bar on the
             // list screen; pushed screens (reader) keep theirs for Back.
             .toolbar(.hidden, for: .navigationBar)
-            .reportsModalPresence(showCompose)
-            .sheet(isPresented: $showCompose) {
-                DraftView(seed: nil)
+            .reportsModalPresence(inboxSheet != nil)
+            .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
+                // resume: attach to the live window (draft_active) — the door
+                // back to the draft no matter where navigation went.
+                DraftView(seed: nil,
+                          attachToActive: which.attachesToActive,
+                          resumeSavedId: which.savedDraftId)
                     .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                     .preferredColorScheme(.dark)
             }
@@ -615,12 +739,80 @@ struct InboxView: View {
                 convo.setFocus(inboxBrowsingFocus(newTab))
             }
         }
-        // .task re-runs every time this tab is selected → auto-refresh on
-        // tab appear; foreground return refreshes too.
-        .task { await model.load() }
-        .onReceive(NotificationCenter.default.publisher(
-            for: UIApplication.willEnterForegroundNotification)) { _ in
-            Task { await model.load() }
+    }
+
+    /// The iPad/Mac presentation (design guide §11 — MS Office anatomy): a
+    /// fixed-width message list on the leading edge, a hairline, and the
+    /// SAME reader the phone pushes, inline in the remaining area, driven by
+    /// List selection. The list never disappears; both swipe families keep
+    /// working on it. One `.sheet` per appeared view (Catalyst rule): only
+    /// one of the two body branches ever exists at a time.
+    private var regularSplit: some View {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                headerBar
+                tabPills
+                content(selectable: true)
+            }
+            .frame(width: 400)
+            // Scarlet stays with the LIST column, as on the phone's list
+            // screen; the reading pane has its own action bar.
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 0) {
+                    if selectingDrafts { draftSelectionBar }
+                    if !undoableDeletes.isEmpty { draftUndoBar }
+                    ScarletPresenceView(convo: convo)
+                        .padding(.vertical, 6)
+                }
+            }
+            Divider().overlay(OutlookStyle.separator)
+            readerPane
+        }
+        .background(OutlookStyle.background.ignoresSafeArea())
+        .toolbar(.hidden, for: .navigationBar)
+        .reportsModalPresence(inboxSheet != nil)
+        .sheet(item: $inboxSheet, onDismiss: { Task { await refreshDrafts() } }) { which in
+            // resume: attach to the live window (draft_active) — the door
+            // back to the draft no matter where navigation went.
+            DraftView(seed: nil,
+                      attachToActive: which.attachesToActive,
+                      resumeSavedId: which.savedDraftId)
+                .environmentObject(convo)   // DraftView hard-requires it; match every other call site
+                .preferredColorScheme(.dark)
+        }
+        .onAppear { convo.setFocus(inboxBrowsingFocus(model.tab)) }
+        .onChange(of: model.tab) { _, newTab in
+            convo.setFocus(inboxBrowsingFocus(newTab))
+        }
+    }
+
+    /// The regular-width reading pane: the selected message in the existing
+    /// MailDetailView, constructed exactly like the push path (convo
+    /// re-injected — Catalyst drops @EnvironmentObject across boundaries).
+    /// `.id(message.id)` gives every message its own view identity so the
+    /// reader's `.task` fetch re-runs per selection instead of showing the
+    /// previous body. Archiving removes the row from `model.messages`, the
+    /// lookup fails, and the pane falls back to the empty state on its own.
+    @ViewBuilder
+    private var readerPane: some View {
+        if let selected = selectedMessageId,
+           let message = model.messages.first(where: { $0.id == selected }) {
+            MailDetailView(message: message, model: model,
+                           onClose: { selectedMessageId = nil })
+                .environmentObject(convo)
+                .id(message.id)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(spacing: 10) {
+                Image(systemName: "envelope.open")
+                    .font(.system(size: 36))
+                    .foregroundStyle(OutlookStyle.textSecondary)
+                Text("Select a message")
+                    .font(.system(size: 17))
+                    .foregroundStyle(OutlookStyle.textSecondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(OutlookStyle.background)
         }
     }
 
@@ -642,7 +834,7 @@ struct InboxView: View {
             Spacer()
             // New mail: Scarlet drafts it in the native studio.
             Button {
-                showCompose = true
+                inboxSheet = .compose
             } label: {
                 Image(systemName: "square.and.pencil")
                     .font(.system(size: 20, weight: .medium))
@@ -709,7 +901,7 @@ struct InboxView: View {
     }
 
     @ViewBuilder
-    private var content: some View {
+    private func content(selectable: Bool) -> some View {
         if model.loading && model.messages.isEmpty {
             // Only reachable with no cache at all (true first run): content
             // could not exist yet, so the one spinner in the flow is here.
@@ -740,74 +932,373 @@ struct InboxView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            List {
-                if !model.errorText.isEmpty {
-                    Text(model.errorText)
-                        .font(.footnote)
-                        .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
-                        .listRowBackground(Color.clear)
-                }
-                ForEach(groups) { group in
-                    // Per-day headers, Outlook style: small caps, quiet gray.
-                    Text(group.title.uppercased())
-                        .font(.system(size: 12, weight: .semibold))
-                        .kerning(0.5)
-                        .foregroundStyle(OutlookStyle.textSecondary)
-                        .padding(.top, 12)
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                    ForEach(group.messages) { message in
-                        // ZStack + zero-opacity link: full NavigationLink
-                        // behavior without the disclosure chevron Outlook
-                        // doesn't have.
-                        OutlookArchiveSwipe(
-                            baseBackground: message.flagged
-                                ? OutlookStyle.flaggedRowTint : Color.clear,
-                            onArchive: { model.archive(message) }
-                        ) {
-                            ZStack {
-                                NavigationLink {
-                                    MailDetailView(message: message, model: model)
-                                        // Mac Catalyst drops @EnvironmentObject across
-                                        // the NavigationLink→destination boundary, so
-                                        // MailDetailView's `convo` traps
-                                        // (EnvironmentObject.error → SIGTRAP) on open.
-                                        // Re-inject like every DraftView call site.
-                                        .environmentObject(convo)
-                                } label: {
-                                    EmptyView()
-                                }
-                                .opacity(0)
-                                InboxRow(message: message, accent: OutlookStyle.accentBlue)
-                            }
-                        }
-                        .listRowSeparatorTint(OutlookStyle.separator)
-                        // Leading swipe stays Outlook's: orange Flag + Read/Unread.
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button {
-                                model.toggleFlag(message)
-                            } label: {
-                                Label(message.flagged ? "Unflag" : "Flag",
-                                      systemImage: message.flagged
-                                          ? "flag.slash.fill" : "flag.fill")
-                            }
-                            .tint(OutlookStyle.flagOrange)
-                            Button {
-                                model.toggleRead(message)
-                            } label: {
-                                Label(message.unread ? "Read" : "Unread",
-                                      systemImage: message.unread
-                                          ? "envelope.open.fill" : "envelope.badge.fill")
-                            }
-                            .tint(OutlookStyle.primaryBlue)
-                        }
-                    }
+            // One List body, two shells: at regular width the List carries the
+            // selection binding that drives the reading pane; on the phone it
+            // stays the plain push-flow List. (List(selection:) responds to
+            // row taps outside edit mode only on iPad/Mac — exactly where the
+            // selectable shell is used.)
+            Group {
+                if selectable {
+                    List(selection: $selectedMessageId) { listRows(selectable: true) }
+                } else {
+                    List { listRows(selectable: false) }
                 }
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .refreshable { await model.load() }
         }
+    }
+
+    /// DRAFTS — pinned above the mail (Ido 2026-08-29): the live draft and
+    /// the saved shelf, one tap back into the studio from either width. A
+    /// draft can be out of sight, never out of reach. Renders nothing when
+    /// there are no drafts, so the inbox stays clean.
+    @ViewBuilder
+    private var draftsSection: some View {
+        if waitingDraft != nil || !savedDrafts.isEmpty {
+            HStack {
+                Text("DRAFTS")
+                    .font(.system(size: 12, weight: .semibold))
+                    .kerning(0.5)
+                    .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
+                Spacer()
+                // Select only appears once there is a saved pile to act on —
+                // the ACTIVE draft is never selectable (it is the one being
+                // written; it is discarded from inside the studio).
+                if !savedDrafts.isEmpty {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            selectingDrafts.toggle()
+                            if !selectingDrafts { selectedDraftIDs.removeAll() }
+                        }
+                    } label: {
+                        Text(selectingDrafts ? "Done" : "Select")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(selectingDrafts
+                                ? Color(red: 0.95, green: 0.45, blue: 0.5) : .white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 12)
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            if !deleteError.isEmpty {
+                Text(deleteError)
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .listRowBackground(Color.black)
+                    .listRowSeparator(.hidden)
+            }
+            // The live draft: hidden while selecting, so the one row that must
+            // NOT be swept up in a bulk delete cannot be tapped by accident.
+            if let w = waitingDraft, !selectingDrafts {
+                draftRow(icon: "pencil.circle.fill",
+                         title: w.recipient.isEmpty ? draftChannelDisplayName(w.channel) : w.recipient,
+                         detail: "Active now — \(draftChannelDisplayName(w.channel))",
+                         active: true) {
+                    inboxSheet = .resume
+                }
+            }
+            ForEach(savedDrafts) { d in
+                if selectingDrafts {
+                    Button {
+                        if selectedDraftIDs.contains(d.id) {
+                            selectedDraftIDs.remove(d.id)
+                        } else {
+                            selectedDraftIDs.insert(d.id)
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: selectedDraftIDs.contains(d.id)
+                                ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 22))
+                                .foregroundStyle(selectedDraftIDs.contains(d.id)
+                                    ? Color(red: 0.95, green: 0.45, blue: 0.5)
+                                    : .white.opacity(0.35))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                                Text(d.subject.isEmpty ? d.preview : d.subject)
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(OutlookStyle.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(Color.black)
+                } else {
+                    draftRow(icon: "tray.full.fill",
+                             title: d.recipient.isEmpty ? draftChannelDisplayName(d.channel) : d.recipient,
+                             detail: d.subject.isEmpty ? d.preview : d.subject,
+                             active: false) {
+                        // The sheet opens NOW; the pickup runs inside it.
+                        inboxSheet = .resumeSaved(d.id)
+                    }
+                    // One-off delete without entering Select mode — the
+                    // fastest path when it is a single stale draft.
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) {
+                            deleteDrafts([d.id])
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Select-mode command bar: Select All / Deselect All and one
+    /// destructive action, matching Active's and the Library's bar.
+    private var draftSelectionBar: some View {
+        HStack(spacing: 12) {
+            Button(selectedDraftIDs.count == savedDrafts.count ? "Deselect All" : "Select All") {
+                if selectedDraftIDs.count == savedDrafts.count {
+                    selectedDraftIDs.removeAll()
+                } else {
+                    selectedDraftIDs = Set(savedDrafts.map(\.id))
+                }
+            }
+            .font(.system(size: 15, weight: .semibold))
+            .foregroundStyle(.white.opacity(0.85))
+            Spacer()
+            Button {
+                deleteDrafts(Array(selectedDraftIDs))
+            } label: {
+                Label("Delete\(selectedDraftIDs.isEmpty ? "" : " \(selectedDraftIDs.count)")",
+                      systemImage: "trash.fill")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(Capsule().fill(selectedDraftIDs.isEmpty
+                        ? Color.white.opacity(0.12) : Color.red.opacity(0.85)))
+            }
+            .disabled(selectedDraftIDs.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    /// The undo bar. `discard` KEEPS the row server-side and `restore` brings
+    /// it back, so this is a real undo — which is what earns the right to
+    /// delete several drafts on one tap without a confirmation dialog.
+    private var draftUndoBar: some View {
+        HStack(spacing: 12) {
+            Text(undoableDeletes.count == 1
+                 ? "1 draft deleted"
+                 : "\(undoableDeletes.count) drafts deleted")
+                .font(.system(size: 15))
+                .foregroundStyle(.white)
+            Spacer()
+            Button("Undo") {
+                let back = undoableDeletes
+                undoableDeletes = []
+                deleteError = ""
+                Task {
+                    // The result is CHECKED, not discarded: the server refuses
+                    // `restore` with 409 while another draft is active (the
+                    // one-active-draft invariant). Ignoring that would leave
+                    // the Undo button looking like it worked while the drafts
+                    // stayed deleted — the exact class of quiet lie this
+                    // codebase keeps paying for.
+                    var failed = 0
+                    await withTaskGroup(of: Bool.self) { group in
+                        for d in back {
+                            group.addTask { await DraftFlowAPI.action(draftId: d.id, action: "restore") }
+                        }
+                        for await ok in group where !ok { failed += 1 }
+                    }
+                    await refreshDrafts()
+                    if failed > 0 {
+                        deleteError = failed == back.count
+                            ? "Couldn't restore — finish or discard the draft you have open, then try again."
+                            : "Restored \(back.count - failed) of \(back.count) — the rest need the open draft finished first."
+                    }
+                }
+            }
+            .font(.system(size: 16, weight: .bold))
+            .foregroundStyle(Color(red: 0.95, green: 0.45, blue: 0.5))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+    }
+
+    /// Delete drafts by id: optimistic removal (the list must feel instant),
+    /// concurrent `discard` calls, and an honest count when some refuse —
+    /// a draft that has already been sent cannot be deleted, and the server
+    /// says so rather than pretending.
+    private func deleteDrafts(_ ids: [String]) {
+        let targets = savedDrafts.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            savedDrafts.removeAll { ids.contains($0.id) }
+            selectedDraftIDs.subtract(ids)
+            if savedDrafts.isEmpty { selectingDrafts = false }
+        }
+        deleteError = ""
+        Task {
+            var failed = 0
+            await withTaskGroup(of: Bool.self) { group in
+                for t in targets {
+                    group.addTask { await DraftFlowAPI.action(draftId: t.id, action: "discard") }
+                }
+                for await ok in group where !ok { failed += 1 }
+            }
+            if failed > 0 {
+                deleteError = failed == targets.count
+                    ? "Couldn't delete \(failed == 1 ? "that draft" : "those drafts") — they're back in the list."
+                    : "Deleted \(targets.count - failed) of \(targets.count); the rest are back in the list."
+                // Whatever refused is restored to the list by the refresh —
+                // never leave a row hidden that still exists server-side.
+                await refreshDrafts()
+            } else {
+                undoableDeletes = targets
+            }
+        }
+    }
+
+    /// One Drafts row — directive #13 styling: white text on true black.
+    private func draftRow(icon: String, title: String, detail: String,
+                          active: Bool, tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.system(size: 22))
+                    .foregroundStyle(active
+                        ? Color(red: 0.95, green: 0.45, blue: 0.5)
+                        : OutlookStyle.textSecondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(.system(size: 13))
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if active {
+                    Text("OPEN")
+                        .font(.system(size: 11, weight: .bold))
+                        .kerning(0.5)
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(Capsule().fill(Color(red: 0.95, green: 0.45, blue: 0.5)))
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(OutlookStyle.textSecondary)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(Color.black)
+    }
+
+    /// The shared List content — error line, per-day headers, message rows.
+    @ViewBuilder
+    private func listRows(selectable: Bool) -> some View {
+        draftsSection
+        if !model.errorText.isEmpty {
+            Text(model.errorText)
+                .font(.footnote)
+                .foregroundStyle(Color(red: 0.91, green: 0.69, blue: 0.31))
+                .listRowBackground(Color.clear)
+        }
+        ForEach(groups) { group in
+            // Per-day headers, Outlook style: small caps, quiet gray.
+            Text(group.title.uppercased())
+                .font(.system(size: 12, weight: .semibold))
+                .kerning(0.5)
+                .foregroundStyle(OutlookStyle.textSecondary)
+                .padding(.top, 12)
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
+            ForEach(group.messages) { message in
+                messageRow(message, selectable: selectable)
+            }
+        }
+    }
+
+    /// One message line: the archive-swipe shell around the row face, with
+    /// the Outlook leading swipes on both shells. Compact wraps the row in a
+    /// zero-opacity NavigationLink (full push behavior without the disclosure
+    /// chevron Outlook doesn't have); regular tags the row for
+    /// List(selection:) so the reading pane follows the tap instead.
+    @ViewBuilder
+    private func messageRow(_ message: MailMessage, selectable: Bool) -> some View {
+        let row = OutlookArchiveSwipe(
+            baseBackground: rowBackground(message, selectable: selectable),
+            onArchive: { model.archive(message) }
+        ) {
+            if selectable {
+                InboxRow(message: message, accent: OutlookStyle.accentBlue)
+            } else {
+                ZStack {
+                    NavigationLink {
+                        MailDetailView(message: message, model: model)
+                            // Mac Catalyst drops @EnvironmentObject across
+                            // the NavigationLink→destination boundary, so
+                            // MailDetailView's `convo` traps
+                            // (EnvironmentObject.error → SIGTRAP) on open.
+                            // Re-inject like every DraftView call site.
+                            .environmentObject(convo)
+                    } label: {
+                        EmptyView()
+                    }
+                    .opacity(0)
+                    InboxRow(message: message, accent: OutlookStyle.accentBlue)
+                }
+            }
+        }
+        .listRowSeparatorTint(OutlookStyle.separator)
+        // Leading swipe stays Outlook's: orange Flag + Read/Unread.
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                model.toggleFlag(message)
+            } label: {
+                Label(message.flagged ? "Unflag" : "Flag",
+                      systemImage: message.flagged
+                          ? "flag.slash.fill" : "flag.fill")
+            }
+            .tint(OutlookStyle.flagOrange)
+            Button {
+                model.toggleRead(message)
+            } label: {
+                Label(message.unread ? "Read" : "Unread",
+                      systemImage: message.unread
+                          ? "envelope.open.fill" : "envelope.badge.fill")
+            }
+            .tint(OutlookStyle.primaryBlue)
+        }
+        if selectable {
+            row.tag(message.id)
+        } else {
+            row
+        }
+    }
+
+    /// Row ground: in the regular-width list the open message shows a quiet
+    /// Outlook-blue selection wash (OutlookArchiveSwipe owns
+    /// `listRowBackground`, which replaces the system highlight); selection
+    /// wins over the flagged whisper-tint.
+    private func rowBackground(_ message: MailMessage, selectable: Bool) -> Color {
+        if selectable && message.id == selectedMessageId {
+            return OutlookStyle.accentBlue.opacity(0.18)
+        }
+        return message.flagged ? OutlookStyle.flaggedRowTint : Color.clear
     }
 
     // MARK: date buckets (Outlook grouping: one section per day)
@@ -896,7 +1387,9 @@ struct InboxRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 5) {
                     Text(senderName)
-                        .font(.system(size: 15, weight: message.unread ? .bold : .semibold))
+                        // Type floor (design guide): sender 17pt semibold —
+                        // density comes from layout, never smaller type.
+                        .font(.system(size: 17, weight: message.unread ? .bold : .semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -907,12 +1400,12 @@ struct InboxRow: View {
                     }
                     Spacer(minLength: 8)
                     Text(timeLabel)
-                        .font(.system(size: 12))
+                        .font(.system(size: 13))
                         .foregroundStyle(OutlookStyle.textSecondary)
                 }
                 HStack(spacing: 6) {
                     Text(message.subject)
-                        .font(.system(size: 14, weight: message.unread ? .semibold : .regular))
+                        .font(.system(size: 17, weight: message.unread ? .semibold : .regular))
                         .foregroundStyle(Color.white.opacity(message.unread ? 1.0 : 0.9))
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -929,7 +1422,7 @@ struct InboxRow: View {
                     }
                 }
                 Text(message.preview)
-                    .font(.system(size: 13))
+                    .font(.system(size: 15))
                     .foregroundStyle(OutlookStyle.textSecondary)
                     .lineLimit(2)
                     .truncationMode(.tail)
@@ -977,6 +1470,11 @@ struct InboxRow: View {
 struct MailDetailView: View {
     let message: MailMessage
     @ObservedObject var model: InboxModel
+    /// How to leave the reader when it is NOT a push: the regular-width
+    /// reading pane passes a closure that clears the list selection (there
+    /// is nothing to dismiss inline). Defaulted to nil so the phone's
+    /// NavigationLink construction stays exactly as it was.
+    var onClose: (() -> Void)? = nil
     @EnvironmentObject private var convo: Conversation
     @Environment(\.dismiss) private var dismiss
 
@@ -987,19 +1485,25 @@ struct MailDetailView: View {
     @State private var downloadingAttachmentId: String?
     /// Small red footnote under the chips; cleared on the next tap.
     @State private var attachmentError = ""
-    /// ONE sheet for the reader — the Reply drafting window OR a QuickLook
-    /// attachment preview. Two stacked `.sheet` modifiers on one view crash Mac
-    /// Catalyst; a single enum-driven sheet is safe.
+    /// ONE sheet for the reader — the reply CHOOSER, the review surface, or a
+    /// QuickLook attachment preview. Two stacked `.sheet` modifiers on one
+    /// view crash Mac Catalyst; a single enum-driven sheet is safe.
     enum ReaderSheet: Identifiable {
-        case draft, preview(PreviewFile)
+        case chooser, draft(ReplyMode), preview(PreviewFile)
         var id: String {
             switch self {
-            case .draft: return "draft"
+            case .chooser: return "chooser"
+            case .draft(let m): return "draft-\(m.rawValue)"
             case .preview(let f): return "preview-\(f.id)"
             }
         }
     }
     @State private var activeSheet: ReaderSheet?
+    /// The chooser's pick — the review surface presents from the sheet's
+    /// onDismiss (the reliable Catalyst sheet-swap pattern).
+    @State private var pendingReplyMode: ReplyMode?
+    /// iPhone → the chooser is a bottom sheet; iPad/Mac → a menu on Reply.
+    @Environment(\.horizontalSizeClass) private var hSize
     /// Display name of the attachment being previewed — feeds the viewer's
     /// [FOCUS] line so Scarlet knows exactly which file is on screen.
     @State private var previewName = ""
@@ -1041,9 +1545,16 @@ struct MailDetailView: View {
         // `onDismiss` runs the attachment-focus restore for every case — it's a
         // no-op when the draft closes (no attachment focus was set).
         .reportsModalPresence(activeSheet != nil)
-        .sheet(item: $activeSheet, onDismiss: attachmentViewerClosed) { sheet in
+        .sheet(item: $activeSheet, onDismiss: readerSheetClosed) { sheet in
             switch sheet {
-            case .draft:
+            case .chooser:
+                // READ-FIRST (spec §2): Reply presents the three choices —
+                // never a draft straight away. The pick is only remembered
+                // here; the review surface presents from onDismiss.
+                ReplyChooserView(recipient: senderDisplayName) { mode in
+                    pendingReplyMode = mode
+                }
+            case .draft(let mode):
                 // The loaded detail carries the original's To/Cc; Reply is only
                 // reachable once it's up, but fall back to empty gracefully.
                 DraftView(seed: DraftSeed(
@@ -1054,7 +1565,7 @@ struct MailDetailView: View {
                     preview: message.preview,
                     toLine: detail?.to ?? "",
                     ccLine: detail?.cc ?? ""
-                ))
+                ), replyMode: mode)
                 .environmentObject(convo)   // DraftView hard-requires it; match every other call site
                 .preferredColorScheme(.dark)
             case .preview(let file):
@@ -1083,6 +1594,39 @@ struct MailDetailView: View {
             if convo.currentFocus == emailFocus {
                 convo.setFocus(inboxBrowsingFocus(model.tab))
             }
+        }
+        // Work-surface keys (§5): R = reply chooser, E = archive — silent
+        // twins of the action-bar buttons.
+        .background {
+            Group {
+                Button("") { activeSheet = .chooser }
+                    .keyboardShortcut("r", modifiers: [])
+                Button("") {
+                    model.archive(message)
+                    closeReader()
+                }
+                .keyboardShortcut("e", modifiers: [])
+            }
+            .opacity(0)
+            .accessibilityHidden(true)
+        }
+    }
+
+    /// Leaves the reader: pops the push on the phone; clears the reading-pane
+    /// selection at regular width, where the reader is inline and `dismiss()`
+    /// has nothing to act on.
+    private func closeReader() {
+        if let onClose { onClose() } else { dismiss() }
+    }
+
+    /// One dismiss handler for the reader's single sheet: restore the
+    /// attachment focus (no-op for the other cases), then present the review
+    /// surface if the chooser just picked a mode.
+    private func readerSheetClosed() {
+        attachmentViewerClosed()
+        if let mode = pendingReplyMode {
+            pendingReplyMode = nil
+            activeSheet = .draft(mode)
         }
     }
 
@@ -1309,7 +1853,7 @@ struct MailDetailView: View {
             // list root hides the system nav bar — so the only reliable exit is one
             // we draw ourselves. A reader you can act in but not leave is the bug
             // we're killing app-wide.
-            Button { dismiss() } label: {
+            Button { closeReader() } label: {
                 HStack(spacing: 3) {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 15, weight: .semibold))
@@ -1404,18 +1948,30 @@ struct MailDetailView: View {
     /// quiet raised chips. Same three behaviors as always.
     private var actionBar: some View {
         HStack(spacing: 10) {
-            // "Reply All" — the draft is a true threaded Reply-All (every
-            // original recipient), so the button says exactly that.
-            actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
-                         tint: OutlookStyle.primaryBlue, filled: true) {
-                activeSheet = .draft
+            // "Reply All" — the eventual draft is a true threaded Reply-All
+            // (every original recipient). READ-FIRST: the button opens the
+            // three-option chooser — a bottom sheet on iPhone, the same three
+            // choices as a menu on iPad/Mac — never a draft directly.
+            if hSize == .regular {
+                ReplyChooserMenu(onChoose: { mode in
+                    activeSheet = .draft(mode)
+                }) {
+                    actionLabel("Reply All", icon: "arrowshape.turn.up.left.2.fill",
+                                tint: OutlookStyle.primaryBlue, filled: true)
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                actionButton("Reply All", icon: "arrowshape.turn.up.left.2.fill",
+                             tint: OutlookStyle.primaryBlue, filled: true) {
+                    activeSheet = .chooser
+                }
             }
             // Archive is GREEN here too, matching the list swipe — one color per
             // concept.
             actionButton("Archive", icon: "archivebox.fill",
                          tint: OutlookStyle.archiveGreen) {
                 model.archive(message)
-                dismiss()
+                closeReader()
             }
             actionButton("Ask Scarlet", icon: "sparkles", tint: scarletRose) {
                 askScarlet()
@@ -1429,18 +1985,25 @@ struct MailDetailView: View {
                               filled: Bool = false,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                Image(systemName: icon).font(.system(size: 13, weight: .semibold))
-                Text(label).font(.footnote.weight(.semibold))
-            }
-            .lineLimit(1)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .background(filled ? tint : OutlookStyle.surface, in: Capsule())
-            .overlay(Capsule().stroke(
-                filled ? Color.clear : OutlookStyle.separator, lineWidth: 1))
-            .foregroundStyle(filled ? Color.white : tint)
+            actionLabel(label, icon: icon, tint: tint, filled: filled)
         }
+    }
+
+    /// The action-bar chip's face, shared by plain buttons and the Reply
+    /// menu (which needs the label without a Button around it).
+    private func actionLabel(_ label: String, icon: String, tint: Color,
+                             filled: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+            Text(label).font(.footnote.weight(.semibold))
+        }
+        .lineLimit(1)
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(filled ? tint : OutlookStyle.surface, in: Capsule())
+        .overlay(Capsule().stroke(
+            filled ? Color.clear : OutlookStyle.separator, lineWidth: 1))
+        .foregroundStyle(filled ? Color.white : tint)
     }
 
     /// "All Scarlet capabilities" in the reader: hand this email to the live
@@ -1617,7 +2180,7 @@ struct MailBodyView: UIViewRepresentable {
            ("quit unexpectedly"). Render the message on a clean light page —
            stability first; a dark re-theme can return once verified safe. */
         html,body{margin:0;padding:12px;background:#fff;color:#111;\
-        font:16px -apple-system,system-ui,sans-serif;\
+        font:17px/1.5 -apple-system,system-ui,sans-serif;\
         -webkit-text-size-adjust:100%;word-wrap:break-word;overflow-wrap:break-word}\
         img{max-width:100%!important;height:auto!important}\
         table{max-width:100%!important;table-layout:auto}\

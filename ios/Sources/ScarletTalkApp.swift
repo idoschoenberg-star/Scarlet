@@ -45,6 +45,12 @@ struct ScarletTalkApp: App {
         // The phone recorder: finish and upload anything a killed or
         // offline recording left on disk.
         MeetingRecorder.recoverOrphans()
+        // The journal's "where" axis (task #112): significant-change monitoring
+        // runs for the life of the install, not the life of a session — iOS
+        // relaunches the app in the background to deliver each point. Started
+        // here so a cold background launch (which never reaches a scene phase
+        // change) re-arms it too. No-op until Always is granted.
+        LocationReporter.shared.startTrail()
     }
 
     var body: some Scene {
@@ -75,15 +81,24 @@ struct RootView: View {
     /// Refreshed by piggybacking the existing backstop loop below (the store
     /// gates itself to ~30s) — no timer of its own.
     @ObservedObject private var counts = InboxCounts.shared
+    /// Injected by ScarletTalkApp — the auth-expired path signs out through it.
+    @EnvironmentObject private var session: AppSession
     @State private var tab: Tab = .talk
     @State private var voiceDraftPresented = false
     /// The compose_draft tool arguments (recipient, instruction, channel) posted
     /// the instant Scarlet calls the tool — handed to the DraftView so the
     /// writing card paints his request before the server row exists.
     @State private var voiceDraftIntent: [String: String]? = nil
-    /// Draft ids already offered for recovery THIS process — a fresh launch
-    /// (i.e. after a crash) offers again; within one run we don't nag.
-    @State private var recoveredDraftIds: Set<String> = []
+    /// Draft ids this process has SEEN, with where they stand: "live" while
+    /// their sheet is on screen, or the Date the sheet was dismissed. The
+    /// backstop poll uses this to (a) never re-open a draft he just swiped
+    /// away unchanged — the false "your draft was interrupted" 2s after a
+    /// dismissal — and (b) STILL re-open it, quietly, when a later voice
+    /// revision lands server-side (updated_at after the dismissal): work he
+    /// asked for must reach the screen. A fresh launch (crash) starts empty,
+    /// so real recovery still announces.
+    @State private var seenDrafts: [String: DraftMark] = [:]
+    enum DraftMark: Equatable { case live, dismissed(Date) }
     /// True while ANY draft sheet is on screen (RootView's or Inbox/Chats/Desk's,
     /// via the shared scarletDraftSheetVisible signal) — the backstop poll must
     /// not open a second window over one already up.
@@ -93,19 +108,46 @@ struct RootView: View {
     /// crash moments ago, never for an old row (Ido 2026-08-13: "she should
     /// not initiate a session with a draft").
     private let launchedAt = Date()
+    /// SplitShell's frontmost section (regular width), mirrored via
+    /// .scarletShellSection. On the phone `tab` is the truth instead.
+    @State private var splitSection = "talk"
+    /// Device Boundary: the one-time tier question, presented as a
+    /// FULL-SCREEN COVER because this view's single Catalyst-safe .sheet
+    /// slot belongs to the draft window (one .sheet + one .fullScreenCover
+    /// on a view is the allowed pairing). Driven by DeviceBoundary's
+    /// published flag via onReceive so answering closes it by itself.
+    @State private var tierQuestionPresented = false
     @Environment(\.scenePhase) private var scenePhase
+
+    /// Whether the Talk screen is what Ido is actually looking at, on either
+    /// presentation. The desk-mode Mac-focus poll runs ONLY then — desktop
+    /// Outlook focus must never overwrite the [FOCUS] of a pane he has open
+    /// in the app itself (the iPad/Mac clobber bug).
+    private var talkIsFrontmost: Bool {
+        hSize == .regular ? splitSection == "talk" : tab == .talk
+    }
+    /// Restart key for the desk poll: changes whenever the frontmost screen
+    /// (on the relevant axis for this width class) changes.
+    private var deskPollKey: String {
+        hSize == .regular ? "r-" + splitSection : "c-" + String(describing: tab)
+    }
     /// iPhone keeps the TabView; iPad/Mac (regular width) get the
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, news, library, health, desk, estate, travel, settings }
+    enum Tab: Hashable { case talk, inbox, journal, active, calendar, chats, photos, music, news, library, health, desk, estate, travel, settings }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
     private static let talkFocus =
         "[FOCUS] Ido is on the Talk screen, in live conversation. No item focused."
 
-    var body: some View {
+    // body was one ~150-line modifier chain; at that size the Swift type
+    // checker gives up ("unable to type-check this expression in reasonable
+    // time", build 299's first attempt). It is split into shellCore + thin
+    // closures that forward to named handlers below — same behavior, sane
+    // inference cost.
+    private var shellCore: some View {
         Group {
             if hSize == .regular {
                 SplitShell(convo: convo)
@@ -113,6 +155,10 @@ struct RootView: View {
                 phoneTabs
             }
         }
+    }
+
+    var body: some View {
+        shellCore
         .tint(Color(red: 1, green: 0.35, blue: 0.42))
         // 1Password approval cards float at the ROOT so they appear over any
         // tab, any pushed detail, and a live call alike — an overlay, not a
@@ -137,34 +183,13 @@ struct RootView: View {
         // this shell (which owns the conversation) switches to Talk and hands
         // her the question — waking the conversation first if it isn't live.
         .onReceive(NotificationCenter.default.publisher(for: .scarletAskAboutEmail)) { note in
-            guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
-            tab = .talk
-            if convo.state == .idle {
-                convo.hasAutoStarted = true
-                convo.start(token: TokenStore.token ?? "")
-            }
-            Task { @MainActor in
-                // Give a cold socket a moment to come up before delivering.
-                var waited = 0
-                while convo.state == .connecting && waited < 40 {
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    waited += 1
-                }
-                convo.sendText(text)
-            }
+            handleAskAboutEmail(note)
         }
         // Scarlet started a draft by voice (compose_draft tool): open the
         // drafting table over whatever screen Ido is on. The sheet attaches
         // to the active server-side draft instead of composing its own.
         .onReceive(NotificationCenter.default.publisher(for: .scarletVoiceDraftStarted)) { note in
-            // Mark the id "seen" ONLY when we actually present it. Marking it
-            // unconditionally (the old bug) permanently blinded the backstop
-            // poll for that draft whenever draftSheetOpen was momentarily true,
-            // so the window then never opened at all.
-            if !draftSheetOpen {
-                if let id = note.object as? String { recoveredDraftIds.insert(id) }
-                voiceDraftPresented = true
-            }
+            handleVoiceDraftStarted(note)
         }
         // The INSTANT Scarlet calls compose_draft (before the network round-trip):
         // capture his request and open the window immediately so it reacts the
@@ -176,89 +201,74 @@ struct RootView: View {
         // Track any draft sheet's visibility (from every DraftView) so the
         // backstop poll never double-opens.
         .onReceive(NotificationCenter.default.publisher(for: .scarletDraftSheetVisible)) { note in
-            draftSheetOpen = (note.userInfo?["visible"] as? Bool) ?? false
+            let visible = (note.userInfo?["visible"] as? Bool) ?? false
+            draftSheetOpen = visible
+            if !visible { stampDismissedDrafts() }
         }
         // Reliability backstop: a voice-composed draft reaches the window even if
         // the compose_draft tool-result notification is missed. Every ~2s, if no
         // draft sheet is open, check for a fresh server-side draft and open it.
         // recoverActiveDraft() only opens ids not already seen, so a dismissed
         // draft is never reopened.
-        .task {
-            while !Task.isCancelled {
-                if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
-                // Badge counts ride the same heartbeat — the store's own
-                // stale-gate turns this into a ~30s poll, no extra timer.
-                await InboxCounts.shared.refreshIfStale()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-            }
-        }
-        .sheet(isPresented: $voiceDraftPresented, onDismiss: { voiceDraftIntent = nil }) {
+        .task { await runDraftBackstopLoop() }
+        .sheet(isPresented: $voiceDraftPresented, onDismiss: {
+            voiceDraftIntent = nil
+            stampDismissedDrafts()
+            // Reliably clear the gate when THIS voice-draft sheet closes.
+            // draftSheetOpen was otherwise driven ONLY by DraftView's
+            // .onDisappear notification, and SwiftUI does not guarantee
+            // .onDisappear fires for a dismissing sheet (Ido 2026-08-26: a
+            // wire draft composed by voice never appeared — the previous
+            // voice draft's missed onDisappear left draftSheetOpen stuck true,
+            // which silently blocked both the compose notifications AND the 2s
+            // backstop for every later voice draft). onDismiss IS reliably
+            // called, so resetting here can never leave the gate wedged.
+            draftSheetOpen = false
+        }) {
             DraftView(seed: nil, attachToActive: true, voiceIntent: voiceDraftIntent)
                 .environmentObject(convo)
                 .preferredColorScheme(.dark)
         }
+        // DEVICE BOUNDARY: the one-time "is this device company-managed?"
+        // question. DeviceBoundary raises the flag at most once per launch
+        // (device_me came back 'unknown'); answering or "Not now" clears it
+        // and this cover follows. Until answered the device renders as
+        // corporate — the fail-closed contract.
+        .fullScreenCover(isPresented: $tierQuestionPresented) {
+            DeviceTierQuestionView()
+        }
+        .onReceive(DeviceBoundary.shared.$needsClassification) { needs in
+            tierQuestionPresented = needs
+        }
+        // Launch refresh: adopt the server's tier for this device (and ask
+        // the one-time question when it is still unclassified).
+        .task { await DeviceBoundary.shared.refresh() }
         // Ambient focus: Talk at launch and whenever the tab returns to it;
         // switching to Inbox lets that hierarchy report itself.
-        .onAppear {
-            convo.setFocus(Self.talkFocus)
-            FlightRecorder.reportUncleanExitIfAny()
-            FlightRecorder.note(screen: "talk")
-            Task { await recoverActiveDraft() }
-            // Cold-launch "Talk to Scarlet": the intent may have fired before
-            // the observer above was listening, so drain the pending flag once.
-            if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
-            // Health sync must not depend on the Health TAB being opened —
-            // that left health_days stale for days and Scarlet answering
-            // "how many steps today" from an old row (CarPlay 2026-08-15).
-            // Register the HealthKit observers and push once at launch.
-            if HealthSync.shared.authorized {
-                Task { await HealthSync.shared.syncNow() }
-            }
-        }
+        .onAppear { handleAppear() }
         // Coming back to the foreground re-checks for an orphaned draft —
         // a crash or an iOS kill mid-draft must NEVER lose Ido's work.
         // Badges refresh immediately too: stale counts on wake read as lies.
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                Task { await recoverActiveDraft() }
-                Task { await InboxCounts.shared.refresh() }
-                // Fresh GPS fix to the backend so "here" answers (where am I,
-                // weather, directions) are minutes old, never a stale share.
-                LocationReporter.shared.report()
-                // Same for the body: every return to the foreground pushes
-                // today's HealthKit numbers so the server row stays current.
-                if HealthSync.shared.authorized {
-                    Task { await HealthSync.shared.syncNow() }
-                }
-            }
-            FlightRecorder.note(screen: "phase:\(phase)")
-        }
+        .onChange(of: scenePhase) { _, phase in handleScenePhase(phase) }
         .onChange(of: tab) { _, newTab in
             if newTab == .talk { convo.setFocus(Self.talkFocus) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .scarletShellSection)) { note in
+            if let name = note.object as? String { splitSection = name }
+        }
+        // A revoked/rotated device key (two consecutive 401/403s from the
+        // API) is a sign-in problem, not a network problem: drop to the
+        // unlock screen instead of letting every list claim the network is
+        // down while showing stale rows.
+        .onReceive(NotificationCenter.default.publisher(for: .scarletAuthExpired)) { _ in
+            session.signOut()
         }
         // Desk mode: while the phone sits open on Talk next to his Mac, poll
         // what he's focused on at the desk. Reading an email in DESKTOP
         // Outlook flows to Scarlet as [FOCUS] — he speaks to the phone, the
         // draft opens here, and the approved reply lands back in Outlook.
         // Only on the Talk tab: inside the app, each screen owns its focus.
-        .task(id: tab) {
-            guard tab == .talk else { return }
-            var lastSig = ""
-            while !Task.isCancelled {
-                if convo.state == .listening || convo.state == .speaking {
-                    if let desk = await Self.fetchMacFocus() {
-                        if desk.sig != lastSig {
-                            lastSig = desk.sig
-                            convo.setFocus(desk.focusText)
-                        }
-                    } else if lastSig != "" {
-                        lastSig = ""
-                        if tab == .talk { convo.setFocus(Self.talkFocus) }
-                    }
-                }
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-            }
-        }
+        .task(id: deskPollKey) { await runDeskFocusPoll() }
     }
 
     /// The iPhone presentation: the main tabs (5+ fold into More).
@@ -275,6 +285,28 @@ struct RootView: View {
                 // focused unread count (`op=inbox_counts` outlook_mail).
                 .badge(counts.inboxBadge)
                 .tag(Tab.inbox)
+            // The Journal — the review lane where staged actions and derived
+            // storylines wait for his ruling (docs/JOURNAL_PROGRAM.md). Sits
+            // right after Inbox: it is the OTHER inbox, and the two are the
+            // pair he works through.
+            // Corp-view profile (Device Boundary): on a corporate or
+            // still-unknown device the personal surfaces — Journal, Photos,
+            // Health — collapse to a quiet "Personal — tap to show" card;
+            // one tap reveals each for this session only. Work surfaces
+            // (Inbox, Calendar, Chats, drafting, Talk) are untouched.
+            PersonalSurface(section: "journal", title: "Your journal",
+                            icon: "book.closed.fill") {
+                JournalView()
+                    .environmentObject(convo)
+            }
+                .tabItem { Label("Journal", systemImage: "book.closed.fill") }
+                .tag(Tab.journal)
+            // The Active board: what he asked Scarlet to do, in flight,
+            // amendable/stoppable; done = checkmarked archive; recurring list.
+            ActiveView()
+                .environmentObject(convo)
+                .tabItem { Label("Active", systemImage: "dot.radiowaves.left.and.right") }
+                .tag(Tab.active)
             CalendarView()
                 .environmentObject(convo)
                 .tabItem { Label("Calendar", systemImage: "calendar") }
@@ -289,8 +321,11 @@ struct RootView: View {
             // Photos and Music fold into "More" with the rest of the tail —
             // first-class native screens at last (they lived only in the web
             // app before build 202).
-            PhotosView()
-                .environmentObject(convo)
+            PersonalSurface(section: "photos", title: "Your photos",
+                            icon: "photo.on.rectangle") {
+                PhotosView()
+                    .environmentObject(convo)
+            }
                 .tabItem { Label("Photos", systemImage: "photo.on.rectangle") }
                 .tag(Tab.photos)
             MusicView()
@@ -304,8 +339,11 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Library", systemImage: "books.vertical.fill") }
                 .tag(Tab.library)
-            HealthView()
-                .environmentObject(convo)
+            PersonalSurface(section: "health", title: "Your health",
+                            icon: "heart.fill") {
+                HealthView()
+                    .environmentObject(convo)
+            }
                 .tabItem { Label("Health", systemImage: "heart.fill") }
                 .tag(Tab.health)
             DeskView()
@@ -347,9 +385,120 @@ struct RootView: View {
     /// whatever screen we're on. Once per draft per process: a fresh launch
     /// after a crash offers again; dismissing it doesn't nag within a run.
     // @MainActor: after the `await` below the continuation can resume off-main,
-    // and everything past it mutates SwiftUI @State (recoveredDraftIds,
+    // and everything past it mutates SwiftUI @State (seenDrafts,
     // voiceDraftPresented) and touches `convo`. Pin the whole method to main.
     @MainActor
+    // MARK: body handlers (extracted so body's type-check stays tractable)
+
+    private func handleAskAboutEmail(_ note: Notification) {
+        guard let text = note.userInfo?["text"] as? String, !text.isEmpty else { return }
+        tab = .talk
+        if convo.state == .idle {
+            convo.hasAutoStarted = true
+            convo.start(token: TokenStore.token ?? "")
+        }
+        Task { @MainActor in
+            // Give a cold socket a moment to come up before delivering.
+            var waited = 0
+            while convo.state == .connecting && waited < 40 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                waited += 1
+            }
+            convo.sendText(text)
+        }
+    }
+
+    /// A sheet already on screen IS this draft's window (attach mode) —
+    /// record the id as live either way; only the PRESENTATION is gated.
+    /// Not recording it here was the false-interruption bug: he dismissed
+    /// the sheet, the backstop found the still-active id it had never
+    /// "seen", and re-opened it 2s later announcing an interruption that
+    /// never happened. The dismissal stamp (not a permanent blind) is what
+    /// keeps the backstop able to re-open on a real later revision.
+    private func handleVoiceDraftStarted(_ note: Notification) {
+        if let id = note.object as? String { seenDrafts[id] = .live }
+        if !draftSheetOpen { voiceDraftPresented = true }
+    }
+
+    private func runDraftBackstopLoop() async {
+        while !Task.isCancelled {
+            if !draftSheetOpen && !voiceDraftPresented { await recoverActiveDraft() }
+            // Badge counts ride the same heartbeat — the store's own
+            // stale-gate turns this into a ~30s poll, no extra timer.
+            await InboxCounts.shared.refreshIfStale()
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    private func handleAppear() {
+        convo.setFocus(Self.talkFocus)
+        FlightRecorder.reportUncleanExitIfAny()
+        FlightRecorder.note(screen: "talk")
+        Task { await recoverActiveDraft() }
+        // Cold-launch "Talk to Scarlet": the intent may have fired before
+        // the observer above was listening, so drain the pending flag once.
+        if ScarletLauncher.shared.consumePendingStart() { startFromIntent() }
+        // Health sync must not depend on the Health TAB being opened —
+        // that left health_days stale for days and Scarlet answering
+        // "how many steps today" from an old row (CarPlay 2026-08-15).
+        // Register the HealthKit observers and push once at launch.
+        if HealthSync.shared.authorized {
+            Task { await HealthSync.shared.syncNow() }
+        }
+    }
+
+    private func handleScenePhase(_ phase: ScenePhase) {
+        if phase == .active {
+            Task { await recoverActiveDraft() }
+            Task { await InboxCounts.shared.refresh() }
+            // Fresh GPS fix to the backend so "here" answers (where am I,
+            // weather, directions) are minutes old, never a stale share.
+            LocationReporter.shared.report()
+            // Re-arm the trail: he may have granted Always from the
+            // Settings row since the last foreground, and a grant that
+            // lands while we're backgrounded has nothing else to start it.
+            LocationReporter.shared.startTrail()
+            // Same for the body: every return to the foreground pushes
+            // today's HealthKit numbers so the server row stays current —
+            // today's fast path first, then the full window behind it.
+            if HealthSync.shared.authorized {
+                Task {
+                    await HealthSync.shared.syncToday()
+                    await HealthSync.shared.syncNow()
+                }
+            }
+        }
+        FlightRecorder.note(screen: "phase:\(phase)")
+    }
+
+    private func runDeskFocusPoll() async {
+        guard talkIsFrontmost else { return }
+        var lastSig = ""
+        while !Task.isCancelled {
+            if convo.state == .listening || convo.state == .speaking {
+                if let desk = await Self.fetchMacFocus() {
+                    if desk.sig != lastSig {
+                        lastSig = desk.sig
+                        convo.setFocus(desk.focusText)
+                    }
+                } else if lastSig != "" {
+                    lastSig = ""
+                    if talkIsFrontmost { convo.setFocus(Self.talkFocus) }
+                }
+            }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+        }
+    }
+
+    /// Every draft marked live gets a dismissal stamp the moment its sheet
+    /// leaves the screen — the timestamp the backstop compares revisions to.
+    private func stampDismissedDrafts() {
+        let now = Date()
+        for (id, mark) in seenDrafts where mark == .live {
+            seenDrafts[id] = .dismissed(now)
+        }
+    }
+
     private func recoverActiveDraft() async {
         guard !voiceDraftPresented, !draftSheetOpen else { return }
         var comps = URLComponents(url: AppConfig.appAPIURL, resolvingAgainstBaseURL: false)!
@@ -380,8 +529,25 @@ struct RootView: View {
         guard let ts = draft["updated_at"] as? String,
               let when = MailDates.parse(ts),
               when >= launchedAt.addingTimeInterval(-15 * 60) else { return }
-        guard !recoveredDraftIds.contains(id) else { return }
-        recoveredDraftIds.insert(id)
+        switch seenDrafts[id] {
+        case .live:
+            // Its sheet is (or moments ago was) on screen — nothing to recover.
+            return
+        case .dismissed(let at):
+            // He swiped this one away. Unchanged → stays away. Revised AFTER
+            // the dismissal (5s grace absorbs the compose-stream's own tail
+            // writes) → his spoken revision landed and must reach the screen:
+            // re-open QUIETLY — no "interrupted" announcement, he asked for
+            // this change seconds ago.
+            guard when > at.addingTimeInterval(5) else { return }
+            seenDrafts[id] = .live
+            FlightRecorder.note(screen: "draft-reopened-revision:\(id)")
+            voiceDraftPresented = true
+            return
+        case nil:
+            break   // never seen this run — genuine recovery, announce below
+        }
+        seenDrafts[id] = .live
         FlightRecorder.note(screen: "draft-recovered:\(id)")
         voiceDraftPresented = true
         // She announces it — Ido should never have to go looking for lost

@@ -79,6 +79,9 @@ struct SettingsView: View {
 
     @StateObject private var m = SettingsModel()
     @Environment(\.dismiss) private var dismiss
+    /// Address gate (car cabins): GateSettings.enabledKey is the single
+    /// source of truth; @AppStorage just gives the toggle live UI state.
+    @AppStorage(GateSettings.enabledKey) private var addressGateOn = true
 
     var body: some View {
         NavigationStack {
@@ -122,6 +125,25 @@ struct SettingsView: View {
                     Text("Tap play to hear a sample. Changes apply from your next conversation.")
                 }
 
+                // Device Boundary: every paired device and Mac node, each
+                // wearing its personal/corporate tier, with relabel + revoke.
+                Section {
+                    NavigationLink {
+                        DevicesView()
+                            .background(ScarletBackground().ignoresSafeArea())
+                    } label: {
+                        Label("Devices", systemImage: "laptopcomputer.and.iphone")
+                    }
+                } footer: {
+                    Text("Every device signed in to Scarlet, and whether each is personal or company-managed. Personal sections stay tucked away on managed screens.")
+                }
+
+                Section {
+                    Toggle("In the car: answer only when addressed", isOn: $addressGateOn)
+                } footer: {
+                    Text("With this on, cabin conversation and media speech she wasn't part of stay unanswered — say “Scarlet” to reach her cold, or just keep talking within half a minute of her last reply.")
+                }
+
                 // Microphone: live level meter (ground truth), input-device and
                 // channel pickers, and input gain — for capturing a close mic on
                 // a multichannel interface (e.g. the RME Babyface on the Mac).
@@ -148,6 +170,7 @@ struct SettingsView: View {
 /// always exists.
 private struct LocationSettingsSection: View {
     @State private var status: CLAuthorizationStatus = CLLocationManager().authorizationStatus
+    @State private var trailOn = false
 
     private var label: String {
         switch status {
@@ -168,6 +191,15 @@ private struct LocationSettingsSection: View {
                 Text(label).fontWeight(.semibold)
                     .foregroundStyle(good ? Color.green : Color.orange)
             }
+            // The trail is what gives the Journal its "where" axis — a day
+            // reconstructs as a real route instead of a list of guesses. It
+            // records only on Always, so say plainly whether it is running.
+            HStack {
+                Text("Journal trail").foregroundStyle(.secondary)
+                Spacer()
+                Text(trailOn ? "Recording ✓" : "Needs “Always”").fontWeight(.semibold)
+                    .foregroundStyle(trailOn ? Color.green : Color.orange)
+            }
             if !good {
                 Button {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -180,12 +212,14 @@ private struct LocationSettingsSection: View {
         } header: {
             Text("Location")
         } footer: {
-            Text("“Always” is what lets navigation and “where am I” answers work while the phone is locked in the car. On the page that opens, tap Location and choose Always.")
+            Text("“Always” is what lets navigation and “where am I” answers work while the phone is locked in the car — and what lets the Journal record where your day was spent. On the page that opens, tap Location and choose Always. The trail only wakes on meaningful movement; a phone sitting still costs nothing.")
         }
         // Re-read on return from the Settings app so the row reflects reality.
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didBecomeActiveNotification)) { _ in
             status = CLLocationManager().authorizationStatus
+            trailOn = LocationReporter.shared.trailActive
         }
+        .onAppear { trailOn = LocationReporter.shared.trailActive }
     }
 }
