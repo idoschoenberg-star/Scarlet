@@ -43,6 +43,7 @@ struct SplitShell: View {
         case desk
         case estate
         case travel
+        case finance
         case settings
 
         var id: String { rawValue }
@@ -61,6 +62,7 @@ struct SplitShell: View {
             case .desk: return "Desk"
             case .estate: return "Estate"
             case .travel: return "Travel"
+            case .finance: return "Finance"
             case .settings: return "Settings"
             }
         }
@@ -80,6 +82,7 @@ struct SplitShell: View {
             case .desk: return "checklist"
             case .estate: return "house.fill"
             case .travel: return "airplane"
+            case .finance: return "creditcard.fill"
             case .settings: return "gearshape.fill"
             }
         }
@@ -100,6 +103,8 @@ struct SplitShell: View {
             // ⌘0…⌘9 are all taken; new sections use letters (as News uses ⌘N).
             case .estate: return "e"
             case .travel: return "t"
+            // Ido's answer of 2026-10-25: Finance, ⌘M.
+            case .finance: return "m"
             case .settings: return "0"
             }
         }
@@ -122,7 +127,7 @@ struct SplitShell: View {
     /// The main (top) sidebar group; Settings renders separately at the
     /// bottom of the sidebar.
     private var mainSections: [ShellSection] {
-        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate, .travel]
+        [.talk, .inbox, .calendar, .chats, .photos, .music, .library, .health, .desk, .estate, .travel, .finance]
     }
 
     var body: some View {
@@ -299,6 +304,12 @@ struct SplitShell: View {
             // Self-contained: list pane + detail pane (Up next · Passes ·
             // Reservations · Past).
             TravelView()
+                .environmentObject(convo)
+        case .finance:
+            // Self-contained: seven leaves over the Finance Desk's ledger
+            // (Overview · Transactions · Open · Recurring · Documents ·
+            // Wires · Sitting). Records his word; never pays or cancels.
+            FinanceView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar. As a detail column there

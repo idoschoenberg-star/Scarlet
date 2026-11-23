@@ -98,7 +98,7 @@ struct RootView: View {
     /// three-pane SplitShell — one codebase, presentation by surface.
     @Environment(\.horizontalSizeClass) private var hSize
 
-    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, news, library, health, desk, estate, travel, settings }
+    enum Tab: Hashable { case talk, inbox, calendar, chats, photos, music, news, library, health, desk, estate, travel, finance, settings }
 
     /// Ambient focus for the Talk screen; the Inbox hierarchy reports its
     /// own (list vs. open email) from its onAppears.
@@ -320,6 +320,10 @@ struct RootView: View {
                 .environmentObject(convo)
                 .tabItem { Label("Travel", systemImage: "airplane") }
                 .tag(Tab.travel)
+            FinanceView()
+                .environmentObject(convo)
+                .tabItem { Label("Finance", systemImage: "creditcard.fill") }
+                .tag(Tab.finance)
             // Settings must be REACHABLE on the phone: with 5+ tabs iOS folds
             // the tail into "More", so this row lands in the More list — the
             // iOS-convention home for Settings, and the phone twin of the
