@@ -249,7 +249,17 @@ struct HealthView: View {
         }
         // .task re-runs every time this tab is selected → sync on appear.
         // (The cache already painted; this refreshes deltas in background.)
-        .task { if sync.authorized { await sync.syncNow() } }
+        // The tab is on screen here, the one place the Health access sheet
+        // can be shown when the set of types has grown.
+        .task {
+            if sync.authorized {
+                await sync.ensureAccessCurrent()
+                await sync.syncNow()
+                // The sync may have just learned that the reader was
+                // switched on: ask for its types now and read them.
+                if await sync.ensureAccessCurrent() { await sync.syncNow() }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willEnterForegroundNotification)) { _ in
             Task { if sync.authorized { await sync.syncNow() } }
@@ -394,6 +404,9 @@ struct HealthView: View {
                 trainingBalanceCard
                 sleepCard
                 bodyCard
+                if !nutritionDays.isEmpty {
+                    nutritionCard
+                }
                 heartCard
                 if period != .today {
                     stepsCard
@@ -991,6 +1004,83 @@ struct HealthView: View {
             .healthYAxis()
             .chartXAxis(.hidden)
             .frame(height: 50)
+        }
+    }
+
+    // MARK: NUTRITION — what other apps (Noom) wrote into Apple Health
+
+    /// Days of the chart window that carry at least one nutrition figure.
+    /// Empty while the reader is off, and then the card is not drawn at all.
+    private var nutritionDays: [DayMetrics] {
+        let cal = Calendar.current
+        let cutoff = cal.date(byAdding: .day, value: -(period.chartDays - 1),
+                              to: cal.startOfDay(for: Date())) ?? .distantPast
+        let names = ["calories", "protein_g", "carbs_g", "fat_g", "water_ml"]
+        return sync.dayMetrics.filter { m in
+            m.date >= cutoff && names.contains { m.values[$0] != nil }
+        }
+    }
+
+    /// Today's figure, or the average per logged day of the period. nil when
+    /// no day of the scope carries the metric: a blank, never a zero.
+    private func nutritionValue(_ metric: String, in days: [DayMetrics]) -> Double? {
+        if period == .today {
+            let key = HealthSync.dayKey.string(from: Date())
+            return days.first(where: { $0.dateKey == key })?.values[metric]
+        }
+        let cal = Calendar.current
+        let cutoff = cal.date(byAdding: .day, value: -(period.windowDays - 1),
+                              to: cal.startOfDay(for: Date())) ?? .distantPast
+        let vals = days.filter { $0.date >= cutoff }.compactMap { $0.values[metric] }
+        guard !vals.isEmpty else { return nil }
+        return vals.reduce(0, +) / Double(vals.count)
+    }
+
+    private func nutritionText(_ value: Double?, divide: Double = 1, decimals: Int = 0) -> String {
+        guard let value else { return "–" }
+        let v = value / divide
+        return decimals == 0 ? "\(Int(v.rounded()))" : String(format: "%.\(decimals)f", v)
+    }
+
+    private var nutritionCard: some View {
+        card(period == .today ? "Nutrition" : "Nutrition · daily average",
+             icon: "fork.knife", tint: HealthStyle.amber) {
+            let days = nutritionDays
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 8) {
+                    HeroStat(value: nutritionText(nutritionValue("calories", in: days)),
+                             label: "kcal", tint: HealthStyle.amber)
+                    HeroStat(value: nutritionText(nutritionValue("protein_g", in: days)),
+                             label: "protein g", tint: HealthStyle.pink)
+                    HeroStat(value: nutritionText(nutritionValue("carbs_g", in: days)),
+                             label: "carbs g", tint: HealthStyle.pink)
+                    HeroStat(value: nutritionText(nutritionValue("fat_g", in: days)),
+                             label: "fat g", tint: HealthStyle.pink)
+                    HeroStat(value: nutritionText(nutritionValue("water_ml", in: days),
+                                                  divide: 1000, decimals: 1),
+                             label: "water L", tint: HealthStyle.pink)
+                }
+                let withCalories = days.filter { $0.values["calories"] != nil }
+                if withCalories.count >= 2 {
+                    Chart(withCalories) { d in
+                        BarMark(
+                            x: .value("Day", d.date, unit: .day),
+                            y: .value("kcal", d.values["calories"] ?? 0)
+                        )
+                        .foregroundStyle(HealthStyle.amber.gradient)
+                        .cornerRadius(3)
+                    }
+                    .healthYAxis()
+                    .healthXAxis(days: period.chartDays)
+                    .frame(height: 90)
+                }
+                let sources = Array(Set(days.flatMap { $0.sources })).sorted()
+                if !sources.isEmpty {
+                    Text("From Apple Health · " + sources.joined(separator: ", "))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.4))
+                }
+            }
         }
     }
 

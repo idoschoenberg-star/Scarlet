@@ -46,6 +46,10 @@ struct HealthDay: Identifiable, Codable {
     var sleepDeepMin: Int = 0
     var sleepREMMin: Int = 0
     var sleepAwakeMin: Int = 0
+    /// Flights of stairs climbed. nil = HealthKit returned nothing for the
+    /// day (no reading, or the read was not granted): "unknown", never a
+    /// claimed zero, so the key is left off the wire.
+    var flightsClimbed: Int? = nil
 
     var id: String { dateKey }
     /// Asleep-but-not-deep-not-REM minutes, for the stage bar.
@@ -91,6 +95,51 @@ struct WithingsNight: Identifiable, Codable {
     var hrAvg: Int = 0      // average heart rate during the night, 0 = none
 
     var id: String { night }
+}
+
+/// One Apple Health day metric the app reads for the Health desk (the Noom
+/// bridge: Noom has no API and writes what he eats and drinks, his glucose,
+/// weight and mindful minutes into Apple Health). The names, units and the
+/// way a day is summarised mirror the server's catalogue,
+/// `_shared/health_apple_metrics.ts` in the backend repo: a name the server
+/// does not know is dropped there, so the two lists change together.
+struct DayMetricSpec {
+    enum Kind { case sum, mean, latest }
+    let metric: String
+    let id: HKQuantityTypeIdentifier
+    let unit: HKUnit
+    let kind: Kind
+
+    static let all: [DayMetricSpec] = [
+        DayMetricSpec(metric: "calories", id: .dietaryEnergyConsumed, unit: .kilocalorie(), kind: .sum),
+        DayMetricSpec(metric: "protein_g", id: .dietaryProtein, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "carbs_g", id: .dietaryCarbohydrates, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "fat_g", id: .dietaryFatTotal, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "fat_sat_g", id: .dietaryFatSaturated, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "fiber_g", id: .dietaryFiber, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "sugar_g", id: .dietarySugar, unit: .gram(), kind: .sum),
+        DayMetricSpec(metric: "sodium_mg", id: .dietarySodium, unit: .gramUnit(with: .milli), kind: .sum),
+        DayMetricSpec(metric: "potassium_mg", id: .dietaryPotassium, unit: .gramUnit(with: .milli), kind: .sum),
+        DayMetricSpec(metric: "cholesterol_mg", id: .dietaryCholesterol, unit: .gramUnit(with: .milli), kind: .sum),
+        DayMetricSpec(metric: "caffeine_mg", id: .dietaryCaffeine, unit: .gramUnit(with: .milli), kind: .sum),
+        DayMetricSpec(metric: "water_ml", id: .dietaryWater, unit: .literUnit(with: .milli), kind: .sum),
+        DayMetricSpec(metric: "glucose_mgdl", id: .bloodGlucose,
+                      unit: HKUnit.gramUnit(with: .milli).unitDivided(by: .literUnit(with: .deci)), kind: .mean),
+        DayMetricSpec(metric: "apple_weight_kg", id: .bodyMass, unit: .gramUnit(with: .kilo), kind: .latest),
+    ]
+    /// The one category type of the list: mindful sessions, minutes per day.
+    static let mindfulMetric = "mindful_min"
+}
+
+/// One local day of those metrics, as the Health tab shows them:
+/// metric name → the day's value, plus the apps that wrote them.
+struct DayMetrics: Identifiable, Codable {
+    let dateKey: String     // "2026-11-23"
+    var values: [String: Double] = [:]
+    var sources: [String] = []
+
+    var id: String { dateKey }
+    var date: Date { HealthSync.dayKey.date(from: dateKey) ?? .distantPast }
 }
 
 /// Strength vs cardio vs other — the owner's "weights vs steps" split.
@@ -170,19 +219,44 @@ final class HealthSync: ObservableObject {
     /// Withings sleep nights, oldest first.
     @Published var withingsNights: [WithingsNight] = []
     @Published var errorText = ""
+    /// The day metrics (nutrition, water, glucose, Apple Health weight,
+    /// mindful minutes), oldest day first. Empty while the reader is off.
+    @Published var dayMetrics: [DayMetrics] = []
+    /// The server's switch for the day-metric reader (Health desk switch
+    /// `app_metrics`, flipped only by health-admin on the owner's word).
+    /// It ships off: while it is off the app neither asks for the new
+    /// Health types nor reads nor pushes them. Learned from every
+    /// `health_overview` answer and kept across launches.
+    @Published private(set) var metricsReaderOn: Bool
 
     private let store = HKHealthStore()
     private static let authorizedKey = "scarlet.healthAuthorized"
+    private static let metricsReaderKey = "scarlet.healthMetricsReader"
+    /// Which set of Health types the access sheet has been shown for:
+    /// 1 = the original set, 2 = plus floors climbed, 3 = plus the day
+    /// metrics. HealthKit shows the sheet only for types it has not asked
+    /// about, so asking again for a larger set never re-asks the old ones.
+    private static let accessVersionKey = "scarlet.healthAccessVersion"
+    private var accessVersion: Int {
+        get { max(1, UserDefaults.standard.integer(forKey: Self.accessVersionKey)) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.accessVersionKey) }
+    }
+    private var wantedAccessVersion: Int { metricsReaderOn ? 3 : 2 }
+    /// True once the sheet for the day metrics has completed: only then
+    /// are they read and pushed.
+    private var metricsReadable: Bool { metricsReaderOn && accessVersion >= 3 }
 
     /// Observer machinery (doctrine #1).
     private var observerQueries: [HKObserverQuery] = []
     private var observing = false
+    private var observingMetrics = false
     private var lastObserverSync = Date.distantPast
     private var observerSyncScheduled = false
     private static let observerDebounce: TimeInterval = 60
 
     private init() {
         authorized = UserDefaults.standard.bool(forKey: Self.authorizedKey)
+        metricsReaderOn = UserDefaults.standard.bool(forKey: Self.metricsReaderKey)
         // Local-first: paint from the cache before any query or network call.
         loadCache()
     }
@@ -201,17 +275,22 @@ final class HealthSync: ObservableObject {
     // MARK: authorization
 
     /// Everything the tab reads. Share (write) nothing.
-    private static func readTypes() -> Set<HKObjectType> {
+    /// The day metrics join the set only while the server switch is on.
+    private static func readTypes(dayMetrics: Bool) -> Set<HKObjectType> {
         var read: Set<HKObjectType> = []
-        let quantities: [HKQuantityTypeIdentifier] = [
+        var quantities: [HKQuantityTypeIdentifier] = [
             .stepCount, .distanceWalkingRunning, .activeEnergyBurned,
             .appleExerciseTime, .restingHeartRate,
-            .heartRateVariabilitySDNN, .heartRate,
+            .heartRateVariabilitySDNN, .heartRate, .flightsClimbed,
         ]
+        var categories: [HKCategoryTypeIdentifier] = [.sleepAnalysis, .appleStandHour]
+        if dayMetrics {
+            quantities.append(contentsOf: DayMetricSpec.all.map { $0.id })
+            categories.append(.mindfulSession)
+        }
         for id in quantities {
             if let t = HKObjectType.quantityType(forIdentifier: id) { read.insert(t) }
         }
-        let categories: [HKCategoryTypeIdentifier] = [.sleepAnalysis, .appleStandHour]
         for id in categories {
             if let t = HKObjectType.categoryType(forIdentifier: id) { read.insert(t) }
         }
@@ -225,8 +304,10 @@ final class HealthSync: ObservableObject {
             errorText = "Health data isn't available on this device."
             return
         }
+        let wanted = wantedAccessVersion
+        let types = Self.readTypes(dayMetrics: metricsReaderOn)
         let ok: Bool = await withCheckedContinuation { cont in
-            store.requestAuthorization(toShare: nil, read: Self.readTypes()) { granted, _ in
+            store.requestAuthorization(toShare: nil, read: types) { granted, _ in
                 cont.resume(returning: granted)
             }
         }
@@ -235,10 +316,28 @@ final class HealthSync: ObservableObject {
         if ok {
             authorized = true
             UserDefaults.standard.set(true, forKey: Self.authorizedKey)
+            accessVersion = max(accessVersion, wanted)
             startObserving()
         } else {
             errorText = "Couldn't open the Health access sheet — try again."
         }
+    }
+
+    /// Asks once more when the set of types has grown since the sheet was
+    /// last shown (floors climbed; the day metrics once the server switch
+    /// is on). Called only from the visible Health tab, because the sheet
+    /// cannot be presented from the background. HealthKit lists only the
+    /// types it has not asked about; when there are none, no sheet appears.
+    /// Returns true when the sheet completed for a larger set, so the
+    /// caller can sync again and read the new types at once.
+    @discardableResult
+    func ensureAccessCurrent() async -> Bool {
+        guard available, authorized, accessVersion < wantedAccessVersion else { return false }
+        let before = accessVersion
+        await requestAccess()
+        guard accessVersion > before else { return false }
+        FlightRecorder.telemetry(kind: "health_sync", detail: ["access_version": accessVersion])
+        return true
     }
 
     // MARK: real-time observers (doctrine #1)
@@ -248,14 +347,25 @@ final class HealthSync: ObservableObject {
     /// sync. When HealthKit signals, an incremental sync runs, debounced to
     /// one per `observerDebounce` seconds.
     func startObserving() {
-        guard available, authorized, !observing else { return }
-        observing = true
+        guard available, authorized else { return }
         var types: [HKSampleType] = []
-        for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned] {
-            if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
+        if !observing {
+            observing = true
+            for id in [HKQuantityTypeIdentifier.stepCount, .activeEnergyBurned] {
+                if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
+            }
+            if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(t) }
+            types.append(HKObjectType.workoutType())
         }
-        if let t = HKObjectType.categoryType(forIdentifier: .sleepAnalysis) { types.append(t) }
-        types.append(HKObjectType.workoutType())
+        // A meal or a glass of water logged in another app reaches the desk
+        // without opening this one. Registered once, after the switch is on
+        // and the sheet for these types has completed.
+        if metricsReadable, !observingMetrics {
+            observingMetrics = true
+            for id in [HKQuantityTypeIdentifier.dietaryEnergyConsumed, .dietaryWater] {
+                if let t = HKObjectType.quantityType(forIdentifier: id) { types.append(t) }
+            }
+        }
         for type in types {
             let q = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, error in
                 // Always complete first — that's what keeps background
@@ -336,8 +446,14 @@ final class HealthSync: ObservableObject {
         let hrv = await dailyStats(.heartRateVariabilitySDNN,
                                    unit: HKUnit.secondUnit(with: .milli),
                                    options: .discreteAverage, from: windowStart, to: now)
+        let flights = await dailyStats(.flightsClimbed, unit: .count(),
+                                       options: .cumulativeSum, from: windowStart, to: now)
         let stand = await standHoursByDay(from: windowStart, to: now)
         let nights = await sleepByNight(from: windowStart, to: now)
+        // The day metrics: read only while the server switch is on and the
+        // sheet for them has completed; otherwise nothing is queried.
+        let readMetrics = metricsReadable
+        let newMetrics = readMetrics ? await dayMetricsWindow(from: windowStart, to: now) : []
 
         var newDays: [HealthDay] = []
         for i in 0..<14 {
@@ -350,6 +466,7 @@ final class HealthSync: ObservableObject {
             d.standHours = stand[dayStart] ?? 0
             d.restingHR = Int((restingHR[dayStart] ?? 0).rounded())
             d.hrvMS = Int((hrv[dayStart] ?? 0).rounded())
+            if let f = flights[dayStart] { d.flightsClimbed = Int(f.rounded()) }
             if let n = nights[dayStart] {
                 d.sleepMin = Int(n.asleepTotal.rounded())
                 d.sleepDeepMin = Int(n.deep.rounded())
@@ -379,13 +496,15 @@ final class HealthSync: ObservableObject {
 
         // Local-first publish: fresh device data lands immediately (and is
         // cached), even if every network call below fails.
-        applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: nil)
+        applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: nil,
+                    localMetrics: readMetrics ? newMetrics : nil)
 
         // Push, so the server copy includes today...
         var pushResult = "ok"
         do {
             try await Self.push(days: newDays.map(Self.wireDay),
-                                workouts: newWorkouts.map(Self.wireWorkout))
+                                workouts: newWorkouts.map(Self.wireWorkout),
+                                metrics: readMetrics ? Self.wireMetrics(newMetrics) : nil)
             lastSync = Date()
         } catch {
             errorText = "Synced locally — couldn't reach the server."
@@ -398,13 +517,23 @@ final class HealthSync: ObservableObject {
             "today_kcal": newDays.last?.activeKcal ?? -1,
             "days": newDays.count,
             "workouts": newWorkouts.count,
+            // Counts only, never a value: how many days carried a metric.
+            "metric_days": readMetrics ? newMetrics.count : -1,
             "push": pushResult,
         ])
 
         // ...then the Withings join: read back the merged overview (server
         // day history + Withings body & sleep) and fold it in.
         if let overview = try? await Self.fetchOverview(windowDays: 30) {
-            applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: overview)
+            if let on = overview.metricsReaderOn, on != metricsReaderOn {
+                metricsReaderOn = on
+                UserDefaults.standard.set(on, forKey: Self.metricsReaderKey)
+                // Switched off: what the tab held is dropped with the next
+                // merge below; nothing more is read or pushed.
+                if !on { dayMetrics = [] }
+            }
+            applyMerged(localDays: newDays, localWorkouts: newWorkouts, overview: overview,
+                        localMetrics: readMetrics ? newMetrics : nil)
         }
     }
 
@@ -415,7 +544,19 @@ final class HealthSync: ObservableObject {
     /// present, and are kept as-is when offline. Everything is trimmed to
     /// 120 days and cached.
     private func applyMerged(localDays: [HealthDay], localWorkouts: [HealthWorkout],
-                             overview: Overview?) {
+                             overview: Overview?, localMetrics: [DayMetrics]? = nil) {
+        // Day metrics: server days, then this device's fresh read per date.
+        // With the reader off the list stays empty.
+        if metricsReaderOn {
+            var mByKey: [String: DayMetrics] = [:]
+            for m in dayMetrics { mByKey[m.dateKey] = m }
+            if let o = overview { for m in o.dayMetrics { mByKey[m.dateKey] = m } }
+            for m in localMetrics ?? [] { mByKey[m.dateKey] = m }
+            dayMetrics = Array(mByKey.values.sorted { $0.dateKey < $1.dateKey }.suffix(120))
+        } else if !dayMetrics.isEmpty {
+            dayMetrics = []
+        }
+
         var byKey: [String: HealthDay] = [:]
         for d in days { byKey[d.dateKey] = d }
         if let o = overview {
@@ -468,6 +609,8 @@ final class HealthSync: ObservableObject {
         var workouts: [HealthWorkout]
         var withingsMeasures: [WithingsMeasure]
         var withingsNights: [WithingsNight]
+        /// Optional so a cache written before this field still opens.
+        var dayMetrics: [DayMetrics]?
     }
 
     private static var cacheURL: URL {
@@ -499,6 +642,7 @@ final class HealthSync: ObservableObject {
         workouts = file.workouts
         withingsMeasures = file.withingsMeasures
         withingsNights = file.withingsNights
+        dayMetrics = metricsReaderOn ? (file.dayMetrics ?? []) : []
         lastSync = file.lastSync
         lastUpdated = file.savedAt
         refreshTodaySnapshot()
@@ -510,7 +654,8 @@ final class HealthSync: ObservableObject {
                                    days: days,
                                    workouts: workouts,
                                    withingsMeasures: withingsMeasures,
-                                   withingsNights: withingsNights)
+                                   withingsNights: withingsNights,
+                                   dayMetrics: dayMetrics.isEmpty ? nil : dayMetrics)
         guard let data = try? Self.cacheEncoder.encode(file) else { return }
         try? data.write(to: Self.cacheURL, options: .atomic)
     }
@@ -546,6 +691,101 @@ final class HealthSync: ObservableObject {
                 store.execute(q)
             }
         }
+    }
+
+    /// One quantity metric per local day with the apps that wrote it. A day
+    /// with no sample is absent, never a zero. `.separateBySource` is what
+    /// makes HealthKit name the sources; the day's own figure stays the
+    /// merged one HealthKit computes across them.
+    private func dailyMetric(_ spec: DayMetricSpec,
+                             from start: Date, to end: Date) async -> [Date: (value: Double, sources: [String])] {
+        guard let type = HKObjectType.quantityType(forIdentifier: spec.id) else { return [:] }
+        let anchor = Calendar.current.startOfDay(for: start)
+        let predicate = HKQuery.predicateForSamples(withStart: start, end: end,
+                                                    options: .strictStartDate)
+        let base: HKStatisticsOptions
+        switch spec.kind {
+        case .sum: base = .cumulativeSum
+        case .mean: base = .discreteAverage
+        case .latest: base = .mostRecent
+        }
+        let kind = spec.kind
+        let unit = spec.unit
+        let store = self.store
+        return await hkTimeout(fallback: [:]) {
+            await withCheckedContinuation { cont in
+                let q = HKStatisticsCollectionQuery(quantityType: type,
+                                                    quantitySamplePredicate: predicate,
+                                                    options: [base, .separateBySource],
+                                                    anchorDate: anchor,
+                                                    intervalComponents: DateComponents(day: 1))
+                q.initialResultsHandler = { _, collection, _ in
+                    var out: [Date: (value: Double, sources: [String])] = [:]
+                    collection?.enumerateStatistics(from: anchor, to: end) { stat, _ in
+                        let sources = stat.sources ?? []
+                        let merged: HKQuantity?
+                        switch kind {
+                        case .sum: merged = stat.sumQuantity()
+                        case .mean: merged = stat.averageQuantity()
+                        case .latest: merged = stat.mostRecentQuantity()
+                        }
+                        var value = merged?.doubleValue(for: unit)
+                        if value == nil {
+                            // No merged figure came back: take one source's
+                            // own figure (the largest), never a sum across
+                            // sources, which would count a meal twice.
+                            let perSource: [Double] = sources.compactMap { (src: HKSource) -> Double? in
+                                switch kind {
+                                case .sum: return stat.sumQuantity(for: src)?.doubleValue(for: unit)
+                                case .mean: return stat.averageQuantity(for: src)?.doubleValue(for: unit)
+                                case .latest: return stat.mostRecentQuantity(for: src)?.doubleValue(for: unit)
+                                }
+                            }
+                            value = perSource.max()
+                        }
+                        if let value, value.isFinite, value >= 0 {
+                            let names = Array(Set(sources.map { $0.name })).sorted()
+                            out[stat.startDate] = (value, names)
+                        }
+                    }
+                    cont.resume(returning: out)
+                }
+                store.execute(q)
+            }
+        }
+    }
+
+    /// Every day metric of the window, one entry per local day that has at
+    /// least one of them.
+    private func dayMetricsWindow(from start: Date, to end: Date) async -> [DayMetrics] {
+        let cal = Calendar.current
+        var byKey: [String: DayMetrics] = [:]
+        func add(_ day: Date, _ metric: String, _ value: Double, _ sources: [String]) {
+            let key = Self.dayKey.string(from: day)
+            var m = byKey[key] ?? DayMetrics(dateKey: key)
+            m.values[metric] = (value * 100).rounded() / 100
+            for s in sources where !m.sources.contains(s) { m.sources.append(s) }
+            byKey[key] = m
+        }
+        for spec in DayMetricSpec.all {
+            let days = await dailyMetric(spec, from: start, to: end)
+            for (day, v) in days { add(day, spec.metric, v.value, v.sources) }
+        }
+        // Mindful sessions: minutes per local day of the session's start.
+        let sessions = await categorySamples(.mindfulSession, from: start, to: end)
+        var minutes: [Date: Double] = [:]
+        var names: [Date: Set<String>] = [:]
+        for s in sessions where s.startDate >= start {
+            let day = cal.startOfDay(for: s.startDate)
+            let mins = s.endDate.timeIntervalSince(s.startDate) / 60
+            guard mins > 0 else { continue }
+            minutes[day, default: 0] += mins
+            names[day, default: []].insert(s.sourceRevision.source.name)
+        }
+        for (day, total) in minutes {
+            add(day, DayMetricSpec.mindfulMetric, total, Array(names[day] ?? []).sorted())
+        }
+        return byKey.values.sorted { $0.dateKey < $1.dateKey }
     }
 
     private func categorySamples(_ id: HKCategoryTypeIdentifier,
@@ -776,6 +1016,26 @@ final class HealthSync: ObservableObject {
     }
 
     static func wireDay(_ d: HealthDay) -> [String: Any] {
+        var out = wireDayBase(d)
+        // Left off when unknown, so the server keeps "no reading" as null.
+        if let f = d.flightsClimbed { out["flights_climbed"] = f }
+        return out
+    }
+
+    /// One wire row per metric per day: {date, metric, value, sources}. The
+    /// server takes the unit from its own catalogue.
+    static func wireMetrics(_ days: [DayMetrics]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for d in days {
+            for (metric, value) in d.values {
+                out.append(["date": d.dateKey, "metric": metric,
+                            "value": value, "sources": d.sources])
+            }
+        }
+        return out
+    }
+
+    private static func wireDayBase(_ d: HealthDay) -> [String: Any] {
         [
             "date": d.dateKey,
             "steps": d.steps,
@@ -820,11 +1080,13 @@ final class HealthSync: ObservableObject {
         return req
     }
 
-    private static func push(days: [[String: Any]], workouts: [[String: Any]]) async throws {
-        let req = try makeRequest(op: "health_push", body: [
-            "days": days,
-            "workouts": workouts,
-        ])
+    private static func push(days: [[String: Any]], workouts: [[String: Any]],
+                             metrics: [[String: Any]]? = nil) async throws {
+        var body: [String: Any] = ["days": days, "workouts": workouts]
+        // The key exists only while the reader is on; the server refuses it
+        // while its switch is off in any case.
+        if let metrics, !metrics.isEmpty { body["metrics"] = metrics }
+        let req = try makeRequest(op: "health_push", body: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw URLError(.badServerResponse)
@@ -841,6 +1103,10 @@ final class HealthSync: ObservableObject {
         var workouts: [HealthWorkout] = []
         var measures: [WithingsMeasure] = []
         var nights: [WithingsNight] = []
+        var dayMetrics: [DayMetrics] = []
+        /// nil when the server did not say (an older backend): keep what
+        /// the app holds.
+        var metricsReaderOn: Bool?
     }
 
     /// POST op=health_overview {"days": N} → server-side history + Withings.
@@ -872,7 +1138,23 @@ final class HealthSync: ObservableObject {
             d.sleepDeepMin = intVal(row["sleep_deep_min"])
             d.sleepREMMin = intVal(row["sleep_rem_min"])
             d.sleepAwakeMin = intVal(row["sleep_awake_min"])
+            if let f = row["flights_climbed"], !(f is NSNull) { d.flightsClimbed = intVal(f) }
             out.days.append(d)
+        }
+
+        if let reader = obj["reader"] as? [String: Any],
+           let on = reader["day_metrics"] as? Bool {
+            out.metricsReaderOn = on
+        }
+        // One object per date: {date, <metric>: value, …, sources: [...]}.
+        for row in (obj["day_metrics"] as? [[String: Any]]) ?? [] {
+            guard let key = row["date"] as? String, dayKey.date(from: key) != nil else { continue }
+            var m = DayMetrics(dateKey: key)
+            for (name, any) in row where name != "date" && name != "sources" {
+                if let n = any as? NSNumber { m.values[name] = n.doubleValue }
+            }
+            m.sources = (row["sources"] as? [String]) ?? []
+            if !m.values.isEmpty { out.dayMetrics.append(m) }
         }
 
         for row in (obj["workouts"] as? [[String: Any]]) ?? [] {
