@@ -1929,13 +1929,7 @@ final class Conversation: ObservableObject {
                 // patience window), so the mint suppresses the VAD
                 // auto-response. Older builds don't send it and keep the
                 // legacy auto-reply.
-                // mdl=1 — this build DIALS THE ENGINE THE MINT RETURNS (the
-                // server's model-negotiation contract): the socket address
-                // below takes its model from the mint's answer, so the engine
-                // is the server's decision and can be moved, or moved back,
-                // without a build. gpt-realtime, the name every earlier build
-                // compiled in, is shut down by OpenAI on 2027-01-20.
-                var mintString = AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1"
+                var mintString = AppConfig.realtimeURL.absoluteString + "?defer=1"
                 if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey), !v.isEmpty {
                     mintString += "&voice=" + v
                 }
