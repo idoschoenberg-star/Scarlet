@@ -3086,6 +3086,21 @@ final class Conversation: ObservableObject {
     /// Post-result cues: the visual confirmations that ride the RESULT.
     private func postToolCues(name: String, out: String) {
         do {
+            // Shopping by voice (Ido 2026-11-23, "One tap, I press Buy in the
+            // store"): his spoken yes was recorded by the server, which hands
+            // the store page; open it here so the store's Buy is his next
+            // tap. The app opens a page and nothing else: it never buys.
+            if name == "shopping",
+               let data = out.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               obj["status"] as? String == "approved",
+               let link = obj["open_url"] as? String, let url = URL(string: link),
+               url.scheme == "https" {
+                Task { @MainActor in
+                    UIApplication.shared.open(url)
+                    self.transcript.append(Line(text: "🛒 The store page is open. Press Buy there.", fromHer: true))
+                }
+            }
             // A voice-started draft: compose_draft came back with a draft id,
             // so tell the shell to open the drafting table over whatever
             // screen is showing.
