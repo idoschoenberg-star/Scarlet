@@ -45,6 +45,7 @@ struct SplitShell: View {
         case desk
         case estate
         case travel
+        case shopping
         case settings
 
         var id: String { rawValue }
@@ -65,6 +66,7 @@ struct SplitShell: View {
             case .desk: return "Desk"
             case .estate: return "Estate"
             case .travel: return "Travel"
+            case .shopping: return "Shopping"
             case .settings: return "Settings"
             }
         }
@@ -86,6 +88,7 @@ struct SplitShell: View {
             case .desk: return "checklist"
             case .estate: return "house.fill"
             case .travel: return "airplane"
+            case .shopping: return "cart.fill"
             case .settings: return "gearshape.fill"
             }
         }
@@ -108,6 +111,8 @@ struct SplitShell: View {
             // ⌘0…⌘9 are all taken; new sections use letters (as News uses ⌘N).
             case .estate: return "e"
             case .travel: return "t"
+            // Shopping, ⌘B (Buy).
+            case .shopping: return "b"
             case .settings: return "0"
             }
         }
@@ -135,7 +140,7 @@ struct SplitShell: View {
         // shortcut never registers, making it unreachable on the MAIN work
         // platform (the design sweep caught .news absent; .active nearly
         // shipped with the same hole).
-        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk, .estate, .travel]
+        [.talk, .inbox, .journal, .active, .calendar, .chats, .photos, .music, .news, .library, .health, .desk, .estate, .travel, .shopping]
     }
 
     var body: some View {
@@ -345,6 +350,12 @@ struct SplitShell: View {
             // Self-contained: list pane + detail pane (Up next · Passes ·
             // Reservations · Past).
             TravelView()
+                .environmentObject(convo)
+        case .shopping:
+            // Self-contained: four leaves over the Shopping Desk (Buy · On
+            // the way · Lists · Watches). One tap is his yes to the line; the
+            // store page opens and he presses Buy there. Nothing here buys.
+            ShoppingView()
                 .environmentObject(convo)
         case .settings:
             // Has its own NavigationStack and title bar. As a detail column there
