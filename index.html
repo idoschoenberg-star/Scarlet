@@ -4149,7 +4149,7 @@
     mainBtn.disabled = true;
     setStatus("Waking her up…");
     try {
-      const tokResp = await fetch(SESSION_URL, { method: "POST" });
+      const tokResp = await fetch(SESSION_URL + "&mdl=1", { method: "POST" }); // mdl=1: this page dials the engine the mint returns
       const tok = await tokResp.json().catch(() => ({}));
       if (!tok.client_secret) throw new Error((tok.detail || tok.error || ("session " + tokResp.status)));
 
@@ -4179,7 +4179,10 @@
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
-      const resp = await fetch("https://api.openai.com/v1/realtime/calls?model=gpt-realtime", {
+      // The engine is the server's decision (the mint's `model`); gpt-realtime,
+      // the name compiled in until now, is shut down by OpenAI on 2027-01-20.
+      const engine = /^gpt-realtime[a-z0-9.-]{0,28}$/.test(tok.model || "") ? tok.model : "gpt-realtime";
+      const resp = await fetch("https://api.openai.com/v1/realtime/calls?model=" + engine, {
         method: "POST",
         headers: { Authorization: "Bearer " + tok.client_secret, "Content-Type": "application/sdp" },
         body: offer.sdp,

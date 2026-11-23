@@ -68,3 +68,18 @@ enum TokenStore {
         ] as CFDictionary)
     }
 }
+
+/// The voice engine the socket dials is the one the session mint returns
+/// (the server's model-negotiation contract, `mdl=1` at mint): a mint bound
+/// to one engine while the socket dials another simply hangs, so the pair
+/// must agree by construction. The fallback is the name every earlier build
+/// compiled in; an answer that is not a plain Realtime model id is refused,
+/// so nothing the server says can put anything else into the address.
+enum RealtimeEngine {
+    static let fallback = "gpt-realtime"
+    static func dialed(_ minted: Any?) -> String {
+        guard let m = minted as? String, m.hasPrefix("gpt-realtime"), m.count <= 40,
+              m.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == ".") }) else { return fallback }
+        return m
+    }
+}

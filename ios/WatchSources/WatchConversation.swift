@@ -460,7 +460,9 @@ final class WatchConversation {
             // ?defer=1 — this build drives response.create itself (the
             // patience window; same as the phone), so the mint suppresses
             // the VAD auto-response.
-            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1") ?? AppConfig.realtimeURL
+            // mdl=1 — the wrist dials the engine the mint returns, like the
+            // phone (RealtimeEngine): the engine is the server's decision.
+            let mintURL = URL(string: AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1") ?? AppConfig.realtimeURL
             var req = URLRequest(url: mintURL)
             req.httpMethod = "POST"
             req.setValue(token, forHTTPHeaderField: "x-scarlet-token")
@@ -470,7 +472,7 @@ final class WatchConversation {
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,
-                  let url = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime") else {
+                  let url = URL(string: "wss://api.openai.com/v1/realtime?model=" + RealtimeEngine.dialed(obj?["model"])) else {
                 if httpStatus == 401 || httpStatus == 403 {
                     authFailStreak += 1
                     if authFailStreak >= 2 {
