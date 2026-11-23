@@ -1929,7 +1929,13 @@ final class Conversation: ObservableObject {
                 // patience window), so the mint suppresses the VAD
                 // auto-response. Older builds don't send it and keep the
                 // legacy auto-reply.
-                var mintString = AppConfig.realtimeURL.absoluteString + "?defer=1"
+                // mdl=1 — this build DIALS THE ENGINE THE MINT RETURNS (the
+                // server's model-negotiation contract): the socket address
+                // below takes its model from the mint's answer, so the engine
+                // is the server's decision and can be moved, or moved back,
+                // without a build. gpt-realtime, the name every earlier build
+                // compiled in, is shut down by OpenAI on 2027-01-20.
+                var mintString = AppConfig.realtimeURL.absoluteString + "?defer=1&mdl=1"
                 if let v = UserDefaults.standard.string(forKey: SettingsModel.voiceKey), !v.isEmpty {
                     mintString += "&voice=" + v
                 }
@@ -1981,9 +1987,10 @@ final class Conversation: ObservableObject {
                 // is the ONLY correct value for the socket URL. The fallback
                 // is the legacy name the server serves anyone who did not
                 // send mdl=1, so an old/partial response still connects.
-                let mintedModel = (obj?["model"] as? String).flatMap {
-                    $0.isEmpty ? nil : $0
-                } ?? "gpt-realtime"
+                // RealtimeEngine.dialed refuses anything that is not a plain
+                // Realtime model id, so the server's answer cannot put
+                // anything else into the address.
+                let mintedModel = RealtimeEngine.dialed(obj?["model"])
                 activeModel = mintedModel
                 let socketURL = "wss://api.openai.com/v1/realtime?model="
                     + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)

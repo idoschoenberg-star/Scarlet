@@ -529,8 +529,7 @@ final class WatchConversation {
             guard connectEpoch == epoch else { return }
             let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            let mintedModel = (obj?["model"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                ?? "gpt-realtime"
+            let mintedModel = RealtimeEngine.dialed(obj?["model"])
             let socketURL = "wss://api.openai.com/v1/realtime?model="
                 + (mintedModel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? mintedModel)
             guard let secret = obj?["client_secret"] as? String, !secret.isEmpty,

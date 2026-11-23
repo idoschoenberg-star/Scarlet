@@ -361,6 +361,7 @@ struct SplitShell: View {
             // the way · Lists · Watches). One tap is his yes to the line; the
             // store page opens and he presses Buy there. Nothing here buys.
             ShoppingView()
+                .environmentObject(convo)
         case .finance:
             // Self-contained: seven leaves over the Finance Desk's ledger
             // (Overview · Transactions · Open · Recurring · Documents ·
