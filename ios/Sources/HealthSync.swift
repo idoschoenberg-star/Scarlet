@@ -459,8 +459,6 @@ final class HealthSync: ObservableObject {
         let hrv = await dailyStats(.heartRateVariabilitySDNN,
                                    unit: HKUnit.secondUnit(with: .milli),
                                    options: .discreteAverage, from: windowStart, to: now)
-        let flights = await dailyStats(.flightsClimbed, unit: .count(),
-                                       options: .cumulativeSum, from: windowStart, to: now)
         let stand = await standHoursByDay(from: windowStart, to: now)
         let nights = await sleepByNight(from: windowStart, to: now)
         // The day metrics: read only while the server switch is on and the
