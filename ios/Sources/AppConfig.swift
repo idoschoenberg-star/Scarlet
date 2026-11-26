@@ -96,7 +96,9 @@ enum AuthLapse {
         strikes += 1
         if strikes >= 2 {
             strikes = 0
-            NotificationCenter.default.post(name: .scarletAuthExpired, object: nil)
+            // The name spelled out: this file is also compiled into the Watch
+            // and widget targets, where InboxView's constant does not exist.
+            NotificationCenter.default.post(name: Notification.Name("scarletAuthExpired"), object: nil)
         }
         return "This device's sign-in has lapsed. Tap Refresh to unlock again."
     }
