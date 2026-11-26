@@ -83,3 +83,22 @@ enum RealtimeEngine {
         return m
     }
 }
+
+/// A section's request refused as not signed in (401/403) is a lapsed
+/// device key, not a network fault (2026-11-26: the iPad's key had lapsed
+/// after a month unused and Shopping said "Couldn't load"). The first
+/// refusal shows an honest line; the second in a row signs out through the
+/// app's one auth-expired path, as Inbox does, so the unlock screen appears.
+@MainActor
+enum AuthLapse {
+    private static var strikes = 0
+    static func rejected() -> String {
+        strikes += 1
+        if strikes >= 2 {
+            strikes = 0
+            NotificationCenter.default.post(name: .scarletAuthExpired, object: nil)
+        }
+        return "This device's sign-in has lapsed. Tap Refresh to unlock again."
+    }
+    static func accepted() { strikes = 0 }
+}

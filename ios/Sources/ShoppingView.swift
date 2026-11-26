@@ -154,6 +154,7 @@ final class ShoppingModel: ObservableObject {
                 return
             }
             errorText = ""
+            AuthLapse.accepted()
             paused = ss(r, "status") == "paused"
             researchOn = (r["research_on"] as? Bool) ?? true
             proposals = sa(r, "proposals")
@@ -163,6 +164,8 @@ final class ShoppingModel: ObservableObject {
             orders = sa(r, "orders")
             watches = sa(r, "watches")
             loadedOnce = true
+        } catch is ScarletAuthError {
+            errorText = AuthLapse.rejected()
         } catch {
             errorText = "Couldn't load Shopping. Pull to retry."
         }
@@ -217,6 +220,7 @@ final class ShoppingModel: ObservableObject {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 { throw ScarletAuthError() }
         if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) { throw URLError(.badServerResponse) }
         return ((try? JSONSerialization.jsonObject(with: data)) as? ShopRow) ?? [:]
     }
