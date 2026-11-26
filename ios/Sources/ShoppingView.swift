@@ -716,6 +716,9 @@ private struct ShoppingProposalSheet: View {
     @State private var working = false
     @State private var message = ""
     @State private var openedURL: URL?
+    /// The address book (2026-11-26): every place with what it lacks.
+    @State private var places: [ShopRow] = []
+    @State private var place: String = ""
 
     private var line: ShopRow { so(proposal, "order_line") }
     private var options: [ShopRow] { sa(proposal, "options") }
@@ -735,8 +738,9 @@ private struct ShoppingProposalSheet: View {
                                 .multilineTextAlignment(ss(proposal, "need").isRTLDominant ? .trailing : .leading)
                                 .environment(\.layoutDirection, ss(proposal, "need").layoutDir)
                         }
-                        if options.count > 1 { optionsBlock }
+                        if !options.isEmpty { optionsBlock }
                         lineBlock
+                        if !line.isEmpty && (status == "proposed" || status == "approved") && !readyPlaces.isEmpty { placeBlock }
                         if !message.isEmpty { Text(message).font(ShopUI.small).foregroundColor(ShopUI.warn) }
                         actions
                     }
@@ -760,11 +764,21 @@ private struct ShoppingProposalSheet: View {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: i == pick ? "largecircle.fill.circle" : "circle")
                             .foregroundColor(i == pick ? ShopUI.accent : ShopUI.muted).padding(.top, 2)
+                        optionPicture(ss(o, "image"))
                         VStack(alignment: .leading, spacing: 3) {
                             Text(ss(o, "name")).font(ShopUI.body).foregroundColor(.white).lineLimit(3)
                                 .multilineTextAlignment(ss(o, "name").isRTLDominant ? .trailing : .leading)
                                 .environment(\.layoutDirection, ss(o, "name").layoutDir)
                             if !ss(o, "reason").isEmpty { Text(ss(o, "reason")).font(ShopUI.small).foregroundColor(ShopUI.muted) }
+                            ForEach(Array(((o["details"] as? [String]) ?? []).prefix(5).enumerated()), id: \.offset) { _, d in
+                                Text("· \(d)").font(ShopUI.small).foregroundColor(.white.opacity(0.85))
+                                    .multilineTextAlignment(d.isRTLDominant ? .trailing : .leading)
+                                    .environment(\.layoutDirection, d.layoutDir)
+                            }
+                            if !ss(o, "rating").isEmpty || !ss(o, "delivery").isEmpty {
+                                Text([ss(o, "rating"), ss(o, "delivery")].filter { !$0.isEmpty }.joined(separator: " · "))
+                                    .font(ShopUI.small).foregroundColor(ShopUI.muted)
+                            }
                             if !ss(o, "retailer").isEmpty { Text(ShopStore.label(ss(o, "retailer"))).font(ShopUI.small).foregroundColor(ShopUI.muted) }
                         }
                         Spacer()
@@ -779,6 +793,50 @@ private struct ShoppingProposalSheet: View {
                 Text("Why this one: \(ss(proposal, "pick_reason"))").font(ShopUI.small).foregroundColor(ShopUI.muted)
             }
         }
+    }
+
+    /// The product's picture, from the search index's record of its page; a plain tile when there is none.
+    @ViewBuilder private func optionPicture(_ s: String) -> some View {
+        if let url = URL(string: s), !s.isEmpty {
+            AsyncImage(url: url) { phase in
+                if let img = phase.image { img.resizable().scaledToFit() }
+                else { Image(systemName: "photo").foregroundColor(ShopUI.muted) }
+            }
+            .frame(width: 84, height: 84)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+        } else {
+            RoundedRectangle(cornerRadius: 10).fill(ShopUI.card2).frame(width: 84, height: 84)
+                .overlay(Image(systemName: "photo").foregroundColor(ShopUI.muted))
+        }
+    }
+
+    private var readyPlaces: [ShopRow] { places.filter { ($0["ready"] as? Bool) == true } }
+    private var placeLabel: String {
+        for p in readyPlaces where ss(p, "key") == place { return ss(p, "label") }
+        return ""
+    }
+
+    /// Where it goes: the places of his book that are complete; the line's home first.
+    private var placeBlock: some View {
+        HStack {
+            Text("Ship to").font(ShopUI.body).foregroundColor(ShopUI.muted)
+            Spacer()
+            Menu {
+                ForEach(readyPlaces.indices, id: \.self) { i in
+                    let p = readyPlaces[i]
+                    Button { place = ss(p, "key") } label: {
+                        Text(ss(p, "label") + (place == ss(p, "key") ? "  ✓" : ""))
+                    }
+                }
+            } label: {
+                Label(placeLabel.isEmpty ? "Choose" : placeLabel, systemImage: "shippingbox")
+                    .font(ShopUI.body)
+            }
+            .disabled(working)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(ShopUI.card))
     }
 
     @ViewBuilder private var lineBlock: some View {
@@ -813,13 +871,15 @@ private struct ShoppingProposalSheet: View {
     @ViewBuilder private var actions: some View {
         if status == "proposed" {
             if !line.isEmpty {
-                Button { Task { await buy() } } label: {
-                    Label("Buy: open it in the store", systemImage: "cart.fill")
+                Button { Task { await buy(chrome: true) } } label: {
+                    Label("Prepare in Chrome", systemImage: "cart.fill")
                         .font(.system(size: 19, weight: .semibold)).frame(maxWidth: .infinity).padding(.vertical, 6)
                 }
-                .buttonStyle(.borderedProminent).tint(ShopUI.accent).disabled(working)
-                Text("This is your yes to the line above. The store page opens in your own account and you press Buy there. Scarlet orders nothing.")
+                .buttonStyle(.borderedProminent).tint(ShopUI.accent).disabled(working || place.isEmpty)
+                Text("This is your yes to the line above. Scarlet fills the checkout in Chrome on your Mac and tells you when the tab is ready; you press Pay there. Scarlet orders nothing.")
                     .font(ShopUI.small).foregroundColor(ShopUI.muted)
+                Button { Task { await buy(chrome: false) } } label: { Text("Open the store page instead") }
+                    .buttonStyle(.bordered).tint(.white).disabled(working)
             }
             HStack(spacing: 10) {
                 Button { Task { await finish("shopping_snooze", ["proposal_id": proposalID, "days": 7], "Later, in a week") } } label: { Text("Later") }
@@ -829,6 +889,12 @@ private struct ShoppingProposalSheet: View {
             }
             .disabled(working)
         } else if status == "approved" {
+            if !place.isEmpty {
+                Button { Task { await prepareChrome() } } label: {
+                    Label("Prepare in Chrome", systemImage: "cart.fill").frame(maxWidth: .infinity).padding(.vertical, 4)
+                }
+                .buttonStyle(.borderedProminent).tint(ShopUI.accent).disabled(working)
+            }
             if let url = openedURL ?? URL(string: ss(proposal, "link")) {
                 Button { UIApplication.shared.open(url) } label: {
                     Label("Open the store page", systemImage: "arrow.up.right.square").frame(maxWidth: .infinity).padding(.vertical, 4)
@@ -852,6 +918,33 @@ private struct ShoppingProposalSheet: View {
         }
         if (r["ok"] as? Bool) == false { message = ss(r, "error"); return }
         proposal = so(r, "proposal")
+        await readPlaces()
+    }
+
+    /// The book, and the place this line is for (its home), when he has not chosen.
+    private func readPlaces() async {
+        guard places.isEmpty, let r = try? await ShoppingModel.call("shopping_profile", [:]) else { return }
+        places = sa(r, "places")
+        if place.isEmpty {
+            let dest = ss(line, "destination").lowercased()
+            let guess = dest.contains("boston") ? "boston" : dest.contains("tel aviv") ? "tlv" : dest.contains("kisch") || dest.contains("kish") ? "kisch" : (dest.contains("pontresina") || dest.contains("moritz")) ? "kronenhof" : ""
+            let known = readyPlaces.contains(where: { ss($0, "key") == guess })
+            place = known ? guess : ss(readyPlaces.first ?? [:], "key")
+        }
+    }
+
+    /// "Prepare in Chrome": the checkout is filled in Chrome on his Mac; the
+    /// Pay press stays his. When it cannot be prepared, the store page opens.
+    private func prepareChrome() async {
+        working = true
+        defer { working = false }
+        guard let r = try? await ShoppingModel.call("shopping_chrome", ["proposal_id": proposalID, "place": place]) else { message = "No connection. Nothing was started."; return }
+        if (r["ok"] as? Bool) == false { message = ss(r, "error"); return }
+        message = ss(r, "note")
+        if ss(r, "status") == "store_page", let url = URL(string: ss(r, "open_url")), !ss(r, "open_url").isEmpty {
+            openedURL = url
+            _ = await UIApplication.shared.open(url)
+        }
     }
 
     private func choose(option: Int?, qty: Int?) async {
@@ -867,9 +960,8 @@ private struct ShoppingProposalSheet: View {
     }
 
     /// The one tap: his yes to the line as shown, then the store page opens.
-    private func buy() async {
+    private func buy(chrome: Bool) async {
         working = true
-        defer { working = false }
         var body: ShopRow = [
             "proposal_id": proposalID,
             "item": ss(line, "item"),
@@ -879,14 +971,24 @@ private struct ShoppingProposalSheet: View {
             "said": "Tapped Buy on this line in the app",
         ]
         if let price = sd(line, "price") { body["price"] = price }
-        guard let r = try? await ShoppingModel.call("shopping_approve", body) else { message = "No connection. Nothing was changed."; return }
+        guard let r = try? await ShoppingModel.call("shopping_approve", body) else { working = false; message = "No connection. Nothing was changed."; return }
         if (r["ok"] as? Bool) == false {
             // The line changed or its time passed: show it again, he taps again.
+            working = false
             message = ss(r, "error")
             await read()
             return
         }
         message = ""
+        working = false
+        if chrome {
+            await prepareChrome()
+            await read()
+            await model.load(force: true)
+            return
+        }
+        working = true
+        defer { working = false }
         if let url = URL(string: ss(r, "open_url")), !ss(r, "open_url").isEmpty {
             openedURL = url
             _ = await UIApplication.shared.open(url)
